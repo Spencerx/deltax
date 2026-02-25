@@ -25,7 +25,7 @@ def pg_container():
         capture_output=True,
     )
 
-    # Start container
+    # Start container with shared_preload_libraries so the background worker runs
     subprocess.check_call(
         [
             "docker", "run", "-d",
@@ -33,6 +33,7 @@ def pg_container():
             "-p", f"{HOST_PORT}:5432",
             "-e", f"POSTGRES_PASSWORD={PG_PASSWORD}",
             image,
+            "-c", "shared_preload_libraries=pg_cocoon",
         ]
     )
 
@@ -101,3 +102,29 @@ def db(pg_container):
     admin = _admin_conn()
     admin.execute(f'DROP DATABASE "{db_name}"')
     admin.close()
+
+
+@pytest.fixture()
+def postgres_db(pg_container):
+    """Connection to the postgres database where the background worker operates.
+
+    Creates the extension if needed.  Each test gets a unique table prefix
+    to avoid collisions, but cleanup is the caller's responsibility.
+    """
+    conn = psycopg.connect(
+        host="localhost",
+        port=HOST_PORT,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        dbname="postgres",
+    )
+    conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cocoon")
+    conn.commit()
+
+    yield conn
+
+    # The connection may be in an error state after a failed test; roll back first
+    conn.rollback()
+    conn.execute("RESET pg_cocoon.mock_now")
+    conn.commit()
+    conn.close()

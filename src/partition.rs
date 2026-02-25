@@ -74,7 +74,19 @@ fn align_to_interval(ts_usec: i64, interval_usec: i64) -> i64 {
 }
 
 /// Get current time as microseconds since Unix epoch via SPI.
+/// Respects the `pg_cocoon.mock_now` GUC when set.
 fn now_usec() -> i64 {
+    if let Some(mock_cstr) = crate::MOCK_NOW.get() {
+        let mock_val = mock_cstr.to_str().unwrap_or("");
+        if !mock_val.is_empty() {
+            return Spi::get_one_with_args::<i64>(
+                "SELECT (EXTRACT(EPOCH FROM $1::timestamptz) * 1000000)::int8",
+                &[mock_val.into()],
+            )
+            .expect("failed to parse pg_cocoon.mock_now")
+            .unwrap();
+        }
+    }
     Spi::get_one::<i64>("SELECT (EXTRACT(EPOCH FROM now()) * 1000000)::int8")
         .expect("failed to get current time")
         .unwrap()

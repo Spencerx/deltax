@@ -1,0 +1,159 @@
+"""Integration tests for the background worker using pg_cocoon.mock_now."""
+
+import time
+import uuid
+
+import psycopg
+
+# ALTER SYSTEM requires autocommit (cannot run inside a transaction block),
+# so we use a short-lived connection for those statements.
+CONN_PARAMS = dict(
+    host="localhost", port=15432, user="postgres",
+    password="postgres", dbname="postgres",
+)
+
+
+def _alter_system(sql):
+    """Run an ALTER SYSTEM statement via a temporary autocommit connection."""
+    with psycopg.connect(**CONN_PARAMS, autocommit=True) as conn:
+        conn.execute(sql)
+        conn.execute("SELECT pg_reload_conf()")
+
+
+def _unique_table():
+    return "wt_" + uuid.uuid4().hex[:8]
+
+
+def _cleanup(db, table_name):
+    """Drop test table and its catalog entries."""
+    # Reset the worker's clock
+    _alter_system("ALTER SYSTEM RESET pg_cocoon.mock_now")
+
+    # The connection may be in an error state; roll back first
+    db.rollback()
+    db.execute("RESET pg_cocoon.mock_now")
+    db.execute(
+        "DELETE FROM cocoon_partition WHERE hypertable_id IN "
+        "(SELECT id FROM cocoon_hypertable WHERE table_name = %s)",
+        (table_name,),
+    )
+    db.execute(
+        "DELETE FROM cocoon_hypertable WHERE table_name = %s", (table_name,)
+    )
+    db.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
+    db.commit()
+
+
+def test_worker_creates_future_partitions(postgres_db):
+    """After time advances past the pre-made window, the worker creates new partitions."""
+    db = postgres_db
+    table = _unique_table()
+
+    try:
+        # Pin "now" to a known time for deterministic partition layout
+        db.execute("SET pg_cocoon.mock_now = '2025-06-15 00:00:00+00'")
+        db.execute(
+            f'CREATE TABLE "{table}" (ts TIMESTAMPTZ NOT NULL, val FLOAT8)'
+        )
+        db.commit()
+
+        # premake=2 → 4 partitions: 1 past + 1 current + 2 future
+        #   [June 14-15), [June 15-16), [June 16-17), [June 17-18)
+        db.execute(
+            f"SELECT cocoon_create_table('{table}', 'ts', '1 day', 2)"
+        )
+        db.commit()
+
+        initial = db.execute(
+            f"SELECT count(*) FROM cocoon_partition_info('{table}')"
+        ).fetchone()[0]
+        assert initial == 4
+
+        # Jump time forward 5 days. The worker (premake=3) will see that
+        # it needs partitions around June 20 and create them.
+        _alter_system(
+            "ALTER SYSTEM SET pg_cocoon.mock_now = '2025-06-20 00:00:00+00'"
+        )
+
+        # Poll until the worker has created new partitions (runs every 60s).
+        # Commit after each read to release locks — the worker needs
+        # ACCESS EXCLUSIVE to create partitions.
+        deadline = time.time() + 90
+        new_count = initial
+        while time.time() < deadline:
+            time.sleep(5)
+            new_count = db.execute(
+                f"SELECT count(*) FROM cocoon_partition_info('{table}')"
+            ).fetchone()[0]
+            db.commit()
+            if new_count > initial:
+                break
+
+        assert new_count > initial, (
+            f"Expected worker to create new partitions (was {initial}, "
+            f"still {new_count} after waiting)"
+        )
+
+    finally:
+        _cleanup(db, table)
+
+
+def test_worker_drains_default_partition(postgres_db):
+    """Rows landing in the default partition are moved by the worker."""
+    db = postgres_db
+    table = _unique_table()
+
+    try:
+        # Pin "now" so we get predictable partitions
+        db.execute("SET pg_cocoon.mock_now = '2025-06-15 00:00:00+00'")
+        db.execute(
+            f'CREATE TABLE "{table}" (ts TIMESTAMPTZ NOT NULL, val FLOAT8)'
+        )
+        db.commit()
+
+        # premake=1 → 3 partitions: [June 14-15), [June 15-16), [June 16-17)
+        db.execute(
+            f"SELECT cocoon_create_table('{table}', 'ts', '1 day', 1)"
+        )
+        db.commit()
+
+        # Insert a row far in the future — lands in the default partition
+        db.execute(
+            f"INSERT INTO \"{table}\" VALUES ('2025-07-01 12:00:00+00', 99.0)"
+        )
+        db.commit()
+
+        default_count = db.execute(
+            f'SELECT count(*) FROM "{table}_default"'
+        ).fetchone()[0]
+        assert default_count == 1, "Row should be in the default partition"
+
+        # Tell the worker it's July 1 so it can create a matching partition
+        # and drain the default
+        _alter_system(
+            "ALTER SYSTEM SET pg_cocoon.mock_now = '2025-07-01 00:00:00+00'"
+        )
+
+        # Poll until the default partition is empty.
+        # Commit after each read to release locks — the worker needs
+        # ACCESS EXCLUSIVE on the partition to detach/reattach it.
+        deadline = time.time() + 90
+        drained = False
+        while time.time() < deadline:
+            time.sleep(5)
+            cnt = db.execute(
+                f'SELECT count(*) FROM "{table}_default"'
+            ).fetchone()[0]
+            db.commit()
+            if cnt == 0:
+                drained = True
+                break
+
+        assert drained, "Expected worker to drain the default partition"
+
+        # The row should still be queryable from the parent table
+        total = db.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+        assert total == 1
+
+    finally:
+        _cleanup(db, table)

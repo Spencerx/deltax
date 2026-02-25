@@ -1,3 +1,6 @@
+use std::ffi::CString;
+
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 
 mod catalog;
@@ -6,6 +9,9 @@ mod partition;
 mod worker;
 
 pg_module_magic!();
+
+pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 
 extension_sql!(
     r#"
@@ -43,6 +49,14 @@ CREATE TABLE IF NOT EXISTS cocoon_partition (
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    GucRegistry::define_string_guc(
+        c"pg_cocoon.mock_now",
+        c"Override current time for testing (timestamptz literal, empty = use real time)",
+        c"Override current time for testing (timestamptz literal, empty = use real time)",
+        &MOCK_NOW,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
     worker::register_bgworker();
 }
 

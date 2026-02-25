@@ -45,6 +45,16 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
 
         BackgroundWorker::transaction(|| {
             Spi::connect_mut(|client| {
+                // Skip if the extension hasn't been installed yet (catalog tables missing)
+                let has_catalog = client.select(
+                    "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'cocoon_hypertable'",
+                    None,
+                    &[],
+                ).map(|r| !r.is_empty()).unwrap_or(false);
+                if !has_catalog {
+                    return;
+                }
+
                 let hypertables = match catalog::get_all_hypertables(client) {
                     Ok(hts) => hts,
                     Err(e) => {
@@ -54,6 +64,29 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                 };
 
                 for ht in &hypertables {
+                    // Drain default partition first — rows in the default
+                    // would block creation of new partitions whose range
+                    // overlaps with those rows.
+                    match drain_default_partition(client, ht) {
+                        Ok(moved) => {
+                            if moved > 0 {
+                                log!(
+                                    "pg_cocoon: drained {} rows from {}_default",
+                                    moved,
+                                    ht.table_name
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log!(
+                                "pg_cocoon: failed to drain default partition for {}.{}: {:?}",
+                                ht.schema_name,
+                                ht.table_name,
+                                e
+                            );
+                        }
+                    }
+
                     // Pre-create future partitions (default premake = 3)
                     match partition::ensure_future_partitions(client, ht, 3) {
                         Ok(created) => {
@@ -69,27 +102,6 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                         Err(e) => {
                             log!(
                                 "pg_cocoon: failed to create partitions for {}.{}: {:?}",
-                                ht.schema_name,
-                                ht.table_name,
-                                e
-                            );
-                        }
-                    }
-
-                    // Drain default partition
-                    match drain_default_partition(client, ht) {
-                        Ok(moved) => {
-                            if moved > 0 {
-                                log!(
-                                    "pg_cocoon: drained {} rows from {}_default",
-                                    moved,
-                                    ht.table_name
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log!(
-                                "pg_cocoon: failed to drain default partition for {}.{}: {:?}",
                                 ht.schema_name,
                                 ht.table_name,
                                 e
@@ -178,65 +190,6 @@ fn drain_default_partition(
         v
     };
 
-    for boundary_usec in &boundaries {
-        let end_usec = boundary_usec + interval_usec;
-
-        // Format timestamps
-        let start_sec = *boundary_usec as f64 / 1_000_000.0;
-        let end_sec = end_usec as f64 / 1_000_000.0;
-
-        let start_str = Spi::get_one_with_args::<String>(
-            "SELECT to_char(to_timestamp($1), 'YYYY-MM-DD HH24:MI:SS')",
-            &[start_sec.into()],
-        )?
-        .unwrap();
-        let end_str = Spi::get_one_with_args::<String>(
-            "SELECT to_char(to_timestamp($1), 'YYYY-MM-DD HH24:MI:SS')",
-            &[end_sec.into()],
-        )?
-        .unwrap();
-
-        // Generate partition name
-        let query = if interval_usec >= 86_400_000_000 {
-            "SELECT to_char(to_timestamp($1), 'YYYYMMDD')"
-        } else {
-            "SELECT to_char(to_timestamp($1), 'YYYYMMDD_HH24MI')"
-        };
-        let suffix =
-            Spi::get_one_with_args::<String>(query, &[start_sec.into()])?.unwrap();
-        let part_name = format!("{}_p{}", ht.table_name, suffix);
-
-        // Create the partition if it doesn't exist
-        partition::create_partition(
-            client,
-            &ht.schema_name,
-            &ht.table_name,
-            &part_name,
-            &start_str,
-            &end_str,
-        )?;
-
-        // Register in catalog
-        let start_tstz = Spi::get_one_with_args::<TimestampWithTimeZone>(
-            "SELECT to_timestamp($1)",
-            &[start_sec.into()],
-        )?
-        .unwrap();
-        let end_tstz = Spi::get_one_with_args::<TimestampWithTimeZone>(
-            "SELECT to_timestamp($1)",
-            &[end_sec.into()],
-        )?
-        .unwrap();
-        catalog::register_partition(
-            client,
-            ht.id,
-            &ht.schema_name,
-            &part_name,
-            start_tstz,
-            end_tstz,
-        )?;
-    }
-
     if !boundaries.is_empty() {
         let parent = if ht.schema_name == "public" {
             format!("\"{}\"", ht.table_name)
@@ -244,13 +197,71 @@ fn drain_default_partition(
             format!("\"{}\".\"{}\"", ht.schema_name, ht.table_name)
         };
 
-        // Detach default, move rows, truncate, reattach
+        // Detach default first — PG won't allow creating a partition whose
+        // range overlaps with rows already sitting in the default.
         client.update(
             &format!("ALTER TABLE {} DETACH PARTITION {}", parent, fq_default),
             None,
             &[],
         )?;
 
+        // Now create the missing partitions
+        for boundary_usec in &boundaries {
+            let end_usec = boundary_usec + interval_usec;
+
+            let start_sec = *boundary_usec as f64 / 1_000_000.0;
+            let end_sec = end_usec as f64 / 1_000_000.0;
+
+            let start_str = Spi::get_one_with_args::<String>(
+                "SELECT to_char(to_timestamp($1), 'YYYY-MM-DD HH24:MI:SS')",
+                &[start_sec.into()],
+            )?
+            .unwrap();
+            let end_str = Spi::get_one_with_args::<String>(
+                "SELECT to_char(to_timestamp($1), 'YYYY-MM-DD HH24:MI:SS')",
+                &[end_sec.into()],
+            )?
+            .unwrap();
+
+            let query = if interval_usec >= 86_400_000_000 {
+                "SELECT to_char(to_timestamp($1), 'YYYYMMDD')"
+            } else {
+                "SELECT to_char(to_timestamp($1), 'YYYYMMDD_HH24MI')"
+            };
+            let suffix =
+                Spi::get_one_with_args::<String>(query, &[start_sec.into()])?.unwrap();
+            let part_name = format!("{}_p{}", ht.table_name, suffix);
+
+            partition::create_partition(
+                client,
+                &ht.schema_name,
+                &ht.table_name,
+                &part_name,
+                &start_str,
+                &end_str,
+            )?;
+
+            let start_tstz = Spi::get_one_with_args::<TimestampWithTimeZone>(
+                "SELECT to_timestamp($1)",
+                &[start_sec.into()],
+            )?
+            .unwrap();
+            let end_tstz = Spi::get_one_with_args::<TimestampWithTimeZone>(
+                "SELECT to_timestamp($1)",
+                &[end_sec.into()],
+            )?
+            .unwrap();
+            catalog::register_partition(
+                client,
+                ht.id,
+                &ht.schema_name,
+                &part_name,
+                start_tstz,
+                end_tstz,
+            )?;
+        }
+
+        // Move rows from the detached default into the proper partitions
         client.update(
             &format!("INSERT INTO {} SELECT * FROM {}", parent, fq_default),
             None,
