@@ -4,8 +4,11 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 
 mod catalog;
+mod compress;
+mod compression;
 mod functions;
 mod partition;
+mod scan;
 mod worker;
 
 pg_module_magic!();
@@ -15,6 +18,8 @@ pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
 
 extension_sql!(
     r#"
+CREATE SCHEMA IF NOT EXISTS _cocoon_compressed;
+
 CREATE TABLE IF NOT EXISTS cocoon_hypertable (
     id              SERIAL PRIMARY KEY,
     schema_name     TEXT NOT NULL,
@@ -58,6 +63,7 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     worker::register_bgworker();
+    unsafe { scan::register_hook(); }
 }
 
 #[cfg(any(test, feature = "pg_test"))]

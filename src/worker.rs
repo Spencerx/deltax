@@ -108,6 +108,17 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                             );
                         }
                     }
+
+                    // Auto-compress eligible partitions
+                    let compressed = crate::compress::auto_compress_partitions(client, ht);
+                    if compressed > 0 {
+                        log!(
+                            "pg_cocoon: auto-compressed {} partitions for {}.{}",
+                            compressed,
+                            ht.schema_name,
+                            ht.table_name
+                        );
+                    }
                 }
             })
         });

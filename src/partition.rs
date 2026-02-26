@@ -104,7 +104,7 @@ fn usec_to_tstz(usec: i64) -> TimestampWithTimeZone {
 }
 
 /// Format a fully-qualified table name.
-fn fqn(schema: &str, table: &str) -> String {
+pub fn fqn(schema: &str, table: &str) -> String {
     if schema == "public" {
         format!("\"{}\"", table)
     } else {
@@ -305,7 +305,7 @@ fn cocoon_create_table(
 }
 
 /// Resolve a relation name to (schema, table).
-fn resolve_relation(_client: &SpiClient, relation: &str) -> (String, String) {
+pub fn resolve_relation(_client: &SpiClient, relation: &str) -> (String, String) {
     let parts: Vec<&str> = relation.split('.').collect();
     match parts.len() {
         1 => {

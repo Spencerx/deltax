@@ -25,6 +25,8 @@ make cargo CMD="<cmd>"                # Run arbitrary cargo command in dev conta
 make clean                            # Clean Docker volumes
 ```
 
+If you need to reference pgrx source code, it is in ~/src/pgrx.
+
 ## Architecture
 
 Overall design and plan with several phases is in pg_cocoon_design_v03.md
