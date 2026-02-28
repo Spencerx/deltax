@@ -115,6 +115,7 @@ fn cocoon_decompress_partition(partition: &str) -> String {
 
 /// Show compression statistics for a hypertable.
 #[pg_extern]
+#[allow(clippy::type_complexity)]
 fn cocoon_compression_stats(
     relation: &str,
 ) -> TableIterator<
@@ -277,10 +278,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         // Get distinct segment values
         let segment_cols_quoted: Vec<String> = ht.segment_by.iter().map(|c| format!("\"{}\"", c)).collect();
         let segment_cols_str = segment_cols_quoted.join(", ");
+        // Cast to text so we can read as String regardless of the column type
+        let segment_cols_text: Vec<String> = ht.segment_by.iter().map(|c| format!("\"{}\"::text", c)).collect();
+        let segment_cols_text_str = segment_cols_text.join(", ");
 
         let segments_query = format!(
             "SELECT DISTINCT {} FROM {} ORDER BY {}",
-            segment_cols_str, part_fqn, segment_cols_str
+            segment_cols_text_str, part_fqn, segment_cols_str
         );
         let segment_result = client
             .select(&segments_query, None, &[])
@@ -339,6 +343,8 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     )
     .expect("failed to update catalog");
 
+    crate::scan::invalidate_compressed_cache();
+
     format!(
         "Compressed {}.{}: {} rows, ratio {:.1}x",
         schema,
@@ -354,6 +360,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
 /// Compress a single segment (subset of rows matching the segment filter).
 /// Returns the total compressed size in bytes.
+#[allow(clippy::too_many_arguments)]
 fn compress_segment(
     client: &mut SpiClient,
     part_fqn: &str,
@@ -423,18 +430,16 @@ fn compress_segment(
 
         // Track min/max for time column
         if col.name == time_column {
-            for v in values {
-                if let Some(val) = v {
-                    match &min_ts {
-                        None => min_ts = Some(val.clone()),
-                        Some(cur) if val < cur => min_ts = Some(val.clone()),
-                        _ => {}
-                    }
-                    match &max_ts {
-                        None => max_ts = Some(val.clone()),
-                        Some(cur) if val > cur => max_ts = Some(val.clone()),
-                        _ => {}
-                    }
+            for val in values.iter().flatten() {
+                match &min_ts {
+                    None => min_ts = Some(val.clone()),
+                    Some(cur) if val < cur => min_ts = Some(val.clone()),
+                    _ => {}
+                }
+                match &max_ts {
+                    None => max_ts = Some(val.clone()),
+                    Some(cur) if val > cur => max_ts = Some(val.clone()),
+                    _ => {}
                 }
             }
         }
@@ -559,6 +564,33 @@ fn compress_column_values(values: &[Option<String>], data_type: &str, _col_name:
             }
             .to_bytes()
         }
+    } else if dt == "smallint" || dt == "int2" {
+        // Upcast smallint to i32 for delta-varint encoding
+        let (non_null, null_bitmap) = compression::extract_nulls(values);
+        let ints: Vec<i32> = non_null.iter().map(|v| v.parse::<i16>().unwrap_or(0) as i32).collect();
+        let data = compression::integer::encode_i32(&ints);
+        CompressedColumn {
+            type_tag: CompressionType::DeltaVarint,
+            row_count: values.len() as u32,
+            null_bitmap,
+            data,
+        }
+        .to_bytes()
+    } else if dt == "date" {
+        // Treat date as timestamp for Gorilla encoding
+        let (non_null, null_bitmap) = compression::extract_nulls(values);
+        let timestamps: Vec<i64> = non_null
+            .iter()
+            .map(|v| parse_timestamp_to_usec(v))
+            .collect();
+        let data = compression::gorilla::encode_timestamps(&timestamps);
+        CompressedColumn {
+            type_tag: CompressionType::Gorilla,
+            row_count: values.len() as u32,
+            null_bitmap,
+            data,
+        }
+        .to_bytes()
     } else if dt == "integer" || dt == "int4" {
         let (non_null, null_bitmap) = compression::extract_nulls(values);
         let ints: Vec<i32> = non_null.iter().map(|v| v.parse::<i32>().unwrap_or(0)).collect();
@@ -597,7 +629,7 @@ fn compress_column_values(values: &[Option<String>], data_type: &str, _col_name:
         let (non_null, null_bitmap) = compression::extract_nulls(values);
         let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
 
-        let data = if compression::dictionary::should_use_dictionary(&refs) {
+        if compression::dictionary::should_use_dictionary(&refs) {
             let encoded = compression::dictionary::encode(&refs);
             // Wrap with Dictionary tag
             CompressedColumn {
@@ -616,8 +648,7 @@ fn compress_column_values(values: &[Option<String>], data_type: &str, _col_name:
                 data: encoded,
             }
             .to_bytes()
-        };
-        data
+        }
     }
 }
 
@@ -717,7 +748,7 @@ fn decompress_partition_impl(client: &mut SpiClient, partition: &str) -> String 
     let mut select_cols = Vec::new();
     for col in &columns {
         if col.is_segment_by {
-            select_cols.push(format!("\"{}\"", col.name));
+            select_cols.push(format!("\"{}\"::text", col.name));
         }
     }
     for col in &columns {
@@ -855,6 +886,8 @@ fn decompress_partition_impl(client: &mut SpiClient, partition: &str) -> String 
     catalog::mark_partition_decompressed(client, part_info.id)
         .expect("failed to update catalog");
 
+    crate::scan::invalidate_compressed_cache();
+
     format!(
         "Decompressed {}.{}: {} rows restored",
         schema, part_table, total_rows_restored
@@ -873,12 +906,24 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
 
     match cc.type_tag {
         CompressionType::Gorilla => {
-            if dt.contains("timestamp") {
+            if dt.contains("timestamp") || dt == "date" {
                 let timestamps = compression::gorilla::decode_timestamps(&cc.data, count_non_null(&cc.null_bitmap, total_count));
-                let strings: Vec<String> = timestamps
-                    .iter()
-                    .map(|&usec| usec_to_timestamp_string(usec))
-                    .collect();
+                let strings: Vec<String> = if dt == "date" {
+                    // Format back as date string (YYYY-MM-DD)
+                    timestamps
+                        .iter()
+                        .map(|&usec| {
+                            let ts = usec_to_timestamp_string(usec);
+                            // Extract just the date part
+                            ts.split_whitespace().next().unwrap_or(&ts).to_string()
+                        })
+                        .collect()
+                } else {
+                    timestamps
+                        .iter()
+                        .map(|&usec| usec_to_timestamp_string(usec))
+                        .collect()
+                };
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
             } else if dt == "real" || dt == "float4" {
                 let floats = compression::gorilla::decode_floats_f32(&cc.data, count_non_null(&cc.null_bitmap, total_count));
@@ -891,7 +936,12 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
             }
         }
         CompressionType::DeltaVarint => {
-            if dt == "integer" || dt == "int4" {
+            if dt == "smallint" || dt == "int2" {
+                // Decode as i32 and downcast to i16
+                let ints = compression::integer::decode_i32(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+                let strings: Vec<String> = ints.iter().map(|v| (*v as i16).to_string()).collect();
+                compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+            } else if dt == "integer" || dt == "int4" {
                 let ints = compression::integer::decode_i32(&cc.data, count_non_null(&cc.null_bitmap, total_count));
                 let strings: Vec<String> = ints.iter().map(|v| v.to_string()).collect();
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
@@ -941,6 +991,8 @@ fn format_value_for_insert(value: &str, data_type: &str) -> String {
     let dt = data_type.to_lowercase();
     if dt.contains("timestamp") {
         format!("'{}'::timestamptz", value.replace('\'', "''"))
+    } else if dt == "date" {
+        format!("'{}'::date", value.replace('\'', "''"))
     } else if dt == "boolean" || dt == "bool" {
         if value == "t" || value == "true" || value == "1" {
             "true".to_string()
@@ -948,6 +1000,7 @@ fn format_value_for_insert(value: &str, data_type: &str) -> String {
             "false".to_string()
         }
     } else if dt == "integer" || dt == "int4" || dt == "bigint" || dt == "int8"
+        || dt == "smallint" || dt == "int2"
         || dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4"
     {
         value.to_string()

@@ -21,7 +21,7 @@ static CUSTOM_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
 
 /// Add a CocoonDecompress custom path to the relation's pathlist.
 pub unsafe fn add_decompress_path(
-    root: *mut pg_sys::PlannerInfo,
+    _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oid: pg_sys::Oid,
 ) {
@@ -49,6 +49,11 @@ pub unsafe fn add_decompress_path(
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &CUSTOM_PATH_METHODS.0;
+
+        // Clear existing paths — the partition is truncated so any SeqScan
+        // would return 0 rows.  We must replace it with the decompression path.
+        (*rel).pathlist = std::ptr::null_mut();
+        (*rel).partial_pathlist = std::ptr::null_mut();
 
         pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
     }

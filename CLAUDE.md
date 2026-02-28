@@ -26,6 +26,8 @@ make clean                            # Clean Docker volumes
 ```
 
 If you need to reference pgrx source code, it is in ~/src/pgrx.
+If you need to reference the postgres source code, is in ~/src/postgres. 
+Use the source there, it's much faster than looking into the docker images.
 
 ## Architecture
 

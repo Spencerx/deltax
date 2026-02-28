@@ -1,7 +1,7 @@
-/// Gorilla compression for floating-point and timestamp data.
-///
-/// - Floats: XOR-based encoding (Facebook Gorilla paper)
-/// - Timestamps: Delta-of-delta encoding
+// Gorilla compression for floating-point and timestamp data.
+//
+// - Floats: XOR-based encoding (Facebook Gorilla paper)
+// - Timestamps: Delta-of-delta encoding
 
 // ---------------------------------------------------------------------------
 // Bit-level I/O

@@ -12,7 +12,6 @@
 ///
 /// Use dictionary encoding when cardinality < 10% of row count AND < 65536 distinct values.
 /// Otherwise fall back to LZ4.
-
 use std::collections::HashMap;
 
 fn write_varint(buf: &mut Vec<u8>, mut v: u32) {

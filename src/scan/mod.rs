@@ -2,7 +2,6 @@
 ///
 /// Installs a `set_rel_pathlist_hook` that detects compressed partitions
 /// and injects a `CocoonDecompress` custom path/scan node.
-
 mod cost;
 pub(crate) mod exec;
 mod explain;
@@ -24,6 +23,10 @@ const CUSTOM_NAME: &std::ffi::CStr = c"CocoonDecompress";
 pub(crate) struct SyncStatic<T>(pub T);
 unsafe impl<T> Sync for SyncStatic<T> {}
 unsafe impl<T> Send for SyncStatic<T> {}
+
+pub fn invalidate_compressed_cache() {
+    hook::invalidate_compressed_cache();
+}
 
 /// Register the planner hook at extension load time.
 ///

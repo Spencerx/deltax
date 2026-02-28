@@ -5,7 +5,6 @@
 ///     4 bytes — string length (u32 LE)
 ///     N bytes — string UTF-8 data
 ///   Then the entire buffer is LZ4-compressed.
-
 pub fn encode(values: &[&str]) -> Vec<u8> {
     if values.is_empty() {
         return Vec::new();

@@ -12,6 +12,10 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+pub fn invalidate_compressed_cache() {
+    COMPRESSED_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// The planner hook. Called for each relation during path generation.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
@@ -24,14 +28,16 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
         // Chain the previous hook first
         let prev = PREV_HOOK.load(Ordering::SeqCst);
         if !prev.is_null() {
-            let prev_fn: pg_sys::set_rel_pathlist_hook_type = Some(std::mem::transmute(prev));
+            let prev_fn: pg_sys::set_rel_pathlist_hook_type = Some(std::mem::transmute::<*mut (), unsafe extern "C-unwind" fn(*mut pg_sys::PlannerInfo, *mut pg_sys::RelOptInfo, u32, *mut pg_sys::RangeTblEntry)>(prev));
             if let Some(f) = prev_fn {
                 f(root, rel, rti, rte);
             }
         }
 
-        // Only process base relations
-        if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL {
+        // Only process base relations and child member relations (partitions)
+        if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
+            && (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL
+        {
             return;
         }
 
@@ -80,6 +86,12 @@ unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
         let schema_cstr = c"_cocoon_compressed";
         let compressed_ns_oid = pg_sys::get_namespace_oid(schema_cstr.as_ptr(), true);
         if compressed_ns_oid == pg_sys::InvalidOid {
+            return pg_sys::InvalidOid;
+        }
+
+        // Skip tables already in the _cocoon_compressed schema to avoid recursion
+        let rel_ns_oid = pg_sys::get_rel_namespace(rel_oid);
+        if rel_ns_oid == compressed_ns_oid {
             return pg_sys::InvalidOid;
         }
 

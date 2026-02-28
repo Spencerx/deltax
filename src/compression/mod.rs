@@ -47,7 +47,7 @@ impl CompressedColumn {
     pub fn to_bytes(&self) -> Vec<u8> {
         let has_nulls = !self.null_bitmap.is_empty();
         let bitmap_len = if has_nulls {
-            (self.row_count as usize + 7) / 8
+            (self.row_count as usize).div_ceil(8)
         } else {
             0
         };
@@ -69,7 +69,7 @@ impl CompressedColumn {
         let row_count = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
         let has_nulls = bytes[5] != 0;
         let (null_bitmap, data_start) = if has_nulls {
-            let bitmap_len = (row_count as usize + 7) / 8;
+            let bitmap_len = (row_count as usize).div_ceil(8);
             (bytes[6..6 + bitmap_len].to_vec(), 6 + bitmap_len)
         } else {
             (Vec::new(), 6)
@@ -89,7 +89,7 @@ impl CompressedColumn {
 pub fn extract_nulls<T: Clone>(values: &[Option<T>]) -> (Vec<T>, Vec<u8>) {
     let mut non_null = Vec::with_capacity(values.len());
     let mut has_any_null = false;
-    let bitmap_len = (values.len() + 7) / 8;
+    let bitmap_len = values.len().div_ceil(8);
     let mut bitmap = vec![0u8; bitmap_len];
 
     for (i, val) in values.iter().enumerate() {

@@ -2,13 +2,12 @@
 ///
 /// Simply packs 8 booleans per byte (bit 0 of byte 0 = value[0], etc.).
 /// This is simpler and typically as effective as RLE for boolean data.
-
 pub fn encode(values: &[bool]) -> Vec<u8> {
     if values.is_empty() {
         return Vec::new();
     }
 
-    let byte_count = (values.len() + 7) / 8;
+    let byte_count = values.len().div_ceil(8);
     let mut buf = vec![0u8; byte_count];
 
     for (i, &val) in values.iter().enumerate() {

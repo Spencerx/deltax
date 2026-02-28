@@ -3,7 +3,6 @@
 /// Encoding format:
 ///   8 bytes — first value (i64, little-endian)
 ///   rest    — zigzag-encoded deltas as varints
-
 /// Zigzag encode: maps signed integers to unsigned so small absolute values
 /// produce small unsigned values. 0→0, -1→1, 1→2, -2→3, 2→4, ...
 fn zigzag_encode(v: i64) -> u64 {
