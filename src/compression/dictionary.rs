@@ -93,6 +93,36 @@ pub fn encode(values: &[&str]) -> Vec<u8> {
     buf
 }
 
+/// Decode dictionary-encoded data, returning borrowed &str slices.
+/// Avoids N String allocations by referencing the dictionary entries in-place.
+pub fn decode_to_slices<'a>(data: &'a [u8], count: usize) -> Vec<&'a str> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let mut offset = 0;
+    let dict_size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let mut dict: Vec<&str> = Vec::with_capacity(dict_size);
+    for _ in 0..dict_size {
+        let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let s = std::str::from_utf8(&data[offset..offset + str_len])
+            .expect("invalid UTF-8 in dictionary");
+        offset += str_len;
+        dict.push(s);
+    }
+
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (idx, consumed) = read_varint(&data[offset..]);
+        offset += consumed;
+        values.push(dict[idx as usize]);
+    }
+    values
+}
+
 pub fn decode(data: &[u8], count: usize) -> Vec<String> {
     if count == 0 {
         return Vec::new();

@@ -84,6 +84,38 @@ impl CompressedColumn {
     }
 }
 
+/// A borrowing view of a compressed column blob — avoids copying bitmap + data.
+///
+/// Same wire format as `CompressedColumn`, but references the original byte slice.
+pub struct CompressedColumnRef<'a> {
+    pub type_tag: CompressionType,
+    pub row_count: u32,
+    pub null_bitmap: &'a [u8],
+    pub data: &'a [u8],
+}
+
+impl<'a> CompressedColumnRef<'a> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Self {
+        assert!(bytes.len() >= 6, "compressed column too short");
+        let type_tag = CompressionType::from_u8(bytes[0]);
+        let row_count = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+        let has_nulls = bytes[5] != 0;
+        let (null_bitmap, data_start) = if has_nulls {
+            let bitmap_len = (row_count as usize).div_ceil(8);
+            (&bytes[6..6 + bitmap_len], 6 + bitmap_len)
+        } else {
+            (&bytes[0..0], 6) // empty slice, no allocation
+        };
+        let data = &bytes[data_start..];
+        Self {
+            type_tag,
+            row_count,
+            null_bitmap,
+            data,
+        }
+    }
+}
+
 /// Build a null bitmap from an iterator of Option values.
 /// Returns (non_null_values, null_bitmap). Bitmap is empty if no nulls.
 pub fn extract_nulls<T: Clone>(values: &[Option<T>]) -> (Vec<T>, Vec<u8>) {

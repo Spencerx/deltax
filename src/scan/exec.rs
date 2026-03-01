@@ -2,7 +2,10 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::pg_guard;
 
-use crate::compression::{self, CompressionType, CompressedColumn};
+use std::collections::HashMap;
+use std::time::Instant;
+
+use crate::compression::{self, CompressionType, CompressedColumnRef};
 use super::SyncStatic;
 
 /// Static CustomExecMethods struct.
@@ -29,7 +32,7 @@ const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
 const PG_EPOCH_OFFSET_DAYS: i32 = 10_957;
 
 /// Decompression state stored as a raw pointer in the CustomScanState.
-pub(crate) struct DecompressState {
+pub(super) struct DecompressState {
     /// Column names in the original table (in order).
     col_names: Vec<String>,
     /// Column type OIDs (in order).
@@ -41,6 +44,8 @@ pub(crate) struct DecompressState {
     /// Decompressed datums for the current segment: outer = column, inner = row.
     /// Each element is (datum, is_null).
     current_segment: Vec<Vec<(pg_sys::Datum, bool)>>,
+    /// Total row count for the current segment (avoids indexing into empty Vecs).
+    current_row_count: usize,
     /// Current row index within current_segment.
     row_cursor: usize,
     /// Current segment index (0-based).
@@ -52,6 +57,28 @@ pub(crate) struct DecompressState {
     needed_cols: Vec<bool>,
     /// Per-segment memory context (child of es_query_cxt, reset per segment).
     segment_mcxt: pg_sys::MemoryContext,
+    /// Timing: wall-clock durations for profiling (accumulated across calls).
+    pub(super) timing: ScanTiming,
+}
+
+/// Wall-clock timing for the decompress scan phases.
+pub(super) struct ScanTiming {
+    /// Time spent in load_metadata (SPI).
+    pub(super) metadata_us: u64,
+    /// Time spent in load_segments_heap (heap scan + detoast).
+    pub(super) heap_scan_us: u64,
+    /// Time spent decompressing blobs to datums (per segment).
+    pub(super) decompress_us: u64,
+    /// Time spent in fill_slot + qual + projection (per row).
+    pub(super) emit_us: u64,
+    /// Total rows emitted (passed qual).
+    pub(super) rows_emitted: u64,
+    /// Total rows filtered by qual.
+    pub(super) rows_filtered: u64,
+    /// Total segments decompressed.
+    pub(super) segments_decompressed: u64,
+    /// Total compressed bytes loaded.
+    pub(super) compressed_bytes: u64,
 }
 
 struct SegmentData {
@@ -125,10 +152,8 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
                 .into_owned()
         };
 
-        // Load data via SPI, passing needed columns so we skip unneeded blobs
-        let mut state = Spi::connect(|client| {
-            load_decompress_state(client, &companion_name, &needed_indices)
-        });
+        // Load metadata via SPI, then load segment data via direct heap scan
+        let mut state = load_decompress_state(companion_oid, &companion_name, &needed_indices);
 
         // Create per-segment memory context
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
@@ -147,17 +172,19 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
     }
 }
 
-/// Load decompression state from the companion table via SPI.
-///
-/// `needed_indices` contains 0-based column indices the query needs.
-/// If empty, all columns are loaded (safety fallback).
-/// Only compressed blobs for needed columns are loaded from the companion table;
-/// unneeded columns get empty placeholder blobs to keep index mapping correct.
-fn load_decompress_state(
+/// Metadata returned by the SPI metadata query.
+struct MetadataInfo {
+    col_names: Vec<String>,
+    col_types: Vec<pg_sys::Oid>,
+    col_typmods: Vec<i32>,
+    segment_by: Vec<String>,
+}
+
+/// Load metadata (column names, types, segment_by) from catalog via SPI.
+fn load_metadata(
     client: &pgrx::spi::SpiClient<'_>,
     companion_name: &str,
-    needed_indices: &[usize],
-) -> DecompressState {
+) -> MetadataInfo {
     // Get the partition's hypertable info
     let mut ht_result = client
         .select(
@@ -183,12 +210,6 @@ fn load_decompress_state(
         .value::<Vec<String>>()
         .unwrap()
         .unwrap_or_default();
-    let time_column: String = ht_row
-        .get_datum_by_ordinal(3)
-        .unwrap()
-        .value::<String>()
-        .unwrap()
-        .unwrap();
     let parent_schema: String = ht_row
         .get_datum_by_ordinal(4)
         .unwrap()
@@ -230,9 +251,200 @@ fn load_decompress_state(
         col_typmods.push(typmod);
     }
 
-    // Build needed_cols from needed_indices.
-    // Empty means no columns needed (e.g. COUNT(*)) — skip all decompression.
-    let num_cols = col_names.len();
+    let col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
+
+    MetadataInfo {
+        col_names,
+        col_types,
+        col_typmods,
+        segment_by,
+    }
+}
+
+/// Load segment data from the companion table via direct heap scan.
+///
+/// Bypasses SPI entirely — opens the companion table, iterates all tuples
+/// with `heap_getnext`, and extracts segment_by values, compressed BYTEA blobs,
+/// and row counts directly from the heap tuples.
+unsafe fn load_segments_heap(
+    companion_oid: pg_sys::Oid,
+    col_names: &[String],
+    segment_by: &[String],
+    needed_cols: &[bool],
+) -> Vec<SegmentData> {
+    unsafe {
+        // Open companion table with AccessShareLock
+        let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let tupdesc = (*rel).rd_att;
+        let natts = (*tupdesc).natts as usize;
+
+        // Build column-name-to-attno mapping from companion TupleDesc
+        let mut attno_map: HashMap<String, usize> = HashMap::new();
+        let mut att_type_oids: HashMap<String, pg_sys::Oid> = HashMap::new();
+        for i in 0..natts {
+            let att = &*tupdesc_get_attr(tupdesc, i);
+            if att.attisdropped {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            att_type_oids.insert(name.clone(), att.atttypid);
+            attno_map.insert(name, i);
+        }
+
+        // Locate attribute indices for segment_by columns, compressed columns, and _row_count
+        let mut segment_by_attnos: Vec<(usize, pg_sys::Oid)> = Vec::new(); // (attno, type_oid)
+        for name in col_names {
+            if segment_by.contains(name) {
+                if let Some(&attno) = attno_map.get(name.as_str()) {
+                    let type_oid = att_type_oids[name.as_str()];
+                    segment_by_attnos.push((attno, type_oid));
+                }
+            }
+        }
+
+        let mut compressed_attnos: Vec<Option<usize>> = Vec::new(); // Some(attno) for needed, None for unneeded
+        for (idx, name) in col_names.iter().enumerate() {
+            if !segment_by.contains(name) {
+                if needed_cols[idx] {
+                    let comp_name = format!("_{}_compressed", name);
+                    compressed_attnos.push(attno_map.get(comp_name.as_str()).copied());
+                } else {
+                    compressed_attnos.push(None);
+                }
+            }
+        }
+
+        let row_count_attno = attno_map.get("_row_count").copied();
+
+        // Begin table scan via TableAmRoutine vtable
+        // (table_beginscan is static inline in C, so we call via the vtable)
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
+            | pg_sys::ScanOptions::SO_ALLOW_STRAT
+            | pg_sys::ScanOptions::SO_ALLOW_SYNC
+            | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
+        let scan = (*(*rel).rd_tableam).scan_begin.unwrap()(
+            rel,
+            snapshot,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            flags,
+        );
+
+        // Iterate all tuples
+        let mut segments = Vec::new();
+        let mut values = vec![pg_sys::Datum::from(0); natts];
+        let mut nulls = vec![true; natts];
+
+        loop {
+            let tuple = pg_sys::heap_getnext(
+                scan,
+                pg_sys::ScanDirection::ForwardScanDirection,
+            );
+            if tuple.is_null() {
+                break;
+            }
+
+            // Deform tuple into datums + nulls arrays
+            pg_sys::heap_deform_tuple(
+                tuple,
+                tupdesc,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+            );
+
+            // Extract segment_by values
+            let mut segment_values: Vec<Option<String>> = Vec::new();
+            for &(attno, type_oid) in &segment_by_attnos {
+                if !nulls[attno] {
+                    let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
+                    let mut typisvarlena: bool = false;
+                    pg_sys::getTypeOutputInfo(type_oid, &mut typoutput, &mut typisvarlena);
+                    let cstr = pg_sys::OidOutputFunctionCall(typoutput, values[attno]);
+                    let s = std::ffi::CStr::from_ptr(cstr)
+                        .to_string_lossy()
+                        .into_owned();
+                    pg_sys::pfree(cstr as *mut _);
+                    segment_values.push(Some(s));
+                } else {
+                    segment_values.push(None);
+                }
+            }
+
+            // Extract compressed BYTEA blobs
+            let mut compressed_blobs: Vec<Vec<u8>> = Vec::new();
+            for opt_attno in &compressed_attnos {
+                match opt_attno {
+                    Some(attno) => {
+                        let attno = *attno;
+                        if !nulls[attno] {
+                            let varlena_ptr: *mut pg_sys::varlena =
+                                values[attno].cast_mut_ptr();
+                            let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                            let len = pgrx::varsize_any_exhdr(detoasted);
+                            let data = pgrx::vardata_any(detoasted);
+                            let bytes = std::slice::from_raw_parts(
+                                data as *const u8,
+                                len,
+                            )
+                            .to_vec();
+                            if detoasted != varlena_ptr {
+                                pg_sys::pfree(detoasted as *mut _);
+                            }
+                            compressed_blobs.push(bytes);
+                        } else {
+                            compressed_blobs.push(Vec::new());
+                        }
+                    }
+                    None => {
+                        // Unneeded column — empty placeholder to keep blob_idx mapping
+                        compressed_blobs.push(Vec::new());
+                    }
+                }
+            }
+
+            // Extract _row_count (INT4)
+            let row_count = match row_count_attno {
+                Some(attno) if !nulls[attno] => values[attno].value() as i32,
+                _ => 0,
+            };
+
+            segments.push(SegmentData {
+                segment_values,
+                compressed_blobs,
+                row_count,
+            });
+        }
+
+        // End scan + close relation
+        (*(*rel).rd_tableam).scan_end.unwrap()(scan);
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        segments
+    }
+}
+
+/// Load decompression state: metadata via SPI, segment data via direct heap scan.
+///
+/// `needed_indices` contains 0-based column indices the query needs.
+/// If empty, all columns are loaded (safety fallback).
+/// Only compressed blobs for needed columns are loaded from the companion table;
+/// unneeded columns get empty placeholder blobs to keep index mapping correct.
+fn load_decompress_state(
+    companion_oid: pg_sys::Oid,
+    companion_name: &str,
+    needed_indices: &[usize],
+) -> DecompressState {
+    // Phase 1: SPI for metadata only (small, fast)
+    let t0 = Instant::now();
+    let meta = Spi::connect(|client| load_metadata(&client, companion_name));
+    let metadata_us = t0.elapsed().as_micros() as u64;
+
+    // Build needed_cols from needed_indices
+    let num_cols = meta.col_names.len();
     let needed_cols = {
         let mut nc = vec![false; num_cols];
         for &idx in needed_indices {
@@ -243,93 +455,40 @@ fn load_decompress_state(
         nc
     };
 
-    // Build SELECT columns for companion table — only include needed compressed columns
-    let companion_fqn = format!("\"_cocoon_compressed\".\"{}\"", companion_name);
-    let mut select_cols = Vec::new();
-    for name in &col_names {
-        if segment_by.contains(name) {
-            select_cols.push(format!("\"{}\"::text", name));
-        }
-    }
-    for (idx, name) in col_names.iter().enumerate() {
-        if !segment_by.contains(name) && needed_cols[idx] {
-            select_cols.push(format!("\"_{}_compressed\"", name));
-        }
-    }
-    select_cols.push(format!("_min_{}", time_column));
-    select_cols.push(format!("_max_{}", time_column));
-    select_cols.push("_row_count".to_string());
+    // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
+    let t1 = Instant::now();
+    let segments_data = unsafe {
+        load_segments_heap(companion_oid, &meta.col_names, &meta.segment_by, &needed_cols)
+    };
+    let heap_scan_us = t1.elapsed().as_micros() as u64;
 
-    let read_query = format!("SELECT {} FROM {}", select_cols.join(", "), companion_fqn);
-    let segments_result = client
-        .select(&read_query, None, &[])
-        .expect("failed to read segments");
-
-    let mut segments_data = Vec::new();
-
-    for row in segments_result {
-        let mut ordinal: usize = 1;
-        let mut segment_values = Vec::new();
-        let mut compressed_blobs = Vec::new();
-
-        for name in &col_names {
-            if segment_by.contains(name) {
-                let val: Option<String> = row
-                    .get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<String>()
-                    .unwrap();
-                segment_values.push(val);
-                ordinal += 1;
-            }
-        }
-        for (idx, name) in col_names.iter().enumerate() {
-            if !segment_by.contains(name) {
-                if needed_cols[idx] {
-                    let blob: Option<Vec<u8>> = row
-                        .get_datum_by_ordinal(ordinal)
-                        .unwrap()
-                        .value::<Vec<u8>>()
-                        .unwrap();
-                    compressed_blobs.push(blob.unwrap_or_default());
-                    ordinal += 1;
-                } else {
-                    // Unneeded column — empty placeholder to keep blob_idx mapping
-                    compressed_blobs.push(Vec::new());
-                }
-            }
-        }
-
-        // Skip _min_ts, _max_ts columns
-        ordinal += 2;
-
-        let row_count: i32 = row
-            .get_datum_by_ordinal(ordinal)
-            .unwrap()
-            .value::<i32>()
-            .unwrap()
-            .unwrap_or(0);
-
-        segments_data.push(SegmentData {
-            segment_values,
-            compressed_blobs,
-            row_count,
-        });
-    }
-
-    let col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
+    let compressed_bytes: u64 = segments_data
+        .iter()
+        .map(|s| s.compressed_blobs.iter().map(|b| b.len() as u64).sum::<u64>())
+        .sum();
 
     DecompressState {
-        col_names,
-        col_types,
-        col_typmods,
-        segment_by,
+        col_names: meta.col_names,
+        col_types: meta.col_types,
+        col_typmods: meta.col_typmods,
+        segment_by: meta.segment_by,
         current_segment: Vec::new(),
+        current_row_count: 0,
         row_cursor: 0,
         segment_index: 0,
         segments_data,
         needed_cols,
         segment_mcxt: std::ptr::null_mut(),
+        timing: ScanTiming {
+            metadata_us,
+            heap_scan_us,
+            decompress_us: 0,
+            emit_us: 0,
+            rows_emitted: 0,
+            rows_filtered: 0,
+            segments_decompressed: 0,
+            compressed_bytes,
+        },
     }
 }
 
@@ -351,8 +510,9 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
         loop {
             // If current segment has more rows, try the next one
             if !state.current_segment.is_empty() {
-                let seg_rows = state.current_segment[0].len();
+                let seg_rows = state.current_row_count;
                 if state.row_cursor < seg_rows {
+                    let t_emit = Instant::now();
                     fill_slot(scan_slot, state);
                     state.row_cursor += 1;
 
@@ -363,15 +523,20 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     if !qual.is_null() && !exec_qual(qual, econtext) {
                         // Reset per-tuple memory context on filtered rows
                         pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
+                        state.timing.emit_us += t_emit.elapsed().as_micros() as u64;
+                        state.timing.rows_filtered += 1;
                         continue; // skip this row, try next
                     }
 
                     // Apply projection if needed
-                    if !proj_info.is_null() {
-                        return exec_project(proj_info);
-                    }
-
-                    return scan_slot;
+                    let result = if !proj_info.is_null() {
+                        exec_project(proj_info)
+                    } else {
+                        scan_slot
+                    };
+                    state.timing.emit_us += t_emit.elapsed().as_micros() as u64;
+                    state.timing.rows_emitted += 1;
+                    return result;
                 }
             }
 
@@ -387,6 +552,8 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
             if seg.row_count == 0 {
                 continue;
             }
+
+            let t_decompress = Instant::now();
 
             // Reset segment memory context — frees all varlena from previous segment
             pg_sys::MemoryContextReset(state.segment_mcxt);
@@ -407,9 +574,7 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     } else {
                         blob_idx += 1;
                     }
-                    let dummy: Vec<(pg_sys::Datum, bool)> =
-                        (0..seg.row_count).map(|_| (pg_sys::Datum::from(0), true)).collect();
-                    decompressed.push(dummy);
+                    decompressed.push(Vec::new());
                     continue;
                 }
 
@@ -435,13 +600,17 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
 
             pg_sys::MemoryContextSwitchTo(old_ctx);
 
+            state.timing.decompress_us += t_decompress.elapsed().as_micros() as u64;
+            state.timing.segments_decompressed += 1;
+
             state.current_segment = decompressed;
+            state.current_row_count = seg.row_count as usize;
             state.row_cursor = 0;
         }
     }
 }
 
-/// EndCustomScan callback: cleanup.
+/// EndCustomScan callback: cleanup and emit timing summary.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn end_custom_scan(
     node: *mut pg_sys::CustomScanState,
@@ -450,6 +619,25 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
         let state_ptr = (*node).custom_ps as *mut DecompressState;
         if !state_ptr.is_null() {
             let state = Box::from_raw(state_ptr);
+
+            // Emit timing summary at LOG level (visible with SET client_min_messages = log)
+            let t = &state.timing;
+            let total_us = t.metadata_us + t.heap_scan_us + t.decompress_us + t.emit_us;
+            pgrx::log!(
+                "pg_cocoon scan timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
+                 decompress={:.1}ms  emit={:.1}ms  | \
+                 segments={} rows_out={} rows_filtered={} compressed_bytes={}",
+                total_us as f64 / 1000.0,
+                t.metadata_us as f64 / 1000.0,
+                t.heap_scan_us as f64 / 1000.0,
+                t.decompress_us as f64 / 1000.0,
+                t.emit_us as f64 / 1000.0,
+                t.segments_decompressed,
+                t.rows_emitted,
+                t.rows_filtered,
+                t.compressed_bytes,
+            );
+
             if !state.segment_mcxt.is_null() {
                 pg_sys::MemoryContextDelete(state.segment_mcxt);
             }
@@ -467,6 +655,7 @@ pub unsafe extern "C-unwind" fn rescan_custom_scan(
         let state = &mut *((*node).custom_ps as *mut DecompressState);
         state.segment_index = 0;
         state.row_cursor = 0;
+        state.current_row_count = 0;
         state.current_segment.clear();
     }
 }
@@ -521,6 +710,43 @@ unsafe fn exec_qual(state: *mut pg_sys::ExprState, econtext: *mut pg_sys::ExprCo
         pg_sys::MemoryContextSwitchTo(old_ctx);
 
         ret != pg_sys::Datum::from(0)
+    }
+}
+
+// ============================================================================
+// TupleDesc attribute access (PG14–17 vs PG18)
+// ============================================================================
+
+/// Get a pointer to the i-th `FormData_pg_attribute` from a TupleDesc.
+/// PG14–17 store attrs directly; PG18 stores CompactAttribute first, then attrs.
+#[cfg(any(
+    feature = "pg14",
+    feature = "pg15",
+    feature = "pg16",
+    feature = "pg17"
+))]
+#[inline]
+unsafe fn tupdesc_get_attr(
+    tupdesc: pg_sys::TupleDesc,
+    i: usize,
+) -> *const pg_sys::FormData_pg_attribute {
+    unsafe { (*tupdesc).attrs.as_ptr().add(i) }
+}
+
+#[cfg(feature = "pg18")]
+#[inline]
+unsafe fn tupdesc_get_attr(
+    tupdesc: pg_sys::TupleDesc,
+    i: usize,
+) -> *const pg_sys::FormData_pg_attribute {
+    unsafe {
+        let natts = (*tupdesc).natts as usize;
+        let att_pointer = (*tupdesc)
+            .compact_attrs
+            .as_ptr()
+            .add(natts)
+            .cast::<pg_sys::FormData_pg_attribute>();
+        att_pointer.add(i)
     }
 }
 
@@ -625,9 +851,9 @@ unsafe fn decompress_blob_to_datums(
         return Vec::new();
     }
 
-    let cc = CompressedColumn::from_bytes(blob);
+    let cc = CompressedColumnRef::from_bytes(blob);
     let total_count = cc.row_count as usize;
-    let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
     let dt = data_type.to_lowercase();
 
     let datums: Vec<pg_sys::Datum> = match cc.type_tag {
@@ -689,20 +915,24 @@ unsafe fn decompress_blob_to_datums(
             }
         }
         CompressionType::Dictionary => {
-            let strings = compression::dictionary::decode(&cc.data, non_null_count);
+            let slices = compression::dictionary::decode_to_slices(cc.data, non_null_count);
             unsafe {
-                strings
+                slices
                     .iter()
                     .map(|s| str_to_text_datum(s, type_oid, typmod))
                     .collect()
             }
         }
         CompressionType::Lz4 => {
-            let strings = compression::lz4::decode(&cc.data, non_null_count);
+            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
             unsafe {
-                strings
+                ranges
                     .iter()
-                    .map(|s| str_to_text_datum(s, type_oid, typmod))
+                    .map(|&(off, len)| {
+                        let s = std::str::from_utf8(&buf[off..off + len])
+                            .expect("invalid UTF-8 in LZ4 data");
+                        str_to_text_datum(s, type_oid, typmod)
+                    })
                     .collect()
             }
         }
@@ -715,7 +945,7 @@ unsafe fn decompress_blob_to_datums(
         }
     };
 
-    reinsert_nulls_datum(&datums, &cc.null_bitmap, total_count)
+    reinsert_nulls_datum(&datums, cc.null_bitmap, total_count)
 }
 
 /// Create a text/varchar/bpchar datum from a Rust string.
@@ -744,7 +974,12 @@ fn reinsert_nulls_datum(
     total_count: usize,
 ) -> Vec<(pg_sys::Datum, bool)> {
     if null_bitmap.is_empty() {
-        return datums.iter().map(|&d| (d, false)).collect();
+        // Fast path: no nulls — direct copy with pre-allocated Vec
+        let mut result = Vec::with_capacity(total_count);
+        for &d in datums {
+            result.push((d, false));
+        }
+        return result;
     }
     let mut result = Vec::with_capacity(total_count);
     let mut val_idx = 0;
@@ -764,9 +999,17 @@ fn count_non_null(null_bitmap: &[u8], total_count: usize) -> usize {
     if null_bitmap.is_empty() {
         return total_count;
     }
-    let null_count: usize = (0..total_count)
-        .filter(|&i| (null_bitmap[i / 8] >> (i % 8)) & 1 == 1)
-        .count();
+    let full_bytes = total_count / 8;
+    let mut null_count: usize = null_bitmap[..full_bytes]
+        .iter()
+        .map(|b| b.count_ones() as usize)
+        .sum();
+    let remainder = total_count % 8;
+    if remainder > 0 {
+        let last = null_bitmap[full_bytes];
+        let mask = (1u8 << remainder) - 1;
+        null_count += (last & mask).count_ones() as usize;
+    }
     total_count - null_count
 }
 

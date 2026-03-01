@@ -35,8 +35,25 @@ impl BitWriter {
     }
 
     fn write_bits(&mut self, value: u64, num_bits: u8) {
-        for i in (0..num_bits).rev() {
-            self.write_bit((value >> i) & 1 == 1);
+        if num_bits == 0 {
+            return;
+        }
+        let mut remaining = num_bits;
+        while remaining > 0 {
+            let avail = 8 - self.bits_used;
+            let take = remaining.min(avail);
+            // Extract `take` bits from the MSB side of the remaining value
+            let shift = remaining - take;
+            let mask = ((1u64 << take) - 1) as u8;
+            let bits = ((value >> shift) & mask as u64) as u8;
+            self.current |= bits << (avail - take);
+            self.bits_used += take;
+            if self.bits_used == 8 {
+                self.bytes.push(self.current);
+                self.current = 0;
+                self.bits_used = 0;
+            }
+            remaining -= take;
         }
     }
 
@@ -77,9 +94,27 @@ impl<'a> BitReader<'a> {
     }
 
     fn read_bits(&mut self, num_bits: u8) -> u64 {
+        if num_bits == 0 {
+            return 0;
+        }
+        let mut remaining = num_bits;
         let mut value = 0u64;
-        for _ in 0..num_bits {
-            value = (value << 1) | (self.read_bit() as u64);
+        while remaining > 0 {
+            if self.byte_pos >= self.bytes.len() {
+                break;
+            }
+            let avail = 8 - self.bit_pos;
+            let take = remaining.min(avail);
+            let shift = avail - take;
+            let mask = ((1u16 << take) - 1) as u8;
+            let bits = (self.bytes[self.byte_pos] >> shift) & mask;
+            value = (value << take) | bits as u64;
+            self.bit_pos += take;
+            if self.bit_pos == 8 {
+                self.byte_pos += 1;
+                self.bit_pos = 0;
+            }
+            remaining -= take;
         }
         value
     }

@@ -23,6 +23,25 @@ pub fn encode(values: &[&str]) -> Vec<u8> {
     lz4_flex::compress_prepend_size(&raw)
 }
 
+/// Decode LZ4 data, returning the decompressed buffer and (offset, len) ranges.
+/// Callers can reference `&buf[offset..offset+len]` as `&str` without allocating Strings.
+pub fn decode_to_ranges(data: &[u8], count: usize) -> (Vec<u8>, Vec<(usize, usize)>) {
+    if count == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let raw = lz4_flex::decompress_size_prepended(data).expect("LZ4 decompression failed");
+    let mut ranges = Vec::with_capacity(count);
+    let mut offset = 0;
+    for _ in 0..count {
+        let str_len = u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        ranges.push((offset, str_len));
+        offset += str_len;
+    }
+    (raw, ranges)
+}
+
 pub fn decode(data: &[u8], count: usize) -> Vec<String> {
     if count == 0 {
         return Vec::new();
