@@ -378,14 +378,88 @@ def run_queries(conn, queries, label=""):
     return results
 
 
+def run_explain_analyze(conn, queries):
+    """Run EXPLAIN ANALYZE for each query and extract Cocoon timing/stats.
+
+    Returns {qid: {"timing": str, "stats": str}} with the raw property values,
+    or empty dict entries for queries that don't hit compressed partitions.
+    """
+    results = {}
+    for qid, desc, sql in queries:
+        try:
+            rows = conn.execute(
+                f"EXPLAIN (ANALYZE, COSTS OFF) {sql}"
+            ).fetchall()
+            explain_text = "\n".join(r[0] for r in rows)
+
+            # Collect all Cocoon Timing/Stats lines (one per compressed partition)
+            timings = []
+            stats_lines = []
+            for line in explain_text.split("\n"):
+                line = line.strip()
+                if line.startswith("Cocoon Timing:"):
+                    timings.append(line.split(":", 1)[1].strip())
+                elif line.startswith("Cocoon Stats:"):
+                    stats_lines.append(line.split(":", 1)[1].strip())
+
+            if not timings:
+                results[qid] = {}
+                continue
+
+            # Sum timing values across partitions
+            totals = {"metadata": 0.0, "heap_scan": 0.0, "decompress": 0.0, "emit": 0.0}
+            for t in timings:
+                for token in t.replace("(", "").replace(")", "").split():
+                    if "=" in token:
+                        k, v = token.split("=", 1)
+                        if k in totals:
+                            try:
+                                totals[k] += float(v)
+                            except ValueError:
+                                pass
+
+            total_ms = sum(totals.values())
+            timing_str = (
+                f"{total_ms:.3f} ms (metadata={totals['metadata']:.3f} "
+                f"heap_scan={totals['heap_scan']:.3f} "
+                f"decompress={totals['decompress']:.3f} "
+                f"emit={totals['emit']:.3f})"
+            )
+
+            # Sum stats across partitions
+            stat_totals = {"segments": 0, "rows_out": 0, "rows_filtered": 0, "compressed_bytes": 0}
+            for s in stats_lines:
+                for token in s.split():
+                    if "=" in token:
+                        k, v = token.split("=", 1)
+                        if k in stat_totals:
+                            try:
+                                stat_totals[k] += int(v)
+                            except ValueError:
+                                pass
+            stats_str = " ".join(f"{k}={v}" for k, v in stat_totals.items())
+
+            results[qid] = {
+                "timing": timing_str,
+                "stats": stats_str,
+                "partitions": len(timings),
+            }
+        except Exception as e:
+            conn.rollback()
+            results[qid] = {"error": str(e)}
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Results reporting
 # ---------------------------------------------------------------------------
 
-def print_query_results(uncompr_results, compr_results):
+def print_query_results(uncompr_results, compr_results, profile_results=None):
     """Print markdown table of query performance.
 
     Accepts results in the format {qid: (median_ms, rows)}.
+    If profile_results is provided, also prints Cocoon timing breakdown.
     """
     print("\n### Query Performance")
     print()
@@ -402,6 +476,33 @@ def print_query_results(uncompr_results, compr_results):
         u_str = f"{u:.1f}" if u != float("inf") else "ERR"
         c_str = f"{c:.1f}" if c != float("inf") else "ERR"
         print(f"| {qid:<6} | {desc:<25} | {u_str:>13} | {c_str:>11} | {ratio:>6} |")
+
+    if profile_results:
+        print("\n### Cocoon Scan Timing Breakdown (EXPLAIN ANALYZE)")
+        print()
+        print(f"| {'Query':<6} | {'Cocoon Total':>13} | {'Metadata':>10} | {'Heap Scan':>10} | {'Decompress':>11} | {'Emit':>10} | {'Stats':<45} |")
+        print(f"|{'-'*8}|{'-'*15}|{'-'*12}|{'-'*12}|{'-'*13}|{'-'*12}|{'-'*47}|")
+
+        for qid, desc, _ in QUERIES:
+            info = profile_results.get(qid, {})
+            if "error" in info:
+                print(f"| {qid:<6} | {'ERR':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {info['error'][:45]:<45} |")
+                continue
+            timing = info.get("timing", "")
+            stats = info.get("stats", "")
+            if not timing:
+                print(f"| {qid:<6} | {'n/a':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'(no compressed scan)' :<45} |")
+                continue
+
+            # Parse timing: "X.XXX ms (metadata=X.XXX heap_scan=X.XXX decompress=X.XXX emit=X.XXX)"
+            parts = {}
+            for token in timing.replace("(", "").replace(")", "").split():
+                if "=" in token:
+                    k, v = token.split("=", 1)
+                    parts[k] = v
+
+            total_str = timing.split(" ms")[0].strip() if " ms" in timing else timing
+            print(f"| {qid:<6} | {total_str + ' ms':>13} | {parts.get('metadata', ''):>10} | {parts.get('heap_scan', ''):>10} | {parts.get('decompress', ''):>11} | {parts.get('emit', ''):>10} | {stats[:45]:<45} |")
 
 
 def print_compression_stats(conn):
@@ -521,8 +622,19 @@ class TestClickBench:
         print("\n=== Phase 3: Compressed Queries ===")
         compr_results = run_queries(conn, QUERIES, label="compr")
 
-        # Phase 4: Validate compressed results match uncompressed
-        print("\n=== Phase 4: Validating Results ===")
+        # Phase 4: Profile compressed queries with EXPLAIN ANALYZE
+        print("\n=== Phase 4: Profiling Compressed Queries (EXPLAIN ANALYZE) ===")
+        profile_results = run_explain_analyze(conn, QUERIES)
+        for qid, info in profile_results.items():
+            if "error" in info:
+                print(f"  {qid}: ERROR - {info['error']}")
+            elif "timing" in info:
+                print(f"  {qid}: {info['timing']}")
+            else:
+                print(f"  {qid}: (no compressed scan)")
+
+        # Phase 5: Validate compressed results match uncompressed
+        print("\n=== Phase 5: Validating Results ===")
         mismatches = []
         for qid, desc, _ in QUERIES:
             u_timing, u_rows = uncompr_results.get(qid, (float("inf"), None))
@@ -540,13 +652,13 @@ class TestClickBench:
                 print(f"    uncompressed: {len(u_rows)} rows, first={u_rows[:2]}")
                 print(f"    compressed:   {len(c_rows)} rows, first={c_rows[:2]}")
 
-        # Phase 5: Print results
+        # Phase 6: Print results
         print("\n\n" + "=" * 72)
         print("  ClickBench Benchmark Results")
         print(f"  Files: {NUM_FILES}, Warmup: {WARMUP_RUNS}, Timed runs: {TIMED_RUNS}")
         print("=" * 72)
 
-        print_query_results(uncompr_results, compr_results)
+        print_query_results(uncompr_results, compr_results, profile_results)
         print_compression_stats(conn)
 
         assert not mismatches, (

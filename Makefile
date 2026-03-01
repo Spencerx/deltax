@@ -31,7 +31,7 @@ clippy: dev-image
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo clippy --features pg$(PG_MAJOR) --no-default-features
 
 # Build the runtime image (production-like, no build tools)
-image:
+image: dev-image
 	docker build -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
 
 # Run postgres with the extension for manual testing
@@ -54,5 +54,5 @@ integration-test: $(VENV)/.stamp
 	done
 
 clean:
-	docker volume rm $(TARGET_VOL) 2>/dev/null || true
-	docker volume rm $(CARGO_VOL) 2>/dev/null || true
+	docker volume rm pg_cocoon_target_pg17 pg_cocoon_target_pg18 $(CARGO_VOL) 2>/dev/null || true
+	docker builder prune -f --filter type=regular 2>/dev/null || true

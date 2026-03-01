@@ -556,6 +556,126 @@ class TestTransparentQuery:
             f"sum mismatch: before={before_sum}, after={after_sum}"
         )
 
+    def test_transparent_query_count_star(self, db):
+        """COUNT(*) on compressed partition — no columns decompressed."""
+        setup_metrics_table(db)
+        insert_metrics(db, n_devices=3, n_points=30)
+        db.execute(
+            "SELECT cocoon_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        before_count = db.execute("SELECT count(*) FROM metrics").fetchone()[0]
+        assert before_count > 0
+
+        _compress_all_partitions(db, "metrics")
+
+        after_count = db.execute("SELECT count(*) FROM metrics").fetchone()[0]
+        assert after_count == before_count, (
+            f"count mismatch: before={before_count}, after={after_count}"
+        )
+
+    def test_transparent_query_where_not_in_select(self, db):
+        """WHERE filter on column not in SELECT list."""
+        setup_metrics_table(db)
+        insert_metrics(db, n_devices=5, n_points=50)
+        db.execute(
+            "SELECT cocoon_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        # Count rows for a specific device BEFORE compression
+        before_count = db.execute(
+            "SELECT count(*) FROM metrics WHERE device_id = 'device-0002'"
+        ).fetchone()[0]
+        before_ts_vals = db.execute(
+            "SELECT ts FROM metrics WHERE device_id = 'device-0002' ORDER BY ts"
+        ).fetchall()
+        assert before_count > 0
+
+        _compress_all_partitions(db, "metrics")
+
+        # Query with WHERE on device_id but only SELECT ts (device_id not in SELECT)
+        after_count = db.execute(
+            "SELECT count(*) FROM metrics WHERE device_id = 'device-0002'"
+        ).fetchone()[0]
+        after_ts_vals = db.execute(
+            "SELECT ts FROM metrics WHERE device_id = 'device-0002' ORDER BY ts"
+        ).fetchall()
+
+        assert after_count == before_count, (
+            f"count mismatch: before={before_count}, after={after_count}"
+        )
+        assert after_ts_vals == before_ts_vals, "timestamp values mismatch"
+
+    def test_transparent_query_multiple_segments(self, db):
+        """Multiple segments with different segment_by values."""
+        setup_metrics_table(db)
+        insert_metrics(db, n_devices=10, n_points=100)
+        db.execute(
+            "SELECT cocoon_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        # Get per-device aggregates BEFORE compression
+        before = db.execute(
+            "SELECT device_id, count(*), sum(temperature) "
+            "FROM metrics GROUP BY device_id ORDER BY device_id"
+        ).fetchall()
+        assert len(before) == 10
+
+        _compress_all_partitions(db, "metrics")
+
+        # Get per-device aggregates AFTER compression
+        after = db.execute(
+            "SELECT device_id, count(*), sum(temperature) "
+            "FROM metrics GROUP BY device_id ORDER BY device_id"
+        ).fetchall()
+
+        assert len(after) == len(before), (
+            f"device count mismatch: {len(before)} vs {len(after)}"
+        )
+        for b, a in zip(before, after):
+            assert b[0] == a[0], f"device_id mismatch: {b[0]} vs {a[0]}"
+            assert b[1] == a[1], f"count mismatch for {b[0]}: {b[1]} vs {a[1]}"
+            assert abs(b[2] - a[2]) < 0.01, (
+                f"sum mismatch for {b[0]}: {b[2]} vs {a[2]}"
+            )
+
+    def test_explain_analyze_shows_timing(self, db):
+        """EXPLAIN ANALYZE on compressed partition shows Cocoon timing."""
+        setup_metrics_table(db)
+        insert_metrics(db, n_devices=3, n_points=30)
+        db.execute(
+            "SELECT cocoon_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "metrics")
+
+        rows = db.execute(
+            "EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM metrics"
+        ).fetchall()
+        explain_text = "\n".join(r[0] for r in rows)
+
+        assert "Cocoon Timing" in explain_text, (
+            f"Expected 'Cocoon Timing' in EXPLAIN ANALYZE output:\n{explain_text}"
+        )
+        assert "Cocoon Stats" in explain_text, (
+            f"Expected 'Cocoon Stats' in EXPLAIN ANALYZE output:\n{explain_text}"
+        )
+        # Verify timing values are present (e.g., "metadata=")
+        assert "metadata=" in explain_text
+        assert "decompress=" in explain_text
+        assert "segments=" in explain_text
+
 
 # ---------------------------------------------------------------------------
 # Datum conversion edge-case tests
