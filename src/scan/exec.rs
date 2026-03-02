@@ -82,6 +82,17 @@ pub(super) struct DecompressState {
     /// Whether EXPLAIN ANALYZE is active (enables per-call timing).
     /// Set lazily on first exec call (PG sets PlanState.instrument after BeginCustomScan).
     instrument: Option<bool>,
+
+    /// Time column name (from hypertable metadata).
+    time_column: String,
+
+    // Segment pruning filters extracted from plan qual
+    /// (index into segment_values, value to match) for segment_by equality filters.
+    segment_by_filters: Vec<(usize, String)>,
+    /// Lower bound for time column (PG epoch microseconds), inclusive.
+    time_min: Option<i64>,
+    /// Upper bound for time column (PG epoch microseconds), inclusive.
+    time_max: Option<i64>,
 }
 
 /// Wall-clock timing for the decompress scan phases.
@@ -102,12 +113,16 @@ pub(super) struct ScanTiming {
     pub(super) segments_decompressed: u64,
     /// Total compressed bytes loaded.
     pub(super) compressed_bytes: u64,
+    /// Total segments skipped by pruning.
+    pub(super) segments_skipped: u64,
 }
 
 struct SegmentData {
     segment_values: Vec<Option<String>>,
     compressed_blobs: Vec<Vec<u8>>,
     row_count: i32,
+    min_time: Option<i64>,
+    max_time: Option<i64>,
 }
 
 /// CreateCustomScanState callback.
@@ -177,6 +192,18 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
 
         // Load metadata via SPI, then load segment data via direct heap scan
         let mut state = load_decompress_state(companion_oid, &companion_name, &needed_indices);
+
+        // Extract segment pruning filters from plan qual
+        let plan_qual = (*(*node).ss.ps.plan).qual;
+        let (seg_filters, t_min, t_max) = extract_segment_filters(
+            plan_qual,
+            &state.col_names,
+            &state.segment_by,
+            &state.time_column,
+        );
+        state.segment_by_filters = seg_filters;
+        state.time_min = t_min;
+        state.time_max = t_max;
 
         // Create per-segment memory context
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
@@ -287,7 +314,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         for &oid in &companion_oids {
-            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols);
+            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column);
             all_segments.extend(segs);
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
@@ -319,9 +346,26 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
                 rows_filtered: 0,
                 segments_decompressed: 0,
                 compressed_bytes,
+                segments_skipped: 0,
             },
             instrument: None,
+            time_column: meta.time_column,
+            segment_by_filters: Vec::new(),
+            time_min: None,
+            time_max: None,
         };
+
+        // Extract segment pruning filters from plan qual
+        let plan_qual = (*(*node).ss.ps.plan).qual;
+        let (seg_filters, t_min, t_max) = extract_segment_filters(
+            plan_qual,
+            &state.col_names,
+            &state.segment_by,
+            &state.time_column,
+        );
+        state.segment_by_filters = seg_filters;
+        state.time_min = t_min;
+        state.time_max = t_max;
 
         // Create per-segment memory context
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
@@ -345,6 +389,7 @@ struct MetadataInfo {
     col_types: Vec<pg_sys::Oid>,
     col_typmods: Vec<i32>,
     segment_by: Vec<String>,
+    time_column: String,
 }
 
 /// Load metadata (column names, types, segment_by) from catalog via SPI.
@@ -377,6 +422,12 @@ fn load_metadata(
         .value::<Vec<String>>()
         .unwrap()
         .unwrap_or_default();
+    let time_column: String = ht_row
+        .get_datum_by_ordinal(3)
+        .unwrap()
+        .value::<String>()
+        .unwrap()
+        .unwrap();
     let parent_schema: String = ht_row
         .get_datum_by_ordinal(4)
         .unwrap()
@@ -425,6 +476,7 @@ fn load_metadata(
         col_types,
         col_typmods,
         segment_by,
+        time_column,
     }
 }
 
@@ -438,6 +490,7 @@ unsafe fn load_segments_heap(
     col_names: &[String],
     segment_by: &[String],
     needed_cols: &[bool],
+    time_column: &str,
 ) -> Vec<SegmentData> {
     unsafe {
         // Open companion table with AccessShareLock
@@ -484,6 +537,11 @@ unsafe fn load_segments_heap(
         }
 
         let row_count_attno = attno_map.get("_row_count").copied();
+
+        let min_time_name = format!("_min_{}", time_column);
+        let max_time_name = format!("_max_{}", time_column);
+        let min_time_attno = attno_map.get(min_time_name.as_str()).copied();
+        let max_time_attno = attno_map.get(max_time_name.as_str()).copied();
 
         // Begin table scan via TableAmRoutine vtable
         // (table_beginscan is static inline in C, so we call via the vtable)
@@ -579,10 +637,22 @@ unsafe fn load_segments_heap(
                 _ => 0,
             };
 
+            // Extract min/max time (TIMESTAMPTZ stored as i64 PG epoch microseconds)
+            let min_time = match min_time_attno {
+                Some(attno) if !nulls[attno] => Some(values[attno].value() as i64),
+                _ => None,
+            };
+            let max_time = match max_time_attno {
+                Some(attno) if !nulls[attno] => Some(values[attno].value() as i64),
+                _ => None,
+            };
+
             segments.push(SegmentData {
                 segment_values,
                 compressed_blobs,
                 row_count,
+                min_time,
+                max_time,
             });
         }
 
@@ -627,7 +697,7 @@ fn load_decompress_state(
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
     let t1 = Instant::now();
     let segments_data = unsafe {
-        load_segments_heap(companion_oid, &meta.col_names, &meta.segment_by, &needed_cols)
+        load_segments_heap(companion_oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column)
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;
 
@@ -658,9 +728,168 @@ fn load_decompress_state(
             rows_filtered: 0,
             segments_decompressed: 0,
             compressed_bytes,
+            segments_skipped: 0,
         },
-        instrument: None, // set lazily on first exec call
+        instrument: None,
+        time_column: meta.time_column,
+        segment_by_filters: Vec::new(),
+        time_min: None,
+        time_max: None,
     }
+}
+
+/// Extract segment pruning filters from the plan qual (raw expression tree).
+///
+/// Walks OpExpr nodes looking for:
+/// - Equality filters on segment_by columns (e.g. `CounterID = 62`)
+/// - Range filters on the time column (e.g. `ts >= '2023-01-01'`)
+///
+/// Returns (segment_by_filters, time_min, time_max).
+unsafe fn extract_segment_filters(
+    qual_list: *mut pg_sys::List,
+    col_names: &[String],
+    segment_by: &[String],
+    time_column: &str,
+) -> (Vec<(usize, String)>, Option<i64>, Option<i64>) {
+    let mut segment_by_filters: Vec<(usize, String)> = Vec::new();
+    let mut time_min: Option<i64> = None;
+    let mut time_max: Option<i64> = None;
+
+    if qual_list.is_null() {
+        return (segment_by_filters, time_min, time_max);
+    }
+
+    unsafe {
+        // Build segment_by column name -> segment_values index mapping
+        let mut seg_val_index_map: HashMap<&str, usize> = HashMap::new();
+        let mut seg_val_idx = 0;
+        for name in col_names {
+            if segment_by.contains(name) {
+                seg_val_index_map.insert(name.as_str(), seg_val_idx);
+                seg_val_idx += 1;
+            }
+        }
+
+        let nquals = (*qual_list).length;
+        for i in 0..nquals {
+            let cell = (*qual_list).elements.add(i as usize);
+            let node = (*cell).ptr_value as *const pg_sys::Node;
+            if node.is_null() {
+                continue;
+            }
+
+            let tag = (*node).type_;
+            if tag != pg_sys::NodeTag::T_OpExpr {
+                continue;
+            }
+
+            let opexpr = node as *const pg_sys::OpExpr;
+            let args = (*opexpr).args;
+            if args.is_null() || (*args).length != 2 {
+                continue;
+            }
+
+            // Get operator name
+            let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+            if opname_ptr.is_null() {
+                continue;
+            }
+            let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                .to_str()
+                .unwrap_or("");
+
+            // Get the two args
+            let arg0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+            let arg1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+            if arg0.is_null() || arg1.is_null() {
+                continue;
+            }
+
+            // Identify Var and Const (handle both orderings)
+            let (var_node, const_node, var_on_left) =
+                if (*arg0).type_ == pg_sys::NodeTag::T_Var
+                    && (*arg1).type_ == pg_sys::NodeTag::T_Const
+                {
+                    (arg0 as *const pg_sys::Var, arg1 as *const pg_sys::Const, true)
+                } else if (*arg0).type_ == pg_sys::NodeTag::T_Const
+                    && (*arg1).type_ == pg_sys::NodeTag::T_Var
+                {
+                    (arg1 as *const pg_sys::Var, arg0 as *const pg_sys::Const, false)
+                } else {
+                    continue;
+                };
+
+            if (*const_node).constisnull {
+                continue;
+            }
+
+            // Convert 1-based varattno to 0-based column index
+            let varattno = (*var_node).varattno as i32;
+            if varattno < 1 || varattno as usize > col_names.len() {
+                continue;
+            }
+            let col_idx = (varattno - 1) as usize;
+            let col_name = &col_names[col_idx];
+
+            // Check if this is a segment_by equality filter
+            if opname == "=" {
+                if let Some(&sv_idx) = seg_val_index_map.get(col_name.as_str()) {
+                    // Extract const value as string (matches how segment_values are stored)
+                    let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
+                    let mut typisvarlena: bool = false;
+                    pg_sys::getTypeOutputInfo(
+                        (*const_node).consttype,
+                        &mut typoutput,
+                        &mut typisvarlena,
+                    );
+                    let cstr = pg_sys::OidOutputFunctionCall(typoutput, (*const_node).constvalue);
+                    let s = std::ffi::CStr::from_ptr(cstr)
+                        .to_string_lossy()
+                        .into_owned();
+                    pg_sys::pfree(cstr as *mut _);
+                    segment_by_filters.push((sv_idx, s));
+                }
+            }
+
+            // Check if this is a time column range filter
+            if col_name == time_column {
+                let ts_val = (*const_node).constvalue.value() as i64;
+
+                // Normalize operator direction (if Var is on right, flip the operator)
+                let effective_op = if var_on_left {
+                    opname
+                } else {
+                    match opname {
+                        ">=" => "<=",
+                        ">" => "<",
+                        "<=" => ">=",
+                        "<" => ">",
+                        _ => opname,
+                    }
+                };
+
+                match effective_op {
+                    ">=" | ">" => {
+                        // Lower bound: take the maximum of all lower bounds
+                        time_min = Some(match time_min {
+                            Some(existing) => existing.max(ts_val),
+                            None => ts_val,
+                        });
+                    }
+                    "<=" | "<" => {
+                        // Upper bound: take the minimum of all upper bounds
+                        time_max = Some(match time_max {
+                            Some(existing) => existing.min(ts_val),
+                            None => ts_val,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    (segment_by_filters, time_min, time_max)
 }
 
 /// ExecCustomScan callback: return the next tuple.
@@ -727,6 +956,37 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
 
             if seg.row_count == 0 {
                 continue;
+            }
+
+            // Segment-by pruning: skip if any equality filter doesn't match
+            if !state.segment_by_filters.is_empty() {
+                let mut skip = false;
+                for &(seg_val_idx, ref filter_val) in &state.segment_by_filters {
+                    match &seg.segment_values[seg_val_idx] {
+                        Some(val) if val == filter_val => {}
+                        _ => { skip = true; break; }
+                    }
+                }
+                if skip {
+                    state.timing.segments_skipped += 1;
+                    continue;
+                }
+            }
+
+            // Time-range pruning: skip if segment's time range doesn't overlap query range
+            if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
+                if let Some(query_min) = state.time_min {
+                    if seg_max < query_min {
+                        state.timing.segments_skipped += 1;
+                        continue;
+                    }
+                }
+                if let Some(query_max) = state.time_max {
+                    if seg_min > query_max {
+                        state.timing.segments_skipped += 1;
+                        continue;
+                    }
+                }
             }
 
             let t_decompress = if instrument { Some(Instant::now()) } else { None };
@@ -804,13 +1064,14 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
             pgrx::log!(
                 "pg_cocoon scan timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
                  decompress={:.1}ms  emit={:.1}ms  | \
-                 segments={} rows_out={} rows_filtered={} compressed_bytes={}",
+                 segments={} segments_skipped={} rows_out={} rows_filtered={} compressed_bytes={}",
                 total_us as f64 / 1000.0,
                 t.metadata_us as f64 / 1000.0,
                 t.heap_scan_us as f64 / 1000.0,
                 t.decompress_us as f64 / 1000.0,
                 t.emit_us as f64 / 1000.0,
                 t.segments_decompressed,
+                t.segments_skipped,
                 t.rows_emitted,
                 t.rows_filtered,
                 t.compressed_bytes,

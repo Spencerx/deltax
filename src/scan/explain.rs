@@ -64,8 +64,9 @@ unsafe fn explain_timing(
                 );
 
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} rows_out={} rows_filtered={} compressed_bytes={}",
+                    "segments={} segments_skipped={} rows_out={} rows_filtered={} compressed_bytes={}",
                     t.segments_decompressed,
+                    t.segments_skipped,
                     t.rows_emitted,
                     t.rows_filtered,
                     t.compressed_bytes,

@@ -12,264 +12,22 @@ Scale up:
     PG_COCOON_IMAGE=pg_cocoon:pg17 CLICKBENCH_FILES=5 pytest tests/bench_clickbench.py -v -s
 """
 
-import io
-import os
-import statistics
 import time
-import urllib.request
-from pathlib import Path
 
 import psycopg
 import pytest
 
+from clickbench_data import (
+    CREATE_TABLE_SQL,
+    NUM_FILES,
+    TIMED_RUNS,
+    WARMUP_RUNS,
+    load_parquet_files,
+    query_results_to_dict,
+    run_queries,
+    save_bench_results,
+)
 from clickbench_queries import QUERIES
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-DATA_DIR = Path(__file__).parent / ".data"
-PARQUET_URL = "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{idx}.parquet"
-NUM_FILES = int(os.environ.get("CLICKBENCH_FILES", "1"))
-WARMUP_RUNS = 1
-TIMED_RUNS = 3
-
-# ClickBench schema adapted for pg_cocoon:
-#   - EventTime changed from TIMESTAMP to TIMESTAMPTZ
-#   - ClientEventTime / LocalEventTime also TIMESTAMPTZ
-#   - All NOT NULL constraints kept
-CREATE_TABLE_SQL = """\
-CREATE TABLE hits (
-    WatchID BIGINT NOT NULL,
-    JavaEnable SMALLINT NOT NULL,
-    Title TEXT NOT NULL,
-    GoodEvent SMALLINT NOT NULL,
-    EventTime TIMESTAMPTZ NOT NULL,
-    EventDate DATE NOT NULL,
-    CounterID INTEGER NOT NULL,
-    ClientIP INTEGER NOT NULL,
-    RegionID INTEGER NOT NULL,
-    UserID BIGINT NOT NULL,
-    CounterClass SMALLINT NOT NULL,
-    OS SMALLINT NOT NULL,
-    UserAgent SMALLINT NOT NULL,
-    URL TEXT NOT NULL,
-    Referer TEXT NOT NULL,
-    IsRefresh SMALLINT NOT NULL,
-    RefererCategoryID SMALLINT NOT NULL,
-    RefererRegionID INTEGER NOT NULL,
-    URLCategoryID SMALLINT NOT NULL,
-    URLRegionID INTEGER NOT NULL,
-    ResolutionWidth SMALLINT NOT NULL,
-    ResolutionHeight SMALLINT NOT NULL,
-    ResolutionDepth SMALLINT NOT NULL,
-    FlashMajor SMALLINT NOT NULL,
-    FlashMinor SMALLINT NOT NULL,
-    FlashMinor2 TEXT NOT NULL,
-    NetMajor SMALLINT NOT NULL,
-    NetMinor SMALLINT NOT NULL,
-    UserAgentMajor SMALLINT NOT NULL,
-    UserAgentMinor VARCHAR(255) NOT NULL,
-    CookieEnable SMALLINT NOT NULL,
-    JavascriptEnable SMALLINT NOT NULL,
-    IsMobile SMALLINT NOT NULL,
-    MobilePhone SMALLINT NOT NULL,
-    MobilePhoneModel TEXT NOT NULL,
-    Params TEXT NOT NULL,
-    IPNetworkID INTEGER NOT NULL,
-    TraficSourceID SMALLINT NOT NULL,
-    SearchEngineID SMALLINT NOT NULL,
-    SearchPhrase TEXT NOT NULL,
-    AdvEngineID SMALLINT NOT NULL,
-    IsArtifical SMALLINT NOT NULL,
-    WindowClientWidth SMALLINT NOT NULL,
-    WindowClientHeight SMALLINT NOT NULL,
-    ClientTimeZone SMALLINT NOT NULL,
-    ClientEventTime TIMESTAMPTZ NOT NULL,
-    SilverlightVersion1 SMALLINT NOT NULL,
-    SilverlightVersion2 SMALLINT NOT NULL,
-    SilverlightVersion3 INTEGER NOT NULL,
-    SilverlightVersion4 SMALLINT NOT NULL,
-    PageCharset TEXT NOT NULL,
-    CodeVersion INTEGER NOT NULL,
-    IsLink SMALLINT NOT NULL,
-    IsDownload SMALLINT NOT NULL,
-    IsNotBounce SMALLINT NOT NULL,
-    FUniqID BIGINT NOT NULL,
-    OriginalURL TEXT NOT NULL,
-    HID INTEGER NOT NULL,
-    IsOldCounter SMALLINT NOT NULL,
-    IsEvent SMALLINT NOT NULL,
-    IsParameter SMALLINT NOT NULL,
-    DontCountHits SMALLINT NOT NULL,
-    WithHash SMALLINT NOT NULL,
-    HitColor CHAR NOT NULL,
-    LocalEventTime TIMESTAMPTZ NOT NULL,
-    Age SMALLINT NOT NULL,
-    Sex SMALLINT NOT NULL,
-    Income SMALLINT NOT NULL,
-    Interests SMALLINT NOT NULL,
-    Robotness SMALLINT NOT NULL,
-    RemoteIP INTEGER NOT NULL,
-    WindowName INTEGER NOT NULL,
-    OpenerName INTEGER NOT NULL,
-    HistoryLength SMALLINT NOT NULL,
-    BrowserLanguage TEXT NOT NULL,
-    BrowserCountry TEXT NOT NULL,
-    SocialNetwork TEXT NOT NULL,
-    SocialAction TEXT NOT NULL,
-    HTTPError SMALLINT NOT NULL,
-    SendTiming INTEGER NOT NULL,
-    DNSTiming INTEGER NOT NULL,
-    ConnectTiming INTEGER NOT NULL,
-    ResponseStartTiming INTEGER NOT NULL,
-    ResponseEndTiming INTEGER NOT NULL,
-    FetchTiming INTEGER NOT NULL,
-    SocialSourceNetworkID SMALLINT NOT NULL,
-    SocialSourcePage TEXT NOT NULL,
-    ParamPrice BIGINT NOT NULL,
-    ParamOrderID TEXT NOT NULL,
-    ParamCurrency TEXT NOT NULL,
-    ParamCurrencyID SMALLINT NOT NULL,
-    OpenstatServiceName TEXT NOT NULL,
-    OpenstatCampaignID TEXT NOT NULL,
-    OpenstatAdID TEXT NOT NULL,
-    OpenstatSourceID TEXT NOT NULL,
-    UTMSource TEXT NOT NULL,
-    UTMMedium TEXT NOT NULL,
-    UTMCampaign TEXT NOT NULL,
-    UTMContent TEXT NOT NULL,
-    UTMTerm TEXT NOT NULL,
-    FromTag TEXT NOT NULL,
-    HasGCLID SMALLINT NOT NULL,
-    RefererHash BIGINT NOT NULL,
-    URLHash BIGINT NOT NULL,
-    CLID INTEGER NOT NULL
-)"""
-
-# Column names in order, matching the schema above
-COLUMN_NAMES = [
-    "WatchID", "JavaEnable", "Title", "GoodEvent", "EventTime", "EventDate",
-    "CounterID", "ClientIP", "RegionID", "UserID", "CounterClass", "OS",
-    "UserAgent", "URL", "Referer", "IsRefresh", "RefererCategoryID",
-    "RefererRegionID", "URLCategoryID", "URLRegionID", "ResolutionWidth",
-    "ResolutionHeight", "ResolutionDepth", "FlashMajor", "FlashMinor",
-    "FlashMinor2", "NetMajor", "NetMinor", "UserAgentMajor", "UserAgentMinor",
-    "CookieEnable", "JavascriptEnable", "IsMobile", "MobilePhone",
-    "MobilePhoneModel", "Params", "IPNetworkID", "TraficSourceID",
-    "SearchEngineID", "SearchPhrase", "AdvEngineID", "IsArtifical",
-    "WindowClientWidth", "WindowClientHeight", "ClientTimeZone",
-    "ClientEventTime", "SilverlightVersion1", "SilverlightVersion2",
-    "SilverlightVersion3", "SilverlightVersion4", "PageCharset", "CodeVersion",
-    "IsLink", "IsDownload", "IsNotBounce", "FUniqID", "OriginalURL", "HID",
-    "IsOldCounter", "IsEvent", "IsParameter", "DontCountHits", "WithHash",
-    "HitColor", "LocalEventTime", "Age", "Sex", "Income", "Interests",
-    "Robotness", "RemoteIP", "WindowName", "OpenerName", "HistoryLength",
-    "BrowserLanguage", "BrowserCountry", "SocialNetwork", "SocialAction",
-    "HTTPError", "SendTiming", "DNSTiming", "ConnectTiming",
-    "ResponseStartTiming", "ResponseEndTiming", "FetchTiming",
-    "SocialSourceNetworkID", "SocialSourcePage", "ParamPrice", "ParamOrderID",
-    "ParamCurrency", "ParamCurrencyID", "OpenstatServiceName",
-    "OpenstatCampaignID", "OpenstatAdID", "OpenstatSourceID", "UTMSource",
-    "UTMMedium", "UTMCampaign", "UTMContent", "UTMTerm", "FromTag",
-    "HasGCLID", "RefererHash", "URLHash", "CLID",
-]
-
-
-# ---------------------------------------------------------------------------
-# Data download & loading
-# ---------------------------------------------------------------------------
-
-def download_parquet(idx: int) -> Path:
-    """Download a single parquet file, caching in tests/.data/."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    dest = DATA_DIR / f"hits_{idx}.parquet"
-    if dest.exists():
-        print(f"  [cached] {dest.name}")
-        return dest
-
-    url = PARQUET_URL.format(idx=idx)
-    print(f"  Downloading {url} ...")
-    req = urllib.request.Request(url, headers={"User-Agent": "pg_cocoon-bench/1.0"})
-    with urllib.request.urlopen(req) as resp, open(dest, "wb") as f:
-        while True:
-            chunk = resp.read(1 << 20)  # 1 MB chunks
-            if not chunk:
-                break
-            f.write(chunk)
-    print(f"  Saved {dest.name} ({dest.stat().st_size / 1e6:.1f} MB)")
-    return dest
-
-
-def _convert_parquet_table(table):
-    """Convert parquet table columns to PostgreSQL-compatible types.
-
-    - int64 epoch-seconds timestamps → timestamp strings
-    - uint16 epoch-days dates → date strings
-    - binary text → utf-8 strings
-    """
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    EPOCH_SEC_COLS = {"EventTime", "ClientEventTime", "LocalEventTime"}
-    EPOCH_DAY_COLS = {"EventDate"}
-
-    new_columns = []
-    for i, name in enumerate(table.column_names):
-        col = table.column(i)
-        if name in EPOCH_SEC_COLS:
-            # Cast int64 epoch seconds to timestamp[s] then to string
-            ts_array = col.cast(pa.timestamp("s", tz="UTC"))
-            new_columns.append(ts_array.cast(pa.string()))
-        elif name in EPOCH_DAY_COLS:
-            # uint16 days since epoch → date32 → string
-            date_array = col.cast(pa.int32()).cast(pa.date32())
-            new_columns.append(date_array.cast(pa.string()))
-        elif pa.types.is_binary(col.type):
-            # binary → utf-8 string (replace invalid bytes)
-            new_columns.append(col.cast(pa.string()))
-        else:
-            new_columns.append(col)
-
-    return pa.table(new_columns, names=table.column_names)
-
-
-def load_parquet_file(conn, parquet_path: Path):
-    """Load a single parquet file into the hits table using pyarrow CSV + COPY."""
-    import pyarrow.csv as pcsv
-    import pyarrow.parquet as pq
-
-    table = pq.read_table(parquet_path)
-    table = _convert_parquet_table(table)
-
-    # Write to an in-memory CSV buffer using pyarrow (no pandas needed)
-    buf = io.BytesIO()
-    pcsv.write_csv(table, buf, write_options=pcsv.WriteOptions(include_header=False))
-    buf.seek(0)
-
-    # PostgreSQL lowercases unquoted column names in CREATE TABLE,
-    # so we must use lowercase here to match.
-    col_list = ", ".join(c.lower() for c in COLUMN_NAMES)
-    with conn.cursor() as cur:
-        with cur.copy(f"COPY hits ({col_list}) FROM STDIN WITH (FORMAT csv)") as copy:
-            while True:
-                chunk = buf.read(1 << 20)  # 1 MB chunks
-                if not chunk:
-                    break
-                copy.write(chunk)
-
-    conn.commit()
-
-
-def load_parquet_files(conn, n: int):
-    """Download and load n parquet files into the hits table."""
-    for idx in range(n):
-        path = download_parquet(idx)
-        print(f"  Loading {path.name} into PostgreSQL ...")
-        t0 = time.monotonic()
-        load_parquet_file(conn, path)
-        elapsed = time.monotonic() - t0
-        print(f"  Loaded {path.name} in {elapsed:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -333,50 +91,8 @@ def compress_all_partitions(conn):
 
 
 # ---------------------------------------------------------------------------
-# Query benchmarking
+# Query profiling (pg_cocoon specific)
 # ---------------------------------------------------------------------------
-
-def run_queries(conn, queries, label=""):
-    """Run each query with warmup + timed runs.
-
-    Returns {qid: (median_ms, result_rows)} where result_rows is the list of
-    tuples from the last successful run (used for validation).
-    """
-    results = {}
-    for qid, desc, sql in queries:
-        # Warmup
-        for _ in range(WARMUP_RUNS):
-            try:
-                conn.execute(sql).fetchall()
-            except Exception:
-                conn.rollback()
-
-        # Timed runs
-        timings = []
-        last_rows = None
-        last_error = None
-        for _ in range(TIMED_RUNS):
-            t0 = time.monotonic()
-            try:
-                rows = conn.execute(sql).fetchall()
-                elapsed = (time.monotonic() - t0) * 1000  # ms
-                timings.append(elapsed)
-                last_rows = rows
-            except Exception as e:
-                conn.rollback()
-                timings.append(float("inf"))
-                last_error = e
-
-        median = statistics.median(timings)
-        results[qid] = (median, last_rows)
-
-        status = f"{median:.1f}ms" if median != float("inf") else "ERROR"
-        print(f"  [{label}] {qid} ({desc}): {status}")
-        if last_error is not None:
-            print(f"    ERROR: {last_error}")
-
-    return results
-
 
 def run_explain_analyze(conn, queries):
     """Run EXPLAIN ANALYZE for each query and extract Cocoon timing/stats.
@@ -427,7 +143,7 @@ def run_explain_analyze(conn, queries):
             )
 
             # Sum stats across partitions
-            stat_totals = {"segments": 0, "rows_out": 0, "rows_filtered": 0, "compressed_bytes": 0}
+            stat_totals = {"segments": 0, "segments_skipped": 0, "rows_out": 0, "rows_filtered": 0, "compressed_bytes": 0}
             for s in stats_lines:
                 for token in s.split():
                     if "=" in token:
@@ -660,6 +376,23 @@ class TestClickBench:
 
         print_query_results(uncompr_results, compr_results, profile_results)
         print_compression_stats(conn)
+
+        # Save results for cross-system comparison
+        totals = conn.execute(
+            "SELECT sum(raw_size), sum(compressed_size) "
+            "FROM cocoon_compression_stats('hits') "
+            "WHERE compressed_size IS NOT NULL"
+        ).fetchone()
+        raw_bytes = int(totals[0] or 0)
+        compressed_bytes = int(totals[1] or 0)
+        save_bench_results("pg_cocoon", {
+            "uncompressed_queries": query_results_to_dict(uncompr_results),
+            "compressed_queries": query_results_to_dict(compr_results),
+            "raw_bytes": raw_bytes,
+            "compressed_bytes": compressed_bytes,
+            "compression_ratio": raw_bytes / compressed_bytes if compressed_bytes > 0 else 0,
+            "compression_time_s": total_compress_time,
+        })
 
         assert not mismatches, (
             f"Result mismatch for queries: {mismatches}. "

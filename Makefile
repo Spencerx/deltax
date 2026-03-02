@@ -7,7 +7,8 @@ CARGO_VOL  = pg_cocoon_cargo
 PG_VERSIONS ?= 17 18
 VENV         = .venv
 
-.PHONY: dev-image image test build clippy run psql cargo clean integration-test
+.PHONY: dev-image image test build clippy run psql cargo clean integration-test \
+       bench-clickbench bench-timescaledb-tsl bench-timescaledb-oss bench-timescaledb bench-compare bench-all
 
 # Build the dev toolchain image (rebuilds only when Dockerfile.dev changes)
 dev-image:
@@ -52,6 +53,22 @@ integration-test: $(VENV)/.stamp
 		$(MAKE) image PG_MAJOR=$$v; \
 		PG_COCOON_IMAGE=pg_cocoon:pg$$v $(VENV)/bin/pytest tests/ -v; \
 	done
+
+bench-clickbench: $(VENV)/.stamp image
+	PG_COCOON_IMAGE=pg_cocoon:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/bench_clickbench.py -v -s
+
+bench-timescaledb-tsl: $(VENV)/.stamp
+	TSDB_VARIANT=tsl $(VENV)/bin/pytest tests/bench_clickbench_timescaledb.py -v -s
+
+bench-timescaledb-oss: $(VENV)/.stamp
+	TSDB_VARIANT=oss $(VENV)/bin/pytest tests/bench_clickbench_timescaledb.py -v -s
+
+bench-timescaledb: bench-timescaledb-tsl bench-timescaledb-oss
+
+bench-compare: $(VENV)/.stamp
+	$(VENV)/bin/python tests/bench_compare.py
+
+bench-all: bench-clickbench bench-timescaledb bench-compare
 
 clean:
 	docker volume rm pg_cocoon_target_pg17 pg_cocoon_target_pg18 $(CARGO_VOL) 2>/dev/null || true
