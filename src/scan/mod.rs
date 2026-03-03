@@ -17,6 +17,9 @@ static PREV_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 /// Previous hook to chain (create_upper_paths_hook).
 static PREV_UPPER_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Previous hook to chain (ExecutorStart_hook).
+static PREV_EXECUTOR_START_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Custom scan method name (NUL-terminated, static lifetime).
 const CUSTOM_NAME: &std::ffi::CStr = c"CocoonDecompress";
 
@@ -25,6 +28,9 @@ const COCOON_APPEND_NAME: &std::ffi::CStr = c"CocoonAppend";
 
 /// CocoonCount custom scan method name (COUNT(*) pushdown).
 const COCOON_COUNT_NAME: &std::ffi::CStr = c"CocoonCount";
+
+/// CocoonMinMax custom scan method name (MIN/MAX pushdown).
+const COCOON_MINMAX_NAME: &std::ffi::CStr = c"CocoonMinMax";
 
 /// Wrapper to make pg_sys structs with raw pointers usable in statics.
 /// Safety: the static structs only contain function pointers and const string pointers
@@ -35,6 +41,10 @@ unsafe impl<T> Send for SyncStatic<T> {}
 
 pub fn invalidate_compressed_cache() {
     hook::invalidate_compressed_cache();
+}
+
+pub(crate) fn set_dml_bypass(bypass: bool) {
+    hook::set_dml_bypass(bypass);
 }
 
 /// Register the planner hook at extension load time.
@@ -55,5 +65,19 @@ pub unsafe fn register_hook() {
             PREV_UPPER_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
         pg_sys::create_upper_paths_hook = Some(hook::cocoon_create_upper_paths);
+    }
+}
+
+/// Register the ExecutorStart hook to block DML on compressed partitions.
+///
+/// # Safety
+/// Must be called from `_PG_init()`. Replaces the global ExecutorStart hook pointer.
+pub unsafe fn register_executor_start_hook() {
+    unsafe {
+        let prev = pg_sys::ExecutorStart_hook;
+        if let Some(prev_fn) = prev {
+            PREV_EXECUTOR_START_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
+        }
+        pg_sys::ExecutorStart_hook = Some(hook::cocoon_executor_start);
     }
 }

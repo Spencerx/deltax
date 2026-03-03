@@ -1036,3 +1036,329 @@ class TestDatumConversions:
             assert b[1] == a[1], f"f8 null mismatch at row {i}: {b[1]} vs {a[1]}"
             assert b[2] == a[2], f"text null mismatch at row {i}: {b[2]!r} vs {a[2]!r}"
             assert b[3] == a[3], f"bool null mismatch at row {i}: {b[3]} vs {a[3]}"
+
+
+# ---------------------------------------------------------------------------
+# MIN/MAX pushdown tests
+# ---------------------------------------------------------------------------
+
+def _setup_minmax_table(conn):
+    """Create a table with multiple orderable columns, insert data, compress."""
+    conn.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+    conn.execute("""
+        CREATE TABLE minmax_test (
+            ts TIMESTAMPTZ NOT NULL,
+            event_date DATE NOT NULL,
+            counter_id INTEGER NOT NULL,
+            value DOUBLE PRECISION NOT NULL,
+            small_val SMALLINT NOT NULL,
+            device_id TEXT NOT NULL
+        )
+    """)
+    conn.execute("SELECT cocoon_create_table('minmax_test', 'ts', '1 day'::interval)")
+    conn.execute(
+        "SELECT cocoon_enable_compression('minmax_test', order_by => ARRAY['ts'])"
+    )
+    conn.commit()
+
+    # Insert 1000 rows into a single partition day
+    values = []
+    for i in range(1, 1001):
+        ts = f"'{BASE_TS}'::timestamptz + interval '{i} seconds'"
+        event_date = f"'2025-01-10'::date + {i % 7}"
+        counter_id = (i % 100) + 1
+        value = (i % 1000) + 0.5
+        small_val = i % 32000
+        device_id = f"'dev-{i % 5:03d}'"
+        values.append(
+            f"({ts}, {event_date}, {counter_id}, {value}, {small_val}, {device_id})"
+        )
+    batch_size = 500
+    for j in range(0, len(values), batch_size):
+        batch = values[j:j + batch_size]
+        conn.execute(
+            "INSERT INTO minmax_test (ts, event_date, counter_id, value, small_val, device_id) VALUES "
+            + ", ".join(batch)
+        )
+    conn.commit()
+
+    _compress_all_partitions(conn, "minmax_test")
+
+
+def _uses_minmax_pushdown(conn, query):
+    """Return True if EXPLAIN shows CocoonMinMax pushdown for query."""
+    rows = conn.execute(f"EXPLAIN (COSTS OFF) {query}").fetchall()
+    explain_text = "\n".join(r[0] for r in rows)
+    return "CocoonMinMax" in explain_text
+
+
+class TestMinMaxPushdown:
+    """Tests for MIN/MAX pushdown via CocoonMinMax custom scan."""
+
+    def test_min_on_non_time_column(self, db):
+        """Single MIN on a DATE column uses pushdown and returns correct result."""
+        _setup_minmax_table(db)
+
+        expected = db.execute(
+            "SELECT MIN(event_date) FROM minmax_test"
+        ).fetchone()[0]
+
+        # Verify pushdown is used
+        assert _uses_minmax_pushdown(db, "SELECT MIN(event_date) FROM minmax_test")
+
+        actual = db.execute("SELECT MIN(event_date) FROM minmax_test").fetchone()[0]
+        assert actual == expected, f"MIN(event_date): {expected} vs {actual}"
+
+    def test_max_on_integer_column(self, db):
+        """Single MAX on an INTEGER column uses pushdown and returns correct result."""
+        _setup_minmax_table(db)
+
+        # Get expected result before compression by computing from known data
+        # counter_id = (i % 100) + 1 for i in 1..1000, so max = 100
+        assert _uses_minmax_pushdown(db, "SELECT MAX(counter_id) FROM minmax_test")
+
+        actual = db.execute("SELECT MAX(counter_id) FROM minmax_test").fetchone()[0]
+        assert actual == 100, f"MAX(counter_id): expected 100, got {actual}"
+
+    def test_multi_aggregate_same_column(self, db):
+        """MIN and MAX of the same column in one query (like ClickBench Q7)."""
+        _setup_minmax_table(db)
+
+        query = "SELECT MIN(event_date), MAX(event_date) FROM minmax_test"
+        assert _uses_minmax_pushdown(db, query)
+
+        row = db.execute(query).fetchone()
+        min_date, max_date = row[0], row[1]
+
+        # event_date = '2025-01-10' + (i % 7) for i in 1..1000
+        # Values: 2025-01-11 through 2025-01-16 and 2025-01-10 (when i%7==0)
+        import datetime
+        assert min_date == datetime.date(2025, 1, 10), f"MIN(event_date): {min_date}"
+        assert max_date == datetime.date(2025, 1, 16), f"MAX(event_date): {max_date}"
+
+    def test_multi_aggregate_different_columns(self, db):
+        """MIN and MAX on different columns in one query."""
+        _setup_minmax_table(db)
+
+        query = "SELECT MIN(counter_id), MAX(counter_id) FROM minmax_test"
+        assert _uses_minmax_pushdown(db, query)
+
+        row = db.execute(query).fetchone()
+        assert row[0] == 1, f"MIN(counter_id): expected 1, got {row[0]}"
+        assert row[1] == 100, f"MAX(counter_id): expected 100, got {row[1]}"
+
+    def test_minmax_on_float_column(self, db):
+        """MIN/MAX on DOUBLE PRECISION column."""
+        _setup_minmax_table(db)
+
+        query = "SELECT MIN(value), MAX(value) FROM minmax_test"
+        assert _uses_minmax_pushdown(db, query)
+
+        row = db.execute(query).fetchone()
+        # value = (i % 1000) + 0.5, so min = 0.5 (i=1000, 1000%1000=0) and max = 999.5 (i=999)
+        assert abs(row[0] - 0.5) < 0.01, f"MIN(value): expected 0.5, got {row[0]}"
+        assert abs(row[1] - 999.5) < 0.01, f"MAX(value): expected 999.5, got {row[1]}"
+
+    def test_minmax_on_smallint_column(self, db):
+        """MIN/MAX on SMALLINT column."""
+        _setup_minmax_table(db)
+
+        query = "SELECT MIN(small_val), MAX(small_val) FROM minmax_test"
+        assert _uses_minmax_pushdown(db, query)
+
+        row = db.execute(query).fetchone()
+        # small_val = i % 32000 for i in 1..1000, so min = 0 (i=1000 if 1000%32000==1000... actually min=1, max=999 since 1..1000 % 32000 is 1..1000)
+        # Wait: i goes 1..1000. i%32000 = i for all since i < 32000. So min=1, max=1000.
+        assert row[0] == 1, f"MIN(small_val): expected 1, got {row[0]}"
+        assert row[1] == 1000, f"MAX(small_val): expected 1000, got {row[1]}"
+
+    def test_minmax_on_timestamp_column(self, db):
+        """MIN/MAX on the time column itself still works with pushdown."""
+        _setup_minmax_table(db)
+
+        query = "SELECT MIN(ts), MAX(ts) FROM minmax_test"
+        assert _uses_minmax_pushdown(db, query)
+
+        row = db.execute(query).fetchone()
+        assert row[0] is not None
+        assert row[1] is not None
+        assert row[1] > row[0], f"MAX(ts) should be > MIN(ts): {row[0]} vs {row[1]}"
+
+    def test_minmax_no_pushdown_for_text(self, db):
+        """MIN/MAX on TEXT column should NOT use pushdown (not orderable in companion)."""
+        _setup_minmax_table(db)
+
+        query = "SELECT MIN(device_id) FROM minmax_test"
+        assert not _uses_minmax_pushdown(db, query), \
+            "TEXT columns should not use CocoonMinMax pushdown"
+
+    def test_minmax_with_segment_by(self, db):
+        """MIN/MAX pushdown works when table has segment_by columns."""
+        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE minmax_seg (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                value INTEGER NOT NULL
+            )
+        """)
+        db.execute("SELECT cocoon_create_table('minmax_seg', 'ts', '1 day'::interval)")
+        db.execute(
+            "SELECT cocoon_enable_compression('minmax_seg', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        for d in range(3):
+            for i in range(100):
+                db.execute(
+                    f"INSERT INTO minmax_seg VALUES ("
+                    f"'{BASE_TS}'::timestamptz + interval '{d * 100 + i} seconds', "
+                    f"'dev-{d}', {d * 100 + i})"
+                )
+        db.commit()
+
+        _compress_all_partitions(db, "minmax_seg")
+
+        query = "SELECT MIN(value), MAX(value) FROM minmax_seg"
+        assert _uses_minmax_pushdown(db, query)
+
+        row = db.execute(query).fetchone()
+        assert row[0] == 0, f"MIN(value): expected 0, got {row[0]}"
+        assert row[1] == 299, f"MAX(value): expected 299, got {row[1]}"
+
+    def test_minmax_explain_analyze(self, db):
+        """EXPLAIN ANALYZE on MIN/MAX pushdown shows CocoonMinMax timing."""
+        _setup_minmax_table(db)
+
+        rows = db.execute(
+            "EXPLAIN (ANALYZE, COSTS OFF) "
+            "SELECT MIN(counter_id), MAX(counter_id) FROM minmax_test"
+        ).fetchall()
+        explain_text = "\n".join(r[0] for r in rows)
+
+        assert "CocoonMinMax" in explain_text, (
+            f"Expected CocoonMinMax in EXPLAIN output:\n{explain_text}"
+        )
+        assert "Cocoon Timing" in explain_text
+        assert "Cocoon Stats" in explain_text
+        assert "segments=" in explain_text
+
+
+# ---------------------------------------------------------------------------
+# DML blocking on compressed partitions
+# ---------------------------------------------------------------------------
+
+class TestDMLBlocking:
+    """Verify that INSERT/UPDATE/DELETE on compressed partitions raise errors."""
+
+    def _setup_and_compress(self, db):
+        """Create table, insert data, compress a partition. Return partition name."""
+        setup_metrics_table(db)
+        insert_metrics(db, n_devices=3, n_points=20)
+        db.execute(
+            "SELECT cocoon_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        partitions = db.execute(
+            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "WHERE range_start <= '2025-01-15'::timestamptz "
+            "AND range_end > '2025-01-15'::timestamptz"
+        ).fetchall()
+        assert len(partitions) > 0
+        part_name = partitions[0][0]
+
+        db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        db.commit()
+        return part_name
+
+    def test_insert_blocked_on_compressed(self, db):
+        """INSERT into a compressed partition raises an error."""
+        part_name = self._setup_and_compress(db)
+        with pytest.raises(Exception, match="cannot INSERT into compressed partition"):
+            db.execute(
+                f"INSERT INTO \"{part_name}\" (ts, device_id, temperature, pressure, status) "
+                f"VALUES ('2025-01-15 06:00:00+00', 'dev-new', 99.0, 1000.0, true)"
+            )
+
+    def test_update_blocked_on_compressed(self, db):
+        """UPDATE on a compressed partition raises an error."""
+        part_name = self._setup_and_compress(db)
+        with pytest.raises(Exception, match="cannot UPDATE compressed partition"):
+            db.execute(
+                f"UPDATE \"{part_name}\" SET temperature = 0.0"
+            )
+
+    def test_delete_blocked_on_compressed(self, db):
+        """DELETE from a compressed partition raises an error."""
+        part_name = self._setup_and_compress(db)
+        with pytest.raises(Exception, match="cannot DELETE from compressed partition"):
+            db.execute(
+                f"DELETE FROM \"{part_name}\""
+            )
+
+    def test_dml_works_after_decompress(self, db):
+        """After decompression, DML works again."""
+        part_name = self._setup_and_compress(db)
+
+        # Decompress
+        db.execute(f"SELECT cocoon_decompress_partition('{part_name}')")
+        db.commit()
+
+        # INSERT should work
+        db.execute(
+            f"INSERT INTO \"{part_name}\" (ts, device_id, temperature, pressure, status) "
+            f"VALUES ('2025-01-15 06:00:00+00', 'dev-new', 99.0, 1000.0, true)"
+        )
+        db.commit()
+
+        count = db.execute(
+            f"SELECT count(*) FROM \"{part_name}\" WHERE device_id = 'dev-new'"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_insert_to_parent_routes_to_uncompressed(self, db):
+        """INSERT to parent table routing to an uncompressed partition works."""
+        setup_metrics_table(db)
+        insert_metrics(db, n_devices=2, n_points=10)
+        db.execute(
+            "SELECT cocoon_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        # Compress only one partition (the 2025-01-15 one)
+        partitions = db.execute(
+            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "WHERE range_start <= '2025-01-15'::timestamptz "
+            "AND range_end > '2025-01-15'::timestamptz"
+        ).fetchall()
+        part_name = partitions[0][0]
+        db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        db.commit()
+
+        # Find an uncompressed partition to target
+        uncompressed = db.execute(
+            "SELECT partition_name, range_start FROM cocoon_partition_info('metrics') "
+            "WHERE is_compressed = false AND partition_name NOT LIKE '%default%' "
+            "LIMIT 1"
+        ).fetchall()
+
+        if len(uncompressed) > 0:
+            # Insert into parent, routing to the uncompressed partition
+            target_start = uncompressed[0][1]
+            db.execute(
+                f"INSERT INTO metrics (ts, device_id, temperature, pressure, status) "
+                f"VALUES ('{target_start}'::timestamptz + interval '1 minute', "
+                f"'dev-new', 42.0, 1013.0, true)"
+            )
+            db.commit()
+
+            count = db.execute(
+                "SELECT count(*) FROM metrics WHERE device_id = 'dev-new'"
+            ).fetchone()[0]
+            assert count == 1

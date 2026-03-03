@@ -44,6 +44,24 @@ pub(crate) static COCOON_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethod
         ExplainCustomScan: Some(super::explain::explain_count_scan),
     });
 
+/// Static CustomExecMethods struct for CocoonMinMax (MIN/MAX pushdown).
+pub(crate) static COCOON_MINMAX_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+    SyncStatic(pg_sys::CustomExecMethods {
+        CustomName: super::COCOON_MINMAX_NAME.as_ptr(),
+        BeginCustomScan: Some(begin_minmax_scan),
+        ExecCustomScan: Some(exec_minmax_scan),
+        EndCustomScan: Some(end_minmax_scan),
+        ReScanCustomScan: Some(rescan_minmax_scan),
+        MarkPosCustomScan: None,
+        RestrPosCustomScan: None,
+        EstimateDSMCustomScan: None,
+        InitializeDSMCustomScan: None,
+        ReInitializeDSMCustomScan: None,
+        InitializeWorkerCustomScan: None,
+        ShutdownCustomScan: None,
+        ExplainCustomScan: Some(super::explain::explain_minmax_scan),
+    });
+
 /// Static CustomExecMethods struct for CocoonAppend.
 pub(crate) static COCOON_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
@@ -135,17 +153,47 @@ pub(super) struct ScanTiming {
     pub(super) segments_skipped: u64,
 }
 
+/// Per-column min/max metadata from the companion table.
+struct ColMinMax {
+    min_datum: pg_sys::Datum,
+    max_datum: pg_sys::Datum,
+    min_null: bool,
+    max_null: bool,
+    type_oid: pg_sys::Oid,
+}
+
 struct SegmentData {
     segment_values: Vec<Option<String>>,
     compressed_blobs: Vec<Vec<u8>>,
     row_count: i32,
     min_time: Option<i64>,
     max_time: Option<i64>,
+    /// Per-column min/max (column name → ColMinMax).
+    col_minmax: HashMap<String, ColMinMax>,
 }
 
 /// State for CocoonCount (COUNT(*) pushdown).
 pub(super) struct CountScanState {
     pub(super) total_count: i64,
+    returned: bool,
+    pub(super) metadata_us: u64,
+    pub(super) heap_scan_us: u64,
+    pub(super) total_segments: u64,
+}
+
+/// Result for one MIN/MAX aggregate in a multi-aggregate pushdown.
+pub(super) struct MinMaxResult {
+    pub(super) datum: pg_sys::Datum,
+    pub(super) is_null: bool,
+    pub(super) col_name: String,
+    pub(super) is_min: bool,
+    pub(super) type_oid: pg_sys::Oid,
+}
+
+/// State for CocoonMinMax (MIN/MAX pushdown on any column, multi-aggregate).
+pub(super) struct MinMaxScanState {
+    /// Results: one per aggregate.
+    pub(super) results: Vec<MinMaxResult>,
     returned: bool,
     pub(super) metadata_us: u64,
     pub(super) heap_scan_us: u64,
@@ -360,7 +408,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         for &oid in &companion_oids {
-            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column);
+            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column, false);
             all_segments.extend(segs);
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
@@ -492,6 +540,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
                 &meta.segment_by,
                 &needed_cols,
                 &meta.time_column,
+                false,
             );
             for seg in &segs {
                 total_count += seg.row_count as i64;
@@ -569,6 +618,261 @@ pub unsafe extern "C-unwind" fn rescan_count_scan(
 ) {
     unsafe {
         let state = &mut *((*node).custom_ps as *mut CountScanState);
+        state.returned = false;
+    }
+}
+
+/// CreateCustomScanState callback for CocoonMinMax.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn create_minmax_scan_state(
+    cscan: *mut pg_sys::CustomScan,
+) -> *mut pg_sys::Node {
+    unsafe {
+        let css = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScanState>())
+            as *mut pg_sys::CustomScanState;
+
+        (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
+        (*css).methods = &COCOON_MINMAX_EXEC_METHODS.0;
+
+        // Copy custom_private for use in BeginCustomScan
+        (*css).custom_ps = (*cscan).custom_private;
+
+        css as *mut pg_sys::Node
+    }
+}
+
+/// Aggregate specification parsed from plan's custom_private at execution time.
+struct ExecAggSpec {
+    is_min: bool,
+    varattno: i32,
+}
+
+/// BeginCustomScan callback for CocoonMinMax: load segment metadata and find global min/max.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn begin_minmax_scan(
+    node: *mut pg_sys::CustomScanState,
+    _estate: *mut pg_sys::EState,
+    _eflags: i32,
+) {
+    unsafe {
+        let custom_private = (*node).custom_ps;
+        if custom_private.is_null() {
+            pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonMinMax state");
+        }
+
+        let list_len = (*custom_private).length as i32;
+
+        // Parse custom_private: [oid1, ..., -1, num_aggs, is_min_0, varattno_0, ...]
+        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+        let mut agg_specs: Vec<ExecAggSpec> = Vec::new();
+        let mut found_sentinel = false;
+        let mut num_aggs: i32 = 0;
+        let mut after_sentinel_idx = 0;
+        let mut current_fields: Vec<i32> = Vec::new();
+
+        for i in 0..list_len {
+            let val = pg_sys::list_nth_int(custom_private, i);
+            if !found_sentinel {
+                if val == -1 {
+                    found_sentinel = true;
+                    continue;
+                }
+                companion_oids.push(pg_sys::Oid::from(val as u32));
+            } else {
+                if after_sentinel_idx == 0 {
+                    num_aggs = val;
+                    after_sentinel_idx += 1;
+                    continue;
+                }
+                current_fields.push(val);
+                if current_fields.len() == 2 {
+                    agg_specs.push(ExecAggSpec {
+                        is_min: current_fields[0] != 0,
+                        varattno: current_fields[1],
+                    });
+                    current_fields.clear();
+                }
+                after_sentinel_idx += 1;
+            }
+        }
+        let _ = num_aggs;
+
+        if companion_oids.is_empty() {
+            pgrx::error!("pg_cocoon: CocoonMinMax has no companion tables");
+        }
+
+        // Get first companion table name for metadata
+        let first_name = {
+            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+            if name_ptr.is_null() {
+                pgrx::error!(
+                    "pg_cocoon: companion table not found for OID {}",
+                    u32::from(companion_oids[0])
+                );
+            }
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // Load metadata via SPI from first companion table
+        let t0 = Instant::now();
+        let meta = Spi::connect(|client| load_metadata(&client, &first_name));
+        let metadata_us = t0.elapsed().as_micros() as u64;
+
+        // Resolve varattno → column name for each aggregate
+        let agg_col_names: Vec<String> = agg_specs
+            .iter()
+            .map(|spec| {
+                let idx = (spec.varattno - 1) as usize;
+                if idx < meta.col_names.len() {
+                    meta.col_names[idx].clone()
+                } else {
+                    pgrx::error!("pg_cocoon: CocoonMinMax varattno {} out of range", spec.varattno);
+                }
+            })
+            .collect();
+
+        // Build needed_cols as all-false (no columns needed for MIN/MAX metadata)
+        let num_cols = meta.col_names.len();
+        let needed_cols = vec![false; num_cols];
+
+        // Load segments from all companion tables and find global min/max per aggregate
+        let t1 = Instant::now();
+        let mut results: Vec<MinMaxResult> = agg_specs
+            .iter()
+            .zip(agg_col_names.iter())
+            .map(|(spec, col_name)| MinMaxResult {
+                datum: pg_sys::Datum::from(0usize),
+                is_null: true,
+                col_name: col_name.clone(),
+                is_min: spec.is_min,
+                type_oid: pg_sys::InvalidOid,
+            })
+            .collect();
+
+        let mut total_segments: u64 = 0;
+        for &oid in &companion_oids {
+            let segs = load_segments_heap(
+                oid,
+                &meta.col_names,
+                &meta.segment_by,
+                &needed_cols,
+                &meta.time_column,
+                true,
+            );
+            for seg in &segs {
+                for (agg_idx, result) in results.iter_mut().enumerate() {
+                    if let Some(cm) = seg.col_minmax.get(&agg_col_names[agg_idx]) {
+                        let seg_datum = if result.is_min { cm.min_datum } else { cm.max_datum };
+                        let seg_null = if result.is_min { cm.min_null } else { cm.max_null };
+
+                        if seg_null {
+                            continue;
+                        }
+
+                        // Update type_oid from companion metadata
+                        if result.type_oid == pg_sys::InvalidOid {
+                            result.type_oid = cm.type_oid;
+                        }
+
+                        if result.is_null {
+                            result.datum = seg_datum;
+                            result.is_null = false;
+                        } else {
+                            let cmp = compare_datums(seg_datum, result.datum, cm.type_oid);
+                            if result.is_min {
+                                if cmp == std::cmp::Ordering::Less {
+                                    result.datum = seg_datum;
+                                }
+                            } else {
+                                if cmp == std::cmp::Ordering::Greater {
+                                    result.datum = seg_datum;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            total_segments += segs.len() as u64;
+        }
+        let heap_scan_us = t1.elapsed().as_micros() as u64;
+
+        let state = MinMaxScanState {
+            results,
+            returned: false,
+            metadata_us,
+            heap_scan_us,
+            total_segments,
+        };
+
+        let state_box = Box::new(state);
+        let state_ptr = Box::into_raw(state_box);
+        (*node).custom_ps = state_ptr as *mut pg_sys::List;
+    }
+}
+
+/// ExecCustomScan callback for CocoonMinMax: return one row with N min/max values.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn exec_minmax_scan(
+    node: *mut pg_sys::CustomScanState,
+) -> *mut pg_sys::TupleTableSlot {
+    unsafe {
+        let scan_slot = (*node).ss.ss_ScanTupleSlot;
+        let state = &mut *((*node).custom_ps as *mut MinMaxScanState);
+
+        if !state.returned {
+            pg_sys::ExecClearTuple(scan_slot);
+            for (i, result) in state.results.iter().enumerate() {
+                (*scan_slot).tts_values.add(i).write(result.datum);
+                (*scan_slot).tts_isnull.add(i).write(result.is_null);
+            }
+            pg_sys::ExecStoreVirtualTuple(scan_slot);
+            state.returned = true;
+            return scan_slot;
+        }
+
+        // EOF — return empty slot
+        pg_sys::ExecClearTuple(scan_slot);
+        scan_slot
+    }
+}
+
+/// EndCustomScan callback for CocoonMinMax: cleanup state.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn end_minmax_scan(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state_ptr = (*node).custom_ps as *mut MinMaxScanState;
+        if !state_ptr.is_null() {
+            let state = Box::from_raw(state_ptr);
+            let total_us = state.metadata_us + state.heap_scan_us;
+            let agg_parts: Vec<String> = state.results.iter().map(|r| {
+                let agg_name = if r.is_min { "MIN" } else { "MAX" };
+                format!("{}({})=null={}", agg_name, r.col_name, r.is_null)
+            }).collect();
+            pgrx::log!(
+                "pg_cocoon CocoonMinMax timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
+                 {} segments={}",
+                total_us as f64 / 1000.0,
+                state.metadata_us as f64 / 1000.0,
+                state.heap_scan_us as f64 / 1000.0,
+                agg_parts.join(", "),
+                state.total_segments,
+            );
+            (*node).custom_ps = std::ptr::null_mut();
+        }
+    }
+}
+
+/// ReScanCustomScan callback for CocoonMinMax: reset returned flag.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn rescan_minmax_scan(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state = &mut *((*node).custom_ps as *mut MinMaxScanState);
         state.returned = false;
     }
 }
@@ -681,6 +985,7 @@ unsafe fn load_segments_heap(
     segment_by: &[String],
     needed_cols: &[bool],
     time_column: &str,
+    load_minmax: bool,
 ) -> Vec<SegmentData> {
     unsafe {
         // Open companion table with AccessShareLock
@@ -732,6 +1037,28 @@ unsafe fn load_segments_heap(
         let max_time_name = format!("_max_{}", time_column);
         let min_time_attno = attno_map.get(min_time_name.as_str()).copied();
         let max_time_attno = attno_map.get(max_time_name.as_str()).copied();
+
+        // Discover per-column min/max columns: (col_name, min_attno, max_attno, type_oid)
+        // Only needed for MinMax pushdown scans — skip for regular decompress scans
+        // to avoid overhead from deforming 100+ extra attributes.
+        let mut minmax_col_attnos: Vec<(String, usize, usize, pg_sys::Oid)> = Vec::new();
+        if load_minmax {
+            for col_name in col_names {
+                if segment_by.contains(col_name) {
+                    continue;
+                }
+                let min_name = format!("_min_{}", col_name);
+                let max_name = format!("_max_{}", col_name);
+                if let (Some(&min_att), Some(&max_att)) = (
+                    attno_map.get(min_name.as_str()),
+                    attno_map.get(max_name.as_str()),
+                ) {
+                    let type_oid = att_type_oids.get(min_name.as_str()).copied()
+                        .unwrap_or(pg_sys::InvalidOid);
+                    minmax_col_attnos.push((col_name.clone(), min_att, max_att, type_oid));
+                }
+            }
+        }
 
         // Begin table scan via TableAmRoutine vtable
         // (table_beginscan is static inline in C, so we call via the vtable)
@@ -837,12 +1164,25 @@ unsafe fn load_segments_heap(
                 _ => None,
             };
 
+            // Extract per-column min/max
+            let mut col_minmax = HashMap::new();
+            for (col_name, min_att, max_att, type_oid) in &minmax_col_attnos {
+                col_minmax.insert(col_name.clone(), ColMinMax {
+                    min_datum: if nulls[*min_att] { pg_sys::Datum::from(0usize) } else { values[*min_att] },
+                    max_datum: if nulls[*max_att] { pg_sys::Datum::from(0usize) } else { values[*max_att] },
+                    min_null: nulls[*min_att],
+                    max_null: nulls[*max_att],
+                    type_oid: *type_oid,
+                });
+            }
+
             segments.push(SegmentData {
                 segment_values,
                 compressed_blobs,
                 row_count,
                 min_time,
                 max_time,
+                col_minmax,
             });
         }
 
@@ -887,7 +1227,7 @@ fn load_decompress_state(
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
     let t1 = Instant::now();
     let segments_data = unsafe {
-        load_segments_heap(companion_oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column)
+        load_segments_heap(companion_oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column, false)
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;
 
@@ -1626,6 +1966,28 @@ fn reinsert_nulls_datum(
         }
     }
     result
+}
+
+/// Compare two Datums of the same type. Returns Ordering for min/max computation.
+/// Only supports pass-by-value orderable types (int, float, date, timestamp).
+fn compare_datums(d1: pg_sys::Datum, d2: pg_sys::Datum, type_oid: pg_sys::Oid) -> std::cmp::Ordering {
+    if type_oid == pg_sys::TIMESTAMPTZOID || type_oid == pg_sys::TIMESTAMPOID || type_oid == pg_sys::INT8OID {
+        (d1.value() as i64).cmp(&(d2.value() as i64))
+    } else if type_oid == pg_sys::DATEOID || type_oid == pg_sys::INT4OID {
+        (d1.value() as i32).cmp(&(d2.value() as i32))
+    } else if type_oid == pg_sys::INT2OID {
+        (d1.value() as i16).cmp(&(d2.value() as i16))
+    } else if type_oid == pg_sys::FLOAT8OID {
+        let f1 = f64::from_bits(d1.value() as u64);
+        let f2 = f64::from_bits(d2.value() as u64);
+        f1.partial_cmp(&f2).unwrap_or(std::cmp::Ordering::Equal)
+    } else if type_oid == pg_sys::FLOAT4OID {
+        let f1 = f32::from_bits(d1.value() as u32);
+        let f2 = f32::from_bits(d2.value() as u32);
+        f1.partial_cmp(&f2).unwrap_or(std::cmp::Ordering::Equal)
+    } else {
+        std::cmp::Ordering::Equal
+    }
 }
 
 fn count_non_null(null_bitmap: &[u8], total_count: usize) -> usize {

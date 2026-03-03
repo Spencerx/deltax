@@ -283,6 +283,231 @@ pub unsafe extern "C-unwind" fn plan_count_star_path(
 }
 
 // ============================================================================
+// CocoonMinMax: MIN/MAX aggregate pushdown on time column
+// ============================================================================
+
+/// Static CustomPathMethods for CocoonMinMax.
+static COCOON_MINMAX_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+    SyncStatic(pg_sys::CustomPathMethods {
+        CustomName: super::COCOON_MINMAX_NAME.as_ptr(),
+        PlanCustomPath: Some(plan_minmax_path),
+        ReparameterizeCustomPathByChild: None,
+    });
+
+/// Static CustomScanMethods for CocoonMinMax.
+static COCOON_MINMAX_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+    SyncStatic(pg_sys::CustomScanMethods {
+        CustomName: super::COCOON_MINMAX_NAME.as_ptr(),
+        CreateCustomScanState: Some(super::exec::create_minmax_scan_state),
+    });
+
+/// Specification for one MIN/MAX aggregate in a multi-aggregate pushdown.
+pub struct MinMaxAggSpec {
+    pub is_min: bool,
+    pub varattno: i16,
+    pub result_type_oid: pg_sys::Oid,
+    pub typlen: i16,
+    pub typbyval: bool,
+}
+
+/// Add a CocoonMinMax custom path to the grouped relation's pathlist.
+///
+/// This replaces the Aggregate → Scan pipeline with a single CustomScan
+/// that returns the pre-computed MIN/MAX values from segment metadata.
+/// Supports multiple aggregates (e.g., `SELECT MIN(col), MAX(col)`).
+pub unsafe fn add_minmax_path(
+    _root: *mut pg_sys::PlannerInfo,
+    output_rel: *mut pg_sys::RelOptInfo,
+    companion_oids: &[pg_sys::Oid],
+    agg_specs: &[MinMaxAggSpec],
+) {
+    unsafe {
+        let cpath =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
+
+        (*cpath).path.type_ = pg_sys::NodeTag::T_CustomPath;
+        (*cpath).path.pathtype = pg_sys::NodeTag::T_CustomScan;
+        (*cpath).path.parent = output_rel;
+        (*cpath).path.pathtarget = (*output_rel).reltarget;
+
+        // Very low cost — metadata-only scan, no decompression
+        (*cpath).path.rows = 1.0;
+        (*cpath).path.startup_cost = 1.0;
+        (*cpath).path.total_cost = 2.0;
+        (*cpath).path.parallel_workers = 0;
+        (*cpath).path.parallel_aware = false;
+        (*cpath).path.parallel_safe = false;
+
+        // Store in custom_private:
+        // [oid1, oid2, ..., -1, num_aggs,
+        //  is_min_0, varattno_0, type_oid_0, typlen_0, typbyval_0,
+        //  is_min_1, varattno_1, type_oid_1, typlen_1, typbyval_1, ...]
+        let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
+        for &oid in companion_oids {
+            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
+        }
+        private_list = pg_sys::lappend_int(private_list, -1);
+        private_list = pg_sys::lappend_int(private_list, agg_specs.len() as i32);
+        for spec in agg_specs {
+            private_list = pg_sys::lappend_int(private_list, if spec.is_min { 1 } else { 0 });
+            private_list = pg_sys::lappend_int(private_list, spec.varattno as i32);
+            private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
+            private_list = pg_sys::lappend_int(private_list, spec.typlen as i32);
+            private_list = pg_sys::lappend_int(private_list, if spec.typbyval { 1 } else { 0 });
+        }
+        (*cpath).custom_private = private_list;
+
+        (*cpath).custom_paths = std::ptr::null_mut();
+        (*cpath).custom_restrictinfo = std::ptr::null_mut();
+        (*cpath).methods = &COCOON_MINMAX_PATH_METHODS.0;
+
+        pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
+    }
+}
+
+/// Per-aggregate info parsed from custom_private during plan creation.
+struct PlanAggSpec {
+    is_min: bool,
+    varattno: i32,
+    type_oid: pg_sys::Oid,
+    typlen: i32,
+    typbyval: bool,
+}
+
+/// PlanCustomPath callback for CocoonMinMax.
+///
+/// Creates a CustomScan with scanrelid=0 that outputs N columns,
+/// one per MIN/MAX aggregate, containing the pre-computed results.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn plan_minmax_path(
+    _root: *mut pg_sys::PlannerInfo,
+    _rel: *mut pg_sys::RelOptInfo,
+    best_path: *mut pg_sys::CustomPath,
+    _tlist: *mut pg_sys::List,
+    _clauses: *mut pg_sys::List,
+    _custom_plans: *mut pg_sys::List,
+) -> *mut pg_sys::Plan {
+    unsafe {
+        let cscan =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
+
+        (*cscan).scan.plan.type_ = pg_sys::NodeTag::T_CustomScan;
+        // scanrelid = 0: no real table scan, slot built from custom_scan_tlist
+        (*cscan).scan.scanrelid = 0;
+
+        // Parse path's custom_private:
+        // [oid1, ..., -1, num_aggs, is_min_0, varattno_0, type_oid_0, typlen_0, typbyval_0, ...]
+        let path_private = (*best_path).custom_private;
+        let path_len = (*path_private).length;
+
+        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+        let mut agg_specs: Vec<PlanAggSpec> = Vec::new();
+        let mut found_sentinel = false;
+        let mut num_aggs: i32 = 0;
+        let mut after_sentinel_idx = 0;
+        let mut current_spec_fields: Vec<i32> = Vec::new();
+
+        for i in 0..path_len {
+            let val = pg_sys::list_nth_int(path_private, i);
+            if !found_sentinel {
+                if val == -1 {
+                    found_sentinel = true;
+                    continue;
+                }
+                companion_oids.push(pg_sys::Oid::from(val as u32));
+            } else {
+                if after_sentinel_idx == 0 {
+                    num_aggs = val;
+                    after_sentinel_idx += 1;
+                    continue;
+                }
+                current_spec_fields.push(val);
+                if current_spec_fields.len() == 5 {
+                    agg_specs.push(PlanAggSpec {
+                        is_min: current_spec_fields[0] != 0,
+                        varattno: current_spec_fields[1],
+                        type_oid: pg_sys::Oid::from(current_spec_fields[2] as u32),
+                        typlen: current_spec_fields[3],
+                        typbyval: current_spec_fields[4] != 0,
+                    });
+                    current_spec_fields.clear();
+                }
+                after_sentinel_idx += 1;
+            }
+        }
+        let _ = num_aggs; // validated by agg_specs.len()
+
+        // Build custom_scan_tlist and plan.targetlist: one entry per aggregate
+        let mut scan_tlist: *mut pg_sys::List = std::ptr::null_mut();
+        let mut plan_tlist: *mut pg_sys::List = std::ptr::null_mut();
+
+        for (idx, spec) in agg_specs.iter().enumerate() {
+            let resno = (idx + 1) as i16;
+
+            // custom_scan_tlist entry
+            let const_node = pg_sys::makeConst(
+                spec.type_oid,
+                -1,                     // consttypmod
+                pg_sys::InvalidOid,     // constcollid
+                spec.typlen,            // constlen
+                pg_sys::Datum::from(0usize),
+                true,                   // constisnull (placeholder)
+                spec.typbyval,          // constbyval
+            );
+            let scan_tle = pg_sys::makeTargetEntry(
+                const_node as *mut pg_sys::Expr,
+                resno,
+                std::ptr::null_mut(),   // resname
+                false,                  // resjunk
+            );
+            scan_tlist = pg_sys::lappend(scan_tlist, scan_tle as *mut _);
+
+            // plan.targetlist entry (PG setrefs will match to custom_scan_tlist)
+            let const_node2 = pg_sys::makeConst(
+                spec.type_oid,
+                -1,
+                pg_sys::InvalidOid,
+                spec.typlen,
+                pg_sys::Datum::from(0usize),
+                true,
+                spec.typbyval,
+            );
+            let plan_tle = pg_sys::makeTargetEntry(
+                const_node2 as *mut pg_sys::Expr,
+                resno,
+                std::ptr::null_mut(),
+                false,
+            );
+            plan_tlist = pg_sys::lappend(plan_tlist, plan_tle as *mut _);
+        }
+
+        (*cscan).custom_scan_tlist = scan_tlist;
+        (*cscan).scan.plan.targetlist = plan_tlist;
+
+        // Build plan's custom_private: [oid1, ..., -1, num_aggs, is_min_0, varattno_0, ...]
+        let mut plan_private: *mut pg_sys::List = std::ptr::null_mut();
+        for &oid in &companion_oids {
+            plan_private = pg_sys::lappend_int(plan_private, u32::from(oid) as i32);
+        }
+        plan_private = pg_sys::lappend_int(plan_private, -1);
+        plan_private = pg_sys::lappend_int(plan_private, agg_specs.len() as i32);
+        for spec in &agg_specs {
+            plan_private = pg_sys::lappend_int(plan_private, if spec.is_min { 1 } else { 0 });
+            plan_private = pg_sys::lappend_int(plan_private, spec.varattno);
+        }
+
+        (*cscan).custom_private = plan_private;
+        (*cscan).custom_plans = std::ptr::null_mut();
+        (*cscan).custom_relids = std::ptr::null_mut();
+        (*cscan).methods = &COCOON_MINMAX_SCAN_METHODS.0;
+        (*cscan).flags = 0;
+        (*cscan).scan.plan.qual = std::ptr::null_mut();
+
+        &mut (*cscan).scan.plan as *mut pg_sys::Plan
+    }
+}
+
+// ============================================================================
 // CocoonAppend: replaces Append with single CustomScan for all compressed partitions
 // ============================================================================
 

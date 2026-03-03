@@ -1,10 +1,12 @@
 use pgrx::pg_sys;
 use pgrx::pg_guard;
 use std::collections::HashMap;
+use std::ffi::c_int;
 use std::sync::atomic::Ordering;
 
 use super::PREV_HOOK;
 use super::PREV_UPPER_HOOK;
+use super::PREV_EXECUTOR_START_HOOK;
 use super::path;
 use super::cost;
 
@@ -12,10 +14,19 @@ thread_local! {
     /// Cache of partition OID → companion table OID (or InvalidOid if not compressed).
     static COMPRESSED_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, pg_sys::Oid>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// When true, the ExecutorStart hook skips the DML-on-compressed check.
+    /// Used by internal operations like cocoon_decompress_partition.
+    static DML_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn invalidate_compressed_cache() {
     COMPRESSED_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// Set or clear the DML bypass flag for internal operations.
+pub(crate) fn set_dml_bypass(bypass: bool) {
+    DML_BYPASS.with(|flag| flag.set(bypass));
 }
 
 /// The planner hook. Called for each relation during path generation.
@@ -79,9 +90,10 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
     }
 }
 
-/// The create_upper_paths hook. Detects simple COUNT(*) over cocoon scans
-/// and injects a CocoonCount custom path that returns the pre-computed count
-/// directly from segment metadata, bypassing decompression entirely.
+/// The create_upper_paths hook. Detects simple aggregate patterns over cocoon
+/// scans and injects optimized custom paths:
+/// - COUNT(*) → CocoonCount (sum of segment row_counts)
+/// - MIN/MAX(time_col) → CocoonMinMax (global min/max from segment metadata)
 #[pg_guard]
 pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
     root: *mut pg_sys::PlannerInfo,
@@ -128,15 +140,14 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
             return;
         }
 
-        // Check target list: must be a single non-junk COUNT(*) aggregate
+        // Check target list: all non-junk entries must be aggregates
         let tlist = (*parse).targetList;
         if tlist.is_null() {
             return;
         }
 
         let nentries = (*tlist).length;
-        let mut count_star_found = false;
-        let mut non_junk_count = 0;
+        let mut aggrefs: Vec<*const pg_sys::Aggref> = Vec::new();
 
         for i in 0..nentries {
             let te = pg_sys::list_nth(tlist, i) as *const pg_sys::TargetEntry;
@@ -145,10 +156,6 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
             }
             if (*te).resjunk {
                 continue;
-            }
-            non_junk_count += 1;
-            if non_junk_count > 1 {
-                return;
             }
 
             let expr = (*te).expr as *const pg_sys::Node;
@@ -159,15 +166,10 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
                 return;
             }
 
-            let aggref = expr as *const pg_sys::Aggref;
-            if !(*aggref).aggstar {
-                return;
-            }
-
-            count_star_found = true;
+            aggrefs.push(expr as *const pg_sys::Aggref);
         }
 
-        if !count_star_found || non_junk_count != 1 {
+        if aggrefs.is_empty() {
             return;
         }
 
@@ -184,7 +186,108 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
             _ => return,
         };
 
-        path::add_count_star_path(root, output_rel, &companion_oids);
+        // Single aggstar (COUNT(*)) pushdown
+        if aggrefs.len() == 1 && (*aggrefs[0]).aggstar {
+            path::add_count_star_path(root, output_rel, &companion_oids);
+            return;
+        }
+
+        // Collect MIN/MAX aggregate specifications
+        let mut agg_specs: Vec<path::MinMaxAggSpec> = Vec::new();
+
+        for &aggref in &aggrefs {
+            // No COUNT(*) mixed with MIN/MAX
+            if (*aggref).aggstar {
+                return;
+            }
+
+            // FILTER clause not supported
+            if !(*aggref).aggfilter.is_null() {
+                return;
+            }
+
+            // Get function name (min or max)
+            let func_name_ptr = pg_sys::get_func_name((*aggref).aggfnoid);
+            if func_name_ptr.is_null() {
+                return;
+            }
+            let func_name = std::ffi::CStr::from_ptr(func_name_ptr)
+                .to_str()
+                .unwrap_or("");
+            let is_min = match func_name {
+                "min" => true,
+                "max" => false,
+                _ => return,
+            };
+
+            // Must have exactly one argument
+            let args = (*aggref).args;
+            if args.is_null() || (*args).length != 1 {
+                return;
+            }
+
+            // Extract the Var from the single argument's TargetEntry
+            let arg_te = pg_sys::list_nth(args, 0) as *const pg_sys::TargetEntry;
+            if arg_te.is_null() {
+                return;
+            }
+            let arg_expr = (*arg_te).expr as *const pg_sys::Node;
+            if arg_expr.is_null() || (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
+                return; // Only push down for plain column references
+            }
+            let var_node = arg_expr as *const pg_sys::Var;
+            let varno = (*var_node).varno as usize;
+            let varattno = (*var_node).varattno;
+
+            // Get column name from the range table entry
+            if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
+                return;
+            }
+            let rte = *(*root).simple_rte_array.add(varno);
+            if rte.is_null() {
+                return;
+            }
+            let relid = (*rte).relid;
+            let col_name_ptr = pg_sys::get_attname(relid, varattno, true);
+            if col_name_ptr.is_null() {
+                return;
+            }
+
+            // Verify the companion table has _min_{colname}
+            let col_name = std::ffi::CStr::from_ptr(col_name_ptr)
+                .to_string_lossy()
+                .into_owned();
+            let min_col_cname = std::ffi::CString::new(format!("_min_{}", col_name)).unwrap();
+            let attnum = pg_sys::get_attnum(companion_oids[0], min_col_cname.as_ptr());
+            if attnum == pg_sys::InvalidAttrNumber as i16 {
+                return; // Column doesn't have segment min/max metadata
+            }
+
+            // Get type info for the result
+            let result_type_oid = (*aggref).aggtype;
+            let mut typlen: i16 = 0;
+            let mut typbyval: bool = false;
+            pg_sys::get_typlenbyval(result_type_oid, &mut typlen, &mut typbyval);
+
+            agg_specs.push(path::MinMaxAggSpec {
+                is_min,
+                varattno,
+                result_type_oid,
+                typlen,
+                typbyval,
+            });
+        }
+
+        if agg_specs.is_empty() {
+            return;
+        }
+
+        path::add_minmax_path(
+            root,
+            output_rel,
+            &companion_oids,
+            &agg_specs,
+        );
     }
 }
 
@@ -362,7 +465,7 @@ unsafe fn collect_compressed_children(
 
 /// Check if a relation OID corresponds to a compressed partition
 /// by looking for a companion table in _cocoon_compressed schema.
-unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
+pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
     unsafe {
         // Get the relation name
         let name_ptr = pg_sys::get_rel_name(rel_oid);
@@ -389,5 +492,110 @@ unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
         // Check if _cocoon_compressed.<rel_name> exists
         let companion_cname = std::ffi::CString::new(rel_name).unwrap();
         pg_sys::get_relname_relid(companion_cname.as_ptr(), compressed_ns_oid)
+    }
+}
+
+/// ExecutorStart hook: block DML on compressed partitions.
+///
+/// INSERT/UPDATE/DELETE on a compressed partition would silently produce
+/// incorrect results (writes go to the truncated heap, reads come from the
+/// companion table). This hook raises an error before execution begins.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn cocoon_executor_start(
+    query_desc: *mut pg_sys::QueryDesc,
+    eflags: c_int,
+) {
+    unsafe {
+        let operation = (*query_desc).operation;
+
+        // Only check DML commands
+        if operation != pg_sys::CmdType::CMD_INSERT
+            && operation != pg_sys::CmdType::CMD_UPDATE
+            && operation != pg_sys::CmdType::CMD_DELETE
+        {
+            call_prev_executor_start(query_desc, eflags);
+            return;
+        }
+
+        // Skip check when internal operations (e.g. decompress) set the bypass flag
+        if DML_BYPASS.with(|flag| flag.get()) {
+            call_prev_executor_start(query_desc, eflags);
+            return;
+        }
+
+        let planned_stmt = (*query_desc).plannedstmt;
+        if planned_stmt.is_null() {
+            call_prev_executor_start(query_desc, eflags);
+            return;
+        }
+
+        let result_relations = (*planned_stmt).resultRelations;
+        if !result_relations.is_null() {
+            let rtable = (*planned_stmt).rtable;
+            let n = (*result_relations).length;
+
+            for i in 0..n {
+                // resultRelations is an IntList of 1-based RTE indices
+                let rti = (*(*result_relations).elements.add(i as usize)).int_value;
+                if rti <= 0 || rtable.is_null() {
+                    continue;
+                }
+
+                // Get the RTE at this index (0-based in the list)
+                let rte = pg_sys::list_nth(rtable, rti - 1) as *const pg_sys::RangeTblEntry;
+                if rte.is_null() {
+                    continue;
+                }
+                let relid = (*rte).relid;
+
+                let companion_oid = COMPRESSED_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    if let Some(&oid) = cache.get(&relid) {
+                        return oid;
+                    }
+                    let oid = check_compressed_partition(relid);
+                    cache.insert(relid, oid);
+                    oid
+                });
+
+                if companion_oid != pg_sys::InvalidOid {
+                    let op_name = match operation {
+                        pg_sys::CmdType::CMD_INSERT => "INSERT into",
+                        pg_sys::CmdType::CMD_UPDATE => "UPDATE",
+                        pg_sys::CmdType::CMD_DELETE => "DELETE from",
+                        _ => "modify",
+                    };
+                    let rel_name_ptr = pg_sys::get_rel_name(relid);
+                    let rel_name = if rel_name_ptr.is_null() {
+                        format!("OID {}", relid)
+                    } else {
+                        std::ffi::CStr::from_ptr(rel_name_ptr)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    pgrx::error!(
+                        "cannot {} compressed partition \"{}\", decompress it first",
+                        op_name,
+                        rel_name,
+                    );
+                }
+            }
+        }
+
+        call_prev_executor_start(query_desc, eflags);
+    }
+}
+
+/// Chain to the previous ExecutorStart hook or call standard_ExecutorStart.
+unsafe fn call_prev_executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: c_int) {
+    unsafe {
+        let prev = PREV_EXECUTOR_START_HOOK.load(Ordering::SeqCst);
+        if !prev.is_null() {
+            let prev_fn: unsafe extern "C-unwind" fn(*mut pg_sys::QueryDesc, c_int) =
+                std::mem::transmute(prev);
+            prev_fn(query_desc, eflags);
+        } else {
+            pg_sys::standard_ExecutorStart(query_desc, eflags);
+        }
     }
 }

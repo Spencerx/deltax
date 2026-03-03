@@ -1,7 +1,7 @@
 use pgrx::pg_sys;
 use pgrx::pg_guard;
 
-use super::exec::{DecompressState, CountScanState};
+use super::exec::{DecompressState, CountScanState, MinMaxScanState};
 
 /// ExplainCustomScan callback: output info for EXPLAIN.
 #[pg_guard]
@@ -70,6 +70,58 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
                 let stats_str = std::ffi::CString::new(format!(
                     "total_count={} segments={}",
                     state.total_count,
+                    state.total_segments,
+                ))
+                .unwrap();
+                pg_sys::ExplainPropertyText(
+                    c"Cocoon Stats".as_ptr(),
+                    stats_str.as_ptr(),
+                    es,
+                );
+            }
+        }
+    }
+}
+
+/// ExplainCustomScan callback for CocoonMinMax (MIN/MAX pushdown).
+#[pg_guard]
+pub unsafe extern "C-unwind" fn explain_minmax_scan(
+    node: *mut pg_sys::CustomScanState,
+    _ancestors: *mut pg_sys::List,
+    es: *mut pg_sys::ExplainState,
+) {
+    unsafe {
+        let label = c"Storage";
+        let value = c"Compressed (CocoonMinMax - MIN/MAX pushdown)";
+        pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
+
+        if (*es).analyze {
+            let state_ptr = (*node).custom_ps as *const MinMaxScanState;
+            if !state_ptr.is_null() {
+                let state = &*state_ptr;
+                let total_ms =
+                    (state.metadata_us + state.heap_scan_us) as f64 / 1000.0;
+
+                let timing_str = std::ffi::CString::new(format!(
+                    "{:.3} ms (metadata={:.3} heap_scan={:.3})",
+                    total_ms,
+                    state.metadata_us as f64 / 1000.0,
+                    state.heap_scan_us as f64 / 1000.0,
+                ))
+                .unwrap();
+                pg_sys::ExplainPropertyText(
+                    c"Cocoon Timing".as_ptr(),
+                    timing_str.as_ptr(),
+                    es,
+                );
+
+                let agg_parts: Vec<String> = state.results.iter().map(|r| {
+                    let agg_name = if r.is_min { "MIN" } else { "MAX" };
+                    format!("{}({})=null={}", agg_name, r.col_name, r.is_null)
+                }).collect();
+                let stats_str = std::ffi::CString::new(format!(
+                    "{} segments={}",
+                    agg_parts.join(", "),
                     state.total_segments,
                 ))
                 .unwrap();

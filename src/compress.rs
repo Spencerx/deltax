@@ -231,9 +231,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
             create_cols.push(format!("\"_{}_compressed\" BYTEA", col.name));
         }
     }
-    // Min/max metadata for the time column
-    create_cols.push(format!("_min_{} TIMESTAMPTZ", ht.time_column));
-    create_cols.push(format!("_max_{} TIMESTAMPTZ", ht.time_column));
+    // Min/max metadata for all orderable (numeric/date/timestamp) columns
+    for col in &columns {
+        if !col.is_segment_by && supports_minmax(&col.data_type) {
+            create_cols.push(format!("\"_min_{}\" {}", col.name, col.data_type));
+            create_cols.push(format!("\"_max_{}\" {}", col.name, col.data_type));
+        }
+    }
     create_cols.push("_row_count INT".to_string());
 
     let create_ddl = format!(
@@ -268,7 +272,6 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
             &part_fqn,
             &companion_fqn,
             &columns,
-            &ht.time_column,
             "TRUE",
             &order_clause,
             &[],
@@ -319,7 +322,6 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
                 &part_fqn,
                 &companion_fqn,
                 &columns,
-                &ht.time_column,
                 filter,
                 &order_clause,
                 &ht.segment_by,
@@ -360,13 +362,11 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
 /// Compress a single segment (subset of rows matching the segment filter).
 /// Returns the total compressed size in bytes.
-#[allow(clippy::too_many_arguments)]
 fn compress_segment(
     client: &mut SpiClient,
     part_fqn: &str,
     companion_fqn: &str,
     columns: &[ColumnMeta],
-    time_column: &str,
     where_clause: &str,
     order_clause: &str,
     segment_by: &[String],
@@ -416,8 +416,9 @@ fn compress_segment(
 
     // Compress each non-segment column
     let mut compressed_data: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut min_ts: Option<String> = None;
-    let mut max_ts: Option<String> = None;
+    // Per-column min/max for all orderable columns (column_name -> (min, max))
+    let mut col_minmax: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+        std::collections::HashMap::new();
     let mut total_size: i64 = 0;
 
     for (i, col) in columns.iter().enumerate() {
@@ -428,20 +429,10 @@ fn compress_segment(
         let values = &col_values[i];
         let compressed = compress_column_values(values, &col.data_type, &col.name);
 
-        // Track min/max for time column
-        if col.name == time_column {
-            for val in values.iter().flatten() {
-                match &min_ts {
-                    None => min_ts = Some(val.clone()),
-                    Some(cur) if val < cur => min_ts = Some(val.clone()),
-                    _ => {}
-                }
-                match &max_ts {
-                    None => max_ts = Some(val.clone()),
-                    Some(cur) if val > cur => max_ts = Some(val.clone()),
-                    _ => {}
-                }
-            }
+        // Track min/max for orderable columns
+        if supports_minmax(&col.data_type) {
+            let (min_val, max_val) = compute_column_minmax(values, &col.data_type);
+            col_minmax.insert(col.name.clone(), (min_val, max_val));
         }
 
         total_size += compressed.len() as i64;
@@ -490,9 +481,13 @@ fn compress_segment(
         insert_cols.push(format!("\"_{}_compressed\"", col_name));
     }
 
-    // Min/max time + row count
-    insert_cols.push(format!("_min_{}", time_column));
-    insert_cols.push(format!("_max_{}", time_column));
+    // Per-column min/max + row count
+    for col in columns {
+        if !col.is_segment_by && supports_minmax(&col.data_type) {
+            insert_cols.push(format!("\"_min_{}\"", col.name));
+            insert_cols.push(format!("\"_max_{}\"", col.name));
+        }
+    }
     insert_cols.push("_row_count".to_string());
 
     // Build the INSERT using hex-encoded bytea literals
@@ -501,13 +496,20 @@ fn compress_segment(
         insert_vals.push(format!("'\\x{}'::bytea", hex));
     }
 
-    match &min_ts {
-        Some(v) => insert_vals.push(format!("'{}'::timestamptz", v)),
-        None => insert_vals.push("NULL".to_string()),
-    }
-    match &max_ts {
-        Some(v) => insert_vals.push(format!("'{}'::timestamptz", v)),
-        None => insert_vals.push("NULL".to_string()),
+    // Per-column min/max values
+    for col in columns {
+        if !col.is_segment_by && supports_minmax(&col.data_type) {
+            match col_minmax.get(&col.name) {
+                Some((Some(min_val), Some(max_val))) => {
+                    insert_vals.push(format_minmax_for_insert(min_val, &col.data_type));
+                    insert_vals.push(format_minmax_for_insert(max_val, &col.data_type));
+                }
+                _ => {
+                    insert_vals.push("NULL".to_string());
+                    insert_vals.push("NULL".to_string());
+                }
+            }
+        }
     }
     insert_vals.push(row_count.to_string());
 
@@ -721,6 +723,14 @@ fn estimate_raw_size(client: &SpiClient, table_fqn: &str) -> i64 {
 // ============================================================================
 
 fn decompress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+    // Bypass the DML-on-compressed check for the INSERT we are about to do
+    crate::scan::set_dml_bypass(true);
+    let result = decompress_partition_inner(client, partition);
+    crate::scan::set_dml_bypass(false);
+    result
+}
+
+fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String {
     // 1. Look up partition
     let (schema, part_table) = crate::partition::resolve_relation(client, partition);
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
@@ -1006,6 +1016,84 @@ fn format_value_for_insert(value: &str, data_type: &str) -> String {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+/// Check if a column type supports min/max metadata.
+fn supports_minmax(data_type: &str) -> bool {
+    let dt = data_type.to_lowercase();
+    dt.contains("timestamp")
+        || dt == "date"
+        || dt == "integer" || dt == "int4"
+        || dt == "bigint" || dt == "int8"
+        || dt == "smallint" || dt == "int2"
+        || dt == "double precision" || dt == "float8"
+        || dt == "real" || dt == "float4"
+}
+
+/// Compute the min and max of a column's string values using type-aware comparison.
+fn compute_column_minmax(
+    values: &[Option<String>],
+    data_type: &str,
+) -> (Option<String>, Option<String>) {
+    let mut min_val: Option<&str> = None;
+    let mut max_val: Option<&str> = None;
+
+    for val in values.iter().flatten() {
+        let v = val.as_str();
+        min_val = Some(match min_val {
+            None => v,
+            Some(cur) => {
+                if compare_values(v, cur, data_type) == std::cmp::Ordering::Less {
+                    v
+                } else {
+                    cur
+                }
+            }
+        });
+        max_val = Some(match max_val {
+            None => v,
+            Some(cur) => {
+                if compare_values(v, cur, data_type) == std::cmp::Ordering::Greater {
+                    v
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+
+    (min_val.map(|s| s.to_string()), max_val.map(|s| s.to_string()))
+}
+
+/// Type-aware comparison of string-encoded values.
+fn compare_values(a: &str, b: &str, data_type: &str) -> std::cmp::Ordering {
+    let dt = data_type.to_lowercase();
+    if dt.contains("timestamp") || dt == "date" {
+        // ISO format sorts lexicographically
+        a.cmp(b)
+    } else if dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4" {
+        let fa: f64 = a.parse().unwrap_or(0.0);
+        let fb: f64 = b.parse().unwrap_or(0.0);
+        fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+    } else {
+        // Integer types
+        let ia: i64 = a.parse().unwrap_or(0);
+        let ib: i64 = b.parse().unwrap_or(0);
+        ia.cmp(&ib)
+    }
+}
+
+/// Format a min/max value for SQL INSERT based on the column type.
+fn format_minmax_for_insert(val: &str, data_type: &str) -> String {
+    let dt = data_type.to_lowercase();
+    if dt.contains("timestamp") {
+        format!("'{}'::timestamptz", val.replace('\'', "''"))
+    } else if dt == "date" {
+        format!("'{}'::date", val.replace('\'', "''"))
+    } else {
+        // Numeric types — use the value directly
+        val.to_string()
     }
 }
 

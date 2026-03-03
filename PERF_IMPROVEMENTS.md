@@ -3,7 +3,27 @@
 Tracking the gap between pg_cocoon and TimescaleDB on ClickBench queries.
 Current geometric mean: **pg_cocoon 127ms vs TimescaleDB 18ms (~7x gap)**.
 
-## Current Benchmark (2024-03-02, segment pruning implemented)
+## Current Benchmark (2026-03-03, per-column min/max implemented)
+
+| Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
+|-------|-------------|-------------|-----------|-----|
+| Q1 | COUNT(*) | 0.7 | 3.3 | 0.2x |
+| Q2 | COUNT WHERE AdvEngineID | 89.6 | 4.5 | 20x |
+| Q3 | SUM/AVG full scan | 118.4 | 6.1 | 19x |
+| Q5 | COUNT DISTINCT UserID | 159.1 | 102.8 | 1.5x |
+| Q7 | MIN/MAX EventDate | 0.7 | 4.7 | 0.1x |
+| Q8 | GROUP BY AdvEngineID | 124.4 | 4.8 | 26x |
+| Q9 | GROUP BY RegionID | 273.1 | 204.6 | 1.3x |
+| Q13 | Top SearchPhrase | 158.1 | 14.1 | 11x |
+| Q20 | Point lookup UserID | 71.3 | 4.8 | 15x |
+| Q21 | URL LIKE google | 196.2 | 34.7 | 6x |
+| Q25 | ORDER BY EventTime | 158.6 | 2.2 | 72x |
+| Q34 | Top URLs | 336.4 | 229.2 | 1.5x |
+| Q37 | CounterID=62 URLs | 277.1 | 107.7 | 2.6x |
+| Q38 | CounterID=62 Titles | 192.4 | 36.0 | 5.3x |
+| Q43 | CounterID=62 by minute | 164.9 | 26.4 | 6.2x |
+
+## Previous Benchmark (2024-03-02, segment pruning implemented)
 
 | Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
 |-------|-------------|-------------|-----------|-----|
@@ -38,9 +58,9 @@ per-string varlena allocation.
 
 ## Improvements
 
-### 1. COUNT(*) / COUNT pushdown
+### 1. COUNT(*) / COUNT pushdown [DONE]
 
-**Impact: Q1 42ms -> <1ms, Q2/Q8 partial benefit**
+**Impact: Q1 42ms -> 0.7ms (achieved)**
 **Complexity: Medium**
 
 For `COUNT(*)` with no WHERE clause, return the sum of `_row_count` from segment
@@ -57,9 +77,9 @@ combine segment pruning with row_count summation — still zero decompression.
 
 **Files:** `src/scan/hook.rs`, `src/scan/exec.rs` (exec_custom_scan), `src/scan/plan.rs`
 
-### 2. MIN/MAX pushdown for time column
+### 2. MIN/MAX pushdown for time column [DONE]
 
-**Impact: Q7 65ms -> <1ms**
+**Impact: Q7 65ms -> 0.7ms (achieved, generalized to all orderable columns)**
 **Complexity: Low**
 
 The companion table already stores `_min_{time_column}` and `_max_{time_column}`
@@ -145,9 +165,9 @@ Options:
 
 **Files:** `src/scan/exec.rs` (str_to_text_datum, decompress_blob_to_datums)
 
-### 7. Store per-column min/max in companion table
+### 7. Store per-column min/max in companion table [DONE]
 
-**Impact: Enables segment pruning on non-time, non-segment-by columns**
+**Impact: Enables segment pruning on non-time, non-segment-by columns + MIN/MAX pushdown for any column**
 **Complexity: Medium**
 
 Currently segment pruning only works for segment_by columns (equality) and the

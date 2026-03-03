@@ -64,6 +64,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     worker::register_bgworker();
     unsafe { scan::register_hook(); }
+    unsafe { scan::register_executor_start_hook(); }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
