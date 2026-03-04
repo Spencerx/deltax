@@ -54,6 +54,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
 }
 
 /// Get relpages from pg_class for a relation OID.
+#[allow(dead_code)]
 pub(super) unsafe fn get_relpages(rel_oid: pg_sys::Oid) -> i32 {
     unsafe {
         let tuple = pg_sys::SearchSysCache1(

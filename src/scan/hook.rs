@@ -53,11 +53,12 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
         }
 
         // Check if this is the parent of a partitioned table (for CocoonAppend)
-        if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL && (*rte).inh {
-            if let Some(companion_oids) = collect_compressed_children(root, rti) {
-                path::add_cocoon_append_path(root, rel, &companion_oids);
-                return;
-            }
+        if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL
+            && (*rte).inh
+            && let Some(companion_oids) = collect_compressed_children(root, rti)
+        {
+            path::add_cocoon_append_path(root, rel, &companion_oids);
+            return;
         }
 
         // Only process base relations and child member relations (partitions)
@@ -90,10 +91,11 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
     }
 }
 
-/// The create_upper_paths hook. Detects simple aggregate patterns over cocoon
+/// The create_upper_paths hook. Detects aggregate patterns over cocoon
 /// scans and injects optimized custom paths:
-/// - COUNT(*) → CocoonCount (sum of segment row_counts)
-/// - MIN/MAX(time_col) → CocoonMinMax (global min/max from segment metadata)
+/// - COUNT(*) alone → CocoonCount (sum of segment row_counts, metadata-only)
+/// - MIN/MAX(col) alone → CocoonMinMax (global min/max from segment metadata)
+/// - SUM/AVG/COUNT/COUNT(DISTINCT) with optional GROUP BY and WHERE → CocoonAgg
 #[pg_guard]
 pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
     root: *mut pg_sys::PlannerInfo,
@@ -124,23 +126,21 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
 
         let parse = (*root).parse;
 
-        // No GROUP BY
-        if !(*parse).groupClause.is_null() {
-            return;
-        }
-
-        // No HAVING
+        // No HAVING (too complex)
         if !(*parse).havingQual.is_null() {
             return;
         }
 
-        // No WHERE clause (check parse tree jointree quals)
-        let jointree = (*parse).jointree;
-        if !jointree.is_null() && !(*jointree).quals.is_null() {
-            return;
-        }
+        // Check for WHERE clause
+        let has_where = {
+            let jointree = (*parse).jointree;
+            !jointree.is_null() && !(*jointree).quals.is_null()
+        };
 
-        // Check target list: all non-junk entries must be aggregates
+        // Check for GROUP BY
+        let has_group_by = !(*parse).groupClause.is_null();
+
+        // Check target list
         let tlist = (*parse).targetList;
         if tlist.is_null() {
             return;
@@ -148,6 +148,7 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
 
         let nentries = (*tlist).length;
         let mut aggrefs: Vec<*const pg_sys::Aggref> = Vec::new();
+        let mut non_agg_vars: Vec<*const pg_sys::Var> = Vec::new();
 
         for i in 0..nentries {
             let te = pg_sys::list_nth(tlist, i) as *const pg_sys::TargetEntry;
@@ -162,20 +163,21 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
             if expr.is_null() {
                 return;
             }
-            if (*expr).type_ != pg_sys::NodeTag::T_Aggref {
-                return;
+            if (*expr).type_ == pg_sys::NodeTag::T_Aggref {
+                aggrefs.push(expr as *const pg_sys::Aggref);
+            } else if (*expr).type_ == pg_sys::NodeTag::T_Var && has_group_by {
+                // Non-aggregate Var in target list — must be a GROUP BY column
+                non_agg_vars.push(expr as *const pg_sys::Var);
+            } else {
+                return; // Non-aggregate, non-Var expression — bail
             }
-
-            aggrefs.push(expr as *const pg_sys::Aggref);
         }
 
         if aggrefs.is_empty() {
             return;
         }
 
-        // Extract companion OIDs from the cheapest input path.
-        // Handles CocoonDecompress/CocoonAppend CustomPaths directly,
-        // and also AppendPaths whose subpaths are CocoonDecompress.
+        // Extract companion OIDs from the cheapest input path
         let cheapest = (*input_rel).cheapest_total_path;
         if cheapest.is_null() {
             return;
@@ -186,27 +188,43 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
             _ => return,
         };
 
-        // Single aggstar (COUNT(*)) pushdown
-        if aggrefs.len() == 1 && (*aggrefs[0]).aggstar {
+        // =====================================================================
+        // Fast path: Single COUNT(*) with no GROUP BY, no WHERE → CocoonCount
+        // =====================================================================
+        if aggrefs.len() == 1 && (*aggrefs[0]).aggstar && !has_group_by && !has_where {
             path::add_count_star_path(root, output_rel, &companion_oids);
             return;
         }
 
-        // Collect MIN/MAX aggregate specifications
-        let mut agg_specs: Vec<path::MinMaxAggSpec> = Vec::new();
+        // =====================================================================
+        // Classify all aggregates
+        // =====================================================================
+        use super::exec::AggType;
+
+        let mut classified_aggs: Vec<path::AggSpec> = Vec::new();
+        let mut all_minmax = true;
+        let mut has_non_minmax = false;
 
         for &aggref in &aggrefs {
-            // No COUNT(*) mixed with MIN/MAX
-            if (*aggref).aggstar {
-                return;
-            }
-
             // FILTER clause not supported
             if !(*aggref).aggfilter.is_null() {
                 return;
             }
 
-            // Get function name (min or max)
+            if (*aggref).aggstar {
+                // COUNT(*)
+                classified_aggs.push(path::AggSpec {
+                    agg_type: AggType::CountStar,
+                    col_idx: -1,
+                    result_type_oid: (*aggref).aggtype,
+                    col_type_oid: pg_sys::InvalidOid,
+                });
+                all_minmax = false;
+                has_non_minmax = true;
+                continue;
+            }
+
+            // Get function name
             let func_name_ptr = pg_sys::get_func_name((*aggref).aggfnoid);
             if func_name_ptr.is_null() {
                 return;
@@ -214,11 +232,6 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
             let func_name = std::ffi::CStr::from_ptr(func_name_ptr)
                 .to_str()
                 .unwrap_or("");
-            let is_min = match func_name {
-                "min" => true,
-                "max" => false,
-                _ => return,
-            };
 
             // Must have exactly one argument
             let args = (*aggref).args;
@@ -226,20 +239,21 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
                 return;
             }
 
-            // Extract the Var from the single argument's TargetEntry
+            // Extract the Var from the argument
             let arg_te = pg_sys::list_nth(args, 0) as *const pg_sys::TargetEntry;
             if arg_te.is_null() {
                 return;
             }
             let arg_expr = (*arg_te).expr as *const pg_sys::Node;
             if arg_expr.is_null() || (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
-                return; // Only push down for plain column references
+                return; // Only plain column references
             }
             let var_node = arg_expr as *const pg_sys::Var;
-            let varno = (*var_node).varno as usize;
             let varattno = (*var_node).varattno;
+            let col_idx = varattno as i32 - 1;
 
-            // Get column name from the range table entry
+            // Get source column type
+            let varno = (*var_node).varno as usize;
             if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
                 return;
             }
@@ -248,45 +262,205 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
                 return;
             }
             let relid = (*rte).relid;
-            let col_name_ptr = pg_sys::get_attname(relid, varattno, true);
-            if col_name_ptr.is_null() {
-                return;
+            let mut col_type_oid = pg_sys::InvalidOid;
+            let mut col_typmod: i32 = -1;
+            let mut col_collation: pg_sys::Oid = pg_sys::InvalidOid;
+            pg_sys::get_atttypetypmodcoll(relid, varattno, &mut col_type_oid, &mut col_typmod, &mut col_collation);
+
+            // Check for COUNT(DISTINCT ...)
+            let is_distinct = !(*aggref).aggdistinct.is_null()
+                && (*(*aggref).aggdistinct).length > 0;
+
+            match func_name {
+                "sum" => {
+                    classified_aggs.push(path::AggSpec {
+                        agg_type: AggType::Sum,
+                        col_idx,
+                        result_type_oid: (*aggref).aggtype,
+                        col_type_oid,
+                    });
+                    all_minmax = false;
+                    has_non_minmax = true;
+                }
+                "avg" => {
+                    classified_aggs.push(path::AggSpec {
+                        agg_type: AggType::Avg,
+                        col_idx,
+                        result_type_oid: (*aggref).aggtype,
+                        col_type_oid,
+                    });
+                    all_minmax = false;
+                    has_non_minmax = true;
+                }
+                "count" => {
+                    if is_distinct {
+                        classified_aggs.push(path::AggSpec {
+                            agg_type: AggType::CountDistinct,
+                            col_idx,
+                            result_type_oid: (*aggref).aggtype,
+                            col_type_oid,
+                        });
+                    } else {
+                        classified_aggs.push(path::AggSpec {
+                            agg_type: AggType::Count,
+                            col_idx,
+                            result_type_oid: (*aggref).aggtype,
+                            col_type_oid,
+                        });
+                    }
+                    all_minmax = false;
+                    has_non_minmax = true;
+                }
+                "min" | "max" => {
+                    if has_non_minmax {
+                        // Mix of min/max with other aggs — use CocoonAgg for all
+                        // Mix of min/max with other aggs — skip MinMax fast path
+                        return; // Bail — mixing MIN/MAX with SUM/COUNT not supported yet
+                    }
+                    classified_aggs.push(path::AggSpec {
+                        agg_type: AggType::Sum, // placeholder, won't be used
+                        col_idx,
+                        result_type_oid: (*aggref).aggtype,
+                        col_type_oid,
+                    });
+                    // Keep all_minmax = true
+                }
+                _ => return, // Unknown aggregate function
             }
-
-            // Verify the companion table has _min_{colname}
-            let col_name = std::ffi::CStr::from_ptr(col_name_ptr)
-                .to_string_lossy()
-                .into_owned();
-            let min_col_cname = std::ffi::CString::new(format!("_min_{}", col_name)).unwrap();
-            let attnum = pg_sys::get_attnum(companion_oids[0], min_col_cname.as_ptr());
-            if attnum == pg_sys::InvalidAttrNumber as i16 {
-                return; // Column doesn't have segment min/max metadata
-            }
-
-            // Get type info for the result
-            let result_type_oid = (*aggref).aggtype;
-            let mut typlen: i16 = 0;
-            let mut typbyval: bool = false;
-            pg_sys::get_typlenbyval(result_type_oid, &mut typlen, &mut typbyval);
-
-            agg_specs.push(path::MinMaxAggSpec {
-                is_min,
-                varattno,
-                result_type_oid,
-                typlen,
-                typbyval,
-            });
         }
 
-        if agg_specs.is_empty() {
+        if classified_aggs.is_empty() {
             return;
         }
 
-        path::add_minmax_path(
+        // =====================================================================
+        // Fast path: All MIN/MAX, no GROUP BY, no WHERE → CocoonMinMax
+        // =====================================================================
+        if all_minmax && !has_group_by && !has_where {
+            let mut minmax_specs: Vec<path::MinMaxAggSpec> = Vec::new();
+            for &aggref in &aggrefs {
+                let func_name_ptr = pg_sys::get_func_name((*aggref).aggfnoid);
+                let func_name = std::ffi::CStr::from_ptr(func_name_ptr)
+                    .to_str()
+                    .unwrap_or("");
+                let is_min = func_name == "min";
+
+                let args = (*aggref).args;
+                let arg_te = pg_sys::list_nth(args, 0) as *const pg_sys::TargetEntry;
+                let arg_expr = (*arg_te).expr as *const pg_sys::Var;
+                let varattno = (*arg_expr).varattno;
+                let varno = (*arg_expr).varno as usize;
+                let rte = *(*root).simple_rte_array.add(varno);
+                let relid = (*rte).relid;
+
+                // Verify the companion table has _min_{colname}
+                let col_name_ptr = pg_sys::get_attname(relid, varattno, true);
+                if col_name_ptr.is_null() {
+                    return;
+                }
+                let col_name = std::ffi::CStr::from_ptr(col_name_ptr)
+                    .to_string_lossy()
+                    .into_owned();
+                let min_col_cname = std::ffi::CString::new(format!("_min_{}", col_name)).unwrap();
+                let attnum = pg_sys::get_attnum(companion_oids[0], min_col_cname.as_ptr());
+                if attnum == pg_sys::InvalidAttrNumber as i16 {
+                    return;
+                }
+
+                let result_type_oid = (*aggref).aggtype;
+                let mut typlen: i16 = 0;
+                let mut typbyval: bool = false;
+                pg_sys::get_typlenbyval(result_type_oid, &mut typlen, &mut typbyval);
+
+                minmax_specs.push(path::MinMaxAggSpec {
+                    is_min,
+                    varattno,
+                    result_type_oid,
+                    typlen,
+                    typbyval,
+                });
+            }
+
+            if !minmax_specs.is_empty() {
+                path::add_minmax_path(root, output_rel, &companion_oids, &minmax_specs);
+            }
+            return;
+        }
+
+        // =====================================================================
+        // CocoonAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY (no WHERE)
+        // =====================================================================
+
+        // CocoonAgg doesn't support WHERE clauses yet — fall through to the
+        // standard CocoonAppend + PG Aggregate path which handles quals correctly
+        // via plan.qual. This ensures correctness for all WHERE patterns.
+        if has_where {
+            return;
+        }
+
+        // Parse GROUP BY columns
+        let mut group_specs: Vec<super::exec::GroupByColSpec> = Vec::new();
+        if has_group_by {
+            let group_clause = (*parse).groupClause;
+            let ngroups = (*group_clause).length;
+            for i in 0..ngroups {
+                let sc = pg_sys::list_nth(group_clause, i) as *const pg_sys::SortGroupClause;
+                if sc.is_null() {
+                    return;
+                }
+                // Find the TargetEntry for this sort group ref
+                let tle = pg_sys::get_sortgroupclause_tle(
+                    sc as *mut pg_sys::SortGroupClause,
+                    tlist,
+                );
+                if tle.is_null() {
+                    return;
+                }
+                let expr = (*tle).expr as *const pg_sys::Node;
+                if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
+                    return; // Only plain column references for GROUP BY
+                }
+                let var_node = expr as *const pg_sys::Var;
+                let col_idx = (*var_node).varattno as i32 - 1;
+
+                // Get type from the Var
+                let varno = (*var_node).varno as usize;
+                if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
+                    return;
+                }
+                let rte = *(*root).simple_rte_array.add(varno);
+                if rte.is_null() {
+                    return;
+                }
+                let relid = (*rte).relid;
+                let mut type_oid = pg_sys::InvalidOid;
+                let mut typmod: i32 = -1;
+                let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+                pg_sys::get_atttypetypmodcoll(relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
+
+                // Don't push down GROUP BY on text/varchar columns —
+                // PG's HashAggregate is faster for high-cardinality string grouping.
+                if type_oid == pg_sys::TEXTOID
+                    || type_oid == pg_sys::VARCHAROID
+                    || type_oid == pg_sys::BPCHAROID
+                    || type_oid == pg_sys::NAMEOID
+                {
+                    return;
+                }
+
+                group_specs.push(super::exec::GroupByColSpec {
+                    col_idx,
+                    type_oid,
+                });
+            }
+        }
+
+        path::add_agg_path(
             root,
             output_rel,
             &companion_oids,
-            &agg_specs,
+            &classified_aggs,
+            &group_specs,
         );
     }
 }
@@ -341,9 +515,9 @@ unsafe fn extract_companion_oids(
 
 /// Check if a subpath's underlying table has actual data on disk.
 ///
-/// Looks up the raw `relpages` from `pg_class` via syscache, bypassing PG's
-/// inflated estimates in `RelOptInfo.pages` (which PG sets to 10 for
-/// never-analyzed tables even when physically empty).
+/// Opens the relation and checks the actual block count via smgr,
+/// which reflects the true on-disk state (not the stale pg_class.relpages
+/// that only updates during VACUUM/ANALYZE).
 unsafe fn subpath_has_data(
     root: *mut pg_sys::PlannerInfo,
     subpath: *const pg_sys::Path,
@@ -363,8 +537,94 @@ unsafe fn subpath_has_data(
             return false;
         }
         let rel_oid = (*rte).relid;
-        // Check raw relpages from pg_class (0 for truly empty/truncated tables)
-        cost::get_relpages(rel_oid) > 0
+        // Open relation and check actual block count via smgr
+        let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
+            rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+        );
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        nblocks > 0
+    }
+}
+
+/// Check if a single qual node is pushable to CocoonAgg's batch filter.
+///
+/// Requirements (must ALL be true):
+/// 1. Node is T_OpExpr with exactly 2 args
+/// 2. Operator is =, <>, <, <=, >, >= (not LIKE, ~~, etc.)
+/// 3. One arg is T_Var (or T_RelabelType wrapping T_Var), other is T_Const
+/// 4. The Var's type is batch-comparable (numeric, bool, date, timestamp)
+#[allow(dead_code)]
+unsafe fn is_pushable_qual(node: *const pg_sys::Node) -> bool {
+    unsafe {
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return false;
+        }
+
+        let opexpr = node as *const pg_sys::OpExpr;
+        let args = (*opexpr).args;
+        if args.is_null() || (*args).length != 2 {
+            return false;
+        }
+
+        // Check operator is a supported comparison
+        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+        if opname_ptr.is_null() {
+            return false;
+        }
+        let opname = std::ffi::CStr::from_ptr(opname_ptr)
+            .to_str()
+            .unwrap_or("");
+        if !matches!(opname, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+            return false;
+        }
+
+        let arg0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+        let arg1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+        if arg0.is_null() || arg1.is_null() {
+            return false;
+        }
+
+        // Unwrap RelabelType to get the underlying node
+        let unwrap = |n: *const pg_sys::Node| -> *const pg_sys::Node {
+            if (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+                let rlt = n as *const pg_sys::RelabelType;
+                (*rlt).arg as *const pg_sys::Node
+            } else {
+                n
+            }
+        };
+        let a0 = unwrap(arg0);
+        let a1 = unwrap(arg1);
+
+        // Must be Var op Const or Const op Var
+        let var_node = if (*a0).type_ == pg_sys::NodeTag::T_Var
+            && (*a1).type_ == pg_sys::NodeTag::T_Const
+        {
+            a0 as *const pg_sys::Var
+        } else if (*a0).type_ == pg_sys::NodeTag::T_Const
+            && (*a1).type_ == pg_sys::NodeTag::T_Var
+        {
+            a1 as *const pg_sys::Var
+        } else {
+            return false;
+        };
+
+        // Check that the Var's type is batch-comparable
+        let var_type = (*var_node).vartype;
+        matches!(
+            var_type,
+            pg_sys::INT2OID
+                | pg_sys::INT4OID
+                | pg_sys::INT8OID
+                | pg_sys::FLOAT4OID
+                | pg_sys::FLOAT8OID
+                | pg_sys::BOOLOID
+                | pg_sys::DATEOID
+                | pg_sys::TIMESTAMPOID
+                | pg_sys::TIMESTAMPTZOID
+        )
     }
 }
 

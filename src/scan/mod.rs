@@ -32,6 +32,9 @@ const COCOON_COUNT_NAME: &std::ffi::CStr = c"CocoonCount";
 /// CocoonMinMax custom scan method name (MIN/MAX pushdown).
 const COCOON_MINMAX_NAME: &std::ffi::CStr = c"CocoonMinMax";
 
+/// CocoonAgg custom scan method name (aggregate pushdown).
+const COCOON_AGG_NAME: &std::ffi::CStr = c"CocoonAgg";
+
 /// Wrapper to make pg_sys structs with raw pointers usable in statics.
 /// Safety: the static structs only contain function pointers and const string pointers
 /// that are valid for the entire backend lifetime.

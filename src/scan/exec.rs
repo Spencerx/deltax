@@ -220,6 +220,98 @@ pub(super) struct MinMaxScanState {
     pub(super) total_segments: u64,
 }
 
+// ============================================================================
+// CocoonAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum AggType { Sum, Count, CountStar, Avg, CountDistinct }
+
+enum AggAccumulator {
+    SumInt { sum: i128, count: i64 },
+    SumFloat { sum: f64, count: i64 },
+    Count { count: i64 },
+    CountDistinctInt { seen: std::collections::HashSet<i64> },
+    CountDistinctStr { seen: std::collections::HashSet<String> },
+}
+
+impl AggAccumulator {
+    fn new_for(agg_type: AggType, col_type: pg_sys::Oid) -> Self {
+        match agg_type {
+            AggType::Sum | AggType::Avg => {
+                if col_type == pg_sys::FLOAT4OID || col_type == pg_sys::FLOAT8OID {
+                    AggAccumulator::SumFloat { sum: 0.0, count: 0 }
+                } else {
+                    AggAccumulator::SumInt { sum: 0, count: 0 }
+                }
+            }
+            AggType::Count | AggType::CountStar => AggAccumulator::Count { count: 0 },
+            AggType::CountDistinct => {
+                if col_type == pg_sys::TEXTOID || col_type == pg_sys::VARCHAROID || col_type == pg_sys::BPCHAROID {
+                    AggAccumulator::CountDistinctStr { seen: std::collections::HashSet::new() }
+                } else {
+                    AggAccumulator::CountDistinctInt { seen: std::collections::HashSet::new() }
+                }
+            }
+        }
+    }
+
+    fn clone_fresh(&self) -> Self {
+        match self {
+            AggAccumulator::SumInt { .. } => AggAccumulator::SumInt { sum: 0, count: 0 },
+            AggAccumulator::SumFloat { .. } => AggAccumulator::SumFloat { sum: 0.0, count: 0 },
+            AggAccumulator::Count { .. } => AggAccumulator::Count { count: 0 },
+            AggAccumulator::CountDistinctInt { .. } => AggAccumulator::CountDistinctInt { seen: std::collections::HashSet::new() },
+            AggAccumulator::CountDistinctStr { .. } => AggAccumulator::CountDistinctStr { seen: std::collections::HashSet::new() },
+        }
+    }
+}
+
+pub(super) struct AggExecSpec {
+    pub(super) agg_type: AggType,
+    pub(super) col_idx: i32,               // -1 for COUNT(*)
+    pub(super) col_type_oid: pg_sys::Oid,  // source column type
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct GroupByColSpec {
+    pub(super) col_idx: i32,  // 0-based column index
+    pub(super) type_oid: pg_sys::Oid,
+}
+
+/// State for CocoonAgg (aggregate pushdown).
+pub(super) struct AggScanState {
+    pub(super) _agg_specs: Vec<AggExecSpec>,
+    pub(super) _group_specs: Vec<GroupByColSpec>,
+    pub(super) result_rows: Vec<Vec<(pg_sys::Datum, bool)>>,
+    pub(super) result_idx: usize,
+    pub(super) _num_result_cols: usize,
+    pub(super) metadata_us: u64,
+    pub(super) heap_scan_us: u64,
+    pub(super) decompress_us: u64,
+    pub(super) agg_us: u64,
+    pub(super) total_segments: u64,
+    pub(super) total_rows_processed: u64,
+}
+
+/// Static CustomExecMethods struct for CocoonAgg.
+pub(crate) static COCOON_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+    SyncStatic(pg_sys::CustomExecMethods {
+        CustomName: super::COCOON_AGG_NAME.as_ptr(),
+        BeginCustomScan: Some(begin_agg_scan),
+        ExecCustomScan: Some(exec_agg_scan),
+        EndCustomScan: Some(end_agg_scan),
+        ReScanCustomScan: Some(rescan_agg_scan),
+        MarkPosCustomScan: None,
+        RestrPosCustomScan: None,
+        EstimateDSMCustomScan: None,
+        InitializeDSMCustomScan: None,
+        ReInitializeDSMCustomScan: None,
+        InitializeWorkerCustomScan: None,
+        ShutdownCustomScan: None,
+        ExplainCustomScan: Some(super::explain::explain_agg_scan),
+    });
+
 /// CreateCustomScanState callback for CocoonCount.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn create_count_scan_state(
@@ -276,7 +368,7 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
             pg_sys::Oid::from(pg_sys::list_nth_int(custom_private, 0) as u32);
 
         // Parse needed column indices from custom_private (after sentinel -1)
-        let list_len = (*custom_private).length as i32;
+        let list_len = (*custom_private).length;
         let mut needed_indices: Vec<usize> = Vec::new();
         let mut found_sentinel = false;
         for i in 1..list_len {
@@ -369,7 +461,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
             pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonAppend state");
         }
 
-        let list_len = (*custom_private).length as i32;
+        let list_len = (*custom_private).length;
 
         // Parse companion OIDs (before sentinel -1) and needed column indices (after sentinel)
         let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
@@ -408,7 +500,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
 
         // Load metadata via SPI from first companion table
         let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(&client, &first_name));
+        let meta = Spi::connect(|client| load_metadata(client, &first_name));
         let metadata_us = t0.elapsed().as_micros() as u64;
 
         // Extract batch quals early — we need to know which extra columns to load
@@ -524,7 +616,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
             pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonCount state");
         }
 
-        let list_len = (*custom_private).length as i32;
+        let list_len = (*custom_private).length;
 
         // Parse companion OIDs (before sentinel -1)
         let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
@@ -556,7 +648,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
 
         // Load metadata via SPI from first companion table
         let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(&client, &first_name));
+        let meta = Spi::connect(|client| load_metadata(client, &first_name));
         let metadata_us = t0.elapsed().as_micros() as u64;
 
         // Build needed_cols as all-false (no columns needed for COUNT(*))
@@ -694,7 +786,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
             pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonMinMax state");
         }
 
-        let list_len = (*custom_private).length as i32;
+        let list_len = (*custom_private).length;
 
         // Parse custom_private: [oid1, ..., -1, num_aggs, is_min_0, varattno_0, ...]
         let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
@@ -751,7 +843,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
 
         // Load metadata via SPI from first companion table
         let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(&client, &first_name));
+        let meta = Spi::connect(|client| load_metadata(client, &first_name));
         let metadata_us = t0.elapsed().as_micros() as u64;
 
         // Resolve varattno → column name for each aggregate
@@ -815,14 +907,13 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
                             result.is_null = false;
                         } else {
                             let cmp = compare_datums(seg_datum, result.datum, cm.type_oid);
-                            if result.is_min {
-                                if cmp == std::cmp::Ordering::Less {
-                                    result.datum = seg_datum;
-                                }
+                            let dominated = if result.is_min {
+                                cmp == std::cmp::Ordering::Less
                             } else {
-                                if cmp == std::cmp::Ordering::Greater {
-                                    result.datum = seg_datum;
-                                }
+                                cmp == std::cmp::Ordering::Greater
+                            };
+                            if dominated {
+                                result.datum = seg_datum;
                             }
                         }
                     }
@@ -908,6 +999,644 @@ pub unsafe extern "C-unwind" fn rescan_minmax_scan(
     unsafe {
         let state = &mut *((*node).custom_ps as *mut MinMaxScanState);
         state.returned = false;
+    }
+}
+
+// ============================================================================
+// CocoonAgg execution callbacks
+// ============================================================================
+
+/// CreateCustomScanState callback for CocoonAgg.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn create_agg_scan_state(
+    cscan: *mut pg_sys::CustomScan,
+) -> *mut pg_sys::Node {
+    unsafe {
+        let css = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScanState>())
+            as *mut pg_sys::CustomScanState;
+
+        (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
+        (*css).methods = &COCOON_AGG_EXEC_METHODS.0;
+        (*css).custom_ps = (*cscan).custom_private;
+
+        css as *mut pg_sys::Node
+    }
+}
+
+/// Output mapping entry: which internal data to put at this slot position.
+#[derive(Debug, Clone, Copy)]
+enum OutputEntry {
+    Agg(usize),    // index into agg_specs
+    Group(usize),  // index into group_specs
+}
+
+/// BeginCustomScan callback for CocoonAgg: decompress and aggregate.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn begin_agg_scan(
+    node: *mut pg_sys::CustomScanState,
+    _estate: *mut pg_sys::EState,
+    _eflags: i32,
+) {
+    unsafe {
+        let custom_private = (*node).custom_ps;
+        if custom_private.is_null() {
+            pgrx::error!("pg_cocoon: missing custom_private in CocoonAgg state");
+        }
+
+        let list_len = (*custom_private).length;
+
+        // Parse custom_private:
+        // [oid1, ..., -1, num_aggs, agg_spec_fields...,
+        //  num_groups, group_spec_fields...,
+        //  num_output, output_type_0, output_ref_0, ...]
+        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+        let mut agg_specs: Vec<AggExecSpec> = Vec::new();
+        let mut group_specs: Vec<GroupByColSpec> = Vec::new();
+        let mut output_map: Vec<OutputEntry> = Vec::new();
+
+        let mut idx = 0;
+        // Parse OIDs until sentinel
+        while idx < list_len {
+            let val = pg_sys::list_nth_int(custom_private, idx);
+            idx += 1;
+            if val == -1 { break; }
+            companion_oids.push(pg_sys::Oid::from(val as u32));
+        }
+        // Parse agg specs
+        if idx < list_len {
+            let num_aggs = pg_sys::list_nth_int(custom_private, idx) as usize;
+            idx += 1;
+            for _ in 0..num_aggs {
+                let agg_type_val = pg_sys::list_nth_int(custom_private, idx);
+                let col_idx = pg_sys::list_nth_int(custom_private, idx + 1);
+                let result_oid = pg_sys::list_nth_int(custom_private, idx + 2) as u32;
+                let col_type_oid = pg_sys::list_nth_int(custom_private, idx + 3) as u32;
+                idx += 4;
+                let agg_type = match agg_type_val {
+                    0 => AggType::Sum,
+                    1 => AggType::Count,
+                    2 => AggType::CountStar,
+                    3 => AggType::Avg,
+                    4 => AggType::CountDistinct,
+                    _ => AggType::Count,
+                };
+                let _ = result_oid; // parsed for offset, not stored
+                agg_specs.push(AggExecSpec {
+                    agg_type,
+                    col_idx,
+                    col_type_oid: pg_sys::Oid::from(col_type_oid),
+                });
+            }
+        }
+        // Parse group specs
+        if idx < list_len {
+            let num_groups = pg_sys::list_nth_int(custom_private, idx) as usize;
+            idx += 1;
+            for _ in 0..num_groups {
+                let col_idx = pg_sys::list_nth_int(custom_private, idx);
+                let type_oid = pg_sys::list_nth_int(custom_private, idx + 1) as u32;
+                idx += 2;
+                group_specs.push(GroupByColSpec {
+                    col_idx,
+                    type_oid: pg_sys::Oid::from(type_oid),
+                });
+            }
+        }
+        // Parse output mapping
+        if idx < list_len {
+            let num_output = pg_sys::list_nth_int(custom_private, idx) as usize;
+            idx += 1;
+            for _ in 0..num_output {
+                let otype = pg_sys::list_nth_int(custom_private, idx);
+                let oref = pg_sys::list_nth_int(custom_private, idx + 1) as usize;
+                idx += 2;
+                output_map.push(if otype == 0 {
+                    OutputEntry::Agg(oref)
+                } else {
+                    OutputEntry::Group(oref)
+                });
+            }
+        }
+        // If no output mapping (backward compat), default to aggs then groups
+        if output_map.is_empty() {
+            for i in 0..agg_specs.len() {
+                output_map.push(OutputEntry::Agg(i));
+            }
+            for i in 0..group_specs.len() {
+                output_map.push(OutputEntry::Group(i));
+            }
+        }
+
+        let _ = idx;
+
+        if companion_oids.is_empty() {
+            pgrx::error!("pg_cocoon: CocoonAgg has no companion tables");
+        }
+
+        // Get first companion table name for metadata
+        let first_name = {
+            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+            if name_ptr.is_null() {
+                pgrx::error!(
+                    "pg_cocoon: companion table not found for OID {}",
+                    u32::from(companion_oids[0])
+                );
+            }
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // Load metadata via SPI
+        let t0 = Instant::now();
+        let meta = Spi::connect(|client| load_metadata(client, &first_name));
+        let metadata_us = t0.elapsed().as_micros() as u64;
+
+        // Build needed_cols: only columns referenced by aggregates and group-by
+        let num_cols = meta.col_names.len();
+        let mut needed_cols = vec![false; num_cols];
+        for spec in &agg_specs {
+            if spec.col_idx >= 0 && (spec.col_idx as usize) < num_cols {
+                needed_cols[spec.col_idx as usize] = true;
+            }
+        }
+        for gs in &group_specs {
+            if gs.col_idx >= 0 && (gs.col_idx as usize) < num_cols {
+                needed_cols[gs.col_idx as usize] = true;
+            }
+        }
+
+        // Take WHERE quals from thread-local (set during planning)
+        let where_quals = super::path::take_agg_plan_quals();
+
+        // Extract batch quals and segment filters from WHERE clause
+        let batch_quals = extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
+        for bq in &batch_quals {
+            if bq.col_idx < num_cols {
+                needed_cols[bq.col_idx] = true;
+            }
+        }
+        let (seg_filters, time_min, time_max) = extract_segment_filters(
+            where_quals,
+            &meta.col_names,
+            &meta.segment_by,
+            &meta.time_column,
+        );
+        // Load segments from all companion tables
+        let t1 = Instant::now();
+        let mut all_segments: Vec<SegmentData> = Vec::new();
+        for &oid in &companion_oids {
+            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column, false);
+            all_segments.extend(segs);
+        }
+        let heap_scan_us = t1.elapsed().as_micros() as u64;
+
+        // Create per-segment memory context
+        let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
+        let segment_mcxt = pg_sys::AllocSetContextCreateInternal(
+            query_ctx,
+            c"CocoonAggSegment".as_ptr(),
+            pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+        );
+
+        // Initialize accumulators
+        let has_group_by = !group_specs.is_empty();
+        let num_result_cols = output_map.len();
+
+        let prototype_accumulators: Vec<AggAccumulator> = agg_specs
+            .iter()
+            .map(|spec| AggAccumulator::new_for(spec.agg_type, spec.col_type_oid))
+            .collect();
+
+        let mut global_accumulators = if !has_group_by {
+            Some(prototype_accumulators.iter().map(|a| a.clone_fresh()).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        let mut group_map: HashMap<Vec<GroupKeyVal>, Vec<AggAccumulator>> = HashMap::new();
+
+        let t2 = Instant::now();
+        let mut total_segments: u64 = 0;
+        let mut total_rows_processed: u64 = 0;
+        let mut decompress_us: u64 = 0;
+
+        for seg in &all_segments {
+            if seg.row_count == 0 {
+                continue;
+            }
+
+            // Segment-by pruning
+            if !seg_filters.is_empty() {
+                let mut skip = false;
+                for &(seg_val_idx, ref filter_val) in &seg_filters {
+                    match &seg.segment_values[seg_val_idx] {
+                        Some(val) if val == filter_val => {}
+                        _ => { skip = true; break; }
+                    }
+                }
+                if skip { continue; }
+            }
+
+            // Time-range pruning
+            if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
+                if time_min.is_some_and(|query_min| seg_max < query_min) { continue; }
+                if time_max.is_some_and(|query_max| seg_min > query_max) { continue; }
+            }
+
+            total_segments += 1;
+
+            // Decompress needed columns
+            let t_dec = Instant::now();
+            pg_sys::MemoryContextReset(segment_mcxt);
+            let old_ctx = pg_sys::MemoryContextSwitchTo(segment_mcxt);
+
+            let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+            let mut blob_idx = 0;
+            let mut seg_val_idx = 0;
+
+            for (col_idx, col_name) in meta.col_names.iter().enumerate() {
+                let type_oid = meta.col_types[col_idx];
+
+                if !needed_cols[col_idx] {
+                    if meta.segment_by.contains(col_name) {
+                        seg_val_idx += 1;
+                    } else {
+                        blob_idx += 1;
+                    }
+                    decompressed.push(Vec::new());
+                    continue;
+                }
+
+                if meta.segment_by.contains(col_name) {
+                    let val = &seg.segment_values[seg_val_idx];
+                    let (datum, is_null) = match val {
+                        Some(s) => (string_to_datum(s, type_oid), false),
+                        None => (pg_sys::Datum::from(0), true),
+                    };
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
+                    seg_val_idx += 1;
+                } else {
+                    let blob = &seg.compressed_blobs[blob_idx];
+                    let type_name = pg_type_name(type_oid);
+                    let typmod = meta.col_typmods[col_idx];
+                    let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
+                    decompressed.push(datums);
+                    blob_idx += 1;
+                }
+            }
+
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+            decompress_us += t_dec.elapsed().as_micros() as u64;
+
+            let row_count = seg.row_count as usize;
+
+            // Evaluate batch quals (WHERE) if any
+            let selection = evaluate_batch_quals(&decompressed, row_count, &batch_quals);
+
+            // Aggregate loop
+            for row in 0..row_count {
+                if !selection.is_empty() && !selection[row] {
+                    continue;
+                }
+
+                total_rows_processed += 1;
+
+                let accumulators = if has_group_by {
+                    let mut key = Vec::with_capacity(group_specs.len());
+                    for gs in &group_specs {
+                        let col = &decompressed[gs.col_idx as usize];
+                        if col.is_empty() || col[row].1 {
+                            key.push(GroupKeyVal::Null);
+                        } else {
+                            let datum = col[row].0;
+                            match gs.type_oid {
+                                pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
+                                    let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
+                                    let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                    pg_sys::pfree(cstr as *mut _);
+                                    key.push(GroupKeyVal::Str(s));
+                                }
+                                _ => {
+                                    key.push(GroupKeyVal::Int(datum.value() as i64));
+                                }
+                            }
+                        }
+                    }
+                    group_map.entry(key).or_insert_with(|| {
+                        prototype_accumulators.iter().map(|a| a.clone_fresh()).collect()
+                    })
+                } else {
+                    global_accumulators.as_mut().unwrap()
+                };
+
+                for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                    let acc = &mut accumulators[spec_idx];
+                    match spec.agg_type {
+                        AggType::CountStar => {
+                            if let AggAccumulator::Count { count } = acc {
+                                *count += 1;
+                            }
+                        }
+                        AggType::Count => {
+                            let col = &decompressed[spec.col_idx as usize];
+                            if !col.is_empty() && !col[row].1
+                                && let AggAccumulator::Count { count } = acc
+                            {
+                                *count += 1;
+                            }
+                        }
+                        AggType::Sum | AggType::Avg => {
+                            let col = &decompressed[spec.col_idx as usize];
+                            if !col.is_empty() && !col[row].1 {
+                                let datum = col[row].0;
+                                match acc {
+                                    AggAccumulator::SumInt { sum, count } => {
+                                        let v = datum_to_i128(datum, spec.col_type_oid);
+                                        *sum += v;
+                                        *count += 1;
+                                    }
+                                    AggAccumulator::SumFloat { sum, count } => {
+                                        let v = datum_to_f64(datum, spec.col_type_oid);
+                                        *sum += v;
+                                        *count += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        AggType::CountDistinct => {
+                            let col = &decompressed[spec.col_idx as usize];
+                            if !col.is_empty() && !col[row].1 {
+                                let datum = col[row].0;
+                                match acc {
+                                    AggAccumulator::CountDistinctInt { seen } => {
+                                        seen.insert(datum.value() as i64);
+                                    }
+                                    AggAccumulator::CountDistinctStr { seen } => {
+                                        let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
+                                        let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                        pg_sys::pfree(cstr as *mut _);
+                                        seen.insert(s);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
+
+        // Finalize results using output mapping
+        let result_rows = if has_group_by {
+            let mut rows = Vec::new();
+            // Pre-finalize all agg results keyed by group
+            for (key, accumulators) in &group_map {
+                let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                    agg_results.push(finalize_accumulator(&accumulators[spec_idx], spec));
+                }
+
+                let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                for entry in &output_map {
+                    match entry {
+                        OutputEntry::Agg(ai) => {
+                            row.push(agg_results[*ai]);
+                        }
+                        OutputEntry::Group(gi) => {
+                            match &key[*gi] {
+                                GroupKeyVal::Null => {
+                                    row.push((pg_sys::Datum::from(0usize), true));
+                                }
+                                GroupKeyVal::Int(v) => {
+                                    row.push((pg_sys::Datum::from(*v as usize), false));
+                                }
+                                GroupKeyVal::Str(s) => {
+                                    let datum = string_to_datum(s, group_specs[*gi].type_oid);
+                                    row.push((datum, false));
+                                }
+                            }
+                        }
+                    }
+                }
+                rows.push(row);
+            }
+            rows
+        } else if let Some(accumulators) = &global_accumulators {
+            let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+            for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                agg_results.push(finalize_accumulator(&accumulators[spec_idx], spec));
+            }
+            let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+            for entry in &output_map {
+                match entry {
+                    OutputEntry::Agg(ai) => {
+                        row.push(agg_results[*ai]);
+                    }
+                    OutputEntry::Group(_) => {
+                        row.push((pg_sys::Datum::from(0usize), true));
+                    }
+                }
+            }
+            vec![row]
+        } else {
+            vec![]
+        };
+
+        // Clean up segment memory context
+        if !segment_mcxt.is_null() {
+            pg_sys::MemoryContextDelete(segment_mcxt);
+        }
+
+        let state = AggScanState {
+            _agg_specs: agg_specs,
+            _group_specs: group_specs,
+            result_rows,
+            result_idx: 0,
+            _num_result_cols: num_result_cols,
+            metadata_us,
+            heap_scan_us,
+            decompress_us,
+            agg_us,
+            total_segments,
+            total_rows_processed,
+        };
+
+        let state_box = Box::new(state);
+        let state_ptr = Box::into_raw(state_box);
+        (*node).custom_ps = state_ptr as *mut pg_sys::List;
+    }
+}
+
+/// Group key value for HashMap key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GroupKeyVal {
+    Null,
+    Int(i64),
+    Str(String),
+}
+
+/// Convert a datum to i128 for SUM accumulation.
+fn datum_to_i128(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> i128 {
+    match type_oid {
+        pg_sys::INT2OID => (datum.value() as i16) as i128,
+        pg_sys::INT4OID => (datum.value() as i32) as i128,
+        pg_sys::INT8OID => (datum.value() as i64) as i128,
+        _ => datum.value() as i128,
+    }
+}
+
+/// Convert a datum to f64 for float SUM/AVG.
+fn datum_to_f64(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> f64 {
+    match type_oid {
+        pg_sys::FLOAT4OID => f32::from_bits(datum.value() as u32) as f64,
+        pg_sys::FLOAT8OID => f64::from_bits(datum.value() as u64),
+        _ => datum.value() as f64,
+    }
+}
+
+/// Finalize an accumulator into a (Datum, is_null) result pair.
+unsafe fn finalize_accumulator(acc: &AggAccumulator, spec: &AggExecSpec) -> (pg_sys::Datum, bool) {
+    unsafe {
+        match acc {
+            AggAccumulator::SumInt { sum, count } => {
+                if *count == 0 {
+                    return (pg_sys::Datum::from(0usize), true);
+                }
+                match spec.agg_type {
+                    AggType::Sum => {
+                        // SUM(int2/int4) → INT8, SUM(int8) → NUMERIC
+                        if spec.col_type_oid == pg_sys::INT8OID {
+                            // Result is NUMERIC — convert via OidFunctionCall
+                            let i64_val = *sum as i64;
+                            let datum = pg_sys::OidFunctionCall1Coll(
+                                pg_sys::Oid::from(1781u32),  // int8_numeric OID
+                                pg_sys::InvalidOid,
+                                pg_sys::Datum::from(i64_val as usize),
+                            );
+                            (datum, false)
+                        } else {
+                            // Result is INT8
+                            (pg_sys::Datum::from(*sum as i64 as usize), false)
+                        }
+                    }
+                    AggType::Avg => {
+                        // AVG(int*) → NUMERIC
+                        let avg_f64 = *sum as f64 / *count as f64;
+                        let datum = pg_sys::OidFunctionCall1Coll(
+                            pg_sys::Oid::from(1743u32),  // float8_numeric OID
+                            pg_sys::InvalidOid,
+                            pg_sys::Datum::from(avg_f64.to_bits() as usize),
+                        );
+                        (datum, false)
+                    }
+                    _ => (pg_sys::Datum::from(*sum as i64 as usize), false),
+                }
+            }
+            AggAccumulator::SumFloat { sum, count } => {
+                if *count == 0 {
+                    return (pg_sys::Datum::from(0usize), true);
+                }
+                match spec.agg_type {
+                    AggType::Sum => {
+                        // SUM(float4) → FLOAT4, SUM(float8) → FLOAT8
+                        if spec.col_type_oid == pg_sys::FLOAT4OID {
+                            let f4 = *sum as f32;
+                            (pg_sys::Datum::from(f4.to_bits() as usize), false)
+                        } else {
+                            (pg_sys::Datum::from(sum.to_bits() as usize), false)
+                        }
+                    }
+                    AggType::Avg => {
+                        // AVG(float*) → FLOAT8
+                        let avg = *sum / *count as f64;
+                        (pg_sys::Datum::from(avg.to_bits() as usize), false)
+                    }
+                    _ => (pg_sys::Datum::from(sum.to_bits() as usize), false),
+                }
+            }
+            AggAccumulator::Count { count } => {
+                (pg_sys::Datum::from(*count as usize), false)
+            }
+            AggAccumulator::CountDistinctInt { seen } => {
+                (pg_sys::Datum::from(seen.len()), false)
+            }
+            AggAccumulator::CountDistinctStr { seen } => {
+                (pg_sys::Datum::from(seen.len()), false)
+            }
+        }
+    }
+}
+
+/// ExecCustomScan callback for CocoonAgg: return result rows.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn exec_agg_scan(
+    node: *mut pg_sys::CustomScanState,
+) -> *mut pg_sys::TupleTableSlot {
+    unsafe {
+        let scan_slot = (*node).ss.ss_ScanTupleSlot;
+        let state = &mut *((*node).custom_ps as *mut AggScanState);
+
+        if state.result_idx < state.result_rows.len() {
+            pg_sys::ExecClearTuple(scan_slot);
+            let row = &state.result_rows[state.result_idx];
+            for (i, &(datum, is_null)) in row.iter().enumerate() {
+                (*scan_slot).tts_values.add(i).write(datum);
+                (*scan_slot).tts_isnull.add(i).write(is_null);
+            }
+            pg_sys::ExecStoreVirtualTuple(scan_slot);
+            state.result_idx += 1;
+            return scan_slot;
+        }
+
+        // EOF
+        pg_sys::ExecClearTuple(scan_slot);
+        scan_slot
+    }
+}
+
+/// EndCustomScan callback for CocoonAgg.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn end_agg_scan(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state_ptr = (*node).custom_ps as *mut AggScanState;
+        if !state_ptr.is_null() {
+            let state = Box::from_raw(state_ptr);
+            let total_us = state.metadata_us + state.heap_scan_us + state.decompress_us + state.agg_us;
+            pgrx::log!(
+                "pg_cocoon CocoonAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
+                 decompress={:.1}ms  agg={:.1}ms  | \
+                 segments={} rows_processed={} result_rows={}",
+                total_us as f64 / 1000.0,
+                state.metadata_us as f64 / 1000.0,
+                state.heap_scan_us as f64 / 1000.0,
+                state.decompress_us as f64 / 1000.0,
+                state.agg_us as f64 / 1000.0,
+                state.total_segments,
+                state.total_rows_processed,
+                state.result_rows.len(),
+            );
+            (*node).custom_ps = std::ptr::null_mut();
+        }
+    }
+}
+
+/// ReScanCustomScan callback for CocoonAgg.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn rescan_agg_scan(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state = &mut *((*node).custom_ps as *mut AggScanState);
+        state.result_idx = 0;
     }
 }
 
@@ -1045,11 +1774,11 @@ unsafe fn load_segments_heap(
         // Locate attribute indices for segment_by columns, compressed columns, and _row_count
         let mut segment_by_attnos: Vec<(usize, pg_sys::Oid)> = Vec::new(); // (attno, type_oid)
         for name in col_names {
-            if segment_by.contains(name) {
-                if let Some(&attno) = attno_map.get(name.as_str()) {
-                    let type_oid = att_type_oids[name.as_str()];
-                    segment_by_attnos.push((attno, type_oid));
-                }
+            if segment_by.contains(name)
+                && let Some(&attno) = attno_map.get(name.as_str())
+            {
+                let type_oid = att_type_oids[name.as_str()];
+                segment_by_attnos.push((attno, type_oid));
             }
         }
 
@@ -1163,7 +1892,7 @@ unsafe fn load_segments_heap(
                             let len = pgrx::varsize_any_exhdr(detoasted);
                             let data = pgrx::vardata_any(detoasted);
                             let bytes = std::slice::from_raw_parts(
-                                data as *const u8,
+                                data,
                                 len,
                             )
                             .to_vec();
@@ -1242,7 +1971,7 @@ fn load_decompress_state(
 ) -> DecompressState {
     // Phase 1: SPI for metadata only (small, fast)
     let t0 = Instant::now();
-    let meta = Spi::connect(|client| load_metadata(&client, companion_name));
+    let meta = Spi::connect(|client| load_metadata(client, companion_name));
     let metadata_us = t0.elapsed().as_micros() as u64;
 
     // Extract batch quals early — we need to know which extra columns to load
@@ -1411,23 +2140,23 @@ unsafe fn extract_segment_filters(
             let col_name = &col_names[col_idx];
 
             // Check if this is a segment_by equality filter
-            if opname == "=" {
-                if let Some(&sv_idx) = seg_val_index_map.get(col_name.as_str()) {
-                    // Extract const value as string (matches how segment_values are stored)
-                    let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
-                    let mut typisvarlena: bool = false;
-                    pg_sys::getTypeOutputInfo(
-                        (*const_node).consttype,
-                        &mut typoutput,
-                        &mut typisvarlena,
-                    );
-                    let cstr = pg_sys::OidOutputFunctionCall(typoutput, (*const_node).constvalue);
-                    let s = std::ffi::CStr::from_ptr(cstr)
-                        .to_string_lossy()
-                        .into_owned();
-                    pg_sys::pfree(cstr as *mut _);
-                    segment_by_filters.push((sv_idx, s));
-                }
+            if opname == "="
+                && let Some(&sv_idx) = seg_val_index_map.get(col_name.as_str())
+            {
+                // Extract const value as string (matches how segment_values are stored)
+                let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
+                let mut typisvarlena: bool = false;
+                pg_sys::getTypeOutputInfo(
+                    (*const_node).consttype,
+                    &mut typoutput,
+                    &mut typisvarlena,
+                );
+                let cstr = pg_sys::OidOutputFunctionCall(typoutput, (*const_node).constvalue);
+                let s = std::ffi::CStr::from_ptr(cstr)
+                    .to_string_lossy()
+                    .into_owned();
+                pg_sys::pfree(cstr as *mut _);
+                segment_by_filters.push((sv_idx, s));
             }
 
             // Check if this is a time column range filter
@@ -1741,11 +2470,23 @@ unsafe fn extract_batch_quals(
                 }
             };
 
-            let arg0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
-            let arg1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
-            if arg0.is_null() || arg1.is_null() {
+            let raw_arg0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+            let raw_arg1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+            if raw_arg0.is_null() || raw_arg1.is_null() {
                 continue;
             }
+
+            // Unwrap RelabelType (PG adds these for int2→int4 coercions etc.)
+            let unwrap_relabel = |n: *const pg_sys::Node| -> *const pg_sys::Node {
+                if (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+                    let rlt = n as *const pg_sys::RelabelType;
+                    (*rlt).arg as *const pg_sys::Node
+                } else {
+                    n
+                }
+            };
+            let arg0 = unwrap_relabel(raw_arg0);
+            let arg1 = unwrap_relabel(raw_arg1);
 
             let arg0_tag = (*arg0).type_;
             let arg1_tag = (*arg1).type_;
@@ -1895,17 +2636,13 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
 
             // Time-range pruning: skip if segment's time range doesn't overlap query range
             if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
-                if let Some(query_min) = state.time_min {
-                    if seg_max < query_min {
-                        state.timing.segments_skipped += 1;
-                        continue;
-                    }
+                if state.time_min.is_some_and(|query_min| seg_max < query_min) {
+                    state.timing.segments_skipped += 1;
+                    continue;
                 }
-                if let Some(query_max) = state.time_max {
-                    if seg_min > query_max {
-                        state.timing.segments_skipped += 1;
-                        continue;
-                    }
+                if state.time_max.is_some_and(|query_max| seg_min > query_max) {
+                    state.timing.segments_skipped += 1;
+                    continue;
                 }
             }
 
@@ -2241,7 +2978,7 @@ unsafe fn decompress_blob_to_datums(
         CompressionType::Gorilla => {
             if dt.contains("timestamp") || dt == "date" {
                 let timestamps =
-                    compression::gorilla::decode_timestamps(&cc.data, non_null_count);
+                    compression::gorilla::decode_timestamps(cc.data, non_null_count);
                 if dt == "date" {
                     timestamps
                         .iter()
@@ -2262,14 +2999,14 @@ unsafe fn decompress_blob_to_datums(
                 }
             } else if dt == "real" || dt.contains("float4") {
                 let floats =
-                    compression::gorilla::decode_floats_f32(&cc.data, non_null_count);
+                    compression::gorilla::decode_floats_f32(cc.data, non_null_count);
                 floats
                     .iter()
                     .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
                     .collect()
             } else {
                 let floats =
-                    compression::gorilla::decode_floats(&cc.data, non_null_count);
+                    compression::gorilla::decode_floats(cc.data, non_null_count);
                 floats
                     .iter()
                     .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
@@ -2278,7 +3015,7 @@ unsafe fn decompress_blob_to_datums(
         }
         CompressionType::DeltaVarint => {
             if dt == "integer" || dt.contains("int4") || dt == "smallint" {
-                let ints = compression::integer::decode_i32(&cc.data, non_null_count);
+                let ints = compression::integer::decode_i32(cc.data, non_null_count);
                 if dt == "smallint" {
                     ints.iter()
                         .map(|&v| pg_sys::Datum::from(v as i16 as usize))
@@ -2289,7 +3026,7 @@ unsafe fn decompress_blob_to_datums(
                         .collect()
                 }
             } else {
-                let ints = compression::integer::decode_i64(&cc.data, non_null_count);
+                let ints = compression::integer::decode_i64(cc.data, non_null_count);
                 ints.iter()
                     .map(|&v| pg_sys::Datum::from(v as usize))
                     .collect()
@@ -2318,7 +3055,7 @@ unsafe fn decompress_blob_to_datums(
             }
         }
         CompressionType::BooleanBitmap => {
-            let bools = compression::boolean::decode(&cc.data, non_null_count);
+            let bools = compression::boolean::decode(cc.data, non_null_count);
             bools
                 .iter()
                 .map(|&b| pg_sys::Datum::from(b as usize))

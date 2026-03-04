@@ -511,6 +511,391 @@ class TestTransparentQuery:
             f"sum_real: {before['sum_real']} vs {after['sum_real']}"
         )
 
+    def test_transparent_query_avg(self, db):
+        """AVG on integer, bigint, float8, and real columns.
+
+        Regression test for wrong OID in float8_numeric conversion (was
+        calling numeric_float8 instead of float8_numeric, causing segfault).
+        """
+        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE avg_test (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                val_int INTEGER,
+                val_bigint BIGINT,
+                val_float8 DOUBLE PRECISION,
+                val_real REAL
+            )
+        """)
+        db.execute("SELECT cocoon_create_table('avg_test', 'ts', '1 day'::interval)")
+        db.commit()
+
+        for i in range(50):
+            db.execute(
+                f"INSERT INTO avg_test VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', "
+                f"{i * 10}, "
+                f"{1000000 + i}, "
+                f"{1.5 + i * 0.1}, "
+                f"{2.5 + i * 0.01})"
+            )
+        db.commit()
+
+        # Query BEFORE compression
+        before = {}
+        before["avg_int"] = db.execute(
+            "SELECT avg(val_int) FROM avg_test"
+        ).fetchone()[0]
+        before["avg_bigint"] = db.execute(
+            "SELECT avg(val_bigint) FROM avg_test"
+        ).fetchone()[0]
+        before["avg_float8"] = db.execute(
+            "SELECT avg(val_float8) FROM avg_test"
+        ).fetchone()[0]
+        before["avg_real"] = db.execute(
+            "SELECT avg(val_real) FROM avg_test"
+        ).fetchone()[0]
+        # Mixed: SUM + AVG + COUNT in single query
+        before["mixed"] = db.execute(
+            "SELECT sum(val_int), avg(val_bigint), count(*) FROM avg_test"
+        ).fetchall()[0]
+
+        # Enable and compress
+        db.execute(
+            "SELECT cocoon_enable_compression('avg_test', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        partitions = db.execute(
+            "SELECT partition_name FROM cocoon_partition_info('avg_test') "
+            "WHERE partition_name NOT LIKE '%default%'"
+        ).fetchall()
+        for (part_name,) in partitions:
+            row_ct = db.execute(
+                f'SELECT count(*) FROM "{part_name}"'
+            ).fetchone()[0]
+            if row_ct == 0:
+                continue
+            db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+            db.commit()
+
+        # Query AFTER compression
+        after = {}
+        after["avg_int"] = db.execute(
+            "SELECT avg(val_int) FROM avg_test"
+        ).fetchone()[0]
+        after["avg_bigint"] = db.execute(
+            "SELECT avg(val_bigint) FROM avg_test"
+        ).fetchone()[0]
+        after["avg_float8"] = db.execute(
+            "SELECT avg(val_float8) FROM avg_test"
+        ).fetchone()[0]
+        after["avg_real"] = db.execute(
+            "SELECT avg(val_real) FROM avg_test"
+        ).fetchone()[0]
+        after["mixed"] = db.execute(
+            "SELECT sum(val_int), avg(val_bigint), count(*) FROM avg_test"
+        ).fetchall()[0]
+
+        assert abs(float(after["avg_int"]) - float(before["avg_int"])) < 0.01, (
+            f"avg_int: {before['avg_int']} vs {after['avg_int']}"
+        )
+        assert abs(float(after["avg_bigint"]) - float(before["avg_bigint"])) < 0.01, (
+            f"avg_bigint: {before['avg_bigint']} vs {after['avg_bigint']}"
+        )
+        assert abs(after["avg_float8"] - before["avg_float8"]) < 0.01, (
+            f"avg_float8: {before['avg_float8']} vs {after['avg_float8']}"
+        )
+        assert abs(after["avg_real"] - before["avg_real"]) < 0.1, (
+            f"avg_real: {before['avg_real']} vs {after['avg_real']}"
+        )
+        assert after["mixed"][2] == before["mixed"][2], (
+            f"mixed count: {before['mixed'][2]} vs {after['mixed'][2]}"
+        )
+        assert after["mixed"][0] == before["mixed"][0], (
+            f"mixed sum: {before['mixed'][0]} vs {after['mixed'][0]}"
+        )
+        assert abs(float(after["mixed"][1]) - float(before["mixed"][1])) < 0.01, (
+            f"mixed avg: {before['mixed'][1]} vs {after['mixed'][1]}"
+        )
+
+    def test_transparent_query_agg_where_text(self, db):
+        """Aggregate with WHERE on text column must not silently drop the filter.
+
+        Regression test: CocoonAgg had no PG-level qual fallback (plan.qual=null)
+        and batch quals silently skipped unsupported types like TEXT, causing
+        WHERE text_col <> '' to be ignored and returning wrong counts.
+        """
+        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE agg_where_text (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                val INTEGER
+            )
+        """)
+        db.execute("SELECT cocoon_create_table('agg_where_text', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert rows: half with empty label, half with non-empty
+        for i in range(60):
+            label = f"item-{i}" if i % 2 == 0 else ""
+            db.execute(
+                f"INSERT INTO agg_where_text VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', '{label}', {i * 10})"
+            )
+        db.commit()
+
+        # Queries BEFORE compression
+        before = {}
+        before["count_nonempty"] = db.execute(
+            "SELECT count(*) FROM agg_where_text WHERE label <> ''"
+        ).fetchone()[0]
+        before["sum_filtered"] = db.execute(
+            "SELECT sum(val) FROM agg_where_text WHERE label <> ''"
+        ).fetchone()[0]
+        before["group_count"] = db.execute(
+            "SELECT label, count(*) AS c FROM agg_where_text "
+            "WHERE label <> '' GROUP BY label ORDER BY c DESC LIMIT 5"
+        ).fetchall()
+        assert before["count_nonempty"] == 30  # half the rows
+
+        # Compress
+        db.execute(
+            "SELECT cocoon_enable_compression('agg_where_text', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "agg_where_text")
+
+        # Queries AFTER compression — must match
+        after = {}
+        after["count_nonempty"] = db.execute(
+            "SELECT count(*) FROM agg_where_text WHERE label <> ''"
+        ).fetchone()[0]
+        after["sum_filtered"] = db.execute(
+            "SELECT sum(val) FROM agg_where_text WHERE label <> ''"
+        ).fetchone()[0]
+        after["group_count"] = db.execute(
+            "SELECT label, count(*) AS c FROM agg_where_text "
+            "WHERE label <> '' GROUP BY label ORDER BY c DESC LIMIT 5"
+        ).fetchall()
+
+        assert after["count_nonempty"] == before["count_nonempty"], (
+            f"count with text WHERE: {before['count_nonempty']} vs {after['count_nonempty']}"
+        )
+        assert after["sum_filtered"] == before["sum_filtered"], (
+            f"sum with text WHERE: {before['sum_filtered']} vs {after['sum_filtered']}"
+        )
+        assert after["group_count"] == before["group_count"], (
+            f"group+text WHERE: {before['group_count']} vs {after['group_count']}"
+        )
+
+    def test_transparent_query_agg_where_like(self, db):
+        """Aggregate with WHERE LIKE must not silently drop the filter.
+
+        Regression test: LIKE operator was not in parse_compare_op, so
+        extract_batch_quals skipped it. With CocoonAgg's plan.qual=null,
+        the LIKE filter was completely ignored.
+        """
+        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE agg_where_like (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                val INTEGER
+            )
+        """)
+        db.execute("SELECT cocoon_create_table('agg_where_like', 'ts', '1 day'::interval)")
+        db.commit()
+
+        for i in range(60):
+            # 10 rows match 'google', 50 don't
+            url = f"https://google.com/page/{i}" if i % 6 == 0 else f"https://example.com/{i}"
+            db.execute(
+                f"INSERT INTO agg_where_like VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', '{url}', {i})"
+            )
+        db.commit()
+
+        before_count = db.execute(
+            "SELECT count(*) FROM agg_where_like WHERE url LIKE '%google%'"
+        ).fetchone()[0]
+        assert before_count == 10
+
+        db.execute(
+            "SELECT cocoon_enable_compression('agg_where_like', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "agg_where_like")
+
+        after_count = db.execute(
+            "SELECT count(*) FROM agg_where_like WHERE url LIKE '%google%'"
+        ).fetchone()[0]
+
+        assert after_count == before_count, (
+            f"count with LIKE WHERE: {before_count} vs {after_count}"
+        )
+
+    def test_transparent_query_agg_where_numeric(self, db):
+        """Aggregate with WHERE on numeric column (supported by batch quals).
+
+        Tests that CocoonAgg correctly applies batch filtering for numeric
+        types including <> with SMALLINT (which PG may wrap in RelabelType).
+        """
+        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE agg_where_num (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                engine_id SMALLINT NOT NULL,
+                category INTEGER NOT NULL,
+                val DOUBLE PRECISION
+            )
+        """)
+        db.execute("SELECT cocoon_create_table('agg_where_num', 'ts', '1 day'::interval)")
+        db.commit()
+
+        for i in range(60):
+            engine = i % 5  # 0..4, so 12 rows have engine_id=0
+            cat = i % 3
+            db.execute(
+                f"INSERT INTO agg_where_num VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', {engine}, {cat}, {1.5 + i * 0.1})"
+            )
+        db.commit()
+
+        before = {}
+        before["count_ne"] = db.execute(
+            "SELECT count(*) FROM agg_where_num WHERE engine_id <> 0"
+        ).fetchone()[0]
+        before["sum_ne"] = db.execute(
+            "SELECT sum(val) FROM agg_where_num WHERE engine_id <> 0"
+        ).fetchone()[0]
+        before["group_ne"] = db.execute(
+            "SELECT engine_id, count(*) FROM agg_where_num "
+            "WHERE engine_id <> 0 GROUP BY engine_id ORDER BY engine_id"
+        ).fetchall()
+        before["multi_where"] = db.execute(
+            "SELECT count(*) FROM agg_where_num "
+            "WHERE engine_id <> 0 AND category = 1"
+        ).fetchone()[0]
+        assert before["count_ne"] == 48  # 60 - 12 rows with engine_id=0
+
+        db.execute(
+            "SELECT cocoon_enable_compression('agg_where_num', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "agg_where_num")
+
+        after = {}
+        after["count_ne"] = db.execute(
+            "SELECT count(*) FROM agg_where_num WHERE engine_id <> 0"
+        ).fetchone()[0]
+        after["sum_ne"] = db.execute(
+            "SELECT sum(val) FROM agg_where_num WHERE engine_id <> 0"
+        ).fetchone()[0]
+        after["group_ne"] = db.execute(
+            "SELECT engine_id, count(*) FROM agg_where_num "
+            "WHERE engine_id <> 0 GROUP BY engine_id ORDER BY engine_id"
+        ).fetchall()
+        after["multi_where"] = db.execute(
+            "SELECT count(*) FROM agg_where_num "
+            "WHERE engine_id <> 0 AND category = 1"
+        ).fetchone()[0]
+
+        assert after["count_ne"] == before["count_ne"], (
+            f"count <> 0: {before['count_ne']} vs {after['count_ne']}"
+        )
+        assert abs(after["sum_ne"] - before["sum_ne"]) < 0.01, (
+            f"sum <> 0: {before['sum_ne']} vs {after['sum_ne']}"
+        )
+        assert after["group_ne"] == before["group_ne"], (
+            f"group <> 0: {before['group_ne']} vs {after['group_ne']}"
+        )
+        assert after["multi_where"] == before["multi_where"], (
+            f"multi WHERE: {before['multi_where']} vs {after['multi_where']}"
+        )
+
+    def test_transparent_query_agg_where_mixed(self, db):
+        """Aggregate with mixed WHERE: numeric conditions + text condition.
+
+        Regression test: queries like Q37/Q38 with multiple WHERE conditions
+        including text <> '' had the text filter silently dropped, returning
+        wrong results because CocoonAgg can't batch-filter text types.
+        """
+        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE agg_where_mixed (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                counter_id INTEGER NOT NULL,
+                is_refresh SMALLINT NOT NULL,
+                title TEXT NOT NULL,
+                val INTEGER
+            )
+        """)
+        db.execute("SELECT cocoon_create_table('agg_where_mixed', 'ts', '1 day'::interval)")
+        db.commit()
+
+        for i in range(60):
+            counter = 62 if i % 4 == 0 else 99
+            refresh = 0 if i % 3 != 0 else 1
+            title = f"Page {i}" if i % 2 == 0 else ""
+            db.execute(
+                f"INSERT INTO agg_where_mixed VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', {counter}, {refresh}, '{title}', {i})"
+            )
+        db.commit()
+
+        # Complex WHERE: numeric + text conditions
+        query = (
+            "SELECT title, count(*) AS c FROM agg_where_mixed "
+            "WHERE counter_id = 62 AND is_refresh = 0 AND title <> '' "
+            "GROUP BY title ORDER BY c DESC LIMIT 5"
+        )
+        before_rows = db.execute(query).fetchall()
+        before_count = db.execute(
+            "SELECT count(*) FROM agg_where_mixed "
+            "WHERE counter_id = 62 AND is_refresh = 0 AND title <> ''"
+        ).fetchone()[0]
+        assert before_count > 0
+
+        db.execute(
+            "SELECT cocoon_enable_compression('agg_where_mixed', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "agg_where_mixed")
+
+        after_rows = db.execute(query).fetchall()
+        after_count = db.execute(
+            "SELECT count(*) FROM agg_where_mixed "
+            "WHERE counter_id = 62 AND is_refresh = 0 AND title <> ''"
+        ).fetchone()[0]
+
+        assert after_count == before_count, (
+            f"mixed WHERE count: {before_count} vs {after_count}"
+        )
+        assert after_rows == before_rows, (
+            f"mixed WHERE group: {before_rows} vs {after_rows}"
+        )
+
     def test_transparent_query_no_segment_by(self, db):
         """Same validation without segment_by columns."""
         setup_metrics_table(db)

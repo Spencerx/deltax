@@ -95,7 +95,7 @@ pub fn encode(values: &[&str]) -> Vec<u8> {
 
 /// Decode dictionary-encoded data, returning borrowed &str slices.
 /// Avoids N String allocations by referencing the dictionary entries in-place.
-pub fn decode_to_slices<'a>(data: &'a [u8], count: usize) -> Vec<&'a str> {
+pub fn decode_to_slices(data: &[u8], count: usize) -> Vec<&str> {
     if count == 0 {
         return Vec::new();
     }
