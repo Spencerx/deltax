@@ -42,8 +42,14 @@ def pg_container():
 
     yield
 
-    # Teardown
-    subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], capture_output=True)
+    # Teardown — skip if KEEP_CONTAINER is set (for manual debugging after benchmarks)
+    if os.environ.get("KEEP_CONTAINER"):
+        print(f"\n  KEEP_CONTAINER set — leaving {CONTAINER_NAME} running on port {HOST_PORT}")
+        print(f"  Connect with: docker exec -it {CONTAINER_NAME} psql -U {PG_USER}")
+        print(f"  Or: psql -h localhost -p {HOST_PORT} -U {PG_USER}")
+        print(f"  Remove with: docker rm -f {CONTAINER_NAME}")
+    else:
+        subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], capture_output=True)
 
 
 def _wait_for_pg(timeout: int = 30):

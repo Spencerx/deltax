@@ -562,6 +562,7 @@ pub unsafe fn add_cocoon_append_path(
         (*rel).partial_pathlist = std::ptr::null_mut();
 
         pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
+
     }
 }
 

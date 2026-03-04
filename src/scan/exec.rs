@@ -85,6 +85,17 @@ const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
 // Days between Unix epoch and PG epoch.
 const PG_EPOCH_OFFSET_DAYS: i32 = 10_957;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BatchCompareOp { Eq, Ne, Lt, Le, Gt, Ge }
+
+#[derive(Debug, Clone)]
+struct BatchQual {
+    col_idx: usize,              // 0-based column index
+    op: BatchCompareOp,          // comparison operator
+    const_datum: pg_sys::Datum,  // constant value
+    type_oid: pg_sys::Oid,       // column type OID
+}
+
 /// Decompression state stored as a raw pointer in the CustomScanState.
 pub(super) struct DecompressState {
     /// Column names in the original table (in order).
@@ -129,6 +140,11 @@ pub(super) struct DecompressState {
     time_min: Option<i64>,
     /// Upper bound for time column (PG epoch microseconds), inclusive.
     time_max: Option<i64>,
+
+    /// Batch quals extracted from plan qual for vectorized evaluation.
+    batch_quals: Vec<BatchQual>,
+    /// Selection vector: true = row passes batch quals. Empty = all pass.
+    selection_vector: Vec<bool>,
 }
 
 /// Wall-clock timing for the decompress scan phases.
@@ -145,6 +161,10 @@ pub(super) struct ScanTiming {
     pub(super) rows_emitted: u64,
     /// Total rows filtered by qual.
     pub(super) rows_filtered: u64,
+    /// Time spent in batch qual evaluation (per segment).
+    pub(super) batch_eval_us: u64,
+    /// Total rows filtered by batch quals (before fill_slot).
+    pub(super) rows_batch_filtered: u64,
     /// Total segments decompressed.
     pub(super) segments_decompressed: u64,
     /// Total compressed bytes loaded.
@@ -285,10 +305,11 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         };
 
         // Load metadata via SPI, then load segment data via direct heap scan
-        let mut state = load_decompress_state(companion_oid, &companion_name, &needed_indices);
+        // (plan_qual is passed so batch qual columns are included in needed_cols)
+        let plan_qual = (*(*node).ss.ps.plan).qual;
+        let mut state = load_decompress_state(companion_oid, &companion_name, &needed_indices, plan_qual);
 
         // Extract segment pruning filters from plan qual
-        let plan_qual = (*(*node).ss.ps.plan).qual;
         let (seg_filters, t_min, t_max) = extract_segment_filters(
             plan_qual,
             &state.col_names,
@@ -390,7 +411,11 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
         let meta = Spi::connect(|client| load_metadata(&client, &first_name));
         let metadata_us = t0.elapsed().as_micros() as u64;
 
-        // Build needed_cols and needed_col_indices
+        // Extract batch quals early — we need to know which extra columns to load
+        let plan_qual = (*(*node).ss.ps.plan).qual;
+        let batch_quals = extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types);
+
+        // Build needed_cols and needed_col_indices (includes batch qual columns)
         let num_cols = meta.col_names.len();
         let (needed_cols, needed_col_indices) = {
             let mut nc = vec![false; num_cols];
@@ -399,6 +424,12 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
                 if idx < num_cols {
                     nc[idx] = true;
                     nci.push(idx);
+                }
+            }
+            for bq in &batch_quals {
+                if bq.col_idx < num_cols && !nc[bq.col_idx] {
+                    nc[bq.col_idx] = true;
+                    nci.push(bq.col_idx);
                 }
             }
             (nc, nci)
@@ -438,6 +469,8 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
                 emit_us: 0,
                 rows_emitted: 0,
                 rows_filtered: 0,
+                batch_eval_us: 0,
+                rows_batch_filtered: 0,
                 segments_decompressed: 0,
                 compressed_bytes,
                 segments_skipped: 0,
@@ -447,10 +480,11 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
             segment_by_filters: Vec::new(),
             time_min: None,
             time_max: None,
+            batch_quals,
+            selection_vector: Vec::new(),
         };
 
         // Extract segment pruning filters from plan qual
-        let plan_qual = (*(*node).ss.ps.plan).qual;
         let (seg_filters, t_min, t_max) = extract_segment_filters(
             plan_qual,
             &state.col_names,
@@ -1204,13 +1238,17 @@ fn load_decompress_state(
     companion_oid: pg_sys::Oid,
     companion_name: &str,
     needed_indices: &[usize],
+    plan_qual: *mut pg_sys::List,
 ) -> DecompressState {
     // Phase 1: SPI for metadata only (small, fast)
     let t0 = Instant::now();
     let meta = Spi::connect(|client| load_metadata(&client, companion_name));
     let metadata_us = t0.elapsed().as_micros() as u64;
 
-    // Build needed_cols and needed_col_indices from needed_indices
+    // Extract batch quals early — we need to know which extra columns to load
+    let batch_quals = unsafe { extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types) };
+
+    // Build needed_cols and needed_col_indices from needed_indices + batch qual columns
     let num_cols = meta.col_names.len();
     let (needed_cols, needed_col_indices) = {
         let mut nc = vec![false; num_cols];
@@ -1219,6 +1257,13 @@ fn load_decompress_state(
             if idx < num_cols {
                 nc[idx] = true;
                 nci.push(idx);
+            }
+        }
+        // Also include columns referenced by batch quals
+        for bq in &batch_quals {
+            if bq.col_idx < num_cols && !nc[bq.col_idx] {
+                nc[bq.col_idx] = true;
+                nci.push(bq.col_idx);
             }
         }
         (nc, nci)
@@ -1256,6 +1301,8 @@ fn load_decompress_state(
             emit_us: 0,
             rows_emitted: 0,
             rows_filtered: 0,
+            batch_eval_us: 0,
+            rows_batch_filtered: 0,
             segments_decompressed: 0,
             compressed_bytes,
             segments_skipped: 0,
@@ -1265,6 +1312,8 @@ fn load_decompress_state(
         segment_by_filters: Vec::new(),
         time_min: None,
         time_max: None,
+        batch_quals,
+        selection_vector: Vec::new(),
     }
 }
 
@@ -1422,6 +1471,327 @@ unsafe fn extract_segment_filters(
     (segment_by_filters, time_min, time_max)
 }
 
+// ============================================================================
+// Batch / vectorized qual evaluation
+// ============================================================================
+
+/// Returns true for pass-by-value types that we can compare directly on datums.
+fn is_batch_comparable_type(type_oid: pg_sys::Oid) -> bool {
+    matches!(
+        type_oid,
+        pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::BOOLOID
+            | pg_sys::DATEOID
+            | pg_sys::TIMESTAMPOID
+            | pg_sys::TIMESTAMPTZOID
+    )
+}
+
+/// Flip a comparison operator for `Const op Var` → `Var op Const` rewriting.
+fn flip_compare_op(op: BatchCompareOp) -> BatchCompareOp {
+    match op {
+        BatchCompareOp::Eq => BatchCompareOp::Eq,
+        BatchCompareOp::Ne => BatchCompareOp::Ne,
+        BatchCompareOp::Lt => BatchCompareOp::Gt,
+        BatchCompareOp::Le => BatchCompareOp::Ge,
+        BatchCompareOp::Gt => BatchCompareOp::Lt,
+        BatchCompareOp::Ge => BatchCompareOp::Le,
+    }
+}
+
+/// Parse an operator name to a BatchCompareOp.
+fn parse_compare_op(opname: &str) -> Option<BatchCompareOp> {
+    match opname {
+        "=" => Some(BatchCompareOp::Eq),
+        "<>" | "!=" => Some(BatchCompareOp::Ne),
+        "<" => Some(BatchCompareOp::Lt),
+        "<=" => Some(BatchCompareOp::Le),
+        ">" => Some(BatchCompareOp::Gt),
+        ">=" => Some(BatchCompareOp::Ge),
+        _ => None,
+    }
+}
+
+// Monomorphized batch filter functions.  Each ANDs the comparison result
+// into the selection vector so that multiple quals compose correctly.
+
+fn apply_batch_filter_i64(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    op: BatchCompareOp,
+    constant: i64,
+) {
+    for (i, &(datum, is_null)) in col.iter().enumerate() {
+        if !sel[i] { continue; }
+        if is_null { sel[i] = false; continue; }
+        let v = datum.value() as i64;
+        sel[i] = match op {
+            BatchCompareOp::Eq => v == constant,
+            BatchCompareOp::Ne => v != constant,
+            BatchCompareOp::Lt => v < constant,
+            BatchCompareOp::Le => v <= constant,
+            BatchCompareOp::Gt => v > constant,
+            BatchCompareOp::Ge => v >= constant,
+        };
+    }
+}
+
+fn apply_batch_filter_i32(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    op: BatchCompareOp,
+    constant: i32,
+) {
+    for (i, &(datum, is_null)) in col.iter().enumerate() {
+        if !sel[i] { continue; }
+        if is_null { sel[i] = false; continue; }
+        let v = datum.value() as i32;
+        sel[i] = match op {
+            BatchCompareOp::Eq => v == constant,
+            BatchCompareOp::Ne => v != constant,
+            BatchCompareOp::Lt => v < constant,
+            BatchCompareOp::Le => v <= constant,
+            BatchCompareOp::Gt => v > constant,
+            BatchCompareOp::Ge => v >= constant,
+        };
+    }
+}
+
+fn apply_batch_filter_i16(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    op: BatchCompareOp,
+    constant: i16,
+) {
+    for (i, &(datum, is_null)) in col.iter().enumerate() {
+        if !sel[i] { continue; }
+        if is_null { sel[i] = false; continue; }
+        let v = datum.value() as i16;
+        sel[i] = match op {
+            BatchCompareOp::Eq => v == constant,
+            BatchCompareOp::Ne => v != constant,
+            BatchCompareOp::Lt => v < constant,
+            BatchCompareOp::Le => v <= constant,
+            BatchCompareOp::Gt => v > constant,
+            BatchCompareOp::Ge => v >= constant,
+        };
+    }
+}
+
+fn apply_batch_filter_f64(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    op: BatchCompareOp,
+    constant: f64,
+) {
+    for (i, &(datum, is_null)) in col.iter().enumerate() {
+        if !sel[i] { continue; }
+        if is_null { sel[i] = false; continue; }
+        let v = f64::from_bits(datum.value() as u64);
+        sel[i] = match op {
+            BatchCompareOp::Eq => v == constant,
+            BatchCompareOp::Ne => v != constant,
+            BatchCompareOp::Lt => v < constant,
+            BatchCompareOp::Le => v <= constant,
+            BatchCompareOp::Gt => v > constant,
+            BatchCompareOp::Ge => v >= constant,
+        };
+    }
+}
+
+fn apply_batch_filter_f32(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    op: BatchCompareOp,
+    constant: f32,
+) {
+    for (i, &(datum, is_null)) in col.iter().enumerate() {
+        if !sel[i] { continue; }
+        if is_null { sel[i] = false; continue; }
+        let v = f32::from_bits(datum.value() as u32);
+        sel[i] = match op {
+            BatchCompareOp::Eq => v == constant,
+            BatchCompareOp::Ne => v != constant,
+            BatchCompareOp::Lt => v < constant,
+            BatchCompareOp::Le => v <= constant,
+            BatchCompareOp::Gt => v > constant,
+            BatchCompareOp::Ge => v >= constant,
+        };
+    }
+}
+
+fn apply_batch_filter_bool(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    op: BatchCompareOp,
+    constant: bool,
+) {
+    for (i, &(datum, is_null)) in col.iter().enumerate() {
+        if !sel[i] { continue; }
+        if is_null { sel[i] = false; continue; }
+        let v = datum.value() != 0;
+        sel[i] = match op {
+            BatchCompareOp::Eq => v == constant,
+            BatchCompareOp::Ne => v != constant,
+            _ => v == constant, // bool only supports = / <>
+        };
+    }
+}
+
+/// Evaluate all batch quals against the current decompressed segment.
+/// Returns a selection vector (one bool per row). Empty vec means "no batch quals".
+fn evaluate_batch_quals(
+    current_segment: &[Vec<(pg_sys::Datum, bool)>],
+    row_count: usize,
+    batch_quals: &[BatchQual],
+) -> Vec<bool> {
+    if batch_quals.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sel = vec![true; row_count];
+
+    for bq in batch_quals {
+        let col = &current_segment[bq.col_idx];
+        if col.is_empty() {
+            // Column wasn't decompressed (not needed) — can't evaluate, skip
+            continue;
+        }
+        match bq.type_oid {
+            pg_sys::INT8OID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+                apply_batch_filter_i64(col, &mut sel, bq.op, bq.const_datum.value() as i64);
+            }
+            pg_sys::INT4OID | pg_sys::DATEOID => {
+                apply_batch_filter_i32(col, &mut sel, bq.op, bq.const_datum.value() as i32);
+            }
+            pg_sys::INT2OID => {
+                apply_batch_filter_i16(col, &mut sel, bq.op, bq.const_datum.value() as i16);
+            }
+            pg_sys::FLOAT8OID => {
+                let c = f64::from_bits(bq.const_datum.value() as u64);
+                apply_batch_filter_f64(col, &mut sel, bq.op, c);
+            }
+            pg_sys::FLOAT4OID => {
+                let c = f32::from_bits(bq.const_datum.value() as u32);
+                apply_batch_filter_f32(col, &mut sel, bq.op, c);
+            }
+            pg_sys::BOOLOID => {
+                let c = bq.const_datum.value() != 0;
+                apply_batch_filter_bool(col, &mut sel, bq.op, c);
+            }
+            _ => {} // unsupported type, skip
+        }
+    }
+
+    sel
+}
+
+/// Extract batch quals from the plan qual list.
+///
+/// Looks for `OpExpr` nodes with `Var op Const` (or `Const op Var`) where the
+/// operator is a simple comparison and the column type is pass-by-value.
+unsafe fn extract_batch_quals(
+    qual_list: *mut pg_sys::List,
+    col_names: &[String],
+    col_types: &[pg_sys::Oid],
+) -> Vec<BatchQual> {
+    let mut batch_quals = Vec::new();
+
+    if qual_list.is_null() {
+        return batch_quals;
+    }
+
+    unsafe {
+        let nquals = (*qual_list).length;
+        for i in 0..nquals {
+            let cell = (*qual_list).elements.add(i as usize);
+            let node = (*cell).ptr_value as *const pg_sys::Node;
+            if node.is_null() {
+                continue;
+            }
+
+            let tag = (*node).type_;
+            if tag != pg_sys::NodeTag::T_OpExpr {
+                continue;
+            }
+
+            let opexpr = node as *const pg_sys::OpExpr;
+            let args = (*opexpr).args;
+            if args.is_null() || (*args).length != 2 {
+                continue;
+            }
+
+            // Get operator name
+            let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+            if opname_ptr.is_null() {
+                continue;
+            }
+            let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                .to_str()
+                .unwrap_or("");
+
+            let cmp_op = match parse_compare_op(opname) {
+                Some(op) => op,
+                None => {
+                    continue;
+                }
+            };
+
+            let arg0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+            let arg1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+            if arg0.is_null() || arg1.is_null() {
+                continue;
+            }
+
+            let arg0_tag = (*arg0).type_;
+            let arg1_tag = (*arg1).type_;
+
+            let (var_node, const_node, var_on_left) =
+                if arg0_tag == pg_sys::NodeTag::T_Var
+                    && arg1_tag == pg_sys::NodeTag::T_Const
+                {
+                    (arg0 as *const pg_sys::Var, arg1 as *const pg_sys::Const, true)
+                } else if arg0_tag == pg_sys::NodeTag::T_Const
+                    && arg1_tag == pg_sys::NodeTag::T_Var
+                {
+                    (arg1 as *const pg_sys::Var, arg0 as *const pg_sys::Const, false)
+                } else {
+                    continue;
+                };
+
+            if (*const_node).constisnull {
+                continue;
+            }
+
+            let varattno = (*var_node).varattno as i32;
+            if varattno < 1 || varattno as usize > col_names.len() {
+                continue;
+            }
+            let col_idx = (varattno - 1) as usize;
+            let type_oid = col_types[col_idx];
+
+            if !is_batch_comparable_type(type_oid) {
+                continue;
+            }
+
+            let op = if var_on_left { cmp_op } else { flip_compare_op(cmp_op) };
+
+            batch_quals.push(BatchQual {
+                col_idx,
+                op,
+                const_datum: (*const_node).constvalue,
+                type_oid,
+            });
+        }
+    }
+
+    batch_quals
+}
+
 /// ExecCustomScan callback: return the next tuple.
 ///
 /// PostgreSQL's ExecCustomScan wrapper does NOT apply qualification or
@@ -1446,6 +1816,26 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
             // If current segment has more rows, try the next one
             if !state.current_segment.is_empty() {
                 let seg_rows = state.current_row_count;
+
+                // Batch filter: advance row_cursor to the next passing row.
+                // Uses slice .position() which LLVM can auto-vectorize (SIMD)
+                // to scan 16-32 bytes at a time instead of per-byte branching.
+                if !state.selection_vector.is_empty() {
+                    let start = state.row_cursor;
+                    let end = seg_rows;
+                    if let Some(offset) = state.selection_vector[start..end]
+                        .iter()
+                        .position(|&v| v)
+                    {
+                        state.timing.rows_batch_filtered += offset as u64;
+                        state.row_cursor = start + offset;
+                    } else {
+                        // All remaining rows fail — skip to end of segment
+                        state.timing.rows_batch_filtered += (end - start) as u64;
+                        state.row_cursor = end;
+                    }
+                }
+
                 if state.row_cursor < seg_rows {
                     fill_slot(scan_slot, state);
                     state.row_cursor += 1;
@@ -1574,6 +1964,21 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
             state.current_segment = decompressed;
             state.current_row_count = seg.row_count as usize;
             state.row_cursor = 0;
+
+            // Evaluate batch quals on the decompressed segment
+            if !state.batch_quals.is_empty() {
+                let t_batch = if instrument { Some(Instant::now()) } else { None };
+                state.selection_vector = evaluate_batch_quals(
+                    &state.current_segment,
+                    state.current_row_count,
+                    &state.batch_quals,
+                );
+                if let Some(t) = t_batch {
+                    state.timing.batch_eval_us += t.elapsed().as_micros() as u64;
+                }
+            } else {
+                state.selection_vector.clear();
+            }
         }
     }
 }
@@ -1590,20 +1995,22 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
 
             // Emit timing summary at LOG level (visible with SET client_min_messages = log)
             let t = &state.timing;
-            let total_us = t.metadata_us + t.heap_scan_us + t.decompress_us + t.emit_us;
+            let total_us = t.metadata_us + t.heap_scan_us + t.decompress_us + t.batch_eval_us + t.emit_us;
             pgrx::log!(
                 "pg_cocoon scan timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
-                 decompress={:.1}ms  emit={:.1}ms  | \
-                 segments={} segments_skipped={} rows_out={} rows_filtered={} compressed_bytes={}",
+                 decompress={:.1}ms  batch_eval={:.1}ms  emit={:.1}ms  | \
+                 segments={} segments_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}",
                 total_us as f64 / 1000.0,
                 t.metadata_us as f64 / 1000.0,
                 t.heap_scan_us as f64 / 1000.0,
                 t.decompress_us as f64 / 1000.0,
+                t.batch_eval_us as f64 / 1000.0,
                 t.emit_us as f64 / 1000.0,
                 t.segments_decompressed,
                 t.segments_skipped,
                 t.rows_emitted,
                 t.rows_filtered,
+                t.rows_batch_filtered,
                 t.compressed_bytes,
             );
 
@@ -1626,6 +2033,7 @@ pub unsafe extern "C-unwind" fn rescan_custom_scan(
         state.row_cursor = 0;
         state.current_row_count = 0;
         state.current_segment.clear();
+        state.selection_vector.clear();
     }
 }
 

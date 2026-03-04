@@ -9,7 +9,7 @@ PG_VERSIONS ?= 17 18
 VENV         = .venv
 
 .PHONY: dev-image image image-fresh test build clippy run psql cargo clean integration-test \
-       bench-clickbench bench-timescaledb-tsl bench-timescaledb-oss bench-timescaledb bench-compare bench-all \
+       bench-clickbench bench-clickbench-keep bench-timescaledb-tsl bench-timescaledb-oss bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow
 
 # Build the dev toolchain image (rebuilds only when Dockerfile.dev changes)
@@ -115,6 +115,10 @@ integration-test: $(VENV)/.stamp
 
 bench-clickbench: $(VENV)/.stamp image
 	PG_COCOON_IMAGE=pg_cocoon:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/bench_clickbench.py -v -s
+
+# Same as bench-clickbench but leaves the container running for manual debugging
+bench-clickbench-keep: $(VENV)/.stamp image
+	PG_COCOON_IMAGE=pg_cocoon:pg$(PG_MAJOR) KEEP_CONTAINER=1 $(VENV)/bin/pytest tests/bench_clickbench.py -v -s
 
 bench-timescaledb-tsl: $(VENV)/.stamp
 	TSDB_VARIANT=tsl $(VENV)/bin/pytest tests/bench_clickbench_timescaledb.py -v -s

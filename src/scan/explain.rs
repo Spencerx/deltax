@@ -145,15 +145,16 @@ unsafe fn explain_timing(
             let state_ptr = (*node).custom_ps as *const DecompressState;
             if !state_ptr.is_null() {
                 let t = &(*state_ptr).timing;
-                let total_ms = (t.metadata_us + t.heap_scan_us + t.decompress_us + t.emit_us)
+                let total_ms = (t.metadata_us + t.heap_scan_us + t.decompress_us + t.batch_eval_us + t.emit_us)
                     as f64 / 1000.0;
 
                 let timing_str = std::ffi::CString::new(format!(
-                    "{:.3} ms (metadata={:.3} heap_scan={:.3} decompress={:.3} emit={:.3})",
+                    "{:.3} ms (metadata={:.3} heap_scan={:.3} decompress={:.3} batch_eval={:.3} emit={:.3})",
                     total_ms,
                     t.metadata_us as f64 / 1000.0,
                     t.heap_scan_us as f64 / 1000.0,
                     t.decompress_us as f64 / 1000.0,
+                    t.batch_eval_us as f64 / 1000.0,
                     t.emit_us as f64 / 1000.0,
                 ))
                 .unwrap();
@@ -164,11 +165,12 @@ unsafe fn explain_timing(
                 );
 
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} segments_skipped={} rows_out={} rows_filtered={} compressed_bytes={}",
+                    "segments={} segments_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}",
                     t.segments_decompressed,
                     t.segments_skipped,
                     t.rows_emitted,
                     t.rows_filtered,
+                    t.rows_batch_filtered,
                     t.compressed_bytes,
                 ))
                 .unwrap();

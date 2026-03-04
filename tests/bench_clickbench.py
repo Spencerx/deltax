@@ -12,6 +12,7 @@ Scale up:
     PG_COCOON_IMAGE=pg_cocoon:pg17 CLICKBENCH_FILES=5 pytest tests/bench_clickbench.py -v -s
 """
 
+import os
 import time
 
 import psycopg
@@ -123,7 +124,7 @@ def run_explain_analyze(conn, queries):
                 continue
 
             # Sum timing values across partitions
-            totals = {"metadata": 0.0, "heap_scan": 0.0, "decompress": 0.0, "emit": 0.0}
+            totals = {"metadata": 0.0, "heap_scan": 0.0, "decompress": 0.0, "batch_eval": 0.0, "emit": 0.0}
             for t in timings:
                 for token in t.replace("(", "").replace(")", "").split():
                     if "=" in token:
@@ -139,11 +140,12 @@ def run_explain_analyze(conn, queries):
                 f"{total_ms:.3f} ms (metadata={totals['metadata']:.3f} "
                 f"heap_scan={totals['heap_scan']:.3f} "
                 f"decompress={totals['decompress']:.3f} "
+                f"batch_eval={totals['batch_eval']:.3f} "
                 f"emit={totals['emit']:.3f})"
             )
 
             # Sum stats across partitions
-            stat_totals = {"segments": 0, "segments_skipped": 0, "rows_out": 0, "rows_filtered": 0, "compressed_bytes": 0}
+            stat_totals = {"segments": 0, "segments_skipped": 0, "rows_out": 0, "rows_filtered": 0, "rows_batch_filtered": 0, "compressed_bytes": 0}
             for s in stats_lines:
                 for token in s.split():
                     if "=" in token:
@@ -196,21 +198,21 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
     if profile_results:
         print("\n### Cocoon Scan Timing Breakdown (EXPLAIN ANALYZE)")
         print()
-        print(f"| {'Query':<6} | {'Cocoon Total':>13} | {'Metadata':>10} | {'Heap Scan':>10} | {'Decompress':>11} | {'Emit':>10} | {'Stats':<45} |")
-        print(f"|{'-'*8}|{'-'*15}|{'-'*12}|{'-'*12}|{'-'*13}|{'-'*12}|{'-'*47}|")
+        print(f"| {'Query':<6} | {'Cocoon Total':>13} | {'Metadata':>10} | {'Heap Scan':>10} | {'Decompress':>11} | {'Batch Eval':>10} | {'Emit':>10} | {'Stats':<65} |")
+        print(f"|{'-'*8}|{'-'*15}|{'-'*12}|{'-'*12}|{'-'*13}|{'-'*12}|{'-'*12}|{'-'*67}|")
 
         for qid, desc, _ in QUERIES:
             info = profile_results.get(qid, {})
             if "error" in info:
-                print(f"| {qid:<6} | {'ERR':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {info['error'][:45]:<45} |")
+                print(f"| {qid:<6} | {'ERR':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'':>10} | {info['error'][:65]:<65} |")
                 continue
             timing = info.get("timing", "")
             stats = info.get("stats", "")
             if not timing:
-                print(f"| {qid:<6} | {'n/a':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'(no compressed scan)' :<45} |")
+                print(f"| {qid:<6} | {'n/a':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'':>10} | {'(no compressed scan)' :<65} |")
                 continue
 
-            # Parse timing: "X.XXX ms (metadata=X.XXX heap_scan=X.XXX decompress=X.XXX emit=X.XXX)"
+            # Parse timing: "X.XXX ms (metadata=X.XXX heap_scan=X.XXX decompress=X.XXX batch_eval=X.XXX emit=X.XXX)"
             parts = {}
             for token in timing.replace("(", "").replace(")", "").split():
                 if "=" in token:
@@ -218,7 +220,7 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
                     parts[k] = v
 
             total_str = timing.split(" ms")[0].strip() if " ms" in timing else timing
-            print(f"| {qid:<6} | {total_str + ' ms':>13} | {parts.get('metadata', ''):>10} | {parts.get('heap_scan', ''):>10} | {parts.get('decompress', ''):>11} | {parts.get('emit', ''):>10} | {stats[:45]:<45} |")
+            print(f"| {qid:<6} | {total_str + ' ms':>13} | {parts.get('metadata', ''):>10} | {parts.get('heap_scan', ''):>10} | {parts.get('decompress', ''):>11} | {parts.get('batch_eval', ''):>10} | {parts.get('emit', ''):>10} | {stats[:65]:<65} |")
 
 
 def print_compression_stats(conn):
@@ -285,6 +287,7 @@ def clickbench_db(pg_container):
         dbname=db_name,
     )
     conn.execute("CREATE EXTENSION pg_cocoon")
+    conn.execute("SET jit = off")
     conn.commit()
 
     # Setup: create table, partition, load data
@@ -294,9 +297,12 @@ def clickbench_db(pg_container):
     yield conn
 
     conn.close()
-    admin = _admin_conn()
-    admin.execute(f'DROP DATABASE "{db_name}"')
-    admin.close()
+    if not os.environ.get("KEEP_CONTAINER"):
+        admin = _admin_conn()
+        admin.execute(f'DROP DATABASE "{db_name}"')
+        admin.close()
+    else:
+        print(f"\n  KEEP_CONTAINER set — keeping database {db_name}")
 
 
 class TestClickBench:
@@ -346,6 +352,8 @@ class TestClickBench:
                 print(f"  {qid}: ERROR - {info['error']}")
             elif "timing" in info:
                 print(f"  {qid}: {info['timing']}")
+                if "stats" in info:
+                    print(f"         {info['stats']}")
             else:
                 print(f"  {qid}: (no compressed scan)")
 
