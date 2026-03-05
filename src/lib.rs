@@ -9,6 +9,7 @@ mod compression;
 mod functions;
 mod partition;
 mod scan;
+mod timeparse;
 mod worker;
 
 pg_module_magic!();

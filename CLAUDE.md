@@ -29,6 +29,9 @@ make logs-all                         # Show all logs from running container
 make logs-follow                      # Follow logs in real-time
 make cargo CMD="<cmd>"                # Run arbitrary cargo command in dev container
 make clean                            # Clean Docker volumes
+make bench-clickbench                 # Run Clickbench benchmark
+make bench-clickbench-keep            # Run Clickbench benchmark, and keep the image for troubleshooting
+make bench-all                        # Compare benchmarks with timescale
 ```
 
 If you need to reference pgrx source code, it is in ~/src/pgrx.
@@ -49,7 +52,6 @@ Overall design and plan with several phases is in pg_cocoon_design_v03.md
 - **`functions/first_last.rs`** — `first(value, ts)` / `last(value, ts)` aggregates with serializable state.
 
 ### Data Flow
-
 1. User calls `cocoon_create_table('my_table', 'ts_column')` → table is converted to PARTITION BY RANGE, initial partitions created, metadata registered in catalog.
 2. Inserts go to the parent table; PostgreSQL routes to the correct partition. Out-of-range data lands in the default partition.
 3. Background worker (every 60s) drains the default partition into proper partitions and pre-creates future partitions.
