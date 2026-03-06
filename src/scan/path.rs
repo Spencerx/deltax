@@ -60,6 +60,7 @@ pub unsafe fn add_decompress_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oid: pg_sys::Oid,
+    pathkeys: *mut pg_sys::List,
 ) {
     unsafe {
         let cpath =
@@ -77,6 +78,7 @@ pub unsafe fn add_decompress_path(
         (*cpath).path.parallel_workers = 0;
         (*cpath).path.parallel_aware = false;
         (*cpath).path.parallel_safe = false;
+        (*cpath).path.pathkeys = pathkeys;
 
         // Store companion OID in custom_private using lappend_oid
         (*cpath).custom_private =
@@ -815,6 +817,7 @@ pub unsafe fn add_cocoon_append_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
+    pathkeys: *mut pg_sys::List,
 ) {
     unsafe {
         let cpath =
@@ -841,6 +844,7 @@ pub unsafe fn add_cocoon_append_path(
         (*cpath).path.parallel_workers = 0;
         (*cpath).path.parallel_aware = false;
         (*cpath).path.parallel_safe = false;
+        (*cpath).path.pathkeys = pathkeys;
 
         // Store companion OIDs in custom_private
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
@@ -858,7 +862,6 @@ pub unsafe fn add_cocoon_append_path(
         (*rel).partial_pathlist = std::ptr::null_mut();
 
         pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
-
     }
 }
 

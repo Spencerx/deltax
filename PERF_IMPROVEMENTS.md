@@ -1,29 +1,29 @@
 # Performance Improvements Roadmap
 
 Tracking the gap between pg_cocoon and TimescaleDB on ClickBench queries.
-Current geometric mean: **pg_cocoon 127ms vs TimescaleDB 18ms (~7x gap)**.
+Current geometric mean: **pg_cocoon 21.1ms vs TimescaleDB 20.2ms (0.96x, essentially on par)**.
 
-## Current Benchmark (2026-03-03, per-column min/max implemented)
+## Current Benchmark (2026-03-05, LIKE filter pushdown + agg pushdown + batch quals)
 
 | Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
 |-------|-------------|-------------|-----------|-----|
-| Q1 | COUNT(*) | 0.7 | 3.3 | 0.2x |
-| Q2 | COUNT WHERE AdvEngineID | 89.6 | 4.5 | 20x |
-| Q3 | SUM/AVG full scan | 118.4 | 6.1 | 19x |
-| Q5 | COUNT DISTINCT UserID | 159.1 | 102.8 | 1.5x |
+| Q1 | COUNT(*) | 0.5 | 3.3 | 0.2x |
+| Q2 | COUNT WHERE AdvEngineID | 4.5 | 4.5 | 1.0x |
+| Q3 | SUM/AVG full scan | 11.9 | 6.1 | 2.0x |
+| Q5 | COUNT DISTINCT UserID | 20.5 | 102.8 | 0.2x |
 | Q7 | MIN/MAX EventDate | 0.7 | 4.7 | 0.1x |
-| Q8 | GROUP BY AdvEngineID | 124.4 | 4.8 | 26x |
-| Q9 | GROUP BY RegionID | 273.1 | 204.6 | 1.3x |
-| Q13 | Top SearchPhrase | 158.1 | 14.1 | 11x |
-| Q20 | Point lookup UserID | 71.3 | 4.8 | 15x |
-| Q21 | URL LIKE google | 196.2 | 34.7 | 6x |
-| Q25 | ORDER BY EventTime | 158.6 | 2.2 | 72x |
-| Q34 | Top URLs | 336.4 | 229.2 | 1.5x |
-| Q37 | CounterID=62 URLs | 277.1 | 107.7 | 2.6x |
-| Q38 | CounterID=62 Titles | 192.4 | 36.0 | 5.3x |
-| Q43 | CounterID=62 by minute | 164.9 | 26.4 | 6.2x |
+| Q8 | GROUP BY AdvEngineID | 5.2 | 4.8 | 1.1x |
+| Q9 | GROUP BY RegionID | 71.8 | 204.6 | 0.4x |
+| Q13 | Top SearchPhrase | 59.3 | 14.1 | 4.2x |
+| Q20 | Point lookup UserID | 7.1 | 4.8 | 1.5x |
+| Q21 | URL LIKE google | 65.2 | 34.7 | 1.9x |
+| Q25 | ORDER BY EventTime | 64.0 | 2.2 | 29x |
+| Q34 | Top URLs | 284.1 | 229.2 | 1.2x |
+| Q37 | CounterID=62 URLs | 148.8 | 107.7 | 1.4x |
+| Q38 | CounterID=62 Titles | 84.2 | 36.0 | 2.3x |
+| Q43 | CounterID=62 by minute | 61.9 | 26.4 | 2.3x |
 
-## Previous Benchmark (2024-03-02, segment pruning implemented)
+## Previous Benchmark (2026-03-02, segment pruning implemented)
 
 | Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
 |-------|-------------|-------------|-----------|-----|
@@ -146,24 +146,29 @@ Options:
 
 **Files:** `src/scan/exec.rs` (load_segments_heap)
 
-### 6. Reduce per-string varlena allocation
+### 6. LIKE filter pushdown into decompression [DONE]
 
-**Impact: Q21 178ms -> ~80ms, Q34/Q37/Q38 moderate improvement**
+**Impact: Q21 196ms -> 65ms (achieved)**
 **Complexity: Medium**
 
-For text columns (Dictionary/LZ4 codecs), each decoded string gets an individual
-`cstring_to_text_with_len` palloc in the segment memory context. For a segment
-with 83K rows and multiple text columns, that's hundreds of thousands of small
-allocations.
+For text columns with LIKE/NOT LIKE quals, the LIKE match is now evaluated on
+raw `&str` slices during decompression — before any PG varlena allocation.
+Only matching rows get `str_to_text_datum()` calls; non-matching rows get a
+dummy datum and are excluded via a pre-selection vector.
 
-Options:
-- **Arena allocation**: allocate one large buffer per segment, pack varlena
-  headers + string data sequentially. Dramatically reduces allocator overhead.
-- **Deferred materialization**: keep strings as `(offset, len)` references into
-  the decompressed buffer. Only create varlena datums for rows that pass the
-  qual filter.
+For dictionary-encoded columns, the LIKE pattern is matched against dictionary
+entries only (e.g. a few thousand), then a per-row integer index lookup
+determines pass/fail — no per-row string work at all.
 
-**Files:** `src/scan/exec.rs` (str_to_text_datum, decompress_blob_to_datums)
+For LZ4-encoded columns (high cardinality, like ClickBench URLs), the LIKE
+match runs on zero-copy `&str` references from the decompressed buffer,
+avoiding ~1M PG palloc calls per segment.
+
+The pre-selection vector is passed into `evaluate_batch_quals` as the initial
+selection, so the LIKE qual is never re-evaluated on dummy datums.
+
+**Files:** `src/compression/dictionary.rs` (decode_dict_and_indices),
+`src/scan/exec.rs` (decompress_text_blob_with_like_filter, decompression loops)
 
 ### 7. Store per-column min/max in companion table [DONE]
 
@@ -216,12 +221,12 @@ Referenced in the design doc (`pg_cocoon_design_v03.md`) as a future optimizatio
 
 The items are roughly ordered by impact/effort ratio:
 
-1. **COUNT(*) pushdown** — huge impact on Q1, low-hanging fruit
-2. **MIN/MAX pushdown** — same pattern, covers Q7
+1. ~~**COUNT(*) pushdown**~~ [DONE]
+2. ~~**MIN/MAX pushdown**~~ [DONE]
 3. **Lazy blob detoasting** — improves all queries, especially pruned ones
 4. **Vectorized qual / batch filtering** — biggest overall impact, covers Q2/Q8/Q20
 5. **Lazy decompression with predicate pushdown** — amplifies #4
-6. **Reduce varlena allocation** — helps text-heavy queries Q21/Q34/Q37/Q38
-7. **Per-column min/max** — enables pruning for more query patterns
+6. ~~**LIKE filter pushdown**~~ [DONE]
+7. ~~**Per-column min/max**~~ [DONE]
 8. **Sorted scan for ORDER BY** — dramatic impact on Q25, complex planner work
 9. **Bloom filters** — niche but powerful for text filtering

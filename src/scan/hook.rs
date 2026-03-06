@@ -15,6 +15,10 @@ thread_local! {
     static COMPRESSED_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, pg_sys::Oid>> =
         std::cell::RefCell::new(HashMap::new());
 
+    /// Cache of parent table OID → time column attribute number (0 = not a hypertable).
+    static TIME_COLUMN_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, i16>> =
+        std::cell::RefCell::new(HashMap::new());
+
     /// When true, the ExecutorStart hook skips the DML-on-compressed check.
     /// Used by internal operations like cocoon_decompress_partition.
     static DML_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -22,11 +26,164 @@ thread_local! {
 
 pub fn invalidate_compressed_cache() {
     COMPRESSED_CACHE.with(|cache| cache.borrow_mut().clear());
+    TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Set or clear the DML bypass flag for internal operations.
 pub(crate) fn set_dml_bypass(bypass: bool) {
     DML_BYPASS.with(|flag| flag.set(bypass));
+}
+
+/// Get the time column's attribute number for a hypertable parent table.
+/// Returns None if the table is not a cocoon hypertable. Result is cached.
+unsafe fn get_time_column_attno(parent_oid: pg_sys::Oid) -> Option<i16> {
+    let cached = TIME_COLUMN_CACHE.with(|cache| cache.borrow().get(&parent_oid).copied());
+    if let Some(attno) = cached {
+        return if attno > 0 { Some(attno) } else { None };
+    }
+
+    unsafe {
+        let schema_name_ptr = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(parent_oid));
+        let table_name_ptr = pg_sys::get_rel_name(parent_oid);
+        if schema_name_ptr.is_null() || table_name_ptr.is_null() {
+            TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, 0));
+            return None;
+        }
+        let schema_name = std::ffi::CStr::from_ptr(schema_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+        let table_name = std::ffi::CStr::from_ptr(table_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+
+        let time_col_name: Option<String> = pgrx::Spi::connect(|client| {
+            let result = client.select(
+                "SELECT time_column FROM cocoon_hypertable WHERE schema_name = $1 AND table_name = $2",
+                None,
+                &[schema_name.as_str().into(), table_name.as_str().into()],
+            );
+            match result {
+                Ok(mut table) => match table.next() {
+                    Some(row) => row
+                        .get_datum_by_ordinal(1)
+                        .ok()
+                        .and_then(|d| d.value::<String>().ok())
+                        .flatten(),
+                    None => None,
+                },
+                Err(_) => None,
+            }
+        });
+
+        match time_col_name {
+            Some(col_name) => {
+                let col_cname = std::ffi::CString::new(col_name).unwrap();
+                let attno = pg_sys::get_attnum(parent_oid, col_cname.as_ptr());
+                if attno == pg_sys::InvalidAttrNumber as i16 {
+                    TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, 0));
+                    None
+                } else {
+                    TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, attno));
+                    Some(attno)
+                }
+            }
+            None => {
+                TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, 0));
+                None
+            }
+        }
+    }
+}
+
+/// Find the parent table OID for a child partition via append_rel_list.
+unsafe fn find_parent_oid(
+    root: *mut pg_sys::PlannerInfo,
+    child_rti: pg_sys::Index,
+) -> Option<pg_sys::Oid> {
+    unsafe {
+        let list = (*root).append_rel_list;
+        if list.is_null() {
+            return None;
+        }
+        let len = (*list).length;
+        for i in 0..len {
+            let node = pg_sys::list_nth(list, i) as *const pg_sys::AppendRelInfo;
+            if node.is_null() {
+                continue;
+            }
+            if (*node).child_relid == child_rti {
+                let parent_rte =
+                    *(*root).simple_rte_array.add((*node).parent_relid as usize);
+                return Some((*parent_rte).relid);
+            }
+        }
+        None
+    }
+}
+
+/// Check if the first query pathkey matches the time column (ASC only).
+/// Returns a single-element pathkey list if matched, null otherwise.
+unsafe fn check_time_pathkey(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    time_col_attno: i16,
+) -> *mut pg_sys::List {
+    unsafe {
+        let query_pathkeys = (*root).query_pathkeys;
+        if query_pathkeys.is_null() || (*query_pathkeys).length == 0 {
+            return std::ptr::null_mut();
+        }
+
+        let first_pk = pg_sys::list_nth(query_pathkeys, 0) as *mut pg_sys::PathKey;
+        if first_pk.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        // Only ASC for now
+        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
+        #[cfg(feature = "pg18")]
+        let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
+        if !is_asc {
+            return std::ptr::null_mut();
+        }
+
+        let eclass = (*first_pk).pk_eclass;
+        if eclass.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        let members = (*eclass).ec_members;
+        if members.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        let rel_varno = (*rel).relid;
+        let nmembers = (*members).length;
+        for i in 0..nmembers {
+            let member = pg_sys::list_nth(members, i) as *const pg_sys::EquivalenceMember;
+            if member.is_null() {
+                continue;
+            }
+            let expr = (*member).em_expr as *const pg_sys::Node;
+            if expr.is_null() {
+                continue;
+            }
+            if (*expr).type_ != pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            let var = expr as *const pg_sys::Var;
+            if (*var).varno as u32 == rel_varno && (*var).varattno == time_col_attno {
+                // Match — return single-element list with this PathKey
+                return pg_sys::lappend(
+                    std::ptr::null_mut(),
+                    first_pk as *mut std::ffi::c_void,
+                );
+            }
+        }
+
+        std::ptr::null_mut()
+    }
 }
 
 /// The planner hook. Called for each relation during path generation.
@@ -57,7 +214,7 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
             && (*rte).inh
             && let Some(companion_oids) = collect_compressed_children(root, rti)
         {
-            path::add_cocoon_append_path(root, rel, &companion_oids);
+            path::add_cocoon_append_path(root, rel, &companion_oids, std::ptr::null_mut());
             return;
         }
 
@@ -86,8 +243,18 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
             return;
         }
 
+        // For child partitions, check if we can advertise sorted output
+        let pathkeys = if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL {
+            find_parent_oid(root, rti)
+                .and_then(|parent_oid| get_time_column_attno(parent_oid))
+                .map(|attno| check_time_pathkey(root, rel, attno))
+                .unwrap_or(std::ptr::null_mut())
+        } else {
+            std::ptr::null_mut()
+        };
+
         // Add the custom decompress path
-        path::add_decompress_path(root, rel, companion_oid);
+        path::add_decompress_path(root, rel, companion_oid, pathkeys);
     }
 }
 

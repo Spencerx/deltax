@@ -432,6 +432,9 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
         );
 
+        // Sort segments by min_time for time-ordered output
+        state.segments_data.sort_by_key(|s| s.min_time.unwrap_or(i64::MAX));
+
         // Box and store as raw pointer in custom_ps
         let state_box = Box::new(state);
         let state_ptr = Box::into_raw(state_box);
@@ -606,6 +609,9 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
             pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
         );
+
+        // Sort segments by min_time for time-ordered output
+        state.segments_data.sort_by_key(|s| s.min_time.unwrap_or(i64::MAX));
 
         let state_box = Box::new(state);
         let state_ptr = Box::into_raw(state_box);
