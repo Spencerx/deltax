@@ -412,17 +412,6 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         let plan_qual = (*(*node).ss.ps.plan).qual;
         let mut state = load_decompress_state(companion_oid, &companion_name, &needed_indices, plan_qual);
 
-        // Extract segment pruning filters from plan qual
-        let (seg_filters, t_min, t_max) = extract_segment_filters(
-            plan_qual,
-            &state.col_names,
-            &state.segment_by,
-            &state.time_column,
-        );
-        state.segment_by_filters = seg_filters;
-        state.time_min = t_min;
-        state.time_max = t_max;
-
         // Create per-segment memory context
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
         state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
@@ -541,12 +530,25 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
             (nc, nci)
         };
 
-        // Load segments from ALL companion tables via heap scan
+        // Extract segment pruning filters BEFORE heap scan for lazy detoasting
+        let (seg_filters, t_min, t_max) = extract_segment_filters(
+            plan_qual,
+            &meta.col_names,
+            &meta.segment_by,
+            &meta.time_column,
+        );
+
+        // Load segments from ALL companion tables via heap scan (with lazy pruning)
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
+        let mut total_skipped: u64 = 0;
         for &oid in &companion_oids {
-            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column, false);
+            let (segs, skipped) = load_segments_heap(
+                oid, &meta.col_names, &meta.segment_by, &needed_cols,
+                &meta.time_column, false, &seg_filters, t_min, t_max,
+            );
             all_segments.extend(segs);
+            total_skipped += skipped;
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
 
@@ -579,27 +581,16 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
                 rows_batch_filtered: 0,
                 segments_decompressed: 0,
                 compressed_bytes,
-                segments_skipped: 0,
+                segments_skipped: total_skipped,
             },
             instrument: None,
             time_column: meta.time_column,
-            segment_by_filters: Vec::new(),
-            time_min: None,
-            time_max: None,
+            segment_by_filters: seg_filters,
+            time_min: t_min,
+            time_max: t_max,
             batch_quals,
             selection_vector: Vec::new(),
         };
-
-        // Extract segment pruning filters from plan qual
-        let (seg_filters, t_min, t_max) = extract_segment_filters(
-            plan_qual,
-            &state.col_names,
-            &state.segment_by,
-            &state.time_column,
-        );
-        state.segment_by_filters = seg_filters;
-        state.time_min = t_min;
-        state.time_max = t_max;
 
         // Create per-segment memory context
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
@@ -677,13 +668,16 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
         let mut total_count: i64 = 0;
         let mut total_segments: u64 = 0;
         for &oid in &companion_oids {
-            let segs = load_segments_heap(
+            let (segs, _) = load_segments_heap(
                 oid,
                 &meta.col_names,
                 &meta.segment_by,
                 &needed_cols,
                 &meta.time_column,
                 false,
+                &[],
+                None,
+                None,
             );
             for seg in &segs {
                 total_count += seg.row_count as i64;
@@ -896,13 +890,16 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
 
         let mut total_segments: u64 = 0;
         for &oid in &companion_oids {
-            let segs = load_segments_heap(
+            let (segs, _) = load_segments_heap(
                 oid,
                 &meta.col_names,
                 &meta.segment_by,
                 &needed_cols,
                 &meta.time_column,
                 true,
+                &[],
+                None,
+                None,
             );
             for seg in &segs {
                 for (agg_idx, result) in results.iter_mut().enumerate() {
@@ -1199,11 +1196,14 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.segment_by,
             &meta.time_column,
         );
-        // Load segments from all companion tables
+        // Load segments from all companion tables (with lazy pruning)
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         for &oid in &companion_oids {
-            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column, false);
+            let (segs, _) = load_segments_heap(
+                oid, &meta.col_names, &meta.segment_by, &needed_cols,
+                &meta.time_column, false, &seg_filters, time_min, time_max,
+            );
             all_segments.extend(segs);
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
@@ -1786,6 +1786,7 @@ fn load_metadata(
 /// Bypasses SPI entirely — opens the companion table, iterates all tuples
 /// with `heap_getnext`, and extracts segment_by values, compressed BYTEA blobs,
 /// and row counts directly from the heap tuples.
+#[allow(clippy::too_many_arguments)]
 unsafe fn load_segments_heap(
     companion_oid: pg_sys::Oid,
     col_names: &[String],
@@ -1793,7 +1794,10 @@ unsafe fn load_segments_heap(
     needed_cols: &[bool],
     time_column: &str,
     load_minmax: bool,
-) -> Vec<SegmentData> {
+    segment_by_filters: &[(usize, String)],
+    time_min: Option<i64>,
+    time_max: Option<i64>,
+) -> (Vec<SegmentData>, u64) {
     unsafe {
         // Open companion table with AccessShareLock
         let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
@@ -1885,6 +1889,7 @@ unsafe fn load_segments_heap(
 
         // Iterate all tuples
         let mut segments = Vec::new();
+        let mut segments_skipped: u64 = 0;
         let mut values = vec![pg_sys::Datum::from(0); natts];
         let mut nulls = vec![true; natts];
 
@@ -1923,6 +1928,50 @@ unsafe fn load_segments_heap(
                 }
             }
 
+            // Extract _row_count (INT4) — cheap, needed before pruning
+            let row_count = match row_count_attno {
+                Some(attno) if !nulls[attno] => values[attno].value() as i32,
+                _ => 0,
+            };
+
+            // Extract min/max time (TIMESTAMPTZ stored as i64 PG epoch microseconds) — cheap
+            let seg_min_time = match min_time_attno {
+                Some(attno) if !nulls[attno] => Some(values[attno].value() as i64),
+                _ => None,
+            };
+            let seg_max_time = match max_time_attno {
+                Some(attno) if !nulls[attno] => Some(values[attno].value() as i64),
+                _ => None,
+            };
+
+            // --- Lazy pruning: skip blob detoasting for segments that fail filters ---
+
+            // Check segment_by filters
+            if !segment_by_filters.is_empty() {
+                let mut skip = false;
+                for &(seg_val_idx, ref filter_val) in segment_by_filters {
+                    match &segment_values.get(seg_val_idx).and_then(|v| v.as_ref()) {
+                        Some(val) if *val == filter_val => {}
+                        _ => { skip = true; break; }
+                    }
+                }
+                if skip {
+                    segments_skipped += 1;
+                    continue;
+                }
+            }
+
+            // Check time range filters
+            if let (Some(s_min), Some(s_max)) = (seg_min_time, seg_max_time)
+                && (time_min.is_some_and(|qmin| s_max < qmin)
+                    || time_max.is_some_and(|qmax| s_min > qmax))
+            {
+                segments_skipped += 1;
+                continue;
+            }
+
+            // --- Segment passed pruning: detoast blobs ---
+
             // Extract compressed BYTEA blobs
             let mut compressed_blobs: Vec<Vec<u8>> = Vec::new();
             for opt_attno in &compressed_attnos {
@@ -1955,22 +2004,6 @@ unsafe fn load_segments_heap(
                 }
             }
 
-            // Extract _row_count (INT4)
-            let row_count = match row_count_attno {
-                Some(attno) if !nulls[attno] => values[attno].value() as i32,
-                _ => 0,
-            };
-
-            // Extract min/max time (TIMESTAMPTZ stored as i64 PG epoch microseconds)
-            let min_time = match min_time_attno {
-                Some(attno) if !nulls[attno] => Some(values[attno].value() as i64),
-                _ => None,
-            };
-            let max_time = match max_time_attno {
-                Some(attno) if !nulls[attno] => Some(values[attno].value() as i64),
-                _ => None,
-            };
-
             // Extract per-column min/max
             let mut col_minmax = HashMap::new();
             for (col_name, min_att, max_att, type_oid) in &minmax_col_attnos {
@@ -1987,8 +2020,8 @@ unsafe fn load_segments_heap(
                 segment_values,
                 compressed_blobs,
                 row_count,
-                min_time,
-                max_time,
+                min_time: seg_min_time,
+                max_time: seg_max_time,
                 col_minmax,
             });
         }
@@ -1997,7 +2030,7 @@ unsafe fn load_segments_heap(
         (*(*rel).rd_tableam).scan_end.unwrap()(scan);
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
-        segments
+        (segments, segments_skipped)
     }
 }
 
@@ -2042,10 +2075,18 @@ fn load_decompress_state(
         (nc, nci)
     };
 
+    // Extract segment pruning filters BEFORE heap scan for lazy detoasting
+    let (seg_filters, t_min, t_max) = unsafe {
+        extract_segment_filters(plan_qual, &meta.col_names, &meta.segment_by, &meta.time_column)
+    };
+
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
     let t1 = Instant::now();
-    let segments_data = unsafe {
-        load_segments_heap(companion_oid, &meta.col_names, &meta.segment_by, &needed_cols, &meta.time_column, false)
+    let (segments_data, segments_skipped) = unsafe {
+        load_segments_heap(
+            companion_oid, &meta.col_names, &meta.segment_by, &needed_cols,
+            &meta.time_column, false, &seg_filters, t_min, t_max,
+        )
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;
 
@@ -2078,13 +2119,13 @@ fn load_decompress_state(
             rows_batch_filtered: 0,
             segments_decompressed: 0,
             compressed_bytes,
-            segments_skipped: 0,
+            segments_skipped,
         },
         instrument: None,
         time_column: meta.time_column,
-        segment_by_filters: Vec::new(),
-        time_min: None,
-        time_max: None,
+        segment_by_filters: seg_filters,
+        time_min: t_min,
+        time_max: t_max,
         batch_quals,
         selection_vector: Vec::new(),
     }
