@@ -1545,6 +1545,31 @@ fn datum_to_f64(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> f64 {
     }
 }
 
+/// Convert an i128 value to a PostgreSQL NUMERIC datum.
+///
+/// For values fitting in i64, uses the fast `int8_numeric` path.
+/// For larger values, converts via string representation.
+unsafe fn i128_to_numeric_datum(val: i128) -> pg_sys::Datum {
+    unsafe {
+        if val >= i64::MIN as i128 && val <= i64::MAX as i128 {
+            pg_sys::OidFunctionCall1Coll(
+                pg_sys::Oid::from(1781u32),  // int8_numeric
+                pg_sys::InvalidOid,
+                pg_sys::Datum::from(val as i64 as usize),
+            )
+        } else {
+            let s = std::ffi::CString::new(val.to_string()).unwrap();
+            pg_sys::OidFunctionCall3Coll(
+                pg_sys::Oid::from(1701u32),  // numeric_in
+                pg_sys::InvalidOid,
+                pg_sys::Datum::from(s.as_ptr()),
+                pg_sys::Datum::from(0usize),
+                pg_sys::Datum::from(-1i32 as usize),
+            )
+        }
+    }
+}
+
 /// Finalize an accumulator into a (Datum, is_null) result pair.
 unsafe fn finalize_accumulator(acc: &AggAccumulator, spec: &AggExecSpec) -> (pg_sys::Datum, bool) {
     unsafe {
@@ -1557,26 +1582,26 @@ unsafe fn finalize_accumulator(acc: &AggAccumulator, spec: &AggExecSpec) -> (pg_
                     AggType::Sum => {
                         // SUM(int2/int4) → INT8, SUM(int8) → NUMERIC
                         if spec.col_type_oid == pg_sys::INT8OID {
-                            // Result is NUMERIC — convert via OidFunctionCall
-                            let i64_val = *sum as i64;
-                            let datum = pg_sys::OidFunctionCall1Coll(
-                                pg_sys::Oid::from(1781u32),  // int8_numeric OID
-                                pg_sys::InvalidOid,
-                                pg_sys::Datum::from(i64_val as usize),
-                            );
-                            (datum, false)
+                            // Result is NUMERIC — use i128_to_numeric for full range
+                            (i128_to_numeric_datum(*sum), false)
                         } else {
                             // Result is INT8
                             (pg_sys::Datum::from(*sum as i64 as usize), false)
                         }
                     }
                     AggType::Avg => {
-                        // AVG(int*) → NUMERIC
-                        let avg_f64 = *sum as f64 / *count as f64;
-                        let datum = pg_sys::OidFunctionCall1Coll(
-                            pg_sys::Oid::from(1743u32),  // float8_numeric OID
+                        // AVG(int*) → NUMERIC — use exact NUMERIC arithmetic
+                        let sum_numeric = i128_to_numeric_datum(*sum);
+                        let count_numeric = pg_sys::OidFunctionCall1Coll(
+                            pg_sys::Oid::from(1781u32),  // int8_numeric
                             pg_sys::InvalidOid,
-                            pg_sys::Datum::from(avg_f64.to_bits() as usize),
+                            pg_sys::Datum::from(*count as usize),
+                        );
+                        let datum = pg_sys::OidFunctionCall2Coll(
+                            pg_sys::Oid::from(1727u32),  // numeric_div
+                            pg_sys::InvalidOid,
+                            sum_numeric,
+                            count_numeric,
                         );
                         (datum, false)
                     }

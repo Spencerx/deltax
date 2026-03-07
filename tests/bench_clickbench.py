@@ -27,8 +27,9 @@ from clickbench_data import (
     query_results_to_dict,
     run_queries,
     save_bench_results,
+    validate_nondet_query,
 )
-from clickbench_queries import QUERIES
+from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, QUERIES
 
 
 # ---------------------------------------------------------------------------
@@ -38,10 +39,10 @@ from clickbench_queries import QUERIES
 def setup_clickbench(conn, n_files: int):
     """Create the hits table, set up partitioning, and load data."""
     # Pin time to July 2013 so partitions cover the data range
-    conn.execute("SET pg_seaturtle.mock_now = '2013-07-15 12:00:00+00'")
+    conn.execute("SET pg_seaturtle.mock_now = '2013-07-01 12:00:00+00'")
     conn.execute(CREATE_TABLE_SQL)
     conn.execute(
-        "SELECT seaturtle_create_table('hits', 'eventtime', '1 day'::interval, 31)"
+        "SELECT seaturtle_create_table('hits', 'eventtime', '3 days'::interval, 15)"
     )
     conn.commit()
 
@@ -358,6 +359,10 @@ class TestClickBench:
                 print(f"  {qid}: (no compressed scan)")
 
         # Phase 5: Validate compressed results match uncompressed
+        #
+        # Non-deterministic queries (ties in ORDER BY + LIMIT/OFFSET) are
+        # validated by row count only.  Deterministic queries use sorted
+        # comparison so scan-order differences don't cause false positives.
         print("\n=== Phase 5: Validating Results ===")
         mismatches = []
         for qid, desc, _ in QUERIES:
@@ -368,7 +373,20 @@ class TestClickBench:
                 print(f"  {qid}: SKIP (query errored)")
                 continue
 
-            if u_rows == c_rows:
+            if qid in NONDETERMINISTIC_QUERIES:
+                if len(u_rows) != len(c_rows):
+                    mismatches.append(qid)
+                    print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
+                else:
+                    ok, detail = validate_nondet_query(
+                        qid, u_rows, c_rows, NONDET_SORT_INFO.get(qid)
+                    )
+                    if ok:
+                        print(f"  {qid}: OK ({detail})")
+                    else:
+                        mismatches.append(qid)
+                        print(f"  {qid}: MISMATCH ({detail})")
+            elif sorted(u_rows) == sorted(c_rows):
                 print(f"  {qid}: OK ({len(u_rows)} rows match)")
             else:
                 mismatches.append(qid)

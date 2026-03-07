@@ -1747,3 +1747,141 @@ class TestDMLBlocking:
                 "SELECT count(*) FROM metrics WHERE device_id = 'dev-new'"
             ).fetchone()[0]
             assert count == 1
+
+
+class TestRegressions:
+    """Regression tests for specific bugs found via ClickBench."""
+
+    def test_avg_bigint_precision(self, db):
+        """AVG(bigint) must use exact NUMERIC arithmetic, not f64.
+
+        Regression: the aggregate pushdown converted the i128 sum to f64
+        before dividing, losing precision for sums exceeding 2^53.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE avg_precision (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                big_val BIGINT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('avg_precision', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert rows with large BIGINT values — the sum will exceed f64
+        # precision (2^53 ≈ 9e15).  100 values near 4e18 → sum ≈ 4e20.
+        for i in range(100):
+            db.execute(
+                f"INSERT INTO avg_precision VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 5}', "
+                f"{4_000_000_000_000_000_000 + i * 1_000_000_000})"
+            )
+        db.commit()
+
+        # Query BEFORE compression
+        before_avg = db.execute(
+            "SELECT avg(big_val) FROM avg_precision"
+        ).fetchone()[0]
+        before_sum = db.execute(
+            "SELECT sum(big_val) FROM avg_precision"
+        ).fetchone()[0]
+
+        # Enable compression and compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('avg_precision', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "avg_precision")
+
+        # Query AFTER compression
+        after_avg = db.execute(
+            "SELECT avg(big_val) FROM avg_precision"
+        ).fetchone()[0]
+        after_sum = db.execute(
+            "SELECT sum(big_val) FROM avg_precision"
+        ).fetchone()[0]
+
+        # Must be EXACTLY equal — no floating-point tolerance
+        assert after_avg == before_avg, (
+            f"AVG(bigint) precision loss: expected {before_avg}, got {after_avg}"
+        )
+        assert after_sum == before_sum, (
+            f"SUM(bigint) overflow: expected {before_sum}, got {after_sum}"
+        )
+
+    def test_order_by_time_with_segment_by(self, db):
+        """ORDER BY time_column must return correct results when segment_by is set.
+
+        Regression: the sorted scan advertised sorted output via pathkeys,
+        but with segment_by, segments have overlapping time ranges so the
+        output was not globally sorted.  The planner skipped the Sort node,
+        producing wrong ORDER BY results.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE order_test (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                value INTEGER NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('order_test', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert data with interleaved timestamps across devices so that
+        # segment_by groups have overlapping time ranges.
+        # Each row gets a unique timestamp to make ORDER BY fully deterministic.
+        devices = ["alpha", "beta", "gamma"]
+        for i in range(60):
+            for j, dev in enumerate(devices):
+                minute = i * len(devices) + j
+                db.execute(
+                    f"INSERT INTO order_test VALUES ("
+                    f"'{BASE_TS}'::timestamptz + interval '{minute} minutes', "
+                    f"'{dev}', {minute})"
+                )
+        db.commit()
+
+        # Query BEFORE compression (this is the ground truth)
+        before_asc = db.execute(
+            "SELECT ts, device_id, value FROM order_test "
+            "ORDER BY ts ASC LIMIT 20"
+        ).fetchall()
+        before_filtered = db.execute(
+            "SELECT device_id, value FROM order_test "
+            "WHERE device_id <> 'alpha' ORDER BY ts ASC LIMIT 15"
+        ).fetchall()
+
+        # Enable compression with segment_by and compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('order_test', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "order_test")
+
+        # Query AFTER compression
+        after_asc = db.execute(
+            "SELECT ts, device_id, value FROM order_test "
+            "ORDER BY ts ASC LIMIT 20"
+        ).fetchall()
+        after_filtered = db.execute(
+            "SELECT device_id, value FROM order_test "
+            "WHERE device_id <> 'alpha' ORDER BY ts ASC LIMIT 15"
+        ).fetchall()
+
+        assert after_asc == before_asc, (
+            f"ORDER BY ts ASC LIMIT 20 mismatch:\n"
+            f"  before: {before_asc[:5]}...\n"
+            f"  after:  {after_asc[:5]}..."
+        )
+        assert after_filtered == before_filtered, (
+            f"Filtered ORDER BY ts ASC LIMIT 15 mismatch:\n"
+            f"  before: {before_filtered[:5]}...\n"
+            f"  after:  {after_filtered[:5]}..."
+        )

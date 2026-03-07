@@ -19,6 +19,10 @@ thread_local! {
     static TIME_COLUMN_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, i16>> =
         std::cell::RefCell::new(HashMap::new());
 
+    /// Cache of parent table OID → whether segment_by is configured.
+    static SEGMENT_BY_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, bool>> =
+        std::cell::RefCell::new(HashMap::new());
+
     /// When true, the ExecutorStart hook skips the DML-on-compressed check.
     /// Used by internal operations like seaturtle_decompress_partition.
     static DML_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -27,6 +31,7 @@ thread_local! {
 pub fn invalidate_compressed_cache() {
     COMPRESSED_CACHE.with(|cache| cache.borrow_mut().clear());
     TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().clear());
+    SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Set or clear the DML bypass flag for internal operations.
@@ -118,6 +123,55 @@ unsafe fn find_parent_oid(
             }
         }
         None
+    }
+}
+
+/// Check whether a hypertable has segment_by configured. When segment_by is
+/// used, segments within a partition have overlapping time ranges, so we cannot
+/// advertise sorted output via pathkeys. Result is cached.
+unsafe fn has_segment_by(parent_oid: pg_sys::Oid) -> bool {
+    let cached = SEGMENT_BY_CACHE.with(|cache| cache.borrow().get(&parent_oid).copied());
+    if let Some(val) = cached {
+        return val;
+    }
+
+    unsafe {
+        let schema_name_ptr = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(parent_oid));
+        let table_name_ptr = pg_sys::get_rel_name(parent_oid);
+        if schema_name_ptr.is_null() || table_name_ptr.is_null() {
+            SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, false));
+            return false;
+        }
+        let schema_name = std::ffi::CStr::from_ptr(schema_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+        let table_name = std::ffi::CStr::from_ptr(table_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+
+        let result: bool = pgrx::Spi::connect(|client| {
+            let result = client.select(
+                "SELECT segment_by FROM seaturtle_hypertable WHERE schema_name = $1 AND table_name = $2",
+                None,
+                &[schema_name.as_str().into(), table_name.as_str().into()],
+            );
+            match result {
+                Ok(mut table) => match table.next() {
+                    Some(row) => row
+                        .get_datum_by_ordinal(1)
+                        .ok()
+                        .and_then(|d| d.value::<Vec<String>>().ok())
+                        .flatten()
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false),
+                    None => false,
+                },
+                Err(_) => false,
+            }
+        });
+
+        SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, result));
+        result
     }
 }
 
@@ -243,10 +297,18 @@ pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
             return;
         }
 
-        // For child partitions, check if we can advertise sorted output
+        // For child partitions, check if we can advertise sorted output.
+        // When segment_by is configured, segments have overlapping time ranges
+        // within a partition, so sorted output cannot be guaranteed.
         let pathkeys = if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL {
             find_parent_oid(root, rti)
-                .and_then(|parent_oid| get_time_column_attno(parent_oid))
+                .and_then(|parent_oid| {
+                    if has_segment_by(parent_oid) {
+                        None
+                    } else {
+                        get_time_column_attno(parent_oid)
+                    }
+                })
                 .map(|attno| check_time_pathkey(root, rel, attno))
                 .unwrap_or(std::ptr::null_mut())
         } else {

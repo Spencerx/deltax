@@ -32,8 +32,9 @@ from clickbench_data import (
     query_results_to_dict,
     run_queries,
     save_bench_results,
+    validate_nondet_query,
 )
-from clickbench_queries import QUERIES
+from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, QUERIES
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -133,7 +134,7 @@ def setup_timescaledb(conn):
     t0 = time.monotonic()
     conn.execute(
         "SELECT create_hypertable('hits', 'eventtime', "
-        "chunk_time_interval => INTERVAL '1 day', migrate_data => true)"
+        "chunk_time_interval => INTERVAL '3 days', migrate_data => true)"
     )
     conn.commit()
     elapsed = time.monotonic() - t0
@@ -318,7 +319,11 @@ def print_oss_results(uncompr):
 # ---------------------------------------------------------------------------
 
 def validate_results(label_a, results_a, label_b, results_b):
-    """Validate that two result sets match. Returns list of mismatched query IDs."""
+    """Validate that two result sets match. Returns list of mismatched query IDs.
+
+    Non-deterministic queries (ties in ORDER BY + LIMIT/OFFSET) are validated
+    by row count only.  Deterministic queries use sorted comparison.
+    """
     mismatches = []
     for qid, desc, _ in QUERIES:
         _, rows_a = results_a.get(qid, (None, None))
@@ -328,7 +333,20 @@ def validate_results(label_a, results_a, label_b, results_b):
             print(f"  {qid}: SKIP (query errored in {label_a if rows_a is None else label_b})")
             continue
 
-        if rows_a == rows_b:
+        if qid in NONDETERMINISTIC_QUERIES:
+            if len(rows_a) != len(rows_b):
+                mismatches.append(qid)
+                print(f"  {qid}: MISMATCH row count ({label_a}={len(rows_a)}, {label_b}={len(rows_b)})")
+            else:
+                ok, detail = validate_nondet_query(
+                    qid, rows_a, rows_b, NONDET_SORT_INFO.get(qid)
+                )
+                if ok:
+                    print(f"  {qid}: OK ({detail})")
+                else:
+                    mismatches.append(qid)
+                    print(f"  {qid}: MISMATCH ({detail})")
+        elif sorted(rows_a) == sorted(rows_b):
             print(f"  {qid}: OK ({len(rows_a)} rows match)")
         else:
             mismatches.append(qid)
