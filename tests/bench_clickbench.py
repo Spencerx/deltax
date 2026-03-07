@@ -146,7 +146,7 @@ def run_explain_analyze(conn, queries):
             )
 
             # Sum stats across partitions
-            stat_totals = {"segments": 0, "segments_skipped": 0, "rows_out": 0, "rows_filtered": 0, "rows_batch_filtered": 0, "compressed_bytes": 0}
+            stat_totals = {"segments": 0, "segments_skipped": 0, "phase2_skipped": 0, "rows_out": 0, "rows_filtered": 0, "rows_batch_filtered": 0, "compressed_bytes": 0}
             for s in stats_lines:
                 for token in s.split():
                     if "=" in token:
@@ -210,18 +210,18 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
     if profile_results:
         print("\n### SeaTurtle Scan Timing Breakdown (EXPLAIN ANALYZE)")
         print()
-        print(f"| {'Query':<6} | {'SeaTurtle Total':>13} | {'Metadata':>10} | {'Heap Scan':>10} | {'Decompress':>11} | {'Batch Eval':>10} | {'Emit':>10} | {'Stats':<65} |")
-        print(f"|{'-'*8}|{'-'*15}|{'-'*12}|{'-'*12}|{'-'*13}|{'-'*12}|{'-'*12}|{'-'*67}|")
+        print(f"| {'Query':<6} | {'SeaTurtle Total':>13} | {'Metadata':>10} | {'Heap Scan':>10} | {'Decompress':>11} | {'Batch Eval':>10} | {'Emit':>10} | {'Stats':<85} |")
+        print(f"|{'-'*8}|{'-'*15}|{'-'*12}|{'-'*12}|{'-'*13}|{'-'*12}|{'-'*12}|{'-'*87}|")
 
         for qid, desc, _ in QUERIES:
             info = profile_results.get(qid, {})
             if "error" in info:
-                print(f"| {qid:<6} | {'ERR':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'':>10} | {info['error'][:65]:<65} |")
+                print(f"| {qid:<6} | {'ERR':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'':>10} | {info['error'][:85]:<85} |")
                 continue
             timing = info.get("timing", "")
             stats = info.get("stats", "")
             if not timing:
-                print(f"| {qid:<6} | {'n/a':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'':>10} | {'(no compressed scan)' :<65} |")
+                print(f"| {qid:<6} | {'n/a':>13} | {'':>10} | {'':>10} | {'':>11} | {'':>10} | {'':>10} | {'(no compressed scan)' :<85} |")
                 continue
 
             # Parse timing: "X.XXX ms (metadata=X.XXX heap_scan=X.XXX decompress=X.XXX batch_eval=X.XXX emit=X.XXX)"
@@ -232,7 +232,7 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
                     parts[k] = v
 
             total_str = timing.split(" ms")[0].strip() if " ms" in timing else timing
-            print(f"| {qid:<6} | {total_str + ' ms':>13} | {parts.get('metadata', ''):>10} | {parts.get('heap_scan', ''):>10} | {parts.get('decompress', ''):>11} | {parts.get('batch_eval', ''):>10} | {parts.get('emit', ''):>10} | {stats[:65]:<65} |")
+            print(f"| {qid:<6} | {total_str + ' ms':>13} | {parts.get('metadata', ''):>10} | {parts.get('heap_scan', ''):>10} | {parts.get('decompress', ''):>11} | {parts.get('batch_eval', ''):>10} | {parts.get('emit', ''):>10} | {stats[:85]:<85} |")
 
 
 def print_compression_stats(conn):

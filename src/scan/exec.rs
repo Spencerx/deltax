@@ -182,6 +182,8 @@ pub(super) struct ScanTiming {
     pub(super) compressed_bytes: u64,
     /// Total segments skipped by pruning.
     pub(super) segments_skipped: u64,
+    /// Total segments where Phase 2 was skipped (no selected rows).
+    pub(super) phase2_skipped: u64,
 }
 
 /// Per-column min/max metadata from the companion table.
@@ -582,6 +584,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
                 segments_decompressed: 0,
                 compressed_bytes,
                 segments_skipped: total_skipped,
+                phase2_skipped: 0,
             },
             instrument: None,
             _time_column: meta.time_column,
@@ -2145,6 +2148,7 @@ fn load_decompress_state(
             segments_decompressed: 0,
             compressed_bytes,
             segments_skipped,
+            phase2_skipped: 0,
         },
         instrument: None,
         _time_column: meta.time_column,
@@ -2328,6 +2332,10 @@ fn is_batch_comparable_type(type_oid: pg_sys::Oid) -> bool {
             | pg_sys::TIMESTAMPOID
             | pg_sys::TIMESTAMPTZOID
     )
+}
+
+fn is_text_type(type_oid: pg_sys::Oid) -> bool {
+    matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID)
 }
 
 /// Flip a comparison operator for `Const op Var` → `Var op Const` rewriting.
@@ -2968,11 +2976,16 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
             pg_sys::MemoryContextReset(state.segment_mcxt);
             let old_ctx = pg_sys::MemoryContextSwitchTo(state.segment_mcxt);
 
-            // Decompress needed columns directly to datums
+            // === Phase 1: Decompress filter columns and segment-by ===
+            // Columns referenced by batch quals are decompressed now.
+            // Other needed columns are deferred to Phase 2 so that text
+            // varlena allocation can be skipped for rows filtered out.
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx = 0;
             let mut seg_val_idx = 0;
             let mut pre_selection: Vec<bool> = Vec::new();
+            let has_batch_quals = !state.batch_quals.is_empty();
+            let mut phase2_cols: Vec<(usize, usize)> = Vec::new(); // (col_idx, blob_idx)
 
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
@@ -3002,7 +3015,7 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = state.col_typmods[col_idx];
 
-                    // Check if this text column has a LIKE or Eq/Ne batch qual
+                    // Check if this column has a batch qual (filter column)
                     let like_qual = state.batch_quals.iter().find(|bq| {
                         bq.col_idx == col_idx
                             && matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
@@ -3012,6 +3025,7 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                             && bq.text_const.is_some()
                             && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
+                    let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
                     if let Some(bq) = like_qual {
                         let strat = bq.like_strategy.as_ref().unwrap();
@@ -3041,7 +3055,19 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                                 *ps = *ps && *es;
                             }
                         }
+                    } else if has_any_batch_qual {
+                        // Column has a non-text batch qual (int/float comparison)
+                        // — must decompress in Phase 1 for evaluate_batch_quals
+                        let type_name = pg_type_name(type_oid);
+                        let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
+                        decompressed.push(datums);
+                    } else if has_batch_quals {
+                        // No batch qual on this column, but other quals exist
+                        // — defer to Phase 2 for selection-aware decompression
+                        phase2_cols.push((col_idx, blob_idx));
+                        decompressed.push(Vec::new());
                     } else {
+                        // No batch quals at all — decompress immediately
                         let type_name = pg_type_name(type_oid);
                         let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
                         decompressed.push(datums);
@@ -3078,6 +3104,45 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
             } else {
                 state.selection_vector.clear();
             }
+
+            // === Phase 2: Decompress deferred columns with selection awareness ===
+            // Text columns only allocate varlena for rows passing the selection
+            // vector, avoiding expensive allocation for filtered-out rows.
+            // Skip Phase 2 entirely if no rows are selected in this segment
+            // (avoids codec decode for segments with zero matches).
+            if !phase2_cols.is_empty() {
+                let any_selected = state.selection_vector.is_empty()
+                    || state.selection_vector.iter().any(|&s| s);
+
+                if any_selected {
+                    let t_phase2 = if instrument { Some(Instant::now()) } else { None };
+                    let old_ctx2 = pg_sys::MemoryContextSwitchTo(state.segment_mcxt);
+
+                    for &(col_idx, p2_blob_idx) in &phase2_cols {
+                        let blob = &seg.compressed_blobs[p2_blob_idx];
+                        let type_oid = state.col_types[col_idx];
+                        let typmod = state.col_typmods[col_idx];
+
+                        let datums = if is_text_type(type_oid) && !state.selection_vector.is_empty() {
+                            decompress_text_blob_with_selection(
+                                blob, type_oid, typmod, &state.selection_vector,
+                            )
+                        } else {
+                            let type_name = pg_type_name(type_oid);
+                            decompress_blob_to_datums(blob, &type_name, type_oid, typmod)
+                        };
+                        state.current_segment[col_idx] = datums;
+                    }
+
+                    pg_sys::MemoryContextSwitchTo(old_ctx2);
+                    if let Some(t) = t_phase2 {
+                        state.timing.decompress_us += t.elapsed().as_micros() as u64;
+                    }
+                } else {
+                    state.timing.phase2_skipped += 1;
+                    // no selected rows — skip decompression entirely
+                }
+            }
         }
     }
 }
@@ -3098,7 +3163,7 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
             pgrx::log!(
                 "pg_seaturtle scan timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
                  decompress={:.1}ms  batch_eval={:.1}ms  emit={:.1}ms  | \
-                 segments={} segments_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}",
+                 segments={} segments_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}",
                 total_us as f64 / 1000.0,
                 t.metadata_us as f64 / 1000.0,
                 t.heap_scan_us as f64 / 1000.0,
@@ -3107,6 +3172,7 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
                 t.emit_us as f64 / 1000.0,
                 t.segments_decompressed,
                 t.segments_skipped,
+                t.phase2_skipped,
                 t.rows_emitted,
                 t.rows_filtered,
                 t.rows_batch_filtered,
@@ -3704,6 +3770,132 @@ unsafe fn decompress_text_blob_with_eq_filter(
             }
         }
         (datums, sel)
+    }
+}
+
+/// Decompress a text column blob but only allocate varlena for rows where
+/// `selection[i] == true`. Non-selected rows get a placeholder `Datum(0)`.
+///
+/// This is used in two-phase decompression: after batch quals produce a
+/// selection vector, non-filter text columns only need real datums for the
+/// (typically small) set of matching rows.
+unsafe fn decompress_text_blob_with_selection(
+    blob: &[u8],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+    selection: &[bool],
+) -> Vec<(pg_sys::Datum, bool)> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    // Build a non-null selection vector (strip out positions that are null)
+    let nn_selection: Vec<bool> = if cc.null_bitmap.is_empty() {
+        selection.to_vec()
+    } else {
+        let mut nn_sel = Vec::with_capacity(non_null_count);
+        for (i, &sel) in selection.iter().enumerate().take(total_count) {
+            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if !is_null {
+                nn_sel.push(sel);
+            }
+        }
+        nn_sel
+    };
+
+    let nn_datums: Vec<pg_sys::Datum> = match cc.type_tag {
+        CompressionType::Dictionary => {
+            let (dict_entries, indices) =
+                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+
+            // Collect only selected slices for arena allocation
+            let matched_slices: Vec<&str> = indices
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&idx, _)| dict_entries[idx as usize])
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            // Merge back: selected rows get real datums, others get placeholder
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &sel in &nn_selection {
+                if sel {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            datums
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+
+            // Collect only selected slices for arena allocation
+            let matched_slices: Vec<&str> = slices
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&s, _)| s)
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &sel in &nn_selection {
+                if sel {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            datums
+        }
+        _ => {
+            // Unexpected compression type — fall back to full decompression
+            let full = unsafe {
+                decompress_blob_to_datums(blob, &pg_type_name(type_oid), type_oid, typmod)
+            };
+            return full;
+        }
+    };
+
+    // Reinsert nulls
+    if cc.null_bitmap.is_empty() {
+        nn_datums.into_iter().map(|d| (d, false)).collect()
+    } else {
+        let mut result = Vec::with_capacity(total_count);
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                result.push((pg_sys::Datum::from(0), true));
+            } else {
+                result.push((nn_datums[val_idx], false));
+                val_idx += 1;
+            }
+        }
+        result
     }
 }
 
