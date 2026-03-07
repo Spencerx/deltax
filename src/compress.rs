@@ -1053,9 +1053,9 @@ fn compress_column_values(values: &[Option<String>], data_type: &str, _col_name:
             }
             .to_bytes()
         } else {
-            let encoded = compression::lz4::encode(&refs);
+            let encoded = compression::lz4::encode_blocked(&refs, compression::lz4::DEFAULT_BLOCK_SIZE);
             CompressedColumn {
-                type_tag: CompressionType::Lz4,
+                type_tag: CompressionType::Lz4Blocked,
                 row_count: values.len() as u32,
                 null_bitmap,
                 data: encoded,
@@ -1370,6 +1370,10 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
         }
         CompressionType::Lz4 => {
             let strings = compression::lz4::decode(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+            compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+        }
+        CompressionType::Lz4Blocked => {
+            let strings = compression::lz4::decode_blocked(&cc.data, count_non_null(&cc.null_bitmap, total_count));
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
         CompressionType::BooleanBitmap => {

@@ -2875,7 +2875,6 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
         let instrument = *state.instrument.get_or_insert_with(|| {
             !(*node).ss.ps.instrument.is_null()
         });
-        let t_call = if instrument { Some(Instant::now()) } else { None };
 
         loop {
             // If current segment has more rows, try the next one
@@ -2902,6 +2901,8 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                 }
 
                 if state.row_cursor < seg_rows {
+                    let t_row = if instrument { Some(Instant::now()) } else { None };
+
                     fill_slot(scan_slot, state);
                     state.row_cursor += 1;
 
@@ -2913,6 +2914,9 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                         // Reset per-tuple memory context on filtered rows
                         pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
                         state.timing.rows_filtered += 1;
+                        if let Some(t) = t_row {
+                            state.timing.emit_us += t.elapsed().as_micros() as u64;
+                        }
                         continue; // skip this row, try next
                     }
 
@@ -2923,7 +2927,7 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                         scan_slot
                     };
                     state.timing.rows_emitted += 1;
-                    if let Some(t) = t_call {
+                    if let Some(t) = t_row {
                         state.timing.emit_us += t.elapsed().as_micros() as u64;
                     }
                     return result;
@@ -3158,6 +3162,12 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
             let state = Box::from_raw(state_ptr);
 
             // Emit timing summary at LOG level (visible with SET client_min_messages = log)
+            // All timers are non-overlapping:
+            //   metadata  — SPI metadata load (in begin)
+            //   heap_scan — direct heap scan of compressed data (in begin)
+            //   decompress — Phase 1 + Phase 2 decompression (in exec loop)
+            //   batch_eval — batch qual evaluation (in exec loop)
+            //   emit      — per-row fill_slot + qual + projection (in exec loop)
             let t = &state.timing;
             let total_us = t.metadata_us + t.heap_scan_us + t.decompress_us + t.batch_eval_us + t.emit_us;
             pgrx::log!(
@@ -3475,6 +3485,17 @@ unsafe fn decompress_blob_to_datums(
                 .collect();
             unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
         }
+        CompressionType::Lz4Blocked => {
+            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+        }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
             bools
@@ -3560,9 +3581,12 @@ unsafe fn decompress_text_blob_with_like_filter(
             }
             (datums, sel)
         }
-        CompressionType::Lz4 => {
-            let (buf, ranges) =
-                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+        CompressionType::Lz4 | CompressionType::Lz4Blocked => {
+            let (buf, ranges) = if cc.type_tag == CompressionType::Lz4 {
+                compression::lz4::decode_to_ranges(cc.data, non_null_count)
+            } else {
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None)
+            };
 
             // First pass: determine which rows match
             let slices: Vec<&str> = ranges
@@ -3699,9 +3723,12 @@ unsafe fn decompress_text_blob_with_eq_filter(
             }
             (datums, sel)
         }
-        CompressionType::Lz4 => {
-            let (buf, ranges) =
-                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+        CompressionType::Lz4 | CompressionType::Lz4Blocked => {
+            let (buf, ranges) = if cc.type_tag == CompressionType::Lz4 {
+                compression::lz4::decode_to_ranges(cc.data, non_null_count)
+            } else {
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None)
+            };
 
             let slices: Vec<&str> = ranges
                 .iter()
@@ -3854,6 +3881,37 @@ unsafe fn decompress_text_blob_with_selection(
                 .zip(nn_selection.iter())
                 .filter(|&(_, &sel)| sel)
                 .map(|(&s, _)| s)
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &sel in &nn_selection {
+                if sel {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            datums
+        }
+        CompressionType::Lz4Blocked => {
+            // Partial decompression: only decode blocks containing selected rows
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, Some(&nn_selection));
+
+            // Collect only selected slices for arena allocation
+            let matched_slices: Vec<&str> = ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
                 .collect();
             let matched_datums = unsafe {
                 str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)

@@ -13,6 +13,7 @@ pub enum CompressionType {
     Dictionary = 3,
     Lz4 = 4,
     BooleanBitmap = 5,
+    Lz4Blocked = 6,
 }
 
 impl CompressionType {
@@ -23,6 +24,7 @@ impl CompressionType {
             3 => Self::Dictionary,
             4 => Self::Lz4,
             5 => Self::BooleanBitmap,
+            6 => Self::Lz4Blocked,
             _ => panic!("unknown compression type tag: {}", v),
         }
     }
