@@ -94,18 +94,11 @@ def print_compression_table(results):
     tsdb = results.get("timescaledb_tsl")
     if tsdb:
         rows.append((
-            "TimescaleDB (matching)",
+            "TimescaleDB",
             tsdb.get("raw_bytes"),
-            tsdb.get("compressed_matching_bytes"),
-            tsdb.get("compression_ratio_matching"),
-            tsdb.get("compression_time_matching_s"),
-        ))
-        rows.append((
-            "TimescaleDB (default)",
-            tsdb.get("raw_bytes"),
-            tsdb.get("compressed_default_bytes"),
-            tsdb.get("compression_ratio_default"),
-            tsdb.get("compression_time_default_s"),
+            tsdb.get("compressed_bytes"),
+            tsdb.get("compression_ratio"),
+            tsdb.get("compression_time_s"),
         ))
 
     if not rows:
@@ -133,8 +126,7 @@ def print_query_table(results):
         columns.append(("SeaTurtle Compr", lambda qid: seaturtle.get("compressed_queries", {}).get(qid)))
     if tsdb:
         columns.append(("TSDB Uncompr", lambda qid: tsdb.get("uncompressed_queries", {}).get(qid)))
-        columns.append(("TSDB Match", lambda qid: tsdb.get("compressed_matching_queries", {}).get(qid)))
-        columns.append(("TSDB Default", lambda qid: tsdb.get("compressed_default_queries", {}).get(qid)))
+        columns.append(("TSDB Compr", lambda qid: tsdb.get("compressed_queries", {}).get(qid)))
 
     if not columns:
         return
@@ -178,12 +170,12 @@ def print_speedup_table(results):
         return
 
     seaturtle_compr = seaturtle.get("compressed_queries", {})
-    tsdb_match = tsdb.get("compressed_matching_queries", {})
+    tsdb_compr = tsdb.get("compressed_queries", {})
 
-    if not seaturtle_compr or not tsdb_match:
+    if not seaturtle_compr or not tsdb_compr:
         return
 
-    print("\n### Compressed Query Speedup (pg_seaturtle vs TimescaleDB matching)")
+    print("\n### Compressed Query Speedup (pg_seaturtle vs TimescaleDB)")
     print()
     print(f"| {'Query':<6} | {'Description':<25} | {'SeaTurtle (ms)':>12} | {'TSDB (ms)':>10} | {'Speedup':>8} |")
     print(f"|{'-'*8}|{'-'*27}|{'-'*14}|{'-'*12}|{'-'*10}|")
@@ -192,7 +184,7 @@ def print_speedup_table(results):
     tsdb_vals = []
     for qid, desc, _ in QUERIES:
         c = seaturtle_compr.get(qid)
-        t = tsdb_match.get(qid)
+        t = tsdb_compr.get(qid)
         speedup = fmt_speedup(c, t)
         print(f"| {qid:<6} | {desc:<25} | {fmt_ms(c):>12} | {fmt_ms(t):>10} | {speedup:>8} |")
         seaturtle_vals.append(c)

@@ -16,6 +16,7 @@ NONDETERMINISTIC_QUERIES = {
     "Q19",  # ORDER BY COUNT(*) DESC LIMIT — ties
     "Q24",  # ORDER BY EventTime LIMIT — timestamp ties (SELECT *)
     "Q25",  # ORDER BY EventTime LIMIT — timestamp ties (single sort key)
+    "Q27",  # ORDER BY EventTime, SearchPhrase LIMIT — timestamp+phrase ties
     "Q31",  # ORDER BY c DESC LIMIT — count ties
     "Q32",  # ORDER BY c DESC LIMIT — count ties (high-cardinality WatchID)
     "Q33",  # ORDER BY c DESC LIMIT — count ties (high-cardinality WatchID)
@@ -33,6 +34,7 @@ NONDET_SORT_INFO = {
     "Q19": (3, "DESC", False),   # COUNT(*)
     "Q24": (4, "ASC",  False),   # EventTime (col 4 in SELECT *)
     "Q25": None,                 # ORDER BY EventTime, but not in SELECT list
+    "Q27": None,                 # ORDER BY EventTime, SearchPhrase — not all sort cols in SELECT
     "Q31": (2, "DESC", False),   # COUNT(*) AS c
     "Q32": (2, "DESC", False),   # COUNT(*) AS c
     "Q33": (2, "DESC", False),   # COUNT(*) AS c

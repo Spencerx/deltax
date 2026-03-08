@@ -10,7 +10,7 @@ VENV         = .venv
 
 .PHONY: dev-image image image-fresh test build clippy run psql cargo clean integration-test \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clickbench-persist bench-clickbench-rerun bench-clean \
-       bench-timescaledb-tsl bench-timescaledb-oss bench-timescaledb bench-compare bench-all \
+       bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow
 
 # Build the dev toolchain image (rebuilds only when Dockerfile.dev changes)
@@ -139,13 +139,8 @@ bench-clickbench-rerun: $(VENV)/.stamp image
 bench-clean:
 	docker volume rm pg_seaturtle_bench_pgdata 2>/dev/null || true
 
-bench-timescaledb-tsl: $(VENV)/.stamp
+bench-timescaledb: $(VENV)/.stamp
 	TSDB_VARIANT=tsl $(VENV)/bin/pytest tests/bench_clickbench_timescaledb.py -v -s
-
-bench-timescaledb-oss: $(VENV)/.stamp
-	TSDB_VARIANT=oss $(VENV)/bin/pytest tests/bench_clickbench_timescaledb.py -v -s
-
-bench-timescaledb: bench-timescaledb-tsl bench-timescaledb-oss
 
 bench-compare: $(VENV)/.stamp
 	$(VENV)/bin/python tests/bench_compare.py

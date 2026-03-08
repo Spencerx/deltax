@@ -28,6 +28,7 @@ fn seaturtle_enable_compression(
     relation: &str,
     segment_by: default!(Vec<String>, "ARRAY[]::text[]"),
     order_by: default!(Vec<String>, "ARRAY[]::text[]"),
+    segment_size: default!(i32, "30000"),
 ) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
@@ -59,12 +60,14 @@ fn seaturtle_enable_compression(
             order_by
         };
 
-        catalog::update_hypertable_compression(client, ht.id, &segment_by, &effective_order_by)
+        let effective_segment_size = if segment_size <= 0 { 30000 } else { segment_size };
+
+        catalog::update_hypertable_compression(client, ht.id, &segment_by, &effective_order_by, effective_segment_size)
             .expect("failed to update compression settings");
 
         format!(
-            "Compression enabled on {}.{} (segment_by: {:?}, order_by: {:?})",
-            schema, table, segment_by, effective_order_by
+            "Compression enabled on {}.{} (segment_by: {:?}, order_by: {:?}, segment_size: {})",
+            schema, table, segment_by, effective_order_by, effective_segment_size
         )
     })
 }
@@ -265,8 +268,10 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let mut total_compressed_size: i64 = 0;
     let raw_size = estimate_raw_size(client, &part_fqn);
 
+    let segment_size = ht.segment_size as usize;
+
     if ht.segment_by.is_empty() {
-        // No segment_by: entire partition is one segment (split at 100k rows)
+        // No segment_by: entire partition is one segment, split at segment_size rows
         let total = compress_segment(
             client,
             &part_fqn,
@@ -275,6 +280,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
             "TRUE",
             &order_clause,
             &[],
+            segment_size,
         );
         total_compressed_size += total;
     } else {
@@ -285,6 +291,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
             &columns,
             &order_clause,
             &ht.segment_by,
+            segment_size,
         );
     }
 
@@ -625,6 +632,27 @@ fn flush_segment_data(
     total_size
 }
 
+/// Slice a TypedColumn to a sub-range [start..end).
+/// Empty columns (e.g. segment_by placeholders) are returned as-is.
+fn slice_typed_column(tc: &TypedColumn, start: usize, end: usize) -> TypedColumn {
+    match tc {
+        TypedColumn::Text(v) if v.is_empty() => TypedColumn::Text(Vec::new()),
+        TypedColumn::Text(v) => TypedColumn::Text(v[start..end].to_vec()),
+        TypedColumn::Int16(v) if v.is_empty() => TypedColumn::Int16(Vec::new()),
+        TypedColumn::Int16(v) => TypedColumn::Int16(v[start..end].to_vec()),
+        TypedColumn::Int32(v) if v.is_empty() => TypedColumn::Int32(Vec::new()),
+        TypedColumn::Int32(v) => TypedColumn::Int32(v[start..end].to_vec()),
+        TypedColumn::Int64(v) if v.is_empty() => TypedColumn::Int64(Vec::new()),
+        TypedColumn::Int64(v) => TypedColumn::Int64(v[start..end].to_vec()),
+        TypedColumn::Float32(v) if v.is_empty() => TypedColumn::Float32(Vec::new()),
+        TypedColumn::Float32(v) => TypedColumn::Float32(v[start..end].to_vec()),
+        TypedColumn::Float64(v) if v.is_empty() => TypedColumn::Float64(Vec::new()),
+        TypedColumn::Float64(v) => TypedColumn::Float64(v[start..end].to_vec()),
+        TypedColumn::Bool(v) if v.is_empty() => TypedColumn::Bool(Vec::new()),
+        TypedColumn::Bool(v) => TypedColumn::Bool(v[start..end].to_vec()),
+    }
+}
+
 /// Compress all segments using GROUP BY + string_agg for bulk column reading.
 ///
 /// Issues a single `SELECT seg_col, string_agg(col1, ...), ... GROUP BY seg_col`
@@ -636,6 +664,7 @@ fn compress_segments_single_pass(
     columns: &[ColumnMeta],
     order_clause: &str,
     segment_by: &[String],
+    segment_size: usize,
 ) -> i64 {
     let order_expr = order_clause
         .trim_start_matches("ORDER BY ")
@@ -724,14 +753,39 @@ fn compress_segments_single_pass(
             continue;
         }
 
-        total_compressed_size += flush_segment_data(
-            client,
-            companion_fqn,
-            columns,
-            &typed_cols,
-            &seg_values,
-            seg_row_count as u32,
-        );
+        // Split into chunks of segment_size rows
+        let mut offset = 0;
+        while offset < seg_row_count {
+            let chunk_end = (offset + segment_size).min(seg_row_count);
+            let chunk_rows = (chunk_end - offset) as u32;
+
+            if offset == 0 && chunk_end == seg_row_count {
+                // No splitting needed — flush directly
+                total_compressed_size += flush_segment_data(
+                    client,
+                    companion_fqn,
+                    columns,
+                    &typed_cols,
+                    &seg_values,
+                    chunk_rows,
+                );
+            } else {
+                // Slice each typed column for this chunk
+                let chunk_cols: Vec<TypedColumn> = typed_cols
+                    .iter()
+                    .map(|tc| slice_typed_column(tc, offset, chunk_end))
+                    .collect();
+                total_compressed_size += flush_segment_data(
+                    client,
+                    companion_fqn,
+                    columns,
+                    &chunk_cols,
+                    &seg_values,
+                    chunk_rows,
+                );
+            }
+            offset = chunk_end;
+        }
     }
 
     total_compressed_size
@@ -869,6 +923,7 @@ fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Option<String>,
 
 /// Compress a single segment (no segment_by) using string_agg for bulk column reading.
 /// One SQL aggregate per column → 105 datum extractions instead of rows×columns.
+#[allow(clippy::too_many_arguments)]
 fn compress_segment(
     client: &mut SpiClient,
     part_fqn: &str,
@@ -877,6 +932,7 @@ fn compress_segment(
     where_clause: &str,
     order_clause: &str,
     _segment_by: &[String],
+    segment_size: usize,
 ) -> i64 {
     let order_expr = order_clause
         .trim_start_matches("ORDER BY ")
@@ -925,14 +981,39 @@ fn compress_segment(
         return 0;
     }
 
-    flush_segment_data(
-        client,
-        companion_fqn,
-        columns,
-        &typed_cols,
-        &[],
-        row_count as u32,
-    )
+    // Split into chunks of segment_size rows
+    let mut total_size: i64 = 0;
+    let mut offset = 0;
+    while offset < row_count {
+        let chunk_end = (offset + segment_size).min(row_count);
+        let chunk_rows = (chunk_end - offset) as u32;
+
+        if offset == 0 && chunk_end == row_count {
+            total_size += flush_segment_data(
+                client,
+                companion_fqn,
+                columns,
+                &typed_cols,
+                &[],
+                chunk_rows,
+            );
+        } else {
+            let chunk_cols: Vec<TypedColumn> = typed_cols
+                .iter()
+                .map(|tc| slice_typed_column(tc, offset, chunk_end))
+                .collect();
+            total_size += flush_segment_data(
+                client,
+                companion_fqn,
+                columns,
+                &chunk_cols,
+                &[],
+                chunk_rows,
+            );
+        }
+        offset = chunk_end;
+    }
+    total_size
 }
 
 /// Compress a column's values based on the PostgreSQL data type.

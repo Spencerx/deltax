@@ -55,12 +55,20 @@ static CUSTOM_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
         CreateCustomScanState: Some(super::exec::create_custom_scan_state),
     });
 
+// Thread-local to pass Top-N info from add_decompress_path to plan_custom_path.
+// Stored as (effective_limit, sort_ascending).
+thread_local! {
+    static TOPN_INFO: std::cell::Cell<(i64, bool)> = const { std::cell::Cell::new((0, true)) };
+}
+
 /// Add a SeaTurtleDecompress custom path to the relation's pathlist.
 pub unsafe fn add_decompress_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oid: pg_sys::Oid,
     pathkeys: *mut pg_sys::List,
+    effective_limit: i64,
+    sort_ascending: bool,
 ) {
     unsafe {
         let cpath =
@@ -87,6 +95,14 @@ pub unsafe fn add_decompress_path(
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &CUSTOM_PATH_METHODS.0;
+
+        // Store Top-N info for plan_custom_path.
+        // Caller already validated that ORDER BY matches the time column.
+        if effective_limit > 0 {
+            TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending)));
+        } else {
+            TOPN_INFO.with(|cell| cell.set((0, true)));
+        }
 
         // Clear existing paths — the partition is truncated so any SeqScan
         // would return 0 rows.  We must replace it with the decompression path.
@@ -147,6 +163,14 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
                 // Convert 1-based attno to 0-based column index
                 private_list = pg_sys::lappend_int(private_list, attno - 1);
             }
+        }
+
+        // Append Top-N info: [-2, effective_limit, sort_ascending_flag]
+        let (effective_limit, sort_ascending) = TOPN_INFO.with(|cell| cell.replace((0, true)));
+        if effective_limit > 0 {
+            private_list = pg_sys::lappend_int(private_list, -2);
+            private_list = pg_sys::lappend_int(private_list, effective_limit as i32);
+            private_list = pg_sys::lappend_int(private_list, if sort_ascending { 1 } else { 0 });
         }
 
         (*cscan).custom_private = private_list;
@@ -809,6 +833,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
 // SeaTurtleAppend: replaces Append with single CustomScan for all compressed partitions
 // ============================================================================
 
+// Thread-local to pass Top-N info from add_seaturtle_append_path to plan_seaturtle_append_path.
+thread_local! {
+    static APPEND_TOPN_INFO: std::cell::Cell<(i64, bool)> = const { std::cell::Cell::new((0, true)) };
+}
+
 /// Add a SeaTurtleAppend custom path to the parent relation's pathlist.
 ///
 /// This replaces the Append node with a single CustomScan that internally
@@ -818,6 +847,8 @@ pub unsafe fn add_seaturtle_append_path(
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     pathkeys: *mut pg_sys::List,
+    effective_limit: i64,
+    sort_ascending: bool,
 ) {
     unsafe {
         let cpath =
@@ -856,6 +887,13 @@ pub unsafe fn add_seaturtle_append_path(
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &SEATURTLE_APPEND_PATH_METHODS.0;
+
+        // Store Top-N info. Caller validates ORDER BY matches time column.
+        if effective_limit > 0 {
+            APPEND_TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending)));
+        } else {
+            APPEND_TOPN_INFO.with(|cell| cell.set((0, true)));
+        }
 
         // Clear existing paths (removes Append paths)
         (*rel).pathlist = std::ptr::null_mut();
@@ -922,6 +960,14 @@ pub unsafe extern "C-unwind" fn plan_seaturtle_append_path(
             if attno > 0 {
                 private_list = pg_sys::lappend_int(private_list, attno - 1);
             }
+        }
+
+        // Append Top-N info: [-2, effective_limit, sort_ascending_flag]
+        let (effective_limit, sort_ascending) = APPEND_TOPN_INFO.with(|cell| cell.replace((0, true)));
+        if effective_limit > 0 {
+            private_list = pg_sys::lappend_int(private_list, -2);
+            private_list = pg_sys::lappend_int(private_list, effective_limit as i32);
+            private_list = pg_sys::lappend_int(private_list, if sort_ascending { 1 } else { 0 });
         }
 
         (*cscan).custom_private = private_list;

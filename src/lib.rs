@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS seaturtle_hypertable (
     drop_after      INTERVAL,
     segment_by      TEXT[],
     order_by        TEXT[],
+    segment_size    INT DEFAULT 30000,
     created_at      TIMESTAMPTZ DEFAULT now(),
     UNIQUE(schema_name, table_name)
 );

@@ -12,6 +12,7 @@ Scale up:
     PG_SEATURTLE_IMAGE=pg_seaturtle:pg17 CLICKBENCH_FILES=5 pytest tests/bench_clickbench.py -v -s
 """
 
+import math
 import os
 import time
 
@@ -55,14 +56,15 @@ def setup_clickbench(conn, n_files: int):
 
 
 def enable_compression(conn):
-    """Enable compression with segment_by=CounterID, order_by=EventTime."""
+    """Enable compression matching ClickBench TimescaleDB config."""
+    segment_size = int(os.environ.get("SEGMENT_SIZE", "30000"))
     conn.execute(
         "SELECT seaturtle_enable_compression('hits', "
-        "segment_by => ARRAY['counterid'], "
-        "order_by => ARRAY['eventtime'])"
+        "order_by => ARRAY['counterid', 'userid', 'eventtime'], "
+        f"segment_size => {segment_size})"
     )
     conn.commit()
-    print("  Compression enabled (segment_by=CounterID, order_by=EventTime)")
+    print(f"  Compression enabled (order_by=counterid,userid,eventtime, segment_size={segment_size})")
 
 
 def compress_all_partitions(conn):
@@ -188,24 +190,43 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
         print(f"| {'Query':<6} | {'Description':<25} | {'Uncompr (ms)':>13} | {'Compr (ms)':>11} | {'Ratio':>6} |")
         print(f"|{'-'*8}|{'-'*27}|{'-'*15}|{'-'*13}|{'-'*8}|")
 
+        u_times = []
+        c_times = []
         for qid, desc, _ in QUERIES:
             u = uncompr_results.get(qid, (float("inf"), None))[0]
             c = compr_results.get(qid, (float("inf"), None))[0]
             if u != float("inf") and c != float("inf") and c > 0:
                 ratio = f"{u / c:.2f}x"
+                u_times.append(u)
+                c_times.append(c)
             else:
                 ratio = "N/A"
             u_str = f"{u:.1f}" if u != float("inf") else "ERR"
             c_str = f"{c:.1f}" if c != float("inf") else "ERR"
             print(f"| {qid:<6} | {desc:<25} | {u_str:>13} | {c_str:>11} | {ratio:>6} |")
+
+        if u_times and c_times:
+            u_gmean = math.exp(sum(math.log(t) for t in u_times) / len(u_times))
+            c_gmean = math.exp(sum(math.log(t) for t in c_times) / len(c_times))
+            gmean_ratio = f"{u_gmean / c_gmean:.2f}x"
+            print(f"|{'-'*8}|{'-'*27}|{'-'*15}|{'-'*13}|{'-'*8}|")
+            print(f"| {'GMEAN':<6} | {'Geometric Mean':<25} | {u_gmean:>13.1f} | {c_gmean:>11.1f} | {gmean_ratio:>6} |")
     else:
         print(f"| {'Query':<6} | {'Description':<25} | {'Compr (ms)':>11} |")
         print(f"|{'-'*8}|{'-'*27}|{'-'*13}|")
 
+        c_times = []
         for qid, desc, _ in QUERIES:
             c = compr_results.get(qid, (float("inf"), None))[0]
             c_str = f"{c:.1f}" if c != float("inf") else "ERR"
             print(f"| {qid:<6} | {desc:<25} | {c_str:>11} |")
+            if c != float("inf") and c > 0:
+                c_times.append(c)
+
+        if c_times:
+            c_gmean = math.exp(sum(math.log(t) for t in c_times) / len(c_times))
+            print(f"|{'-'*8}|{'-'*27}|{'-'*13}|")
+            print(f"| {'GMEAN':<6} | {'Geometric Mean':<25} | {c_gmean:>11.1f} |")
 
     if profile_results:
         print("\n### SeaTurtle Scan Timing Breakdown (EXPLAIN ANALYZE)")

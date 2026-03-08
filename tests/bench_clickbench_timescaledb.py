@@ -1,18 +1,11 @@
-"""ClickBench benchmark for TimescaleDB (TSL and OSS variants).
+"""ClickBench benchmark for TimescaleDB.
 
 Compares TimescaleDB compression performance against pg_seaturtle on the same
-ClickBench dataset and queries.
-
-TSL variant (full license): uncompressed hypertable + two compression configs
-  - "matching": segment_by=CounterID, order_by=EventTime (same as pg_seaturtle)
-  - "default": no segment_by, order_by=EventTime only
-OSS variant (Apache 2): uncompressed hypertable only (no compression support)
-
-Controlled by TSDB_VARIANT env var: "tsl" (default) or "oss".
+ClickBench dataset and queries. Uses the official ClickBench TimescaleDB config:
+no segment_by, order_by=counterid,userid,eventtime.
 
 Run with:
-    TSDB_VARIANT=tsl pytest tests/bench_clickbench_timescaledb.py -v -s
-    TSDB_VARIANT=oss pytest tests/bench_clickbench_timescaledb.py -v -s
+    pytest tests/bench_clickbench_timescaledb.py -v -s
 """
 
 import os
@@ -153,50 +146,18 @@ def setup_timescaledb(conn):
 # Compression operations (TSL only)
 # ---------------------------------------------------------------------------
 
-def compress_matching(conn):
-    """Compress with segment_by=CounterID, order_by=EventTime (matching pg_seaturtle).
+def compress_data(conn):
+    """Compress matching official ClickBench TimescaleDB config.
 
     Returns elapsed time in seconds.
     """
-    print("\n--- Compressing (matching config: segment_by=CounterID) ---")
-    t0 = time.monotonic()
-    conn.execute(
-        "ALTER TABLE hits SET ("
-        "timescaledb.compress, "
-        "timescaledb.compress_segmentby = 'counterid', "
-        "timescaledb.compress_orderby = 'eventtime')"
-    )
-    conn.commit()
-
-    conn.execute("SELECT compress_chunk(ch) FROM show_chunks('hits') ch")
-    conn.commit()
-    elapsed = time.monotonic() - t0
-    print(f"  Compression completed in {elapsed:.1f}s")
-    return elapsed
-
-
-def decompress_all(conn):
-    """Decompress all chunks."""
-    print("\n--- Decompressing all chunks ---")
-    t0 = time.monotonic()
-    conn.execute("SELECT decompress_chunk(ch) FROM show_chunks('hits') ch")
-    conn.commit()
-    elapsed = time.monotonic() - t0
-    print(f"  Decompression completed in {elapsed:.1f}s")
-
-
-def compress_default(conn):
-    """Compress with no segment_by, order_by=EventTime only.
-
-    Returns elapsed time in seconds.
-    """
-    print("\n--- Compressing (default config: no segment_by) ---")
+    print("\n--- Compressing (orderby=counterid,userid,eventtime) ---")
     t0 = time.monotonic()
     conn.execute(
         "ALTER TABLE hits SET ("
         "timescaledb.compress, "
         "timescaledb.compress_segmentby = '', "
-        "timescaledb.compress_orderby = 'eventtime')"
+        "timescaledb.compress_orderby = 'counterid, userid, eventtime')"
     )
     conn.commit()
 
@@ -250,34 +211,28 @@ def print_compression_stats_tsdb(label, before_bytes, after_bytes):
 # Result reporting
 # ---------------------------------------------------------------------------
 
-def print_tsl_results(uncompr, compr_match, compr_dflt, uncompr_size, match_stats, dflt_stats):
+def print_tsl_results(uncompr, compr, uncompr_size, compr_stats):
     """Print combined TSL results table."""
-    match_before, match_after = match_stats
-    dflt_before, dflt_after = dflt_stats
+    compr_before, compr_after = compr_stats
 
     print("\n### Query Performance (TimescaleDB TSL)")
     print()
     print(
         f"| {'Query':<6} | {'Description':<25} "
         f"| {'Uncompr (ms)':>13} "
-        f"| {'Match (ms)':>11} "
-        f"| {'Dflt (ms)':>10} "
-        f"| {'Match Ratio':>12} "
-        f"| {'Dflt Ratio':>11} |"
+        f"| {'Compr (ms)':>11} "
+        f"| {'Ratio':>6} |"
     )
     print(
         f"|{'-'*8}|{'-'*27}"
         f"|{'-'*15}"
         f"|{'-'*13}"
-        f"|{'-'*12}"
-        f"|{'-'*14}"
-        f"|{'-'*13}|"
+        f"|{'-'*8}|"
     )
 
     for qid, desc, _ in QUERIES:
         u = uncompr.get(qid, (float("inf"), None))[0]
-        m = compr_match.get(qid, (float("inf"), None))[0]
-        d = compr_dflt.get(qid, (float("inf"), None))[0]
+        c = compr.get(qid, (float("inf"), None))[0]
 
         def _fmt(val):
             return f"{val:.1f}" if val != float("inf") else "ERR"
@@ -290,15 +245,12 @@ def print_tsl_results(uncompr, compr_match, compr_dflt, uncompr_size, match_stat
         print(
             f"| {qid:<6} | {desc:<25} "
             f"| {_fmt(u):>13} "
-            f"| {_fmt(m):>11} "
-            f"| {_fmt(d):>10} "
-            f"| {_ratio(u, m):>12} "
-            f"| {_ratio(u, d):>11} |"
+            f"| {_fmt(c):>11} "
+            f"| {_ratio(u, c):>6} |"
         )
 
     print_disk_size("uncompressed hypertable", uncompr_size)
-    print_compression_stats_tsdb("matching: segment_by=CounterID", match_before, match_after)
-    print_compression_stats_tsdb("default: no segment_by", dflt_before, dflt_after)
+    print_compression_stats_tsdb("compressed", compr_before, compr_after)
 
 
 def print_oss_results(uncompr):
@@ -411,7 +363,7 @@ class TestClickBenchTimescaleDB:
             self._run_oss_benchmark(conn)
 
     def _run_tsl_benchmark(self, conn):
-        """TSL: uncompressed -> compress matching -> compress default."""
+        """TSL: uncompressed -> compress -> query compressed."""
         # Phase 1: Uncompressed hypertable queries
         print("\n\n=== Phase 1: Uncompressed Hypertable Queries ===")
         uncompr_results = run_queries(conn, QUERIES, label="uncompr")
@@ -420,68 +372,39 @@ class TestClickBenchTimescaleDB:
         uncompr_size = get_hypertable_size(conn)
         print(f"\n  Uncompressed hypertable size: {uncompr_size / 1e6:.1f} MB")
 
-        # Phase 2: Compress with matching config
-        print("\n=== Phase 2: Compress (matching pg_seaturtle config) ===")
-        match_compress_time = compress_matching(conn)
-        match_stats = get_compression_stats(conn)
+        # Phase 2: Compress
+        print("\n=== Phase 2: Compress ===")
+        compress_time = compress_data(conn)
+        compr_stats = get_compression_stats(conn)
 
-        print("\n=== Phase 2b: Query compressed (matching) ===")
-        compr_match_results = run_queries(conn, QUERIES, label="compr-match")
+        print("\n=== Phase 2b: Query compressed ===")
+        compr_results = run_queries(conn, QUERIES, label="compr")
 
-        # Phase 3: Decompress, then compress with default config
-        print("\n=== Phase 3: Decompress ===")
-        decompress_all(conn)
+        # Phase 3: Validate results
+        print("\n=== Phase 3: Validating Results ===")
+        mismatches = validate_results("uncompr", uncompr_results, "compr", compr_results)
 
-        print("\n=== Phase 3b: Compress (default config) ===")
-        dflt_compress_time = compress_default(conn)
-        dflt_stats = get_compression_stats(conn)
-
-        print("\n=== Phase 3c: Query compressed (default) ===")
-        compr_dflt_results = run_queries(conn, QUERIES, label="compr-dflt")
-
-        # Phase 4: Validate results
-        print("\n=== Phase 4: Validating Results ===")
-        all_mismatches = []
-
-        print("\n  --- uncompr vs compr-match ---")
-        all_mismatches.extend(
-            validate_results("uncompr", uncompr_results, "compr-match", compr_match_results)
-        )
-
-        print("\n  --- uncompr vs compr-dflt ---")
-        all_mismatches.extend(
-            validate_results("uncompr", uncompr_results, "compr-dflt", compr_dflt_results)
-        )
-
-        # Phase 5: Print combined report
+        # Phase 4: Print report
         print("\n\n" + "=" * 72)
         print("  ClickBench Benchmark Results (TimescaleDB TSL)")
         print(f"  Files: {NUM_FILES}, Warmup: {WARMUP_RUNS}, Timed runs: {TIMED_RUNS}")
         print("=" * 72)
 
-        print_tsl_results(
-            uncompr_results, compr_match_results, compr_dflt_results,
-            uncompr_size, match_stats, dflt_stats,
-        )
+        print_tsl_results(uncompr_results, compr_results, uncompr_size, compr_stats)
 
         # Save results for cross-system comparison
-        match_before, match_after = match_stats
-        dflt_before, dflt_after = dflt_stats
+        compr_before, compr_after = compr_stats
         save_bench_results("timescaledb_tsl", {
             "uncompressed_queries": query_results_to_dict(uncompr_results),
-            "compressed_matching_queries": query_results_to_dict(compr_match_results),
-            "compressed_default_queries": query_results_to_dict(compr_dflt_results),
-            "raw_bytes": match_before,
-            "compressed_matching_bytes": match_after,
-            "compressed_default_bytes": dflt_after,
-            "compression_ratio_matching": match_before / match_after if match_after > 0 else 0,
-            "compression_ratio_default": dflt_before / dflt_after if dflt_after > 0 else 0,
-            "compression_time_matching_s": match_compress_time,
-            "compression_time_default_s": dflt_compress_time,
+            "compressed_queries": query_results_to_dict(compr_results),
+            "raw_bytes": compr_before,
+            "compressed_bytes": compr_after,
+            "compression_ratio": compr_before / compr_after if compr_after > 0 else 0,
+            "compression_time_s": compress_time,
         })
 
-        assert not all_mismatches, (
-            f"Result mismatch for queries: {all_mismatches}. "
+        assert not mismatches, (
+            f"Result mismatch for queries: {mismatches}. "
             "Compressed query results differ from uncompressed."
         )
 

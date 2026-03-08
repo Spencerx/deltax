@@ -175,41 +175,47 @@ unsafe fn has_segment_by(parent_oid: pg_sys::Oid) -> bool {
     }
 }
 
-/// Check if the first query pathkey matches the time column (ASC only).
-/// Returns a single-element pathkey list if matched, null otherwise.
+/// Check if the first query pathkey matches the time column (ASC or DESC).
+/// Returns `(pathkey_list, is_ascending)` — pathkey_list is null if no match.
 unsafe fn check_time_pathkey(
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     time_col_attno: i16,
-) -> *mut pg_sys::List {
+) -> (*mut pg_sys::List, bool) {
     unsafe {
         let query_pathkeys = (*root).query_pathkeys;
         if query_pathkeys.is_null() || (*query_pathkeys).length == 0 {
-            return std::ptr::null_mut();
+            return (std::ptr::null_mut(), true);
         }
 
         let first_pk = pg_sys::list_nth(query_pathkeys, 0) as *mut pg_sys::PathKey;
         if first_pk.is_null() {
-            return std::ptr::null_mut();
+            return (std::ptr::null_mut(), true);
         }
 
-        // Only ASC for now
+        // Accept both ASC and DESC
         #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
         let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
         #[cfg(feature = "pg18")]
         let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
-        if !is_asc {
-            return std::ptr::null_mut();
+
+        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        let is_desc = (*first_pk).pk_strategy == pg_sys::BTGreaterStrategyNumber as i32;
+        #[cfg(feature = "pg18")]
+        let is_desc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_GT;
+
+        if !is_asc && !is_desc {
+            return (std::ptr::null_mut(), true);
         }
 
         let eclass = (*first_pk).pk_eclass;
         if eclass.is_null() {
-            return std::ptr::null_mut();
+            return (std::ptr::null_mut(), true);
         }
 
         let members = (*eclass).ec_members;
         if members.is_null() {
-            return std::ptr::null_mut();
+            return (std::ptr::null_mut(), true);
         }
 
         let rel_varno = (*rel).relid;
@@ -229,14 +235,154 @@ unsafe fn check_time_pathkey(
             let var = expr as *const pg_sys::Var;
             if (*var).varno as u32 == rel_varno && (*var).varattno == time_col_attno {
                 // Match — return single-element list with this PathKey
-                return pg_sys::lappend(
+                let pk_list = pg_sys::lappend(
                     std::ptr::null_mut(),
                     first_pk as *mut std::ffi::c_void,
                 );
+                return (pk_list, is_asc);
             }
         }
 
-        std::ptr::null_mut()
+        (std::ptr::null_mut(), true)
+    }
+}
+
+/// Check if the first query pathkey matches a given column attno.
+/// Unlike `check_time_pathkey`, this does NOT require varno to match a specific
+/// relation, so it works for both parent and child relations. It only checks
+/// that the EC contains a Var with the given attno and that the pathkey is
+/// ASC or DESC.
+unsafe fn order_by_matches_column(
+    root: *mut pg_sys::PlannerInfo,
+    col_attno: i16,
+) -> bool {
+    unsafe {
+        let query_pathkeys = (*root).query_pathkeys;
+        if query_pathkeys.is_null() || (*query_pathkeys).length == 0 {
+            return false;
+        }
+        let first_pk = pg_sys::list_nth(query_pathkeys, 0) as *mut pg_sys::PathKey;
+        if first_pk.is_null() {
+            return false;
+        }
+        let eclass = (*first_pk).pk_eclass;
+        if eclass.is_null() {
+            return false;
+        }
+        let members = (*eclass).ec_members;
+        if members.is_null() {
+            return false;
+        }
+        let nmembers = (*members).length;
+        for i in 0..nmembers {
+            let member = pg_sys::list_nth(members, i) as *const pg_sys::EquivalenceMember;
+            if member.is_null() {
+                continue;
+            }
+            let expr = (*member).em_expr as *const pg_sys::Node;
+            if expr.is_null() {
+                continue;
+            }
+            if (*expr).type_ != pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            let var = expr as *const pg_sys::Var;
+            if (*var).varattno == col_attno {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Extract Top-N info (effective LIMIT + sort direction) from the parse tree.
+///
+/// Returns `(effective_limit, sort_ascending)`:
+/// - effective_limit = 0 means Top-N is disabled
+/// - Only enabled when LIMIT is a constant integer ≤ 10000 and ORDER BY matches time column
+unsafe fn extract_topn_info(
+    root: *mut pg_sys::PlannerInfo,
+    parse: *mut pg_sys::Query,
+) -> (i64, bool) {
+    unsafe {
+        if parse.is_null() {
+            return (0, true);
+        }
+
+        // Extract LIMIT (constant integer only)
+        let limit_count: i64 = if !(*parse).limitCount.is_null() {
+            let node = (*parse).limitCount as *const pg_sys::Node;
+            if (*node).type_ == pg_sys::NodeTag::T_Const {
+                let c = node as *const pg_sys::Const;
+                if !(*c).constisnull {
+                    (*c).constvalue.value() as i64
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if limit_count <= 0 {
+            return (0, true);
+        }
+
+        // Extract OFFSET if present, add to limit
+        let offset: i64 = if !(*parse).limitOffset.is_null() {
+            let node = (*parse).limitOffset as *const pg_sys::Node;
+            if (*node).type_ == pg_sys::NodeTag::T_Const {
+                let c = node as *const pg_sys::Const;
+                if !(*c).constisnull {
+                    (*c).constvalue.value() as i64
+                } else {
+                    0
+                }
+            } else {
+                // Non-constant OFFSET — disable Top-N
+                return (0, true);
+            }
+        } else {
+            0
+        };
+
+        let effective_limit = limit_count + offset;
+
+        // Cap at 10000 — beyond that, overhead not worth it
+        if effective_limit > 10000 {
+            return (0, true);
+        }
+
+        // Check if ORDER BY matches time column (ASC or DESC).
+        // Only single-column ORDER BY: multi-column ORDER BY (e.g. ORDER BY
+        // EventTime, SearchPhrase) can't be satisfied by sorting on time alone.
+        let query_pathkeys = (*root).query_pathkeys;
+        if query_pathkeys.is_null() || (*query_pathkeys).length != 1 {
+            return (0, true);
+        }
+
+        let first_pk = pg_sys::list_nth(query_pathkeys, 0) as *mut pg_sys::PathKey;
+        if first_pk.is_null() {
+            return (0, true);
+        }
+
+        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
+        #[cfg(feature = "pg18")]
+        let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
+
+        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        let is_desc = (*first_pk).pk_strategy == pg_sys::BTGreaterStrategyNumber as i32;
+        #[cfg(feature = "pg18")]
+        let is_desc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_GT;
+
+        if !is_asc && !is_desc {
+            return (0, true);
+        }
+
+        (effective_limit, is_asc)
     }
 }
 
@@ -263,12 +409,30 @@ pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
             return;
         }
 
+        // Extract LIMIT/OFFSET from parse tree for Top-N optimization
+        let parse = (*root).parse;
+        let (effective_limit, sort_ascending) = extract_topn_info(root, parse);
+
         // Check if this is the parent of a partitioned table (for SeaTurtleAppend)
         if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL
             && (*rte).inh
             && let Some(companion_oids) = collect_compressed_children(root, rti)
         {
-            path::add_seaturtle_append_path(root, rel, &companion_oids, std::ptr::null_mut());
+            // For Top-N, validate ORDER BY matches the time column
+            let append_topn_limit = if effective_limit > 0 {
+                get_time_column_attno((*rte).relid)
+                    .map(|attno| {
+                        if order_by_matches_column(root, attno) {
+                            effective_limit
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            path::add_seaturtle_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending);
             return;
         }
 
@@ -297,26 +461,43 @@ pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
             return;
         }
 
-        // For child partitions, check if we can advertise sorted output.
-        // When segment_by is configured, segments have overlapping time ranges
-        // within a partition, so sorted output cannot be guaranteed.
-        let pathkeys = if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL {
+        // For child partitions, check if we can advertise sorted output
+        // and whether Top-N is valid.
+        let parent_oid_opt = if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL {
             find_parent_oid(root, rti)
-                .and_then(|parent_oid| {
-                    if has_segment_by(parent_oid) {
-                        None
+        } else {
+            None
+        };
+        let time_col_attno_opt = parent_oid_opt.and_then(|oid| get_time_column_attno(oid));
+        let has_segby = parent_oid_opt.map(|oid| has_segment_by(oid)).unwrap_or(false);
+
+        // Pathkeys for sorted output: only when no segment_by and time pathkey matches
+        let (pathkeys, _sort_ascending) = if !has_segby {
+            time_col_attno_opt
+                .map(|attno| check_time_pathkey(root, rel, attno))
+                .unwrap_or((std::ptr::null_mut(), true))
+        } else {
+            (std::ptr::null_mut(), true)
+        };
+
+        // Top-N: enabled when ORDER BY matches time column (works for both
+        // parent and child rels, and regardless of segment_by)
+        let topn_effective_limit = if effective_limit > 0 {
+            time_col_attno_opt
+                .map(|attno| {
+                    if order_by_matches_column(root, attno) {
+                        effective_limit
                     } else {
-                        get_time_column_attno(parent_oid)
+                        0
                     }
                 })
-                .map(|attno| check_time_pathkey(root, rel, attno))
-                .unwrap_or(std::ptr::null_mut())
+                .unwrap_or(0)
         } else {
-            std::ptr::null_mut()
+            0
         };
 
         // Add the custom decompress path
-        path::add_decompress_path(root, rel, companion_oid, pathkeys);
+        path::add_decompress_path(root, rel, companion_oid, pathkeys, topn_effective_limit, sort_ascending);
     }
 }
 

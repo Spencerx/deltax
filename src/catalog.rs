@@ -13,6 +13,7 @@ pub struct HypertableInfo {
     pub order_by: Vec<String>,
     pub compress_after: Option<pgrx::datum::Interval>,
     pub drop_after: Option<pgrx::datum::Interval>,
+    pub segment_size: i32,
 }
 
 /// Metadata for a single partition.
@@ -110,7 +111,7 @@ pub fn get_hypertable_by_id(
 ) -> spi::SpiResult<Option<HypertableInfo>> {
     let mut result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
-                segment_by, order_by, compress_after, drop_after
+                segment_by, order_by, compress_after, drop_after, segment_size
          FROM seaturtle_hypertable
          WHERE id = $1",
         None,
@@ -135,6 +136,7 @@ pub fn get_hypertable_by_id(
             row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?;
         let drop_after: Option<pgrx::datum::Interval> =
             row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?;
+        let segment_size: i32 = row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000);
         return Ok(Some(HypertableInfo {
             id: ht_id,
             schema_name: s,
@@ -145,6 +147,7 @@ pub fn get_hypertable_by_id(
             order_by,
             compress_after,
             drop_after,
+            segment_size,
         }));
     }
 
@@ -157,7 +160,7 @@ pub fn get_all_hypertables(
 ) -> spi::SpiResult<Vec<HypertableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
-                segment_by, order_by, compress_after, drop_after
+                segment_by, order_by, compress_after, drop_after, segment_size
          FROM seaturtle_hypertable",
         None,
         &[],
@@ -175,6 +178,7 @@ pub fn get_all_hypertables(
             order_by: row.get_datum_by_ordinal(7)?.value::<Vec<String>>()?.unwrap_or_default(),
             compress_after: row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?,
             drop_after: row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?,
+            segment_size: row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000),
         });
     }
     Ok(hypertables)
@@ -215,15 +219,16 @@ pub fn update_hypertable_compression(
     hypertable_id: i32,
     segment_by: &[String],
     order_by: &[String],
+    segment_size: i32,
 ) -> spi::SpiResult<()> {
     let seg_vec = segment_by.to_vec();
     let ord_vec = order_by.to_vec();
     client.update(
         "UPDATE seaturtle_hypertable
-         SET segment_by = $1, order_by = $2
-         WHERE id = $3",
+         SET segment_by = $1, order_by = $2, segment_size = $3
+         WHERE id = $4",
         None,
-        &[seg_vec.into(), ord_vec.into(), hypertable_id.into()],
+        &[seg_vec.into(), ord_vec.into(), segment_size.into(), hypertable_id.into()],
     )?;
     Ok(())
 }

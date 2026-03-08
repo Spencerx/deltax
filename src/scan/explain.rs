@@ -216,8 +216,13 @@ unsafe fn explain_timing(
                     es,
                 );
 
+                let topn_str = if t.topn_limit > 0 {
+                    format!(" topn={} topn_candidates={} topn_p2_segs={}", t.topn_limit, t.topn_candidates, t.topn_phase2_segments)
+                } else {
+                    String::new()
+                };
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} segments_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}",
+                    "segments={} segments_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}{}",
                     t.segments_decompressed,
                     t.segments_skipped,
                     t.phase2_skipped,
@@ -225,6 +230,7 @@ unsafe fn explain_timing(
                     t.rows_filtered,
                     t.rows_batch_filtered,
                     t.compressed_bytes,
+                    topn_str,
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
