@@ -577,6 +577,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
         let nentries = (*tlist).length;
         let mut aggrefs: Vec<*const pg_sys::Aggref> = Vec::new();
         let mut non_agg_vars: Vec<*const pg_sys::Var> = Vec::new();
+        let mut non_agg_func_exprs: Vec<(i32, *const pg_sys::FuncExpr)> = Vec::new(); // (tlist_index, FuncExpr)
 
         for i in 0..nentries {
             let te = pg_sys::list_nth(tlist, i) as *const pg_sys::TargetEntry;
@@ -596,14 +597,18 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             } else if (*expr).type_ == pg_sys::NodeTag::T_Var && has_group_by {
                 // Non-aggregate Var in target list — must be a GROUP BY column
                 non_agg_vars.push(expr as *const pg_sys::Var);
+            } else if (*expr).type_ == pg_sys::NodeTag::T_FuncExpr && has_group_by {
+                // Non-aggregate FuncExpr in target list — must match a GROUP BY expression
+                non_agg_func_exprs.push((i, expr as *const pg_sys::FuncExpr));
             } else {
-                return; // Non-aggregate, non-Var expression — bail
+                return; // Non-aggregate, non-Var, non-FuncExpr expression — bail
             }
         }
 
         if aggrefs.is_empty() {
             return;
         }
+
 
         // Extract companion OIDs from the cheapest input path
         let cheapest = (*input_rel).cheapest_total_path;
@@ -613,7 +618,9 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
 
         let companion_oids = match extract_companion_oids(root, cheapest) {
             Some(oids) if !oids.is_empty() => oids,
-            _ => return,
+            _ => {
+                return;
+            }
         };
 
         // =====================================================================
@@ -681,6 +688,15 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
 
             let (var_node, expr_kind): (*const pg_sys::Var, AggExpr) = if (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
                 (arg_expr as *const pg_sys::Var, AggExpr::Column)
+            } else if (*arg_expr).type_ == pg_sys::NodeTag::T_RelabelType {
+                // Unwrap RelabelType → Var
+                let rlt = arg_expr as *const pg_sys::RelabelType;
+                let inner = (*rlt).arg as *const pg_sys::Node;
+                if !inner.is_null() && (*inner).type_ == pg_sys::NodeTag::T_Var {
+                    (inner as *const pg_sys::Var, AggExpr::Column)
+                } else {
+                    return;
+                }
             } else if (*arg_expr).type_ == pg_sys::NodeTag::T_FuncExpr {
                 // Check for length(Var)
                 let funcexpr = arg_expr as *const pg_sys::FuncExpr;
@@ -780,26 +796,42 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     all_minmax = false;
                     has_non_minmax = true;
                 }
-                "min" | "max" => {
-                    if has_non_minmax {
-                        return; // Bail — mixing MIN/MAX with SUM/COUNT not supported yet
-                    }
+                "min" => {
                     classified_aggs.push(path::AggSpec {
-                        agg_type: AggType::Sum, // placeholder, won't be used
+                        agg_type: AggType::Min,
                         col_idx,
                         result_type_oid: (*aggref).aggtype,
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                     });
-                    // Keep all_minmax = true
+                    if has_non_minmax {
+                        // Mixed MIN/MAX with SUM/COUNT/AVG → falls through to general AggScan
+                        all_minmax = false;
+                    }
+                    // else: keep all_minmax = true for potential metadata-only path
                 }
-                _ => return, // Unknown aggregate function
+                "max" => {
+                    classified_aggs.push(path::AggSpec {
+                        agg_type: AggType::Max,
+                        col_idx,
+                        result_type_oid: (*aggref).aggtype,
+                        col_type_oid: effective_col_type_oid,
+                        expr_kind,
+                    });
+                    if has_non_minmax {
+                        all_minmax = false;
+                    }
+                }
+                _ => {
+                    return;
+                }
             }
         }
 
         if classified_aggs.is_empty() {
             return;
         }
+
 
         // =====================================================================
         // Fast path: All MIN/MAX, no GROUP BY, no WHERE → SeaTurtleMinMax
@@ -1032,7 +1064,9 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             }
         }
 
+
         // Parse GROUP BY columns
+        use super::exec::GroupByExpr;
         let mut group_specs: Vec<super::exec::GroupByColSpec> = Vec::new();
         if has_group_by {
             let group_clause = (*parse).groupClause;
@@ -1051,51 +1085,149 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     return;
                 }
                 let expr = (*tle).expr as *const pg_sys::Node;
-                if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
-                    return; // Only plain column references for GROUP BY
+                if expr.is_null() {
+                    return;
                 }
-                let var_node = expr as *const pg_sys::Var;
+
+                if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                    let var_node = expr as *const pg_sys::Var;
+                    let col_idx = (*var_node).varattno as i32 - 1;
+
+                    // Get type from the Var
+                    let varno = (*var_node).varno as usize;
+                    if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
+                        return;
+                    }
+                    let rte = *(*root).simple_rte_array.add(varno);
+                    if rte.is_null() {
+                        return;
+                    }
+                    let relid = (*rte).relid;
+                    let mut type_oid = pg_sys::InvalidOid;
+                    let mut typmod: i32 = -1;
+                    let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+                    pg_sys::get_atttypetypmodcoll(relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
+
+                    // Don't push down GROUP BY on text/varchar columns —
+                    // PG's HashAggregate is faster for high-cardinality string grouping.
+                    if type_oid == pg_sys::TEXTOID
+                        || type_oid == pg_sys::VARCHAROID
+                        || type_oid == pg_sys::BPCHAROID
+                        || type_oid == pg_sys::NAMEOID
+                    {
+                        return;
+                    }
+
+                    group_specs.push(super::exec::GroupByColSpec {
+                        col_idx,
+                        type_oid,
+                        expr: GroupByExpr::Column,
+                    });
+                } else if (*expr).type_ == pg_sys::NodeTag::T_FuncExpr {
+                    let funcexpr = expr as *const pg_sys::FuncExpr;
+                    let fn_name_ptr = pg_sys::get_func_name((*funcexpr).funcid);
+                    if fn_name_ptr.is_null() {
+                        return;
+                    }
+                    let fn_name = std::ffi::CStr::from_ptr(fn_name_ptr)
+                        .to_str()
+                        .unwrap_or("");
+
+                    if fn_name == "regexp_replace" {
+                        // Validate: regexp_replace(Var, Const, Const)
+                        let fn_args = (*funcexpr).args;
+                        if fn_args.is_null() || (*fn_args).length != 3 {
+                            return;
+                        }
+                        let arg0 = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        let arg1 = (*(*fn_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                        let arg2 = (*(*fn_args).elements.add(2)).ptr_value as *const pg_sys::Node;
+
+                        if arg0.is_null() || (*arg0).type_ != pg_sys::NodeTag::T_Var {
+                            return;
+                        }
+                        if arg1.is_null() || (*arg1).type_ != pg_sys::NodeTag::T_Const {
+                            return;
+                        }
+                        if arg2.is_null() || (*arg2).type_ != pg_sys::NodeTag::T_Const {
+                            return;
+                        }
+
+                        let var_node = arg0 as *const pg_sys::Var;
+                        let col_idx = (*var_node).varattno as i32 - 1;
+
+                        let pattern_const = arg1 as *const pg_sys::Const;
+                        let replacement_const = arg2 as *const pg_sys::Const;
+                        if (*pattern_const).constisnull || (*replacement_const).constisnull {
+                            return;
+                        }
+
+                        let pattern_cstr = pg_sys::text_to_cstring((*pattern_const).constvalue.cast_mut_ptr());
+                        let pattern = std::ffi::CStr::from_ptr(pattern_cstr).to_string_lossy().into_owned();
+                        pg_sys::pfree(pattern_cstr as *mut _);
+
+                        let replacement_cstr = pg_sys::text_to_cstring((*replacement_const).constvalue.cast_mut_ptr());
+                        let replacement = std::ffi::CStr::from_ptr(replacement_cstr).to_string_lossy().into_owned();
+                        pg_sys::pfree(replacement_cstr as *mut _);
+
+                        let func_oid = u32::from((*funcexpr).funcid);
+                        let collation = u32::from((*funcexpr).inputcollid);
+
+                        group_specs.push(super::exec::GroupByColSpec {
+                            col_idx,
+                            type_oid: pg_sys::TEXTOID,
+                            expr: GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation },
+                        });
+                    } else {
+                        return; // Only regexp_replace is supported
+                    }
+                } else {
+                    return; // Unsupported GROUP BY expression type
+                }
+            }
+
+
+            // Validate that each non_agg_func_exprs entry matches a GROUP BY spec
+            for &(_tlist_idx, funcexpr) in &non_agg_func_exprs {
+                let funcid = (*funcexpr).funcid;
+                let fn_args = (*funcexpr).args;
+                if fn_args.is_null() || (*fn_args).length < 1 {
+                    return;
+                }
+                let arg0 = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                if arg0.is_null() || (*arg0).type_ != pg_sys::NodeTag::T_Var {
+                    return;
+                }
+                let var_node = arg0 as *const pg_sys::Var;
                 let col_idx = (*var_node).varattno as i32 - 1;
 
-                // Get type from the Var
-                let varno = (*var_node).varno as usize;
-                if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
-                    return;
-                }
-                let rte = *(*root).simple_rte_array.add(varno);
-                if rte.is_null() {
-                    return;
-                }
-                let relid = (*rte).relid;
-                let mut type_oid = pg_sys::InvalidOid;
-                let mut typmod: i32 = -1;
-                let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
-                pg_sys::get_atttypetypmodcoll(relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
-
-                // Don't push down GROUP BY on text/varchar columns —
-                // PG's HashAggregate is faster for high-cardinality string grouping.
-                if type_oid == pg_sys::TEXTOID
-                    || type_oid == pg_sys::VARCHAROID
-                    || type_oid == pg_sys::BPCHAROID
-                    || type_oid == pg_sys::NAMEOID
-                {
-                    return;
-                }
-
-                group_specs.push(super::exec::GroupByColSpec {
-                    col_idx,
-                    type_oid,
+                let matched = group_specs.iter().any(|gs| {
+                    if let GroupByExpr::RegexpReplace { func_oid, .. } = &gs.expr {
+                        gs.col_idx == col_idx && *func_oid == u32::from(funcid)
+                    } else {
+                        false
+                    }
                 });
+                if !matched {
+                    return; // FuncExpr in target doesn't match any GROUP BY spec
+                }
             }
         }
+
 
         // Parse HAVING clause into simple filters
         let mut having_filters: Vec<super::exec::HavingFilter> = Vec::new();
         if has_having {
             use super::exec::{HavingOp, HavingFilter};
             let having_node = (*parse).havingQual as *const pg_sys::Node;
-            // Collect qual nodes (single OpExpr or AND-list)
-            let qual_nodes: Vec<*const pg_sys::Node> = if (*having_node).type_ == pg_sys::NodeTag::T_BoolExpr {
+            // Collect qual nodes — PG may store as a single OpExpr, a BoolExpr
+            // AND-list, or a plain T_List of conditions.
+            let qual_nodes: Vec<*const pg_sys::Node> = if (*having_node).type_ == pg_sys::NodeTag::T_List {
+                let list = having_node as *const pg_sys::List;
+                (0..(*list).length)
+                    .map(|i| pg_sys::list_nth(list as *mut _, i) as *const pg_sys::Node)
+                    .collect()
+            } else if (*having_node).type_ == pg_sys::NodeTag::T_BoolExpr {
                 let boolexpr = having_node as *const pg_sys::BoolExpr;
                 if (*boolexpr).boolop == pg_sys::BoolExprType::AND_EXPR {
                     let args = (*boolexpr).args;
@@ -1223,7 +1355,9 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             const_val,
                         });
                     }
-                    None => return, // Can't match HAVING aggref — bail
+                    None => {
+                        return; // Can't match HAVING aggref — bail
+                    }
                 }
             }
         }
@@ -1239,19 +1373,33 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
     }
 }
 
-/// Extract companion OIDs from a planner path for COUNT(*) pushdown.
+/// Extract companion OIDs from a planner path for aggregate pushdown.
 ///
 /// Handles:
 /// - SeaTurtleDecompress/SeaTurtleAppend CustomPath: extract OIDs from custom_private
-/// - AppendPath: walk subpaths, extract OIDs from SeaTurtleDecompress CustomPaths
+/// - AppendPath: walk subpaths, try CustomPath extraction first, then fall back
+///   to catalog lookup via the child rel OID (handles ProjectionPath wrapping
+///   where PG may use SeqScan instead of our CustomPath as the inner path)
 ///
-/// Returns None if the path doesn't contain seaturtle scan nodes, or if there
-/// are non-seaturtle subpaths with actual data (uncompressed partitions).
+/// Returns None if the path doesn't contain compressed partitions, or if there
+/// are uncompressed partitions with actual data.
 unsafe fn extract_companion_oids(
     root: *mut pg_sys::PlannerInfo,
     path: *const pg_sys::Path,
 ) -> Option<Vec<pg_sys::Oid>> {
     unsafe {
+        // Unwrap ProjectionPath at the top level — PG wraps the input path
+        // in ProjectionPath when the GROUP BY target list contains expressions
+        // (e.g. regexp_replace) that need evaluation.
+        let path = if (*path).type_ == pg_sys::NodeTag::T_ProjectionPath {
+            let proj = path as *const pg_sys::ProjectionPath;
+            (*proj).subpath as *const pg_sys::Path
+        } else {
+            path
+        };
+        if path.is_null() {
+            return None;
+        }
         if (*path).type_ == pg_sys::NodeTag::T_CustomPath {
             extract_oids_from_custom_path(path as *const pg_sys::CustomPath)
         } else if (*path).type_ == pg_sys::NodeTag::T_AppendPath {
@@ -1263,24 +1411,84 @@ unsafe fn extract_companion_oids(
             let num_subpaths = (*subpaths).length;
             let mut oids = Vec::new();
             for i in 0..num_subpaths {
-                let subpath = pg_sys::list_nth(subpaths, i) as *const pg_sys::Path;
+                let raw_subpath = pg_sys::list_nth(subpaths, i) as *const pg_sys::Path;
+                if raw_subpath.is_null() {
+                    continue;
+                }
+                // Unwrap ProjectionPath if present (PG wraps child paths when
+                // the target list needs expression evaluation, e.g. regexp_replace)
+                let subpath = if (*raw_subpath).type_ == pg_sys::NodeTag::T_ProjectionPath {
+                    let proj = raw_subpath as *const pg_sys::ProjectionPath;
+                    (*proj).subpath as *const pg_sys::Path
+                } else {
+                    raw_subpath
+                };
                 if subpath.is_null() {
                     continue;
                 }
+                // Try CustomPath extraction first (fast path)
                 if (*subpath).type_ == pg_sys::NodeTag::T_CustomPath {
                     let cpath = subpath as *const pg_sys::CustomPath;
                     if let Some(sub_oids) = extract_oids_from_custom_path(cpath) {
                         oids.extend(sub_oids);
-                    } else if subpath_has_data(root, subpath) {
-                        return None;
+                        continue;
                     }
-                } else if subpath_has_data(root, subpath) {
-                    // Non-seaturtle subpath with actual data — can't push down
+                }
+                // Fallback: look up companion OID from catalog via the child rel OID.
+                // This handles the case where PG picked SeqScan (T_Path) instead of
+                // our CustomPath as the inner path of a ProjectionPath.
+                if let Some(companion_oid) = lookup_companion_from_subpath(root, subpath) {
+                    oids.push(companion_oid);
+                    continue;
+                }
+                // Not a compressed partition — check if it has data
+                if subpath_has_data(root, subpath) {
                     return None;
                 }
-                // Empty partition (relpages=0) — safe to skip
+                // Empty partition (0 blocks on disk) — safe to skip
             }
-            if oids.is_empty() { None } else { Some(oids) }
+            if oids.is_empty() {
+                None
+            } else {
+                Some(oids)
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// Look up companion OID from the catalog for a subpath's underlying relation.
+/// Returns Some(companion_oid) if the relation is a compressed partition.
+unsafe fn lookup_companion_from_subpath(
+    root: *mut pg_sys::PlannerInfo,
+    subpath: *const pg_sys::Path,
+) -> Option<pg_sys::Oid> {
+    unsafe {
+        let parent = (*subpath).parent;
+        if parent.is_null() {
+            return None;
+        }
+        let rti = (*parent).relid;
+        if rti == 0 {
+            return None;
+        }
+        let rte = *(*root).simple_rte_array.add(rti as usize);
+        if rte.is_null() {
+            return None;
+        }
+        let child_oid = (*rte).relid;
+        let companion_oid = COMPRESSED_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(&oid) = cache.get(&child_oid) {
+                return oid;
+            }
+            let oid = check_compressed_partition(child_oid);
+            cache.insert(child_oid, oid);
+            oid
+        });
+        if companion_oid != pg_sys::InvalidOid {
+            Some(companion_oid)
         } else {
             None
         }

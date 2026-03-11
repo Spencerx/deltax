@@ -348,7 +348,7 @@ pub(super) struct MinMaxScanState {
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum AggType { Sum, Count, CountStar, Avg, CountDistinct }
+pub(super) enum AggType { Sum, Count, CountStar, Avg, CountDistinct, Min, Max }
 
 /// Expression kind for aggregate arguments.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -365,6 +365,12 @@ enum AggAccumulator {
     Count { count: i64 },
     CountDistinctInt { seen: std::collections::HashSet<i64> },
     CountDistinctStr { seen: std::collections::HashSet<String> },
+    MinInt { val: Option<i64> },
+    MaxInt { val: Option<i64> },
+    MinFloat { val: Option<f64> },
+    MaxFloat { val: Option<f64> },
+    MinStr { val: Option<String> },
+    MaxStr { val: Option<String> },
 }
 
 impl AggAccumulator {
@@ -385,6 +391,24 @@ impl AggAccumulator {
                     AggAccumulator::CountDistinctInt { seen: std::collections::HashSet::new() }
                 }
             }
+            AggType::Min => {
+                if col_type == pg_sys::TEXTOID || col_type == pg_sys::VARCHAROID || col_type == pg_sys::BPCHAROID {
+                    AggAccumulator::MinStr { val: None }
+                } else if col_type == pg_sys::FLOAT4OID || col_type == pg_sys::FLOAT8OID {
+                    AggAccumulator::MinFloat { val: None }
+                } else {
+                    AggAccumulator::MinInt { val: None }
+                }
+            }
+            AggType::Max => {
+                if col_type == pg_sys::TEXTOID || col_type == pg_sys::VARCHAROID || col_type == pg_sys::BPCHAROID {
+                    AggAccumulator::MaxStr { val: None }
+                } else if col_type == pg_sys::FLOAT4OID || col_type == pg_sys::FLOAT8OID {
+                    AggAccumulator::MaxFloat { val: None }
+                } else {
+                    AggAccumulator::MaxInt { val: None }
+                }
+            }
         }
     }
 
@@ -395,6 +419,12 @@ impl AggAccumulator {
             AggAccumulator::Count { .. } => AggAccumulator::Count { count: 0 },
             AggAccumulator::CountDistinctInt { .. } => AggAccumulator::CountDistinctInt { seen: std::collections::HashSet::new() },
             AggAccumulator::CountDistinctStr { .. } => AggAccumulator::CountDistinctStr { seen: std::collections::HashSet::new() },
+            AggAccumulator::MinInt { .. } => AggAccumulator::MinInt { val: None },
+            AggAccumulator::MaxInt { .. } => AggAccumulator::MaxInt { val: None },
+            AggAccumulator::MinFloat { .. } => AggAccumulator::MinFloat { val: None },
+            AggAccumulator::MaxFloat { .. } => AggAccumulator::MaxFloat { val: None },
+            AggAccumulator::MinStr { .. } => AggAccumulator::MinStr { val: None },
+            AggAccumulator::MaxStr { .. } => AggAccumulator::MaxStr { val: None },
         }
     }
 }
@@ -406,10 +436,20 @@ pub(super) struct AggExecSpec {
     pub(super) expr_kind: AggExpr,         // Column or LengthOf
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Expression kind for GROUP BY columns.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum GroupByExpr {
+    /// Plain column reference: GROUP BY col
+    Column,
+    /// regexp_replace(col, pattern, replacement): GROUP BY regexp_replace(col, ...)
+    RegexpReplace { pattern: String, replacement: String, func_oid: u32, collation: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct GroupByColSpec {
     pub(super) col_idx: i32,  // 0-based column index
     pub(super) type_oid: pg_sys::Oid,
+    pub(super) expr: GroupByExpr,
 }
 
 /// A HAVING filter: compare an aggregate result against a constant.
@@ -438,6 +478,8 @@ pub(super) struct AggScanState {
     pub(super) total_rows_processed: u64,
     pub(super) batch_quals_count: usize,
     pub(super) where_quals_null: bool,
+    pub(super) regex_cache_size: u64,
+    pub(super) regex_cache_calls: u64,
 }
 
 /// Static CustomExecMethods struct for SeaTurtleAgg.
@@ -1310,6 +1352,8 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     2 => AggType::CountStar,
                     3 => AggType::Avg,
                     4 => AggType::CountDistinct,
+                    5 => AggType::Min,
+                    6 => AggType::Max,
                     _ => AggType::Count,
                 };
                 let expr_kind = match expr_kind_val {
@@ -1332,10 +1376,37 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             for _ in 0..num_groups {
                 let col_idx = pg_sys::list_nth_int(custom_private, idx);
                 let type_oid = pg_sys::list_nth_int(custom_private, idx + 1) as u32;
-                idx += 2;
+                let expr_tag = pg_sys::list_nth_int(custom_private, idx + 2);
+                idx += 3;
+                let expr = if expr_tag == 1 {
+                    // RegexpReplace: func_oid, collation, pattern_len, pattern_bytes..., replacement_len, replacement_bytes...
+                    let func_oid = pg_sys::list_nth_int(custom_private, idx) as u32;
+                    let collation = pg_sys::list_nth_int(custom_private, idx + 1) as u32;
+                    idx += 2;
+                    let pattern_len = pg_sys::list_nth_int(custom_private, idx) as usize;
+                    idx += 1;
+                    let mut pattern_bytes = Vec::with_capacity(pattern_len);
+                    for _ in 0..pattern_len {
+                        pattern_bytes.push(pg_sys::list_nth_int(custom_private, idx) as u8);
+                        idx += 1;
+                    }
+                    let pattern = String::from_utf8_lossy(&pattern_bytes).into_owned();
+                    let replacement_len = pg_sys::list_nth_int(custom_private, idx) as usize;
+                    idx += 1;
+                    let mut replacement_bytes = Vec::with_capacity(replacement_len);
+                    for _ in 0..replacement_len {
+                        replacement_bytes.push(pg_sys::list_nth_int(custom_private, idx) as u8);
+                        idx += 1;
+                    }
+                    let replacement = String::from_utf8_lossy(&replacement_bytes).into_owned();
+                    GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation }
+                } else {
+                    GroupByExpr::Column
+                };
                 group_specs.push(GroupByColSpec {
                     col_idx,
                     type_oid: pg_sys::Oid::from(type_oid),
+                    expr,
                 });
             }
         }
@@ -1509,6 +1580,52 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         };
         let mut group_map: HashMap<Vec<GroupKeyVal>, Vec<AggAccumulator>> = HashMap::new();
 
+        // Check if any GROUP BY uses RegexpReplace — set up cross-segment caches
+        let has_regexp_group = group_specs.iter().any(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }));
+
+        // Cross-segment regex dedup cache: input_string → regexp_replace result
+        let mut regex_cache: HashMap<String, String> = HashMap::new();
+        let mut regex_cache_calls: u64 = 0;
+
+        // Build PG datums for regexp pattern/replacement (once, not per-segment)
+        // and identify which columns need raw string decompression
+        struct RegexpGroupInfo {
+            group_idx: usize,
+            func_oid: pg_sys::Oid,
+            collation: pg_sys::Oid,
+            pattern_datum: pg_sys::Datum,
+            replacement_datum: pg_sys::Datum,
+        }
+        let mut regexp_group_infos: Vec<RegexpGroupInfo> = Vec::new();
+        // Columns that need raw string decompression instead of PG datum decompression
+        let mut raw_string_cols: Vec<bool> = vec![false; meta.col_names.len()];
+
+        if has_regexp_group {
+            for (gi, gs) in group_specs.iter().enumerate() {
+                if let GroupByExpr::RegexpReplace { ref pattern, ref replacement, func_oid, collation } = gs.expr {
+                    raw_string_cols[gs.col_idx as usize] = true;
+                    let pattern_datum = {
+                        let text = pg_sys::cstring_to_text_with_len(pattern.as_ptr() as *const _, pattern.len() as i32);
+                        pg_sys::Datum::from(text as usize)
+                    };
+                    let replacement_datum = {
+                        let text = pg_sys::cstring_to_text_with_len(replacement.as_ptr() as *const _, replacement.len() as i32);
+                        pg_sys::Datum::from(text as usize)
+                    };
+                    regexp_group_infos.push(RegexpGroupInfo {
+                        group_idx: gi,
+                        func_oid: pg_sys::Oid::from(func_oid),
+                        collation: pg_sys::Oid::from(collation),
+                        pattern_datum,
+                        replacement_datum,
+                    });
+                }
+            }
+        }
+
+        // Also check if any agg references a raw_string_col for Min/Max on text
+        // (e.g. MIN(Referer) where Referer is also the regexp GROUP BY column)
+
         let t2 = Instant::now();
         let mut total_segments: u64 = 0;
         let mut total_rows_processed: u64 = 0;
@@ -1545,6 +1662,8 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             let old_ctx = pg_sys::MemoryContextSwitchTo(segment_mcxt);
 
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+            // Raw strings for columns that need regexp_replace (parallel to decompressed)
+            let mut raw_strings: Vec<Option<Vec<Option<String>>>> = Vec::new();
             let mut blob_idx = 0;
             let mut seg_val_idx = 0;
             let mut pre_selection: Vec<bool> = Vec::new();
@@ -1559,6 +1678,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                         blob_idx += 1;
                     }
                     decompressed.push(Vec::new());
+                    raw_strings.push(None);
                     continue;
                 }
 
@@ -1571,15 +1691,35 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     let repeated: Vec<(pg_sys::Datum, bool)> =
                         (0..seg.row_count).map(|_| (datum, is_null)).collect();
                     decompressed.push(repeated);
+                    raw_strings.push(None);
                     seg_val_idx += 1;
                 } else {
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = meta.col_typmods[col_idx];
 
-                    if length_cols[col_idx] {
+                    if raw_string_cols[col_idx] {
+                        // Decompress to raw strings for regexp GROUP BY
+                        let (strings, sel) = decompress_text_blob_to_raw_strings(blob, &batch_quals, col_idx);
+                        // Also build dummy decompressed datums (placeholder — we use raw_strings instead)
+                        let datums: Vec<(pg_sys::Datum, bool)> = strings.iter().map(|s| {
+                            match s {
+                                Some(_) => (pg_sys::Datum::from(0usize), false),
+                                None => (pg_sys::Datum::from(0usize), true),
+                            }
+                        }).collect();
+                        decompressed.push(datums);
+                        raw_strings.push(Some(strings));
+                        if !sel.is_empty() {
+                            if pre_selection.is_empty() {
+                                pre_selection = sel;
+                            } else {
+                                for (ps, s) in pre_selection.iter_mut().zip(sel.iter()) {
+                                    *ps = *ps && *s;
+                                }
+                            }
+                        }
+                    } else if length_cols[col_idx] {
                         // Length-only column: decompress as int4 lengths.
-                        // Check for text_eq filter (e.g. URL <> '') to handle
-                        // during length decompression since we won't have text datums.
                         let has_ne_empty = batch_quals.iter().any(|bq| {
                             bq.col_idx == col_idx
                                 && bq.text_const.as_deref() == Some("")
@@ -1587,6 +1727,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                         });
                         let (datums, len_sel) = decompress_text_blob_to_lengths(blob, has_ne_empty);
                         decompressed.push(datums);
+                        raw_strings.push(None);
                         if !len_sel.is_empty() {
                             if pre_selection.is_empty() {
                                 pre_selection = len_sel;
@@ -1641,6 +1782,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                             let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
                             decompressed.push(datums);
                         }
+                        raw_strings.push(None);
                     }
                     blob_idx += 1;
                 }
@@ -1667,21 +1809,56 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
 
                 let accumulators = if has_group_by {
                     let mut key = Vec::with_capacity(group_specs.len());
-                    for gs in &group_specs {
+                    for (gi, gs) in group_specs.iter().enumerate() {
                         let col = &decompressed[gs.col_idx as usize];
                         if col.is_empty() || col[row].1 {
                             key.push(GroupKeyVal::Null);
                         } else {
-                            let datum = col[row].0;
-                            match gs.type_oid {
-                                pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
-                                    let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
-                                    let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
-                                    pg_sys::pfree(cstr as *mut _);
-                                    key.push(GroupKeyVal::Str(s));
+                            match &gs.expr {
+                                GroupByExpr::RegexpReplace { .. } => {
+                                    // Use raw string + regex cache
+                                    let rs = raw_strings[gs.col_idx as usize].as_ref().unwrap();
+                                    if let Some(ref input_str) = rs[row] {
+                                        let rgi = regexp_group_infos.iter().find(|r| r.group_idx == gi).unwrap();
+                                        let result = regex_cache.entry(input_str.clone()).or_insert_with(|| {
+                                            regex_cache_calls += 1;
+                                            // Call PG's regexp_replace(input, pattern, replacement)
+                                            let input_datum = {
+                                                let text = pg_sys::cstring_to_text_with_len(
+                                                    input_str.as_ptr() as *const _, input_str.len() as i32,
+                                                );
+                                                pg_sys::Datum::from(text as usize)
+                                            };
+                                            let result_datum = pg_sys::OidFunctionCall3Coll(
+                                                rgi.func_oid,
+                                                rgi.collation,
+                                                input_datum,
+                                                rgi.pattern_datum,
+                                                rgi.replacement_datum,
+                                            );
+                                            let cstr = pg_sys::text_to_cstring(result_datum.cast_mut_ptr());
+                                            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                            pg_sys::pfree(cstr as *mut _);
+                                            s
+                                        });
+                                        key.push(GroupKeyVal::Str(result.clone()));
+                                    } else {
+                                        key.push(GroupKeyVal::Null);
+                                    }
                                 }
-                                _ => {
-                                    key.push(GroupKeyVal::Int(datum.value() as i64));
+                                GroupByExpr::Column => {
+                                    let datum = col[row].0;
+                                    match gs.type_oid {
+                                        pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
+                                            let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
+                                            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                            pg_sys::pfree(cstr as *mut _);
+                                            key.push(GroupKeyVal::Str(s));
+                                        }
+                                        _ => {
+                                            key.push(GroupKeyVal::Int(datum.value() as i64));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1710,21 +1887,43 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                             }
                         }
                         AggType::Sum | AggType::Avg => {
-                            let col = &decompressed[spec.col_idx as usize];
-                            if !col.is_empty() && !col[row].1 {
-                                let datum = col[row].0;
-                                match acc {
-                                    AggAccumulator::SumInt { sum, count } => {
-                                        let v = datum_to_i128(datum, spec.col_type_oid);
-                                        *sum += v;
-                                        *count += 1;
+                            // When LengthOf + raw_string_cols, compute length from raw strings
+                            // (decompressed has dummy 0 datums for raw_string_cols columns)
+                            if spec.expr_kind == AggExpr::LengthOf
+                                && raw_string_cols.get(spec.col_idx as usize).copied().unwrap_or(false)
+                            {
+                                if let Some(ref rs) = raw_strings[spec.col_idx as usize]
+                                    && let Some(ref s) = rs[row]
+                                {
+                                    match acc {
+                                        AggAccumulator::SumInt { sum, count } => {
+                                            *sum += s.chars().count() as i128;
+                                            *count += 1;
+                                        }
+                                        AggAccumulator::SumFloat { sum, count } => {
+                                            *sum += s.chars().count() as f64;
+                                            *count += 1;
+                                        }
+                                        _ => {}
                                     }
-                                    AggAccumulator::SumFloat { sum, count } => {
-                                        let v = datum_to_f64(datum, spec.col_type_oid);
-                                        *sum += v;
-                                        *count += 1;
+                                }
+                            } else {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let datum = col[row].0;
+                                    match acc {
+                                        AggAccumulator::SumInt { sum, count } => {
+                                            let v = datum_to_i128(datum, spec.col_type_oid);
+                                            *sum += v;
+                                            *count += 1;
+                                        }
+                                        AggAccumulator::SumFloat { sum, count } => {
+                                            let v = datum_to_f64(datum, spec.col_type_oid);
+                                            *sum += v;
+                                            *count += 1;
+                                        }
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
                             }
                         }
@@ -1743,6 +1942,85 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                         seen.insert(s);
                                     }
                                     _ => {}
+                                }
+                            }
+                        }
+                        AggType::Min => {
+                            // For text columns referenced by raw_string_cols, use raw strings
+                            if raw_string_cols.get(spec.col_idx as usize).copied().unwrap_or(false) {
+                                if let Some(ref rs) = raw_strings[spec.col_idx as usize]
+                                    && let Some(ref s) = rs[row]
+                                    && let AggAccumulator::MinStr { val } = acc
+                                    && val.as_ref().is_none_or(|cur| collation_strcmp(s, cur) < 0)
+                                {
+                                    *val = Some(s.clone());
+                                }
+                            } else {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let datum = col[row].0;
+                                    match acc {
+                                        AggAccumulator::MinInt { val } => {
+                                            let v = datum.value() as i64;
+                                            if val.is_none_or(|cur| v < cur) {
+                                                *val = Some(v);
+                                            }
+                                        }
+                                        AggAccumulator::MinFloat { val } => {
+                                            let v = datum_to_f64(datum, spec.col_type_oid);
+                                            if val.is_none_or(|cur| v < cur) {
+                                                *val = Some(v);
+                                            }
+                                        }
+                                        AggAccumulator::MinStr { val } => {
+                                            let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
+                                            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                            pg_sys::pfree(cstr as *mut _);
+                                            if val.as_ref().is_none_or(|cur| collation_strcmp(&s, cur) < 0) {
+                                                *val = Some(s);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        AggType::Max => {
+                            if raw_string_cols.get(spec.col_idx as usize).copied().unwrap_or(false) {
+                                if let Some(ref rs) = raw_strings[spec.col_idx as usize]
+                                    && let Some(ref s) = rs[row]
+                                    && let AggAccumulator::MaxStr { val } = acc
+                                    && val.as_ref().is_none_or(|cur| collation_strcmp(s, cur) > 0)
+                                {
+                                    *val = Some(s.clone());
+                                }
+                            } else {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let datum = col[row].0;
+                                    match acc {
+                                        AggAccumulator::MaxInt { val } => {
+                                            let v = datum.value() as i64;
+                                            if val.is_none_or(|cur| v > cur) {
+                                                *val = Some(v);
+                                            }
+                                        }
+                                        AggAccumulator::MaxFloat { val } => {
+                                            let v = datum_to_f64(datum, spec.col_type_oid);
+                                            if val.is_none_or(|cur| v > cur) {
+                                                *val = Some(v);
+                                            }
+                                        }
+                                        AggAccumulator::MaxStr { val } => {
+                                            let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
+                                            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                            pg_sys::pfree(cstr as *mut _);
+                                            if val.as_ref().is_none_or(|cur| collation_strcmp(&s, cur) > 0) {
+                                                *val = Some(s);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -1848,6 +2126,8 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             total_rows_processed,
             batch_quals_count: batch_quals.len(),
             where_quals_null: where_quals.is_null(),
+            regex_cache_size: regex_cache.len() as u64,
+            regex_cache_calls,
         };
 
         let state_box = Box::new(state);
@@ -1976,6 +2256,34 @@ unsafe fn finalize_accumulator(acc: &AggAccumulator, spec: &AggExecSpec) -> (pg_
             }
             AggAccumulator::CountDistinctStr { seen } => {
                 (pg_sys::Datum::from(seen.len()), false)
+            }
+            AggAccumulator::MinInt { val } | AggAccumulator::MaxInt { val } => {
+                match val {
+                    Some(v) => (pg_sys::Datum::from(*v as usize), false),
+                    None => (pg_sys::Datum::from(0usize), true),
+                }
+            }
+            AggAccumulator::MinFloat { val } | AggAccumulator::MaxFloat { val } => {
+                match val {
+                    Some(v) => {
+                        if spec.col_type_oid == pg_sys::FLOAT4OID {
+                            let f4 = *v as f32;
+                            (pg_sys::Datum::from(f4.to_bits() as usize), false)
+                        } else {
+                            (pg_sys::Datum::from(v.to_bits() as usize), false)
+                        }
+                    }
+                    None => (pg_sys::Datum::from(0usize), true),
+                }
+            }
+            AggAccumulator::MinStr { val } | AggAccumulator::MaxStr { val } => {
+                match val {
+                    Some(s) => {
+                        let datum = string_to_datum(s, spec.col_type_oid);
+                        (datum, false)
+                    }
+                    None => (pg_sys::Datum::from(0usize), true),
+                }
             }
         }
     }
@@ -4965,6 +5273,101 @@ unsafe fn decompress_text_blob_with_like_filter(
     }
 }
 
+/// Decompress a text column blob to raw Rust strings (no PG datum allocation).
+/// Used for regexp_replace GROUP BY where we need string values for the cache.
+///
+/// Also applies batch quals for this column (Ne empty string) during decompression.
+///
+/// Returns `(strings, selection)` where:
+/// - `strings`: Vec of Option<String> (None for NULL), length = total_count
+/// - `selection`: Per-row bool (true = passes filter). Empty if no filter.
+fn decompress_text_blob_to_raw_strings(
+    blob: &[u8],
+    batch_quals: &[BatchQual],
+    col_idx: usize,
+) -> (Vec<Option<String>>, Vec<bool>) {
+    if blob.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    // Check for Ne '' filter on this column
+    let has_ne_empty = batch_quals.iter().any(|bq| {
+        bq.col_idx == col_idx
+            && bq.text_const.as_deref() == Some("")
+            && bq.op == BatchCompareOp::Ne
+    });
+
+    let (nn_strings, nn_sel): (Vec<String>, Vec<bool>) = match cc.type_tag {
+        CompressionType::Dictionary => {
+            let (dict_entries, indices) =
+                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+
+            let strings: Vec<String> = indices.iter().map(|&idx| dict_entries[idx as usize].to_string()).collect();
+            let sel: Vec<bool> = if has_ne_empty {
+                indices.iter().map(|&idx| !dict_entries[idx as usize].is_empty()).collect()
+            } else {
+                Vec::new()
+            };
+            (strings, sel)
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
+            let strings: Vec<String> = ranges.iter().map(|&(off, len)| {
+                std::str::from_utf8(&buf[off..off + len]).unwrap_or("").to_string()
+            }).collect();
+            let sel: Vec<bool> = if has_ne_empty {
+                ranges.iter().map(|&(_off, len)| len > 0).collect()
+            } else {
+                Vec::new()
+            };
+            (strings, sel)
+        }
+        CompressionType::Lz4Blocked => {
+            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let strings: Vec<String> = ranges.iter().map(|&(off, len)| {
+                std::str::from_utf8(&buf[off..off + len]).unwrap_or("").to_string()
+            }).collect();
+            let sel: Vec<bool> = if has_ne_empty {
+                ranges.iter().map(|&(_off, len)| len > 0).collect()
+            } else {
+                Vec::new()
+            };
+            (strings, sel)
+        }
+        _ => {
+            let strings = vec![String::new(); non_null_count];
+            let sel = if has_ne_empty { vec![false; non_null_count] } else { Vec::new() };
+            (strings, sel)
+        }
+    };
+
+    // Reinsert nulls
+    if cc.null_bitmap.is_empty() {
+        let strings: Vec<Option<String>> = nn_strings.into_iter().map(Some).collect();
+        (strings, nn_sel)
+    } else {
+        let mut strings = Vec::with_capacity(total_count);
+        let mut sel = if has_ne_empty { Vec::with_capacity(total_count) } else { Vec::new() };
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                strings.push(None);
+                if has_ne_empty { sel.push(false); }
+            } else {
+                strings.push(Some(nn_strings[val_idx].clone()));
+                if has_ne_empty { sel.push(nn_sel[val_idx]); }
+                val_idx += 1;
+            }
+        }
+        (strings, sel)
+    }
+}
+
 /// Decompress a text column blob with equality/inequality filtering pushed into decompression.
 ///
 /// Similar to `decompress_text_blob_with_like_filter`, but matches against a constant
@@ -5132,8 +5535,8 @@ fn decompress_text_blob_to_lengths(
             let (dict_entries, indices) =
                 compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
 
-            // Pre-compute lengths and empty status for each dict entry
-            let dict_lengths: Vec<i32> = dict_entries.iter().map(|s| s.len() as i32).collect();
+            // Pre-compute lengths (character count, not byte count) and empty status for each dict entry
+            let dict_lengths: Vec<i32> = dict_entries.iter().map(|s| s.chars().count() as i32).collect();
             let dict_empty: Vec<bool> = if filter_empty {
                 dict_entries.iter().map(|s| s.is_empty()).collect()
             } else {
@@ -5150,8 +5553,11 @@ fn decompress_text_blob_to_lengths(
             (lengths, sel)
         }
         CompressionType::Lz4 => {
-            let (_buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            let lengths: Vec<i32> = ranges.iter().map(|&(_off, len)| len as i32).collect();
+            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
+            let lengths: Vec<i32> = ranges.iter().map(|&(off, len)| {
+                let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
+                s.chars().count() as i32
+            }).collect();
             let sel: Vec<bool> = if filter_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
             } else {
@@ -5160,8 +5566,11 @@ fn decompress_text_blob_to_lengths(
             (lengths, sel)
         }
         CompressionType::Lz4Blocked => {
-            let (_buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            let lengths: Vec<i32> = ranges.iter().map(|&(_off, len)| len as i32).collect();
+            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let lengths: Vec<i32> = ranges.iter().map(|&(off, len)| {
+                let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
+                s.chars().count() as i32
+            }).collect();
             let sel: Vec<bool> = if filter_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
             } else {
@@ -5367,6 +5776,21 @@ unsafe fn decompress_text_blob_with_selection(
 
 /// Create a text/varchar/bpchar datum from a Rust string.
 /// Allocates in the current memory context.
+/// Compare two strings using PG's collation-aware comparison.
+/// Returns negative if a < b, 0 if equal, positive if a > b.
+#[inline]
+unsafe fn collation_strcmp(a: &str, b: &str) -> i32 {
+    unsafe {
+        pg_sys::varstr_cmp(
+            a.as_ptr() as *const _,
+            a.len() as i32,
+            b.as_ptr() as *const _,
+            b.len() as i32,
+            pg_sys::DEFAULT_COLLATION_OID,
+        )
+    }
+}
+
 unsafe fn str_to_text_datum(s: &str, type_oid: pg_sys::Oid, typmod: i32) -> pg_sys::Datum {
     unsafe {
         if type_oid == pg_sys::BPCHAROID {

@@ -627,6 +627,24 @@ pub unsafe fn add_agg_path(
         for gs in group_specs {
             private_list = pg_sys::lappend_int(private_list, gs.col_idx);
             private_list = pg_sys::lappend_int(private_list, u32::from(gs.type_oid) as i32);
+            match &gs.expr {
+                super::exec::GroupByExpr::Column => {
+                    private_list = pg_sys::lappend_int(private_list, 0); // expr_tag=0
+                }
+                super::exec::GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation } => {
+                    private_list = pg_sys::lappend_int(private_list, 1); // expr_tag=1
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, *collation as i32);
+                    private_list = pg_sys::lappend_int(private_list, pattern.len() as i32);
+                    for &b in pattern.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                    private_list = pg_sys::lappend_int(private_list, replacement.len() as i32);
+                    for &b in replacement.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+            }
         }
         // Store HAVING filters for thread-local passing to plan_agg_path
         if !having_filters.is_empty() {
@@ -667,8 +685,29 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         // Use PG's tlist for both targetlists. PG's setrefs will match
         // expressions by equal() and create proper Var(INDEX_VAR) references.
         // This allows ORDER BY/Sort to find pathkey expressions in our output.
-        (*cscan).scan.plan.targetlist = pg_sys::copyObjectImpl(tlist as *const _) as *mut pg_sys::List;
-        (*cscan).custom_scan_tlist = pg_sys::copyObjectImpl(tlist as *const _) as *mut pg_sys::List;
+        // Strip resjunk entries from custom_scan_tlist — we only produce
+        // non-resjunk output columns. Resjunk entries are added by PG for
+        // sort keys and HAVING references and would cause column count mismatches.
+        let clean_tlist = {
+            let mut list: *mut pg_sys::List = std::ptr::null_mut();
+            if !tlist.is_null() {
+                let n = (*tlist).length;
+                let mut resno: i16 = 1;
+                for i in 0..n {
+                    let te = pg_sys::list_nth(tlist, i) as *const pg_sys::TargetEntry;
+                    if te.is_null() || (*te).resjunk {
+                        continue;
+                    }
+                    let te_copy = pg_sys::copyObjectImpl(te as *const _) as *mut pg_sys::TargetEntry;
+                    (*te_copy).resno = resno;
+                    resno += 1;
+                    list = pg_sys::lappend(list, te_copy as *mut _);
+                }
+            }
+            list
+        };
+        (*cscan).scan.plan.targetlist = pg_sys::copyObjectImpl(clean_tlist as *const _) as *mut pg_sys::List;
+        (*cscan).custom_scan_tlist = clean_tlist;
 
         // Parse path's custom_private to get agg specs and group specs,
         // then build output mapping by walking tlist
@@ -683,70 +722,84 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             col_type_oid: u32,
             expr_kind: i32,  // 0=Column, 1=LengthOf
         }
+        #[derive(Clone)]
+        enum ParsedGroupExpr {
+            Column,
+            RegexpReplace { func_oid: u32, collation: u32, pattern: String, replacement: String },
+        }
+        #[derive(Clone)]
         struct ParsedGroup {
             col_idx: i32,
             type_oid: u32,
+            expr: ParsedGroupExpr,
         }
 
         let mut companion_oids: Vec<u32> = Vec::new();
         let mut parsed_aggs: Vec<ParsedAgg> = Vec::new();
         let mut parsed_groups: Vec<ParsedGroup> = Vec::new();
-        let mut found_sentinel = false;
-        let mut after_sentinel_idx = 0;
-        let mut num_aggs: i32 = 0;
-        let mut agg_fields: Vec<i32> = Vec::new();
-        let mut aggs_parsed = false;
-        let mut num_groups: i32 = 0;
-        let mut group_fields: Vec<i32> = Vec::new();
 
-        for i in 0..path_len {
-            let val = pg_sys::list_nth_int(path_private, i);
-            if !found_sentinel {
-                if val == -1 {
-                    found_sentinel = true;
-                    continue;
-                }
-                companion_oids.push(val as u32);
-            } else if !aggs_parsed {
-                if after_sentinel_idx == 0 {
-                    num_aggs = val;
-                    after_sentinel_idx += 1;
-                    if num_aggs == 0 { aggs_parsed = true; }
-                    continue;
-                }
-                agg_fields.push(val);
-                if agg_fields.len() == 5 {
-                    parsed_aggs.push(ParsedAgg {
-                        agg_type: agg_fields[0],
-                        col_idx: agg_fields[1],
-                        result_oid: agg_fields[2] as u32,
-                        col_type_oid: agg_fields[3] as u32,
-                        expr_kind: agg_fields[4],
-                    });
-                    agg_fields.clear();
-                    if parsed_aggs.len() == num_aggs as usize {
-                        aggs_parsed = true;
+        // Sequential parse with index
+        let mut idx = 0;
+        // Parse OIDs until sentinel
+        while idx < path_len {
+            let val = pg_sys::list_nth_int(path_private, idx);
+            idx += 1;
+            if val == -1 { break; }
+            companion_oids.push(val as u32);
+        }
+        // Parse agg specs
+        if idx < path_len {
+            let num_aggs = pg_sys::list_nth_int(path_private, idx) as usize;
+            idx += 1;
+            for _ in 0..num_aggs {
+                let agg_type = pg_sys::list_nth_int(path_private, idx);
+                let col_idx = pg_sys::list_nth_int(path_private, idx + 1);
+                let result_oid = pg_sys::list_nth_int(path_private, idx + 2) as u32;
+                let col_type_oid = pg_sys::list_nth_int(path_private, idx + 3) as u32;
+                let expr_kind = pg_sys::list_nth_int(path_private, idx + 4);
+                idx += 5;
+                parsed_aggs.push(ParsedAgg { agg_type, col_idx, result_oid, col_type_oid, expr_kind });
+            }
+        }
+        // Parse group specs (variable-length due to RegexpReplace)
+        if idx < path_len {
+            let num_groups = pg_sys::list_nth_int(path_private, idx) as usize;
+            idx += 1;
+            for _ in 0..num_groups {
+                let col_idx = pg_sys::list_nth_int(path_private, idx);
+                let type_oid = pg_sys::list_nth_int(path_private, idx + 1) as u32;
+                let expr_tag = pg_sys::list_nth_int(path_private, idx + 2);
+                idx += 3;
+                let expr = if expr_tag == 1 {
+                    let func_oid = pg_sys::list_nth_int(path_private, idx) as u32;
+                    let collation = pg_sys::list_nth_int(path_private, idx + 1) as u32;
+                    idx += 2;
+                    let pattern_len = pg_sys::list_nth_int(path_private, idx) as usize;
+                    idx += 1;
+                    let mut pattern_bytes = Vec::with_capacity(pattern_len);
+                    for _ in 0..pattern_len {
+                        pattern_bytes.push(pg_sys::list_nth_int(path_private, idx) as u8);
+                        idx += 1;
                     }
-                }
-                after_sentinel_idx += 1;
-            } else {
-                if num_groups == 0 && group_fields.is_empty() {
-                    num_groups = val;
-                    continue;
-                }
-                group_fields.push(val);
-                if group_fields.len() == 2 {
-                    parsed_groups.push(ParsedGroup {
-                        col_idx: group_fields[0],
-                        type_oid: group_fields[1] as u32,
-                    });
-                    group_fields.clear();
-                }
+                    let pattern = String::from_utf8_lossy(&pattern_bytes).into_owned();
+                    let replacement_len = pg_sys::list_nth_int(path_private, idx) as usize;
+                    idx += 1;
+                    let mut replacement_bytes = Vec::with_capacity(replacement_len);
+                    for _ in 0..replacement_len {
+                        replacement_bytes.push(pg_sys::list_nth_int(path_private, idx) as u8);
+                        idx += 1;
+                    }
+                    let replacement = String::from_utf8_lossy(&replacement_bytes).into_owned();
+                    ParsedGroupExpr::RegexpReplace { func_oid, collation, pattern, replacement }
+                } else {
+                    ParsedGroupExpr::Column
+                };
+                parsed_groups.push(ParsedGroup { col_idx, type_oid, expr });
             }
         }
 
         // Walk tlist to build output mapping:
-        // For each tlist entry, determine if it's an Aggref or a group Var.
+        // For each tlist entry, determine if it's an Aggref or a group Var/FuncExpr.
         // Track which agg_spec index or group_spec index it maps to.
         // output_map[i] = (type, index) where type=0 → agg, type=1 → group
         let mut output_map: Vec<(i32, i32)> = Vec::new();
@@ -757,6 +810,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             for i in 0..n {
                 let te = pg_sys::list_nth(tlist, i) as *const pg_sys::TargetEntry;
                 if te.is_null() {
+                    continue;
+                }
+                // Skip resjunk entries — these are internal PG entries for ORDER BY
+                // sort keys or HAVING references, not part of the query's output.
+                if (*te).resjunk {
                     continue;
                 }
                 let expr = (*te).expr as *const pg_sys::Node;
@@ -773,6 +831,25 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     // Find matching group spec
                     let group_idx = parsed_groups.iter().position(|g| g.col_idx == var_attno)
                         .unwrap_or(0) as i32;
+                    output_map.push((1, group_idx));
+                } else if (*expr).type_ == pg_sys::NodeTag::T_FuncExpr {
+                    // FuncExpr in target list — find matching GROUP BY spec
+                    let funcexpr = expr as *const pg_sys::FuncExpr;
+                    let funcid = u32::from((*funcexpr).funcid);
+                    let fn_args = (*funcexpr).args;
+                    let col_idx = if !fn_args.is_null() && (*fn_args).length >= 1 {
+                        let arg0 = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        if !arg0.is_null() && (*arg0).type_ == pg_sys::NodeTag::T_Var {
+                            (*( arg0 as *const pg_sys::Var)).varattno as i32 - 1
+                        } else {
+                            -1
+                        }
+                    } else {
+                        -1
+                    };
+                    let group_idx = parsed_groups.iter().position(|g| {
+                        g.col_idx == col_idx && matches!(&g.expr, ParsedGroupExpr::RegexpReplace { func_oid, .. } if *func_oid == funcid)
+                    }).unwrap_or(0) as i32;
                     output_map.push((1, group_idx));
                 }
             }
@@ -798,6 +875,24 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         for g in &parsed_groups {
             private_list = pg_sys::lappend_int(private_list, g.col_idx);
             private_list = pg_sys::lappend_int(private_list, g.type_oid as i32);
+            match &g.expr {
+                ParsedGroupExpr::Column => {
+                    private_list = pg_sys::lappend_int(private_list, 0);
+                }
+                ParsedGroupExpr::RegexpReplace { func_oid, collation, pattern, replacement } => {
+                    private_list = pg_sys::lappend_int(private_list, 1);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, *collation as i32);
+                    private_list = pg_sys::lappend_int(private_list, pattern.len() as i32);
+                    for &b in pattern.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                    private_list = pg_sys::lappend_int(private_list, replacement.len() as i32);
+                    for &b in replacement.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+            }
         }
         // Output mapping
         private_list = pg_sys::lappend_int(private_list, output_map.len() as i32);

@@ -170,13 +170,19 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                     es,
                 );
 
+                let regex_str = if state.regex_cache_size > 0 {
+                    format!(" regex_cache_size={} regex_calls={}", state.regex_cache_size, state.regex_cache_calls)
+                } else {
+                    String::new()
+                };
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} rows_processed={} result_rows={} batch_quals={} where_quals_null={}",
+                    "segments={} rows_processed={} result_rows={} batch_quals={} where_quals_null={}{}",
                     state.total_segments,
                     state.total_rows_processed,
                     state.result_rows.len(),
                     state.batch_quals_count,
                     state.where_quals_null,
+                    regex_str,
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(

@@ -896,6 +896,168 @@ class TestTransparentQuery:
             f"mixed WHERE group: {before_rows} vs {after_rows}"
         )
 
+    def test_transparent_query_avg_length_multibyte(self, db):
+        """AVG(length(text)) must count characters, not bytes.
+
+        Regression test: decompress_text_blob_to_lengths and the raw_string_cols
+        LengthOf path used Rust byte length (s.len()) instead of character count
+        (s.chars().count()), producing inflated AVG(length()) for multi-byte
+        UTF-8 strings.  PG's length(text) counts characters.
+
+        Covers:
+        - length_cols path (all agg refs use LengthOf, no regexp GROUP BY)
+        - raw_string_cols path (regexp_replace GROUP BY + AVG(length()))
+        - MIN(text) alongside AVG(length()) in the same query
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE avg_len_mb (
+                ts TIMESTAMPTZ NOT NULL,
+                category INTEGER NOT NULL,
+                label TEXT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('avg_len_mb', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert rows with multi-byte UTF-8 strings.
+        # Each emoji is 1 character but 4 bytes; each CJK char is 1 char but 3 bytes.
+        labels = [
+            "hello",           # 5 chars, 5 bytes
+            "héllo",           # 5 chars, 6 bytes (é = 2 bytes)
+            "日本語",          # 3 chars, 9 bytes
+            "🎉🎊",           # 2 chars, 8 bytes
+            "café☕",          # 5 chars, 8 bytes (é=2, ☕=3)
+        ]
+        for i in range(100):
+            label = labels[i % len(labels)]
+            cat = i % 3
+            db.execute(
+                f"INSERT INTO avg_len_mb VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"{cat}, '{label}')"
+            )
+        db.commit()
+
+        # Q28-like: GROUP BY int, AVG(length(text)), COUNT(*), HAVING
+        q_length_cols = (
+            "SELECT category, AVG(length(label)) AS l, COUNT(*) AS c "
+            "FROM avg_len_mb WHERE label <> '' "
+            "GROUP BY category HAVING COUNT(*) > 10 ORDER BY l DESC"
+        )
+        # Q29-like: regexp_replace GROUP BY + AVG(length(text)) + MIN(text)
+        q_raw_strings = (
+            "SELECT REGEXP_REPLACE(label, '^(.).*$', '\\1') AS k, "
+            "AVG(length(label)) AS l, COUNT(*) AS c, MIN(label) "
+            "FROM avg_len_mb WHERE label <> '' "
+            "GROUP BY k HAVING COUNT(*) > 5 ORDER BY l DESC"
+        )
+
+        before_length_cols = sorted(db.execute(q_length_cols).fetchall())
+        before_raw_strings = sorted(db.execute(q_raw_strings).fetchall())
+        assert len(before_length_cols) > 0
+        assert len(before_raw_strings) > 0
+
+        # Compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('avg_len_mb', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "avg_len_mb")
+
+        after_length_cols = sorted(db.execute(q_length_cols).fetchall())
+        after_raw_strings = sorted(db.execute(q_raw_strings).fetchall())
+
+        assert after_length_cols == before_length_cols, (
+            f"AVG(length()) with length_cols path mismatch:\n"
+            f"  before: {before_length_cols}\n"
+            f"  after:  {after_length_cols}"
+        )
+        assert after_raw_strings == before_raw_strings, (
+            f"AVG(length()) with raw_strings path mismatch:\n"
+            f"  before: {before_raw_strings}\n"
+            f"  after:  {after_raw_strings}"
+        )
+
+    def test_transparent_query_regexp_group_by_with_min(self, db):
+        """regexp_replace GROUP BY + AVG(length()) + COUNT(*) + MIN(text).
+
+        Regression test for Q29-pattern queries.  Exercises:
+        - regexp_replace expression in GROUP BY (raw_string_cols path)
+        - AVG(length(text)) via raw_string_cols (chars not bytes)
+        - MIN(text) via raw_string_cols (must use PG collation, not Rust byte order)
+        - HAVING filter on COUNT(*)
+
+        Uses strings where en_US.utf8 MIN differs from byte-order MIN
+        (e.g. uppercase vs lowercase, accented characters).
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE agg_regexp_min (
+                ts TIMESTAMPTZ NOT NULL,
+                url TEXT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('agg_regexp_min', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # URLs grouped by domain via regexp_replace.
+        # Within each domain group, MIN(url) must match PG's collation ordering.
+        # Include accented chars and mixed case to expose byte-order vs locale-order.
+        urls = [
+            # domain "example.com" — MIN should pick collation-smallest
+            "https://example.com/Ζεύς",
+            "https://example.com/alpha",
+            "https://example.com/Ångström",
+            "https://example.com/beta",
+            "https://example.com/café",
+            "https://example.com/日本",
+            # domain "test.org"
+            "https://test.org/über",
+            "https://test.org/Abc",
+            "https://test.org/abc",
+            "https://test.org/żółć",
+        ]
+        for i in range(200):
+            url = urls[i % len(urls)]
+            db.execute(
+                f"INSERT INTO agg_regexp_min VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"$${url}$$)"
+            )
+        db.commit()
+
+        # Mirrors Q29 pattern: regexp GROUP BY + AVG(length) + COUNT + MIN + HAVING
+        query = (
+            r"SELECT REGEXP_REPLACE(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, "
+            "AVG(length(url)) AS l, COUNT(*) AS c, MIN(url) "
+            "FROM agg_regexp_min WHERE url <> '' "
+            "GROUP BY k HAVING COUNT(*) > 10 ORDER BY l DESC"
+        )
+
+        before = db.execute(query).fetchall()
+        assert len(before) > 0, "expected results before compression"
+
+        db.execute(
+            "SELECT seaturtle_enable_compression('agg_regexp_min', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "agg_regexp_min")
+
+        after = db.execute(query).fetchall()
+
+        # Compare each column separately for clearer error messages
+        assert len(after) == len(before), (
+            f"row count mismatch: {len(before)} vs {len(after)}"
+        )
+        for i, (b, a) in enumerate(zip(before, after)):
+            assert a[0] == b[0], f"row {i} GROUP BY key: {b[0]} vs {a[0]}"
+            assert a[1] == b[1], f"row {i} AVG(length()): {b[1]} vs {a[1]}"
+            assert a[2] == b[2], f"row {i} COUNT(*): {b[2]} vs {a[2]}"
+            assert a[3] == b[3], f"row {i} MIN(url): {b[3]} vs {a[3]}"
+
     def test_agg_where_prepared_statement_caching(self, db):
         """AggScan+WHERE must return correct results under prepared statement plan caching.
 
