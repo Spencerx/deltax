@@ -357,6 +357,8 @@ pub(super) enum AggExpr {
     Column,
     /// length(col): AGG(length(col)) — compute string lengths without varlena allocation
     LengthOf,
+    /// col + const: AGG(col + N) — add integer constant before aggregation
+    AddConst,
 }
 
 enum AggAccumulator {
@@ -433,7 +435,8 @@ pub(super) struct AggExecSpec {
     pub(super) agg_type: AggType,
     pub(super) col_idx: i32,               // -1 for COUNT(*)
     pub(super) col_type_oid: pg_sys::Oid,  // source column type
-    pub(super) expr_kind: AggExpr,         // Column or LengthOf
+    pub(super) expr_kind: AggExpr,         // Column, LengthOf, or AddConst
+    pub(super) const_offset: i64,          // Only used when expr_kind == AddConst
 }
 
 /// Expression kind for GROUP BY columns.
@@ -1372,9 +1375,14 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     6 => AggType::Max,
                     _ => AggType::Count,
                 };
-                let expr_kind = match expr_kind_val {
-                    1 => AggExpr::LengthOf,
-                    _ => AggExpr::Column,
+                let (expr_kind, const_offset) = match expr_kind_val {
+                    1 => (AggExpr::LengthOf, 0i64),
+                    2 => {
+                        let offset = pg_sys::list_nth_int(custom_private, idx) as i64;
+                        idx += 1;
+                        (AggExpr::AddConst, offset)
+                    }
+                    _ => (AggExpr::Column, 0i64),
                 };
                 let _ = result_oid; // parsed for offset, not stored
                 agg_specs.push(AggExecSpec {
@@ -1382,6 +1390,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     col_idx,
                     col_type_oid: pg_sys::Oid::from(col_type_oid),
                     expr_kind,
+                    const_offset,
                 });
             }
         }
@@ -1949,12 +1958,20 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     match acc {
                                         AggAccumulator::SumInt { sum, count } => {
                                             let v = datum_to_i128(datum, spec.col_type_oid);
-                                            *sum += v;
+                                            if spec.expr_kind == AggExpr::AddConst {
+                                                *sum += v + spec.const_offset as i128;
+                                            } else {
+                                                *sum += v;
+                                            }
                                             *count += 1;
                                         }
                                         AggAccumulator::SumFloat { sum, count } => {
                                             let v = datum_to_f64(datum, spec.col_type_oid);
-                                            *sum += v;
+                                            if spec.expr_kind == AggExpr::AddConst {
+                                                *sum += v + spec.const_offset as f64;
+                                            } else {
+                                                *sum += v;
+                                            }
                                             *count += 1;
                                         }
                                         _ => {}

@@ -575,7 +575,8 @@ pub struct AggSpec {
     pub col_idx: i32,               // 0-based column index, -1 for COUNT(*)
     pub result_type_oid: pg_sys::Oid,
     pub col_type_oid: pg_sys::Oid,  // source column type OID
-    pub expr_kind: super::exec::AggExpr,  // Column or LengthOf
+    pub expr_kind: super::exec::AggExpr,  // Column, LengthOf, or AddConst
+    pub const_offset: i64,          // Only used when expr_kind == AddConst
 }
 
 /// Add a SeaTurtleAgg custom path to the grouped relation's pathlist.
@@ -622,6 +623,9 @@ pub unsafe fn add_agg_path(
             private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
             private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
             private_list = pg_sys::lappend_int(private_list, spec.expr_kind as i32);
+            if matches!(spec.expr_kind, super::exec::AggExpr::AddConst) {
+                private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
+            }
         }
         private_list = pg_sys::lappend_int(private_list, group_specs.len() as i32);
         for gs in group_specs {
@@ -728,7 +732,8 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             col_idx: i32,
             result_oid: u32,
             col_type_oid: u32,
-            expr_kind: i32,  // 0=Column, 1=LengthOf
+            expr_kind: i32,  // 0=Column, 1=LengthOf, 2=AddConst
+            const_offset: i32, // Only used when expr_kind == 2
         }
         #[derive(Clone)]
         enum ParsedGroupExpr {
@@ -767,7 +772,14 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                 let col_type_oid = pg_sys::list_nth_int(path_private, idx + 3) as u32;
                 let expr_kind = pg_sys::list_nth_int(path_private, idx + 4);
                 idx += 5;
-                parsed_aggs.push(ParsedAgg { agg_type, col_idx, result_oid, col_type_oid, expr_kind });
+                let const_offset = if expr_kind == 2 {
+                    let v = pg_sys::list_nth_int(path_private, idx);
+                    idx += 1;
+                    v
+                } else {
+                    0
+                };
+                parsed_aggs.push(ParsedAgg { agg_type, col_idx, result_oid, col_type_oid, expr_kind, const_offset });
             }
         }
         // Parse group specs (variable-length due to RegexpReplace)
@@ -898,6 +910,9 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, a.result_oid as i32);
             private_list = pg_sys::lappend_int(private_list, a.col_type_oid as i32);
             private_list = pg_sys::lappend_int(private_list, a.expr_kind);
+            if a.expr_kind == 2 {
+                private_list = pg_sys::lappend_int(private_list, a.const_offset);
+            }
         }
         private_list = pg_sys::lappend_int(private_list, parsed_groups.len() as i32);
         for g in &parsed_groups {

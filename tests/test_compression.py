@@ -1349,6 +1349,60 @@ class TestTransparentQuery:
                 f"sum mismatch for {b[0]}: {b[2]} vs {a[2]}"
             )
 
+    def test_transparent_query_sum_add_const(self, db):
+        """SUM(col + N) pushdown: results match before/after compression."""
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE sum_add_test (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                val SMALLINT
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('sum_add_test', 'ts', '1 day'::interval)")
+        db.commit()
+
+        for i in range(100):
+            db.execute(
+                f"INSERT INTO sum_add_test VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', "
+                f"{i % 50})"
+            )
+        db.commit()
+
+        # Query BEFORE compression
+        before = db.execute(
+            "SELECT SUM(val), SUM(val + 10), SUM(val + 100) FROM sum_add_test"
+        ).fetchone()
+
+        # Enable and compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('sum_add_test', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "sum_add_test")
+
+        # Query AFTER compression
+        after = db.execute(
+            "SELECT SUM(val), SUM(val + 10), SUM(val + 100) FROM sum_add_test"
+        ).fetchone()
+
+        assert before[0] == after[0], f"SUM(val) mismatch: {before[0]} vs {after[0]}"
+        assert before[1] == after[1], f"SUM(val + 10) mismatch: {before[1]} vs {after[1]}"
+        assert before[2] == after[2], f"SUM(val + 100) mismatch: {before[2]} vs {after[2]}"
+
+        # Verify AggScan is used (not plain Aggregate over DecompressState)
+        explain = db.execute(
+            "EXPLAIN SELECT SUM(val), SUM(val + 10), SUM(val + 100) FROM sum_add_test"
+        ).fetchall()
+        explain_text = "\n".join(r[0] for r in explain)
+        assert "SeaTurtleAgg" in explain_text, (
+            f"Expected SeaTurtleAgg in plan:\n{explain_text}"
+        )
+
     def test_explain_analyze_shows_timing(self, db):
         """EXPLAIN ANALYZE on compressed partition shows SeaTurtle timing."""
         setup_metrics_table(db)

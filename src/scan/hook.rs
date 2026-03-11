@@ -655,6 +655,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     result_type_oid: (*aggref).aggtype,
                     col_type_oid: pg_sys::InvalidOid,
                     expr_kind: AggExpr::Column,
+                    const_offset: 0,
                 });
                 all_minmax = false;
                 has_non_minmax = true;
@@ -686,6 +687,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                 return;
             }
 
+            let mut agg_const_offset: i64 = 0;
             let (var_node, expr_kind): (*const pg_sys::Var, AggExpr) = if (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
                 (arg_expr as *const pg_sys::Var, AggExpr::Column)
             } else if (*arg_expr).type_ == pg_sys::NodeTag::T_RelabelType {
@@ -719,8 +721,59 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     return;
                 }
                 (inner as *const pg_sys::Var, AggExpr::LengthOf)
+            } else if (*arg_expr).type_ == pg_sys::NodeTag::T_OpExpr {
+                // Check for col + const (or const + col)
+                let opexpr = arg_expr as *const pg_sys::OpExpr;
+                let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+                if opname_ptr.is_null() {
+                    return;
+                }
+                let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                    .to_str()
+                    .unwrap_or("");
+                if opname != "+" {
+                    return; // Only + operator supported
+                }
+                let op_args = (*opexpr).args;
+                if op_args.is_null() || (*op_args).length != 2 {
+                    return;
+                }
+                let left = (*(*op_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                let right = (*(*op_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                if left.is_null() || right.is_null() {
+                    return;
+                }
+                // Extract (Var, Const) or (Const, Var)
+                let (var_ptr, const_ptr) = if (*left).type_ == pg_sys::NodeTag::T_Var
+                    && (*right).type_ == pg_sys::NodeTag::T_Const
+                {
+                    (left as *const pg_sys::Var, right as *const pg_sys::Const)
+                } else if (*left).type_ == pg_sys::NodeTag::T_Const
+                    && (*right).type_ == pg_sys::NodeTag::T_Var
+                {
+                    (right as *const pg_sys::Var, left as *const pg_sys::Const)
+                } else {
+                    return; // Not a simple Var + Const
+                };
+                // Extract integer constant value — only INT2/INT4/INT8
+                if (*const_ptr).constisnull {
+                    return;
+                }
+                let const_type = (*const_ptr).consttype;
+                let const_val: i64 = match const_type {
+                    pg_sys::INT2OID => (*const_ptr).constvalue.value() as i16 as i64,
+                    pg_sys::INT4OID => (*const_ptr).constvalue.value() as i32 as i64,
+                    pg_sys::INT8OID => (*const_ptr).constvalue.value() as i64,
+                    _ => return, // Non-integer constant
+                };
+                // Check fits in i32 for serialization
+                if const_val < i32::MIN as i64 || const_val > i32::MAX as i64 {
+                    return;
+                }
+                agg_const_offset = const_val;
+                (var_ptr, AggExpr::AddConst)
             } else {
-                return; // Only plain column references or length(col)
+                return; // Only plain column references, length(col), or col + const
             };
 
             let varattno = (*var_node).varattno;
@@ -760,6 +813,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         result_type_oid: (*aggref).aggtype,
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
+                        const_offset: agg_const_offset,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -771,6 +825,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         result_type_oid: (*aggref).aggtype,
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
+                        const_offset: agg_const_offset,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -783,6 +838,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             result_type_oid: (*aggref).aggtype,
                             col_type_oid: effective_col_type_oid,
                             expr_kind,
+                            const_offset: agg_const_offset,
                         });
                     } else {
                         classified_aggs.push(path::AggSpec {
@@ -791,6 +847,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             result_type_oid: (*aggref).aggtype,
                             col_type_oid: effective_col_type_oid,
                             expr_kind,
+                            const_offset: agg_const_offset,
                         });
                     }
                     all_minmax = false;
@@ -803,6 +860,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         result_type_oid: (*aggref).aggtype,
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
+                        const_offset: agg_const_offset,
                     });
                     if has_non_minmax {
                         // Mixed MIN/MAX with SUM/COUNT/AVG → falls through to general AggScan
@@ -817,6 +875,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         result_type_oid: (*aggref).aggtype,
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
+                        const_offset: agg_const_offset,
                     });
                     if has_non_minmax {
                         all_minmax = false;
