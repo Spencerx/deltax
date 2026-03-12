@@ -1498,50 +1498,51 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             }
         }
 
-        // Compute actual uncompressed row count from our catalog metadata.
-        let total_uncompressed_rows: f64 = companion_oids.iter()
-            .map(|&oid| { let (_, _, rows) = cost::estimate_cost(oid); rows })
-            .sum();
-
         // Skip AggScan when any GROUP BY column has high cardinality (near-unique).
         // Use stored ndistinct from compression to detect this, since PG's own
         // statistics are unavailable (original partitions are empty after compression).
+        // Only check when there's no WHERE clause — a selective filter can drastically
+        // reduce the actual number of groups even for high-ndistinct columns.
         if !group_specs.is_empty()
-            && total_uncompressed_rows > 0.0
+            && !has_where
             && group_by_relid != pg_sys::InvalidOid
         {
-            // Merge ndistinct across all companion partitions (sum = conservative overestimate)
-            let mut merged_ndistinct: std::collections::HashMap<String, i64> =
-                std::collections::HashMap::new();
-            for &oid in &companion_oids {
-                let nd = cost::get_column_ndistinct(oid);
-                for (col, count) in nd {
-                    *merged_ndistinct.entry(col).or_insert(0) += count;
-                }
-            }
+            let total_uncompressed_rows: f64 = companion_oids.iter()
+                .map(|&oid| { let (_, _, rows) = cost::estimate_cost(oid); rows })
+                .sum();
 
-            if !merged_ndistinct.is_empty() {
-                // Check if any plain-column GROUP BY has high cardinality
-                let threshold = total_uncompressed_rows * 0.5;
-                let has_high_cardinality = group_specs.iter().any(|gs| {
-                    if !matches!(gs.expr, GroupByExpr::Column) {
-                        return false; // DateTrunc/RegexpReplace reduce cardinality
+            if total_uncompressed_rows > 0.0 {
+                let mut merged_ndistinct: std::collections::HashMap<String, i64> =
+                    std::collections::HashMap::new();
+                for &oid in &companion_oids {
+                    let nd = cost::get_column_ndistinct(oid);
+                    for (col, count) in nd {
+                        *merged_ndistinct.entry(col).or_insert(0) += count;
                     }
-                    let attno = (gs.col_idx + 1) as i16;
-                    let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
-                    if name_ptr.is_null() {
-                        return false;
+                }
+
+                if !merged_ndistinct.is_empty() {
+                    let threshold = total_uncompressed_rows * 0.5;
+                    let has_high_cardinality = group_specs.iter().any(|gs| {
+                        if !matches!(gs.expr, GroupByExpr::Column) {
+                            return false;
+                        }
+                        let attno = (gs.col_idx + 1) as i16;
+                        let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
+                        if name_ptr.is_null() {
+                            return false;
+                        }
+                        let col_name = std::ffi::CStr::from_ptr(name_ptr)
+                            .to_str()
+                            .unwrap_or("");
+                        merged_ndistinct
+                            .get(col_name)
+                            .map(|&nd| nd as f64 > threshold)
+                            .unwrap_or(false)
+                    });
+                    if has_high_cardinality {
+                        return;
                     }
-                    let col_name = std::ffi::CStr::from_ptr(name_ptr)
-                        .to_str()
-                        .unwrap_or("");
-                    merged_ndistinct
-                        .get(col_name)
-                        .map(|&nd| nd as f64 > threshold)
-                        .unwrap_or(false)
-                });
-                if has_high_cardinality {
-                    return;
                 }
             }
         }
