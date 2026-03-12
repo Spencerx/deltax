@@ -1733,6 +1733,23 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         // Also check if any agg references a raw_string_col for Min/Max on text
         // (e.g. MIN(Referer) where Referer is also the regexp GROUP BY column)
 
+        // Identify text GROUP BY columns that use dictionary-index-level grouping
+        let mut dict_group_cols: Vec<bool> = vec![false; meta.col_names.len()];
+        for gs in &group_specs {
+            if matches!(gs.expr, GroupByExpr::Column)
+                && (gs.type_oid == pg_sys::TEXTOID
+                    || gs.type_oid == pg_sys::VARCHAROID
+                    || gs.type_oid == pg_sys::BPCHAROID
+                    || gs.type_oid == pg_sys::NAMEOID)
+            {
+                dict_group_cols[gs.col_idx as usize] = true;
+            }
+        }
+
+        // Per-segment storage for dict GROUP BY: (dict_key_map, indices) per column
+        // dict_key_map maps dict_idx → GroupKeyVal::Str, built once per segment per column
+        let mut seg_dict_groups: Vec<Option<(Vec<GroupKeyVal>, Vec<u16>)>> = Vec::new();
+
         let t2 = Instant::now();
         let mut total_segments: u64 = 0;
         let mut total_rows_processed: u64 = 0;
@@ -1805,23 +1822,133 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     let typmod = meta.col_typmods[col_idx];
 
                     if raw_string_cols[col_idx] {
-                        // Decompress to raw strings for regexp GROUP BY
-                        let (strings, sel) = decompress_text_blob_to_raw_strings(blob, &batch_quals, col_idx);
-                        // Also build dummy decompressed datums (placeholder — we use raw_strings instead)
-                        let datums: Vec<(pg_sys::Datum, bool)> = strings.iter().map(|s| {
-                            match s {
-                                Some(_) => (pg_sys::Datum::from(0usize), false),
-                                None => (pg_sys::Datum::from(0usize), true),
+                        // Dictionary-optimized path: pre-warm regex cache from dict entries only
+                        let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
+                        if cc_ref.type_tag == compression::CompressionType::Dictionary {
+                            let total_count = cc_ref.row_count as usize;
+                            let non_null_count = count_non_null(cc_ref.null_bitmap, total_count);
+                            let (dict_entries, indices) =
+                                compression::dictionary::decode_dict_and_indices(cc_ref.data, non_null_count);
+
+                            // Pre-warm regex cache from dict entries only — O(dict_size) calls
+                            for &entry in &dict_entries {
+                                let key = entry.to_string();
+                                if !regex_cache.contains_key(&key) {
+                                    for rgi in &regexp_group_infos {
+                                        if group_specs[rgi.group_idx].col_idx as usize == col_idx {
+                                            regex_cache_calls += 1;
+                                            let input_datum = {
+                                                let text = pg_sys::cstring_to_text_with_len(
+                                                    entry.as_ptr() as *const _, entry.len() as i32,
+                                                );
+                                                pg_sys::Datum::from(text as usize)
+                                            };
+                                            let result_datum = pg_sys::OidFunctionCall3Coll(
+                                                rgi.func_oid,
+                                                rgi.collation,
+                                                input_datum,
+                                                rgi.pattern_datum,
+                                                rgi.replacement_datum,
+                                            );
+                                            let cstr = pg_sys::text_to_cstring(result_datum.cast_mut_ptr());
+                                            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                            pg_sys::pfree(cstr as *mut _);
+                                            regex_cache.insert(key.clone(), s);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                        }).collect();
-                        decompressed.push(datums);
-                        raw_strings.push(Some(strings));
-                        if !sel.is_empty() {
-                            if pre_selection.is_empty() {
-                                pre_selection = sel;
+
+                            // Build per-row strings from cached regex results via dict index
+                            let has_ne_empty = batch_quals.iter().any(|bq| {
+                                bq.col_idx == col_idx
+                                    && bq.text_const.as_deref() == Some("")
+                                    && bq.op == BatchCompareOp::Ne
+                            });
+                            let ne_sel = if has_ne_empty {
+                                compression::dictionary::check_ne_empty(cc_ref.data, non_null_count)
                             } else {
-                                for (ps, s) in pre_selection.iter_mut().zip(sel.iter()) {
-                                    *ps = *ps && *s;
+                                Vec::new()
+                            };
+
+                            let nn_strings: Vec<String> = indices
+                                .iter()
+                                .map(|&idx| dict_entries[idx as usize].to_string())
+                                .collect();
+
+                            // Reinsert nulls
+                            if cc_ref.null_bitmap.is_empty() {
+                                let strings: Vec<Option<String>> = nn_strings.into_iter().map(Some).collect();
+                                let datums: Vec<(pg_sys::Datum, bool)> = strings.iter().map(|s| {
+                                    match s {
+                                        Some(_) => (pg_sys::Datum::from(0usize), false),
+                                        None => (pg_sys::Datum::from(0usize), true),
+                                    }
+                                }).collect();
+                                decompressed.push(datums);
+                                raw_strings.push(Some(strings));
+                                if !ne_sel.is_empty() {
+                                    if pre_selection.is_empty() {
+                                        pre_selection = ne_sel;
+                                    } else {
+                                        for (ps, s) in pre_selection.iter_mut().zip(ne_sel.iter()) {
+                                            *ps = *ps && *s;
+                                        }
+                                    }
+                                }
+                            } else {
+                                let mut strings = Vec::with_capacity(total_count);
+                                let mut sel = if has_ne_empty { Vec::with_capacity(total_count) } else { Vec::new() };
+                                let mut val_idx = 0;
+                                for i in 0..total_count {
+                                    let is_null = (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+                                    if is_null {
+                                        strings.push(None);
+                                        if has_ne_empty { sel.push(false); }
+                                    } else {
+                                        strings.push(Some(nn_strings[val_idx].clone()));
+                                        if has_ne_empty && !ne_sel.is_empty() { sel.push(ne_sel[val_idx]); }
+                                        else if has_ne_empty { sel.push(true); }
+                                        val_idx += 1;
+                                    }
+                                }
+                                let datums: Vec<(pg_sys::Datum, bool)> = strings.iter().map(|s| {
+                                    match s {
+                                        Some(_) => (pg_sys::Datum::from(0usize), false),
+                                        None => (pg_sys::Datum::from(0usize), true),
+                                    }
+                                }).collect();
+                                decompressed.push(datums);
+                                raw_strings.push(Some(strings));
+                                if !sel.is_empty() {
+                                    if pre_selection.is_empty() {
+                                        pre_selection = sel;
+                                    } else {
+                                        for (ps, s) in pre_selection.iter_mut().zip(sel.iter()) {
+                                            *ps = *ps && *s;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Non-dictionary: fall back to existing path
+                            let (strings, sel) = decompress_text_blob_to_raw_strings(blob, &batch_quals, col_idx);
+                            let datums: Vec<(pg_sys::Datum, bool)> = strings.iter().map(|s| {
+                                match s {
+                                    Some(_) => (pg_sys::Datum::from(0usize), false),
+                                    None => (pg_sys::Datum::from(0usize), true),
+                                }
+                            }).collect();
+                            decompressed.push(datums);
+                            raw_strings.push(Some(strings));
+                            if !sel.is_empty() {
+                                if pre_selection.is_empty() {
+                                    pre_selection = sel;
+                                } else {
+                                    for (ps, s) in pre_selection.iter_mut().zip(sel.iter()) {
+                                        *ps = *ps && *s;
+                                    }
                                 }
                             }
                         }
@@ -1900,6 +2027,58 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
 
             let row_count = seg.row_count as usize;
 
+            // Extract dict GROUP BY info for text columns (dict_idx → GroupKeyVal mapping + per-row indices)
+            seg_dict_groups.clear();
+            seg_dict_groups.resize_with(meta.col_names.len(), || None);
+            {
+                let mut blob_idx2 = 0;
+                for (col_idx, col_name) in meta.col_names.iter().enumerate() {
+                    if meta.segment_by.contains(col_name) {
+                        // segment_by columns don't have blobs
+                        continue;
+                    }
+                    if needed_cols[col_idx] && dict_group_cols[col_idx] {
+                        let blob = &seg.compressed_blobs[blob_idx2];
+                        if !blob.is_empty() {
+                            let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
+                            if cc_ref.type_tag == compression::CompressionType::Dictionary {
+                                let total = cc_ref.row_count as usize;
+                                let nn_count = count_non_null(cc_ref.null_bitmap, total);
+                                let (dict_entries, nn_indices) =
+                                    compression::dictionary::decode_dict_and_indices(cc_ref.data, nn_count);
+
+                                // Build dict_key_map: one String allocation per unique value
+                                let dict_key_map: Vec<GroupKeyVal> = dict_entries
+                                    .iter()
+                                    .map(|&s| GroupKeyVal::Str(s.to_string()))
+                                    .collect();
+
+                                // Expand nn_indices to full-row indices (nulls get sentinel 0xFFFF)
+                                let full_indices = if cc_ref.null_bitmap.is_empty() {
+                                    nn_indices
+                                } else {
+                                    let mut fi = Vec::with_capacity(total);
+                                    let mut vi = 0;
+                                    for i in 0..total {
+                                        let is_null = (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+                                        if is_null {
+                                            fi.push(0xFFFFu16);
+                                        } else {
+                                            fi.push(nn_indices[vi]);
+                                            vi += 1;
+                                        }
+                                    }
+                                    fi
+                                };
+
+                                seg_dict_groups[col_idx] = Some((dict_key_map, full_indices));
+                            }
+                        }
+                    }
+                    blob_idx2 += 1;
+                }
+            }
+
             // Evaluate batch quals (WHERE) if any.
             // pre_selection seeds the selection vector so that rows already
             // filtered by LIKE during decompression are skipped (their dummy
@@ -1959,16 +2138,26 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     key.push(GroupKeyVal::Int(truncated));
                                 }
                                 GroupByExpr::Column => {
-                                    let datum = col[row].0;
-                                    match gs.type_oid {
-                                        pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
-                                            let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
-                                            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
-                                            pg_sys::pfree(cstr as *mut _);
-                                            key.push(GroupKeyVal::Str(s));
+                                    // Dictionary-index-level text GROUP BY: lookup from pre-built map
+                                    if let Some((ref dict_key_map, ref full_indices)) = seg_dict_groups[gs.col_idx as usize] {
+                                        let idx = full_indices[row];
+                                        if idx == 0xFFFF {
+                                            key.push(GroupKeyVal::Null);
+                                        } else {
+                                            key.push(dict_key_map[idx as usize].clone());
                                         }
-                                        _ => {
-                                            key.push(GroupKeyVal::Int(datum.value() as i64));
+                                    } else {
+                                        let datum = col[row].0;
+                                        match gs.type_oid {
+                                            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
+                                                let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
+                                                let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                                pg_sys::pfree(cstr as *mut _);
+                                                key.push(GroupKeyVal::Str(s));
+                                            }
+                                            _ => {
+                                                key.push(GroupKeyVal::Int(datum.value() as i64));
+                                            }
                                         }
                                     }
                                 }
@@ -5428,7 +5617,7 @@ fn decompress_text_blob_to_raw_strings(
 
             let strings: Vec<String> = indices.iter().map(|&idx| dict_entries[idx as usize].to_string()).collect();
             let sel: Vec<bool> = if has_ne_empty {
-                indices.iter().map(|&idx| !dict_entries[idx as usize].is_empty()).collect()
+                compression::dictionary::check_ne_empty(cc.data, non_null_count)
             } else {
                 Vec::new()
             };
@@ -5520,18 +5709,31 @@ unsafe fn decompress_text_blob_with_eq_filter(
 
     let (nn_datums, nn_sel): (Vec<pg_sys::Datum>, Vec<bool>) = match cc.type_tag {
         CompressionType::Dictionary => {
-            let (dict_entries, indices) =
-                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+            let hdr = compression::dictionary::parse_header(cc.data);
 
-            // Check each dictionary entry once — O(dict_size) instead of O(row_count)
-            let dict_matches: Vec<bool> = dict_entries.iter().map(|s| matches_eq(s)).collect();
+            // Fast path for empty-string comparison: use precomputed empty_string_idx
+            let dict_matches: Vec<bool> = if const_str.is_empty() && hdr.empty_string_idx != 0xFFFF {
+                let mut m = vec![is_ne; hdr.dict.len()];
+                m[hdr.empty_string_idx as usize] = !is_ne;
+                m
+            } else if const_str.is_empty() && hdr.empty_string_idx == 0xFFFF {
+                // No empty string in dict: eq=all false, ne=all true
+                vec![is_ne; hdr.dict.len()]
+            } else {
+                hdr.dict.iter().map(|s| matches_eq(s)).collect()
+            };
+
+            let mut indices = Vec::with_capacity(non_null_count);
+            for i in 0..non_null_count {
+                indices.push(compression::dictionary::read_index(cc.data, hdr.indices_start, hdr.index_width, i));
+            }
 
             let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
             let matched_slices: Vec<&str> = indices
                 .iter()
                 .zip(sel.iter())
                 .filter(|&(_, &pass)| pass)
-                .map(|(&idx, _)| dict_entries[idx as usize])
+                .map(|(&idx, _)| hdr.dict[idx as usize])
                 .collect();
             let matched_datums = unsafe {
                 str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
@@ -5655,17 +5857,12 @@ fn decompress_text_blob_to_lengths(
             let (dict_entries, indices) =
                 compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
 
-            // Pre-compute lengths (character count, not byte count) and empty status for each dict entry
+            // Pre-compute lengths (character count, not byte count) for each dict entry
             let dict_lengths: Vec<i32> = dict_entries.iter().map(|s| s.chars().count() as i32).collect();
-            let dict_empty: Vec<bool> = if filter_empty {
-                dict_entries.iter().map(|s| s.is_empty()).collect()
-            } else {
-                Vec::new()
-            };
 
             let lengths: Vec<i32> = indices.iter().map(|&idx| dict_lengths[idx as usize]).collect();
             let sel: Vec<bool> = if filter_empty {
-                indices.iter().map(|&idx| !dict_empty[idx as usize]).collect()
+                compression::dictionary::check_ne_empty(cc.data, non_null_count)
             } else {
                 Vec::new()
             };

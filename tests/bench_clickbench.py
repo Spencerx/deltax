@@ -30,7 +30,7 @@ from clickbench_data import (
     save_bench_results,
     validate_nondet_query,
 )
-from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, QUERIES
+from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, LIMIT_TIE_QUERIES, QUERIES
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +489,29 @@ class TestClickBench:
                         else:
                             mismatches.append(qid)
                             print(f"  {qid}: MISMATCH ({detail})")
+                elif qid in LIMIT_TIE_QUERIES:
+                    # Tie-tolerant: strip rows at the tail sharing the last
+                    # row's sort key, then exact-match the non-tied prefix.
+                    sk = LIMIT_TIE_QUERIES[qid]
+                    if len(u_rows) != len(c_rows):
+                        mismatches.append(qid)
+                        print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
+                    elif len(u_rows) == 0:
+                        print(f"  {qid}: OK (0 rows)")
+                    else:
+                        # Find the boundary sort-key value (last row)
+                        u_boundary = u_rows[-1][sk]
+                        c_boundary = c_rows[-1][sk]
+                        u_stable = sorted([r for r in u_rows if r[sk] != u_boundary])
+                        c_stable = sorted([r for r in c_rows if r[sk] != c_boundary])
+                        if u_stable == c_stable:
+                            n_tied = len(u_rows) - len(u_stable)
+                            print(f"  {qid}: OK ({len(u_stable)} exact + {n_tied} tied rows)")
+                        else:
+                            mismatches.append(qid)
+                            print(f"  {qid}: MISMATCH (non-tied rows differ)!")
+                            print(f"    uncompressed stable: {len(u_stable)} rows, first={u_stable[:2]}")
+                            print(f"    compressed stable:   {len(c_stable)} rows, first={c_stable[:2]}")
                 elif sorted(u_rows) == sorted(c_rows):
                     print(f"  {qid}: OK ({len(u_rows)} rows match)")
                 else:

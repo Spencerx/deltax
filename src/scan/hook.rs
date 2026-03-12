@@ -1171,15 +1171,8 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
                     pg_sys::get_atttypetypmodcoll(relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
 
-                    // Don't push down GROUP BY on text/varchar columns —
-                    // PG's HashAggregate is faster for high-cardinality string grouping.
-                    if type_oid == pg_sys::TEXTOID
-                        || type_oid == pg_sys::VARCHAROID
-                        || type_oid == pg_sys::BPCHAROID
-                        || type_oid == pg_sys::NAMEOID
-                    {
-                        return;
-                    }
+                    // Text/varchar GROUP BY columns are allowed when dictionary-encoded
+                    // (ndistinct < 65536). Guarded by ndistinct check below.
 
                     group_specs.push(super::exec::GroupByColSpec {
                         col_idx,
@@ -1514,6 +1507,46 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     let nd = cost::get_column_ndistinct(oid);
                     for (col, count) in nd {
                         *merged_ndistinct.entry(col).or_insert(0) += count;
+                    }
+                }
+
+                // Guard: text GROUP BY columns must be dictionary-encodable (ndistinct < 65536)
+                // AND low enough cardinality that our HashMap GROUP BY beats PG's HashAggregate.
+                // Above ~10K merged ndistinct, PG's tuple-based HashAggregate is faster.
+                let has_text_group = group_specs.iter().any(|gs| {
+                    matches!(gs.expr, GroupByExpr::Column)
+                        && (gs.type_oid == pg_sys::TEXTOID
+                            || gs.type_oid == pg_sys::VARCHAROID
+                            || gs.type_oid == pg_sys::BPCHAROID
+                            || gs.type_oid == pg_sys::NAMEOID)
+                });
+                if has_text_group {
+                    let text_ok = group_specs.iter().all(|gs| {
+                        if !matches!(gs.expr, GroupByExpr::Column) {
+                            return true; // non-Column exprs (regexp, date_trunc) are fine
+                        }
+                        let is_text = gs.type_oid == pg_sys::TEXTOID
+                            || gs.type_oid == pg_sys::VARCHAROID
+                            || gs.type_oid == pg_sys::BPCHAROID
+                            || gs.type_oid == pg_sys::NAMEOID;
+                        if !is_text {
+                            return true;
+                        }
+                        let attno = (gs.col_idx + 1) as i16;
+                        let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
+                        if name_ptr.is_null() {
+                            return false;
+                        }
+                        let col_name = std::ffi::CStr::from_ptr(name_ptr)
+                            .to_str()
+                            .unwrap_or("");
+                        merged_ndistinct
+                            .get(col_name)
+                            .map(|&nd| nd > 0 && nd < 10000)
+                            .unwrap_or(false)
+                    });
+                    if !text_ok {
+                        return;
                     }
                 }
 

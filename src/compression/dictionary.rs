@@ -1,42 +1,68 @@
 /// Dictionary encoding for low-cardinality TEXT columns.
 ///
-/// Stores a dictionary of unique strings + an array of indices.
+/// Stores a dictionary of unique strings + an array of fixed-width indices.
 ///
 /// Format:
 ///   4 bytes — dictionary size (number of unique strings, u32 LE)
+///   1 byte  — index_width (1 if dict_size ≤ 255, else 2)
+///   2 bytes — empty_string_idx (u16 LE, 0xFFFF if no empty string)
 ///   For each dictionary entry:
 ///     4 bytes — string length (u32 LE)
 ///     N bytes — string UTF-8 data
 ///   Then for each value:
-///     compressed index (varint, 0-based)
+///     index_width bytes — dictionary index (u8 or u16 LE)
 ///
 /// Use dictionary encoding when cardinality < 10% of row count AND < 65536 distinct values.
 /// Otherwise fall back to LZ4.
 use std::collections::HashMap;
 
-fn write_varint(buf: &mut Vec<u8>, mut v: u32) {
-    loop {
-        let byte = (v & 0x7F) as u8;
-        v >>= 7;
-        if v == 0 {
-            buf.push(byte);
-            return;
-        }
-        buf.push(byte | 0x80);
+/// Parsed dictionary header — dict entries + metadata for direct index access.
+pub struct DictHeader<'a> {
+    pub dict: Vec<&'a str>,
+    pub index_width: u8,
+    pub empty_string_idx: u16,
+    pub indices_start: usize,
+}
+
+/// Parse header + dictionary entries from encoded data.
+pub fn parse_header(data: &[u8]) -> DictHeader<'_> {
+    let mut offset = 0;
+    let dict_size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let index_width = data[offset];
+    offset += 1;
+
+    let empty_string_idx = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
+    offset += 2;
+
+    let mut dict: Vec<&str> = Vec::with_capacity(dict_size);
+    for _ in 0..dict_size {
+        let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let s = std::str::from_utf8(&data[offset..offset + str_len])
+            .expect("invalid UTF-8 in dictionary");
+        offset += str_len;
+        dict.push(s);
+    }
+
+    DictHeader {
+        dict,
+        index_width,
+        empty_string_idx,
+        indices_start: offset,
     }
 }
 
-fn read_varint(buf: &[u8]) -> (u32, usize) {
-    let mut result: u32 = 0;
-    let mut shift = 0u32;
-    for (i, &byte) in buf.iter().enumerate() {
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return (result, i + 1);
-        }
-        shift += 7;
+/// Read a single index from the index array.
+#[inline(always)]
+pub fn read_index(data: &[u8], indices_start: usize, index_width: u8, row: usize) -> u16 {
+    let pos = indices_start + row * index_width as usize;
+    if index_width == 1 {
+        data[pos] as u16
+    } else {
+        u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap())
     }
-    (result, buf.len())
 }
 
 /// Returns true if dictionary encoding is suitable for the given values.
@@ -58,24 +84,43 @@ pub fn should_use_dictionary(values: &[&str]) -> bool {
 
 pub fn encode(values: &[&str]) -> Vec<u8> {
     if values.is_empty() {
-        return 0u32.to_le_bytes().to_vec();
+        let mut buf = 0u32.to_le_bytes().to_vec();
+        buf.push(1); // index_width = 1
+        buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // no empty string
+        return buf;
     }
 
-    let mut dict: HashMap<&str, u32> = HashMap::new();
+    let mut dict: HashMap<&str, u16> = HashMap::new();
     let mut dict_entries: Vec<&str> = Vec::new();
 
     for &v in values {
         if !dict.contains_key(v) {
-            let idx = dict_entries.len() as u32;
+            let idx = dict_entries.len() as u16;
             dict.insert(v, idx);
             dict_entries.push(v);
         }
     }
 
+    let dict_size = dict_entries.len();
+    let index_width: u8 = if dict_size <= 255 { 1 } else { 2 };
+
+    // Find empty string index
+    let empty_string_idx: u16 = dict_entries
+        .iter()
+        .position(|&s| s.is_empty())
+        .map(|i| i as u16)
+        .unwrap_or(0xFFFF);
+
     let mut buf = Vec::new();
 
     // Dictionary size
-    buf.extend_from_slice(&(dict_entries.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(dict_size as u32).to_le_bytes());
+
+    // Index width
+    buf.push(index_width);
+
+    // Empty string index
+    buf.extend_from_slice(&empty_string_idx.to_le_bytes());
 
     // Dictionary entries
     for &entry in &dict_entries {
@@ -84,10 +129,14 @@ pub fn encode(values: &[&str]) -> Vec<u8> {
         buf.extend_from_slice(bytes);
     }
 
-    // Indices
+    // Fixed-width indices
     for &v in values {
         let idx = dict[v];
-        write_varint(&mut buf, idx);
+        if index_width == 1 {
+            buf.push(idx as u8);
+        } else {
+            buf.extend_from_slice(&idx.to_le_bytes());
+        }
     }
 
     buf
@@ -100,25 +149,11 @@ pub fn decode_to_slices(data: &[u8], count: usize) -> Vec<&str> {
         return Vec::new();
     }
 
-    let mut offset = 0;
-    let dict_size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-
-    let mut dict: Vec<&str> = Vec::with_capacity(dict_size);
-    for _ in 0..dict_size {
-        let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        let s = std::str::from_utf8(&data[offset..offset + str_len])
-            .expect("invalid UTF-8 in dictionary");
-        offset += str_len;
-        dict.push(s);
-    }
-
+    let hdr = parse_header(data);
     let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (idx, consumed) = read_varint(&data[offset..]);
-        offset += consumed;
-        values.push(dict[idx as usize]);
+    for i in 0..count {
+        let idx = read_index(data, hdr.indices_start, hdr.index_width, i);
+        values.push(hdr.dict[idx as usize]);
     }
     values
 }
@@ -126,33 +161,18 @@ pub fn decode_to_slices(data: &[u8], count: usize) -> Vec<&str> {
 /// Decode dictionary-encoded data, returning the dictionary entries and per-row indices separately.
 /// This allows matching against only the dictionary entries (e.g. for LIKE filtering)
 /// instead of resolving every row.
-pub fn decode_dict_and_indices(data: &[u8], count: usize) -> (Vec<&str>, Vec<u32>) {
+pub fn decode_dict_and_indices(data: &[u8], count: usize) -> (Vec<&str>, Vec<u16>) {
     if count == 0 {
         return (Vec::new(), Vec::new());
     }
 
-    let mut offset = 0;
-    let dict_size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-
-    let mut dict: Vec<&str> = Vec::with_capacity(dict_size);
-    for _ in 0..dict_size {
-        let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        let s = std::str::from_utf8(&data[offset..offset + str_len])
-            .expect("invalid UTF-8 in dictionary");
-        offset += str_len;
-        dict.push(s);
-    }
-
+    let hdr = parse_header(data);
     let mut indices = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (idx, consumed) = read_varint(&data[offset..]);
-        offset += consumed;
-        indices.push(idx);
+    for i in 0..count {
+        indices.push(read_index(data, hdr.indices_start, hdr.index_width, i));
     }
 
-    (dict, indices)
+    (hdr.dict, indices)
 }
 
 pub fn decode(data: &[u8], count: usize) -> Vec<String> {
@@ -160,32 +180,36 @@ pub fn decode(data: &[u8], count: usize) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut offset = 0;
-
-    // Read dictionary
-    let dict_size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-
-    let mut dict = Vec::with_capacity(dict_size);
-    for _ in 0..dict_size {
-        let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        let s = std::str::from_utf8(&data[offset..offset + str_len])
-            .expect("invalid UTF-8 in dictionary")
-            .to_string();
-        offset += str_len;
-        dict.push(s);
-    }
-
-    // Read indices
+    let hdr = parse_header(data);
     let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (idx, consumed) = read_varint(&data[offset..]);
-        offset += consumed;
-        values.push(dict[idx as usize].clone());
+    for i in 0..count {
+        let idx = read_index(data, hdr.indices_start, hdr.index_width, i);
+        values.push(hdr.dict[idx as usize].to_string());
+    }
+    values
+}
+
+/// Check `<> ''` for each row using the precomputed empty_string_idx.
+/// Returns a Vec<bool> where true = non-empty (passes filter).
+/// Returns empty Vec if no empty string in dictionary (all pass).
+pub fn check_ne_empty(data: &[u8], count: usize) -> Vec<bool> {
+    if count == 0 {
+        return Vec::new();
     }
 
-    values
+    let hdr = parse_header(data);
+    if hdr.empty_string_idx == 0xFFFF {
+        // No empty string in dictionary — all rows pass
+        return Vec::new();
+    }
+
+    let empty_idx = hdr.empty_string_idx;
+    let mut sel = Vec::with_capacity(count);
+    for i in 0..count {
+        let idx = read_index(data, hdr.indices_start, hdr.index_width, i);
+        sel.push(idx != empty_idx);
+    }
+    sel
 }
 
 #[cfg(test)]
@@ -252,5 +276,91 @@ mod tests {
         let decoded = decode(&encoded, values.len());
         let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_fixed_width_u8_indices() {
+        // Dict size ≤ 255 → index_width = 1
+        let values = vec!["a", "b", "c", "a", "b"];
+        let encoded = encode(&values);
+        let hdr = parse_header(&encoded);
+        assert_eq!(hdr.index_width, 1);
+        assert_eq!(hdr.dict.len(), 3);
+
+        let decoded = decode(&encoded, values.len());
+        let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_fixed_width_u16_indices() {
+        // Dict size > 255 → index_width = 2
+        let strings: Vec<String> = (0..300).map(|i| format!("val-{}", i)).collect();
+        // Repeat to satisfy should_use_dictionary cardinality check
+        let mut values: Vec<&str> = Vec::new();
+        for _ in 0..3 {
+            for s in &strings {
+                values.push(s.as_str());
+            }
+        }
+
+        let encoded = encode(&values);
+        let hdr = parse_header(&encoded);
+        assert_eq!(hdr.index_width, 2);
+        assert_eq!(hdr.dict.len(), 300);
+
+        let decoded = decode(&encoded, values.len());
+        let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_decode_to_slices() {
+        let values = vec!["hello", "world", "hello", "world"];
+        let encoded = encode(&values);
+        let slices = decode_to_slices(&encoded, values.len());
+        assert_eq!(slices, values);
+    }
+
+    #[test]
+    fn test_decode_dict_and_indices() {
+        let values = vec!["hello", "world", "hello"];
+        let encoded = encode(&values);
+        let (dict, indices) = decode_dict_and_indices(&encoded, values.len());
+        assert_eq!(dict, vec!["hello", "world"]);
+        assert_eq!(indices, vec![0u16, 1, 0]);
+    }
+
+    #[test]
+    fn test_empty_string_idx() {
+        // With empty string
+        let values = vec!["hello", "", "world", ""];
+        let encoded = encode(&values);
+        let hdr = parse_header(&encoded);
+        assert_eq!(hdr.empty_string_idx, 1); // "" is second dict entry
+
+        // Without empty string
+        let values = vec!["hello", "world"];
+        let encoded = encode(&values);
+        let hdr = parse_header(&encoded);
+        assert_eq!(hdr.empty_string_idx, 0xFFFF);
+    }
+
+    #[test]
+    fn test_check_ne_empty() {
+        let values = vec!["hello", "", "world", "", "hello"];
+        let encoded = encode(&values);
+
+        let sel = check_ne_empty(&encoded, values.len());
+        assert_eq!(sel, vec![true, false, true, false, true]);
+    }
+
+    #[test]
+    fn test_check_ne_empty_no_empty_strings() {
+        let values = vec!["hello", "world", "hello"];
+        let encoded = encode(&values);
+
+        let sel = check_ne_empty(&encoded, values.len());
+        assert!(sel.is_empty()); // All pass — no filtering needed
     }
 }

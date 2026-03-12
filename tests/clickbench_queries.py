@@ -43,6 +43,13 @@ NONDET_SORT_INFO = {
     "Q41": (2, "DESC", True),    # PageViews, OFFSET 100
 }
 
+# Queries where ORDER BY ... LIMIT can have ties at the boundary.
+# Maps qid → 0-based column index of the sort key.
+# Validation: strip rows sharing the last-row's sort key, then exact-match the rest.
+LIMIT_TIE_QUERIES = {
+    "Q12": 2,  # COUNT(DISTINCT UserID) AS u  (3rd column, 0-based index 2)
+}
+
 QUERIES = [
     # Q1: COUNT(*) — full scan baseline
     (

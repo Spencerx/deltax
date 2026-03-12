@@ -661,7 +661,7 @@ class TestTransparentQuery:
         ).fetchone()[0]
         before["group_count"] = db.execute(
             "SELECT label, count(*) AS c FROM agg_where_text "
-            "WHERE label <> '' GROUP BY label ORDER BY c DESC LIMIT 5"
+            "WHERE label <> '' GROUP BY label ORDER BY c DESC, label LIMIT 5"
         ).fetchall()
         assert before["count_nonempty"] == 30  # half the rows
 
@@ -684,7 +684,7 @@ class TestTransparentQuery:
         ).fetchone()[0]
         after["group_count"] = db.execute(
             "SELECT label, count(*) AS c FROM agg_where_text "
-            "WHERE label <> '' GROUP BY label ORDER BY c DESC LIMIT 5"
+            "WHERE label <> '' GROUP BY label ORDER BY c DESC, label LIMIT 5"
         ).fetchall()
 
         assert after["count_nonempty"] == before["count_nonempty"], (
@@ -866,7 +866,7 @@ class TestTransparentQuery:
         query = (
             "SELECT title, count(*) AS c FROM agg_where_mixed "
             "WHERE counter_id = 62 AND is_refresh = 0 AND title <> '' "
-            "GROUP BY title ORDER BY c DESC LIMIT 5"
+            "GROUP BY title ORDER BY c DESC, title LIMIT 5"
         )
         before_rows = db.execute(query).fetchall()
         before_count = db.execute(
