@@ -48,6 +48,7 @@ NONDET_SORT_INFO = {
 # Validation: strip rows sharing the last-row's sort key, then exact-match the rest.
 LIMIT_TIE_QUERIES = {
     "Q12": 2,  # COUNT(DISTINCT UserID) AS u  (3rd column, 0-based index 2)
+    "Q23": 3,  # COUNT(*) AS c  (4th column, 0-based index 3)
 }
 
 QUERIES = [

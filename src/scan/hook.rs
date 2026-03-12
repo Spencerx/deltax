@@ -1512,7 +1512,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
 
                 // Guard: text GROUP BY columns must be dictionary-encodable (ndistinct < 65536)
                 // AND low enough cardinality that our HashMap GROUP BY beats PG's HashAggregate.
-                // Above ~10K merged ndistinct, PG's tuple-based HashAggregate is faster.
+                // Above ~30K merged ndistinct, PG's tuple-based HashAggregate is faster.
                 let has_text_group = group_specs.iter().any(|gs| {
                     matches!(gs.expr, GroupByExpr::Column)
                         && (gs.type_oid == pg_sys::TEXTOID
@@ -1542,7 +1542,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             .unwrap_or("");
                         merged_ndistinct
                             .get(col_name)
-                            .map(|&nd| nd > 0 && nd < 10000)
+                            .map(|&nd| nd > 0 && nd < 30000)
                             .unwrap_or(false)
                     });
                     if !text_ok {
