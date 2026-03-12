@@ -3,6 +3,10 @@
 //! Replaces SPI round-trips to PostgreSQL for converting between text
 //! representations and Unix-epoch microseconds.
 
+// Parsing functions are currently only exercised by unit tests (compression
+// now reads native PG datums), but kept for future use.
+#![allow(dead_code)]
+
 /// Parse a PostgreSQL text-format timestamp/date to Unix epoch microseconds.
 ///
 /// Supported formats:

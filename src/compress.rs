@@ -1,9 +1,14 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog;
 use crate::compression::{self, CompressionType, CompressedColumn};
+
+/// Microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
+const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
+/// Days between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
+const PG_EPOCH_OFFSET_DAYS: i64 = 10_957;
 
 /// Column metadata from information_schema.
 #[derive(Debug, Clone)]
@@ -218,56 +223,6 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
-    // 4b. Compute per-column ndistinct (used for GROUP BY cardinality estimation)
-    let non_seg_cols: Vec<&ColumnMeta> = columns.iter().filter(|c| !c.is_segment_by).collect();
-    let ndistinct_json = if !non_seg_cols.is_empty() {
-        let count_exprs: String = non_seg_cols
-            .iter()
-            .map(|c| format!("COUNT(DISTINCT \"{}\")::int8", c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let nd_query = format!("SELECT {} FROM {}", count_exprs, part_fqn);
-        let nd_result = client
-            .select(&nd_query, None, &[])
-            .expect("failed to compute ndistinct");
-        let mut nd_map: HashMap<String, i64> = HashMap::new();
-        if let Some(row) = nd_result.into_iter().next() {
-            for (i, col) in non_seg_cols.iter().enumerate() {
-                if let Some(nd) = row
-                    .get_datum_by_ordinal(i + 1)
-                    .unwrap()
-                    .value::<i64>()
-                    .unwrap()
-                {
-                    nd_map.insert(col.name.clone(), nd);
-                }
-            }
-        }
-        // Also add segment_by columns: ndistinct = number of distinct segment values
-        for col in columns.iter().filter(|c| c.is_segment_by) {
-            let sq = format!(
-                "SELECT COUNT(DISTINCT \"{}\")::int8 FROM {}",
-                col.name, part_fqn
-            );
-            if let Some(nd) = client
-                .select(&sq, None, &[])
-                .expect("failed to compute segment_by ndistinct")
-                .first()
-                .get_one::<i64>()
-                .unwrap()
-            {
-                nd_map.insert(col.name.clone(), nd);
-            }
-        }
-        let entries: Vec<String> = nd_map
-            .iter()
-            .map(|(k, v)| format!("\"{}\":{}", k, v))
-            .collect();
-        format!("{{{}}}", entries.join(","))
-    } else {
-        "{}".to_string()
-    };
-
     // 5. Build companion table DDL
     let companion_schema = "_seaturtle_compressed";
     let companion_fqn = format!("\"{}\".\"{}\"", companion_schema, part_table);
@@ -301,46 +256,87 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     );
     client.update(&create_ddl, None, &[]).expect("failed to create companion table");
 
-    // 6. Build ORDER BY clause
-    let order_clause = if !ht.order_by.is_empty() {
-        format!(
-            "ORDER BY {}",
-            ht.order_by
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    } else {
-        String::new()
-    };
-
-    // 7. Read and compress data per segment
+    // 6. Read and compress data per segment
     let mut total_compressed_size: i64 = 0;
     let raw_size = estimate_raw_size(client, &part_fqn);
 
     let segment_size = ht.segment_size as usize;
 
+    // ndistinct: for array_agg path, computed from in-memory data (fast);
+    // for streaming path, computed via SQL COUNT(DISTINCT) (slower but segment_by tables are smaller).
+    let ndistinct_json;
+
     if ht.segment_by.is_empty() {
-        // No segment_by: entire partition is one segment, split at segment_size rows
-        let total = compress_segment(
+        let (size, nd_map) = compress_partition_array_agg(
             client,
             &part_fqn,
             &companion_fqn,
             &columns,
-            "TRUE",
-            &order_clause,
-            &[],
+            &ht.order_by,
             segment_size,
         );
-        total_compressed_size += total;
+        total_compressed_size += size;
+        let entries: Vec<String> = nd_map
+            .iter()
+            .map(|(k, v)| format!("\"{}\":{}", k, v))
+            .collect();
+        ndistinct_json = format!("{{{}}}", entries.join(","));
     } else {
-        total_compressed_size += compress_segments_single_pass(
+        // Compute ndistinct via SQL for segment_by path
+        let non_seg_cols: Vec<&ColumnMeta> = columns.iter().filter(|c| !c.is_segment_by).collect();
+        ndistinct_json = if !non_seg_cols.is_empty() {
+            let count_exprs: String = non_seg_cols
+                .iter()
+                .map(|c| format!("COUNT(DISTINCT \"{}\")::int8", c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let nd_query = format!("SELECT {} FROM {}", count_exprs, part_fqn);
+            let nd_result = client
+                .select(&nd_query, None, &[])
+                .expect("failed to compute ndistinct");
+            let mut nd_map: HashMap<String, i64> = HashMap::new();
+            if let Some(row) = nd_result.into_iter().next() {
+                for (i, col) in non_seg_cols.iter().enumerate() {
+                    if let Some(nd) = row
+                        .get_datum_by_ordinal(i + 1)
+                        .unwrap()
+                        .value::<i64>()
+                        .unwrap()
+                    {
+                        nd_map.insert(col.name.clone(), nd);
+                    }
+                }
+            }
+            for col in columns.iter().filter(|c| c.is_segment_by) {
+                let sq = format!(
+                    "SELECT COUNT(DISTINCT \"{}\")::int8 FROM {}",
+                    col.name, part_fqn
+                );
+                if let Some(nd) = client
+                    .select(&sq, None, &[])
+                    .expect("failed to compute segment_by ndistinct")
+                    .first()
+                    .get_one::<i64>()
+                    .unwrap()
+                {
+                    nd_map.insert(col.name.clone(), nd);
+                }
+            }
+            let entries: Vec<String> = nd_map
+                .iter()
+                .map(|(k, v)| format!("\"{}\":{}", k, v))
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        } else {
+            "{}".to_string()
+        };
+
+        total_compressed_size += compress_partition_streaming(
             client,
             &part_fqn,
             &companion_fqn,
             &columns,
-            &order_clause,
+            &ht.order_by,
             &ht.segment_by,
             segment_size,
         );
@@ -384,13 +380,16 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 /// Classifies how to read a column from SPI.
 #[derive(Debug, Clone, Copy)]
 enum ColumnKind {
-    Text,       // text, varchar, char, timestamp, date — read as ::text String
-    Int16,      // smallint/int2
-    Int32,      // integer/int4
-    Int64,      // bigint/int8
-    Float32,    // real/float4
-    Float64,    // double precision/float8
-    Bool,       // boolean/bool
+    Text,         // text, varchar, char — read as String
+    Int16,        // smallint/int2
+    Int32,        // integer/int4
+    Int64,        // bigint/int8
+    Float32,      // real/float4
+    Float64,      // double precision/float8
+    Bool,         // boolean/bool
+    Timestamp,    // timestamp without time zone — read as pgrx::Timestamp → i64 usec
+    TimestampTz,  // timestamp with time zone — read as pgrx::TimestampWithTimeZone → i64 usec
+    Date,         // date — read as pgrx::Date → i64 usec
 }
 
 /// Column data stored in native types.
@@ -421,8 +420,14 @@ fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKind {
         ColumnKind::Float32
     } else if dt == "boolean" || dt == "bool" {
         ColumnKind::Bool
+    } else if dt == "timestamp with time zone" {
+        ColumnKind::TimestampTz
+    } else if dt.contains("timestamp") {
+        ColumnKind::Timestamp
+    } else if dt == "date" {
+        ColumnKind::Date
     } else {
-        ColumnKind::Text // timestamp, date, text, varchar, etc.
+        ColumnKind::Text
     }
 }
 
@@ -435,154 +440,141 @@ fn new_typed_column(kind: ColumnKind) -> TypedColumn {
         ColumnKind::Float32 => TypedColumn::Float32(Vec::new()),
         ColumnKind::Float64 => TypedColumn::Float64(Vec::new()),
         ColumnKind::Bool => TypedColumn::Bool(Vec::new()),
+        ColumnKind::Timestamp | ColumnKind::TimestampTz | ColumnKind::Date => {
+            TypedColumn::Int64(Vec::new())
+        }
     }
 }
 
-// Delimiter and null marker for string_agg-based bulk column reading.
-// ASCII Record Separator and Unit Separator — control chars that don't appear in normal text data.
-const AGG_DELIM: char = '\x1E';
-const AGG_NULL: &str = "\x1F";
-
-/// Build a `string_agg(COALESCE("col"::text, null_marker), delim ORDER BY ...)` expression.
-fn build_string_agg_expr(col_name: &str, order_expr: &str) -> String {
-    if order_expr.is_empty() {
-        format!(
-            "string_agg(COALESCE(\"{}\"::text, E'\\x1F'), E'\\x1E')",
-            col_name
-        )
-    } else {
-        format!(
-            "string_agg(COALESCE(\"{}\"::text, E'\\x1F'), E'\\x1E' ORDER BY {})",
-            col_name, order_expr
-        )
-    }
+/// Create empty TypedColumn vectors for all columns based on their ColumnKind.
+fn init_typed_columns(columns: &[ColumnMeta], kinds: &[ColumnKind]) -> Vec<TypedColumn> {
+    columns
+        .iter()
+        .zip(kinds.iter())
+        .map(|(_, kind)| new_typed_column(*kind))
+        .collect()
 }
 
-/// Parse a delimited aggregate string into a TypedColumn.
-/// For numeric types, parses directly from `&str` slices (no String allocation).
-fn parse_agg_to_typed(agg_str: &str, data_type: &str) -> TypedColumn {
-    let dt = data_type.to_lowercase();
-
-    if dt == "smallint" || dt == "int2" {
-        TypedColumn::Int16(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s.parse::<i16>().unwrap_or(0))
-                    }
-                })
-                .collect(),
-        )
-    } else if dt == "integer" || dt == "int4" {
-        TypedColumn::Int32(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s.parse::<i32>().unwrap_or(0))
-                    }
-                })
-                .collect(),
-        )
-    } else if dt == "bigint" || dt == "int8" {
-        TypedColumn::Int64(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s.parse::<i64>().unwrap_or(0))
-                    }
-                })
-                .collect(),
-        )
-    } else if dt == "double precision" || dt == "float8" {
-        TypedColumn::Float64(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s.parse::<f64>().unwrap_or(0.0))
-                    }
-                })
-                .collect(),
-        )
-    } else if dt == "real" || dt == "float4" {
-        TypedColumn::Float32(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s.parse::<f32>().unwrap_or(0.0))
-                    }
-                })
-                .collect(),
-        )
-    } else if dt == "boolean" || dt == "bool" {
-        TypedColumn::Bool(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s == "t" || s == "true" || s == "1")
-                    }
-                })
-                .collect(),
-        )
-    } else if dt.contains("timestamp") {
-        // Timestamps: parse to i64 microseconds via our fast parser, store as Int64
-        // for direct Gorilla encoding without re-parsing
-        TypedColumn::Text(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s.to_string())
-                    }
-                })
-                .collect(),
-        )
-    } else {
-        // text, date, varchar, etc.
-        TypedColumn::Text(
-            agg_str
-                .split(AGG_DELIM)
-                .map(|s| {
-                    if s == AGG_NULL {
-                        None
-                    } else {
-                        Some(s.to_string())
-                    }
-                })
-                .collect(),
-        )
-    }
-}
-
-/// Get the number of rows in a TypedColumn.
-fn typed_column_len(tc: &TypedColumn) -> usize {
-    match tc {
-        TypedColumn::Text(v) => v.len(),
-        TypedColumn::Int16(v) => v.len(),
-        TypedColumn::Int32(v) => v.len(),
-        TypedColumn::Int64(v) => v.len(),
-        TypedColumn::Float32(v) => v.len(),
-        TypedColumn::Float64(v) => v.len(),
-        TypedColumn::Bool(v) => v.len(),
+/// Extract one SPI row into typed column accumulators using native datum access.
+/// Segment_by columns are skipped (their TypedColumn slots remain empty).
+fn append_row_to_columns(
+    row: &pgrx::spi::SpiHeapTupleData,
+    columns: &[ColumnMeta],
+    kinds: &[ColumnKind],
+    typed_cols: &mut [TypedColumn],
+) {
+    for (i, (col, kind)) in columns.iter().zip(kinds.iter()).enumerate() {
+        if col.is_segment_by {
+            continue;
+        }
+        let ordinal = i + 1; // SPI ordinals are 1-based
+        match kind {
+            ColumnKind::Int16 => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<i16>()
+                    .unwrap();
+                if let TypedColumn::Int16(vec) = &mut typed_cols[i] {
+                    vec.push(v);
+                }
+            }
+            ColumnKind::Int32 => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<i32>()
+                    .unwrap();
+                if let TypedColumn::Int32(vec) = &mut typed_cols[i] {
+                    vec.push(v);
+                }
+            }
+            ColumnKind::Int64 => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<i64>()
+                    .unwrap();
+                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
+                    vec.push(v);
+                }
+            }
+            ColumnKind::Float32 => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<f32>()
+                    .unwrap();
+                if let TypedColumn::Float32(vec) = &mut typed_cols[i] {
+                    vec.push(v);
+                }
+            }
+            ColumnKind::Float64 => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<f64>()
+                    .unwrap();
+                if let TypedColumn::Float64(vec) = &mut typed_cols[i] {
+                    vec.push(v);
+                }
+            }
+            ColumnKind::Bool => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<bool>()
+                    .unwrap();
+                if let TypedColumn::Bool(vec) = &mut typed_cols[i] {
+                    vec.push(v);
+                }
+            }
+            ColumnKind::Timestamp => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<pgrx::datum::Timestamp>()
+                    .unwrap();
+                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
+                    // Convert PG-epoch usec to Unix-epoch usec
+                    vec.push(v.map(|ts| ts.into_inner() + PG_EPOCH_OFFSET_USEC));
+                }
+            }
+            ColumnKind::TimestampTz => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<pgrx::datum::TimestampWithTimeZone>()
+                    .unwrap();
+                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
+                    // Convert PG-epoch usec to Unix-epoch usec
+                    vec.push(v.map(|ts| ts.into_inner() + PG_EPOCH_OFFSET_USEC));
+                }
+            }
+            ColumnKind::Date => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<pgrx::datum::Date>()
+                    .unwrap();
+                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
+                    // Convert PG-epoch days to Unix-epoch usec
+                    vec.push(v.map(|d| {
+                        ((d.into_inner() as i64) + PG_EPOCH_OFFSET_DAYS) * 86_400_000_000
+                    }));
+                }
+            }
+            ColumnKind::Text => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<String>()
+                    .unwrap();
+                if let TypedColumn::Text(vec) = &mut typed_cols[i] {
+                    vec.push(v);
+                }
+            }
+        }
     }
 }
 
@@ -705,140 +697,401 @@ fn slice_typed_column(tc: &TypedColumn, start: usize, end: usize) -> TypedColumn
     }
 }
 
-/// Compress all segments using GROUP BY + string_agg for bulk column reading.
-///
-/// Issues a single `SELECT seg_col, string_agg(col1, ...), ... GROUP BY seg_col`
-/// query. Each result row is one complete segment — no per-row SPI overhead.
-fn compress_segments_single_pass(
+/// Flush typed column data, splitting into segment_size chunks if needed.
+fn flush_with_splitting(
+    client: &mut SpiClient,
+    companion_fqn: &str,
+    columns: &[ColumnMeta],
+    typed_cols: &[TypedColumn],
+    seg_values: &[Option<String>],
+    total_rows: usize,
+    segment_size: usize,
+) -> i64 {
+    let mut total_size = 0i64;
+    let mut offset = 0;
+    while offset < total_rows {
+        let chunk_end = (offset + segment_size).min(total_rows);
+        let chunk_rows = (chunk_end - offset) as u32;
+        if offset == 0 && chunk_end == total_rows {
+            total_size +=
+                flush_segment_data(client, companion_fqn, columns, typed_cols, seg_values, chunk_rows);
+        } else {
+            let chunk_cols: Vec<TypedColumn> = typed_cols
+                .iter()
+                .map(|tc| slice_typed_column(tc, offset, chunk_end))
+                .collect();
+            total_size +=
+                flush_segment_data(client, companion_fqn, columns, &chunk_cols, seg_values, chunk_rows);
+        }
+        offset = chunk_end;
+    }
+    total_size
+}
+
+/// Compute ndistinct (count of distinct non-NULL values) for each column from in-memory data.
+/// Matches SQL `COUNT(DISTINCT col)` semantics (NULLs excluded).
+fn compute_ndistinct_from_typed(
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+) -> HashMap<String, i64> {
+    let mut result = HashMap::new();
+    for (i, col) in columns.iter().enumerate() {
+        let nd = match &typed_cols[i] {
+            TypedColumn::Int16(v) => {
+                let set: HashSet<i16> = v.iter().flatten().copied().collect();
+                set.len() as i64
+            }
+            TypedColumn::Int32(v) => {
+                let set: HashSet<i32> = v.iter().flatten().copied().collect();
+                set.len() as i64
+            }
+            TypedColumn::Int64(v) => {
+                let set: HashSet<i64> = v.iter().flatten().copied().collect();
+                set.len() as i64
+            }
+            TypedColumn::Float32(v) => {
+                let set: HashSet<u32> = v.iter().flatten().map(|f| f.to_bits()).collect();
+                set.len() as i64
+            }
+            TypedColumn::Float64(v) => {
+                let set: HashSet<u64> = v.iter().flatten().map(|f| f.to_bits()).collect();
+                set.len() as i64
+            }
+            TypedColumn::Bool(v) => {
+                let set: HashSet<bool> = v.iter().flatten().copied().collect();
+                set.len() as i64
+            }
+            TypedColumn::Text(v) => {
+                let set: HashSet<&str> = v.iter().flatten().map(|s| s.as_str()).collect();
+                set.len() as i64
+            }
+        };
+        result.insert(col.name.clone(), nd);
+    }
+    result
+}
+
+/// Compress a partition using array_agg — single SPI call, bulk extraction.
+/// Used for partitions WITHOUT segment_by (e.g., ClickBench).
+/// Pushes column aggregation into PG's C code, avoiding per-row Rust overhead.
+/// Also computes ndistinct from in-memory data (avoids expensive SQL COUNT(DISTINCT)).
+fn compress_partition_array_agg(
     client: &mut SpiClient,
     part_fqn: &str,
     companion_fqn: &str,
     columns: &[ColumnMeta],
-    order_clause: &str,
+    order_by: &[String],
+    segment_size: usize,
+) -> (i64, HashMap<String, i64>) {
+    let kinds: Vec<ColumnKind> = columns
+        .iter()
+        .map(|c| classify_column(&c.data_type, c.is_segment_by))
+        .collect();
+
+    // Build ORDER BY clause for array_agg
+    let agg_order = if order_by.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ORDER BY {}",
+            order_by
+                .iter()
+                .map(|o| format!("\"{}\"", o))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    // Build array_agg expressions — timestamps/dates converted to unix usec in SQL
+    let agg_exprs: Vec<String> = columns
+        .iter()
+        .zip(kinds.iter())
+        .map(|(col, kind)| {
+            let expr = match kind {
+                ColumnKind::Text => format!("\"{}\"::text", col.name),
+                ColumnKind::Timestamp | ColumnKind::TimestampTz => {
+                    format!(
+                        "(extract(epoch from \"{}\") * 1000000)::bigint",
+                        col.name
+                    )
+                }
+                ColumnKind::Date => {
+                    format!(
+                        "(extract(epoch from \"{}\"::timestamp) * 1000000)::bigint",
+                        col.name
+                    )
+                }
+                _ => format!("\"{}\"", col.name),
+            };
+            format!("array_agg({}{})", expr, agg_order)
+        })
+        .collect();
+
+    let sql = format!("SELECT {} FROM {}", agg_exprs.join(", "), part_fqn);
+    let result = client
+        .select(&sql, None, &[])
+        .expect("array_agg query failed");
+
+    let mut result_iter = result.into_iter();
+    let row = match result_iter.next() {
+        Some(row) => row,
+        None => return (0, HashMap::new()),
+    };
+
+    let mut typed_cols = Vec::with_capacity(columns.len());
+    for (i, kind) in kinds.iter().enumerate() {
+        let ordinal = i + 1;
+        let tc = match kind {
+            ColumnKind::Int16 => TypedColumn::Int16(
+                row.get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<Vec<Option<i16>>>()
+                    .unwrap()
+                    .unwrap_or_default(),
+            ),
+            ColumnKind::Int32 => TypedColumn::Int32(
+                row.get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<Vec<Option<i32>>>()
+                    .unwrap()
+                    .unwrap_or_default(),
+            ),
+            ColumnKind::Int64
+            | ColumnKind::Timestamp
+            | ColumnKind::TimestampTz
+            | ColumnKind::Date => TypedColumn::Int64(
+                row.get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<Vec<Option<i64>>>()
+                    .unwrap()
+                    .unwrap_or_default(),
+            ),
+            ColumnKind::Float32 => TypedColumn::Float32(
+                row.get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<Vec<Option<f32>>>()
+                    .unwrap()
+                    .unwrap_or_default(),
+            ),
+            ColumnKind::Float64 => TypedColumn::Float64(
+                row.get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<Vec<Option<f64>>>()
+                    .unwrap()
+                    .unwrap_or_default(),
+            ),
+            ColumnKind::Bool => TypedColumn::Bool(
+                row.get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<Vec<Option<bool>>>()
+                    .unwrap()
+                    .unwrap_or_default(),
+            ),
+            ColumnKind::Text => TypedColumn::Text(
+                row.get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<Vec<Option<String>>>()
+                    .unwrap()
+                    .unwrap_or_default(),
+            ),
+        };
+        typed_cols.push(tc);
+    }
+
+    // Compute ndistinct from in-memory data (avoids expensive SQL COUNT(DISTINCT))
+    let ndistinct = compute_ndistinct_from_typed(&typed_cols, columns);
+
+    // Determine total rows from first non-empty column
+    let total_rows = typed_cols
+        .iter()
+        .filter_map(|tc| {
+            let len = match tc {
+                TypedColumn::Int16(v) => v.len(),
+                TypedColumn::Int32(v) => v.len(),
+                TypedColumn::Int64(v) => v.len(),
+                TypedColumn::Float32(v) => v.len(),
+                TypedColumn::Float64(v) => v.len(),
+                TypedColumn::Bool(v) => v.len(),
+                TypedColumn::Text(v) => v.len(),
+            };
+            if len > 0 {
+                Some(len)
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap_or(0);
+
+    let compressed_size = flush_with_splitting(
+        client,
+        companion_fqn,
+        columns,
+        &typed_cols,
+        &[],
+        total_rows,
+        segment_size,
+    );
+
+    (compressed_size, ndistinct)
+}
+
+/// Compress a partition using cursor-based streaming.
+/// Used for partitions WITH segment_by columns.
+/// Reads native PG datums directly — no text round-trip for numeric/timestamp types.
+fn compress_partition_streaming(
+    client: &mut SpiClient,
+    part_fqn: &str,
+    companion_fqn: &str,
+    columns: &[ColumnMeta],
+    order_by: &[String],
     segment_by: &[String],
     segment_size: usize,
 ) -> i64 {
-    let order_expr = order_clause
-        .trim_start_matches("ORDER BY ")
-        .trim();
+    let batch_size = segment_size;
 
-    // Segment-by columns as plain values in SELECT + GROUP BY
-    let seg_select: String = segment_by
+    // Classify columns for native datum extraction
+    let kinds: Vec<ColumnKind> = columns
         .iter()
-        .map(|c| format!("\"{}\"::text", c))
+        .map(|c| classify_column(&c.data_type, c.is_segment_by))
+        .collect();
+
+    // Build SELECT list: segment_by and text-classified cols cast to ::text,
+    // others as native types. The ::text cast is needed for CHAR/VARCHAR
+    // columns which have different OIDs than text.
+    let select_cols = columns
+        .iter()
+        .zip(kinds.iter())
+        .map(|(c, kind)| {
+            if c.is_segment_by || matches!(kind, ColumnKind::Text) {
+                format!("\"{}\"::text", c.name)
+            } else {
+                format!("\"{}\"", c.name)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    let seg_group: String = segment_by
-        .iter()
-        .map(|c| format!("\"{}\"", c))
-        .collect::<Vec<_>>()
-        .join(", ");
 
-    // Non-segment columns as string_agg expressions
-    let agg_list: String = columns
-        .iter()
-        .filter(|c| !c.is_segment_by)
-        .map(|c| build_string_agg_expr(&c.name, order_expr))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Build ORDER BY: segment_by cols first, then order_by cols
+    let mut order_parts = Vec::new();
+    for s in segment_by {
+        order_parts.push(format!("\"{}\"", s));
+    }
+    for o in order_by {
+        order_parts.push(format!("\"{}\"", o));
+    }
+    let order_clause = if order_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {}", order_parts.join(", "))
+    };
 
-    let query = format!(
-        "SELECT {}, {} FROM {} GROUP BY {}",
-        seg_select, agg_list, part_fqn, seg_group
+    // Segment_by column indices (for boundary detection)
+    let seg_col_indices: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_segment_by)
+        .map(|(i, _)| i)
+        .collect();
+
+    // DECLARE CURSOR
+    let cursor_sql = format!(
+        "DECLARE comp_cursor CURSOR FOR SELECT {} FROM {}{}",
+        select_cols, part_fqn, order_clause
     );
-    let result = client
-        .select(&query, None, &[])
-        .expect("failed to read partition data");
+    client
+        .update(&cursor_sql, None, &[])
+        .expect("failed to declare cursor");
 
-    let num_seg_cols = segment_by.len();
+    let fetch_sql = format!("FETCH {} FROM comp_cursor", batch_size);
+
+    let mut typed_cols = init_typed_columns(columns, &kinds);
+    let mut current_seg_values: Vec<Option<String>> = Vec::new();
+    let mut rows_in_segment: usize = 0;
     let mut total_compressed_size: i64 = 0;
 
-    for row in result {
-        // Extract segment_by values (first N columns)
-        let seg_values: Vec<Option<String>> = (0..num_seg_cols)
-            .map(|i| {
-                row.get_datum_by_ordinal(i + 1)
-                    .unwrap()
-                    .value::<String>()
-                    .unwrap()
-            })
-            .collect();
+    loop {
+        let result = client
+            .select(&fetch_sql, None, &[])
+            .expect("failed to fetch from cursor");
+        let fetched = result.len();
+        if fetched == 0 {
+            break;
+        }
 
-        // Extract aggregated column strings (remaining columns)
-        let mut typed_cols: Vec<TypedColumn> = Vec::with_capacity(columns.len());
-        let mut agg_ordinal = num_seg_cols + 1;
+        for row in result {
+            // Check segment_by boundary
+            if !seg_col_indices.is_empty() {
+                let row_seg_values: Vec<Option<String>> = seg_col_indices
+                    .iter()
+                    .map(|&i| {
+                        row.get_datum_by_ordinal(i + 1)
+                            .unwrap()
+                            .value::<String>()
+                            .unwrap()
+                    })
+                    .collect();
 
-        let mut raw_strings: Vec<Option<String>> = Vec::with_capacity(columns.len());
-        for col in columns {
-            if col.is_segment_by {
-                continue;
+                if current_seg_values.is_empty() {
+                    current_seg_values = row_seg_values;
+                } else if row_seg_values != current_seg_values {
+                    // Segment boundary — flush accumulated data
+                    if rows_in_segment > 0 {
+                        total_compressed_size += flush_with_splitting(
+                            client,
+                            companion_fqn,
+                            columns,
+                            &typed_cols,
+                            &current_seg_values,
+                            rows_in_segment,
+                            segment_size,
+                        );
+                        typed_cols = init_typed_columns(columns, &kinds);
+                        rows_in_segment = 0;
+                    }
+                    current_seg_values = row_seg_values;
+                }
             }
-            let s = row
-                .get_datum_by_ordinal(agg_ordinal)
-                .unwrap()
-                .value::<String>()
-                .unwrap();
-            raw_strings.push(s);
-            agg_ordinal += 1;
-        }
 
-        let mut agg_idx = 0;
-        for col in columns {
-            if col.is_segment_by {
-                typed_cols.push(TypedColumn::Text(Vec::new()));
-                continue;
-            }
-            let tc = match &raw_strings[agg_idx] {
-                Some(agg_str) => parse_agg_to_typed(agg_str, &col.data_type),
-                None => new_typed_column(classify_column(&col.data_type, false)),
-            };
-            typed_cols.push(tc);
-            agg_idx += 1;
-        }
+            append_row_to_columns(&row, columns, &kinds, &mut typed_cols);
+            rows_in_segment += 1;
 
-        let seg_row_count = typed_cols
-            .iter()
-            .map(typed_column_len)
-            .max()
-            .unwrap_or(0);
-        if seg_row_count == 0 {
-            continue;
-        }
-
-        // Split into chunks of segment_size rows
-        let mut offset = 0;
-        while offset < seg_row_count {
-            let chunk_end = (offset + segment_size).min(seg_row_count);
-            let chunk_rows = (chunk_end - offset) as u32;
-
-            if offset == 0 && chunk_end == seg_row_count {
-                // No splitting needed — flush directly
+            // Check segment_size limit
+            if rows_in_segment >= segment_size {
                 total_compressed_size += flush_segment_data(
                     client,
                     companion_fqn,
                     columns,
                     &typed_cols,
-                    &seg_values,
-                    chunk_rows,
+                    &current_seg_values,
+                    rows_in_segment as u32,
                 );
-            } else {
-                // Slice each typed column for this chunk
-                let chunk_cols: Vec<TypedColumn> = typed_cols
-                    .iter()
-                    .map(|tc| slice_typed_column(tc, offset, chunk_end))
-                    .collect();
-                total_compressed_size += flush_segment_data(
-                    client,
-                    companion_fqn,
-                    columns,
-                    &chunk_cols,
-                    &seg_values,
-                    chunk_rows,
-                );
+                typed_cols = init_typed_columns(columns, &kinds);
+                rows_in_segment = 0;
             }
-            offset = chunk_end;
+        }
+
+        if fetched < batch_size {
+            break;
         }
     }
+
+    // Flush remaining
+    if rows_in_segment > 0 {
+        total_compressed_size += flush_with_splitting(
+            client,
+            companion_fqn,
+            columns,
+            &typed_cols,
+            &current_seg_values,
+            rows_in_segment,
+            segment_size,
+        );
+    }
+
+    client
+        .update("CLOSE comp_cursor", None, &[])
+        .expect("failed to close cursor");
 
     total_compressed_size
 }
@@ -870,15 +1123,29 @@ fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<u8> {
             .to_bytes()
         }
         TypedColumn::Int64(values) => {
+            let dt = data_type.to_lowercase();
             let (non_null, null_bitmap) = compression::extract_nulls(values);
-            let encoded = compression::integer::encode_i64(&non_null);
-            CompressedColumn {
-                type_tag: CompressionType::DeltaVarint,
-                row_count: values.len() as u32,
-                null_bitmap,
-                data: encoded,
+            if dt.contains("timestamp") || dt == "date" {
+                // Timestamp/date: use Gorilla timestamp encoding
+                let data = compression::gorilla::encode_timestamps(&non_null);
+                CompressedColumn {
+                    type_tag: CompressionType::Gorilla,
+                    row_count: values.len() as u32,
+                    null_bitmap,
+                    data,
+                }
+                .to_bytes()
+            } else {
+                // Integer: use DeltaVarint encoding
+                let encoded = compression::integer::encode_i64(&non_null);
+                CompressedColumn {
+                    type_tag: CompressionType::DeltaVarint,
+                    row_count: values.len() as u32,
+                    null_bitmap,
+                    data: encoded,
+                }
+                .to_bytes()
             }
-            .to_bytes()
         }
         TypedColumn::Float64(values) => {
             let (non_null, null_bitmap) = compression::extract_nulls(values);
@@ -948,7 +1215,20 @@ fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Option<String>,
                 min_v = Some(min_v.map_or(*v, |cur: i64| cur.min(*v)));
                 max_v = Some(max_v.map_or(*v, |cur: i64| cur.max(*v)));
             }
-            (min_v.map(|v| v.to_string()), max_v.map(|v| v.to_string()))
+            let dt = data_type.to_lowercase();
+            if dt.contains("timestamp") {
+                (
+                    min_v.map(usec_to_timestamp_string),
+                    max_v.map(usec_to_timestamp_string),
+                )
+            } else if dt == "date" {
+                (
+                    min_v.map(crate::timeparse::usec_to_date_string),
+                    max_v.map(crate::timeparse::usec_to_date_string),
+                )
+            } else {
+                (min_v.map(|v| v.to_string()), max_v.map(|v| v.to_string()))
+            }
         }
         TypedColumn::Float64(values) => {
             let mut min_v: Option<f64> = None;
@@ -973,233 +1253,32 @@ fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Option<String>,
     }
 }
 
-/// Compress a single segment (no segment_by) using string_agg for bulk column reading.
-/// One SQL aggregate per column → 105 datum extractions instead of rows×columns.
-#[allow(clippy::too_many_arguments)]
-fn compress_segment(
-    client: &mut SpiClient,
-    part_fqn: &str,
-    companion_fqn: &str,
-    columns: &[ColumnMeta],
-    where_clause: &str,
-    order_clause: &str,
-    _segment_by: &[String],
-    segment_size: usize,
-) -> i64 {
-    let order_expr = order_clause
-        .trim_start_matches("ORDER BY ")
-        .trim();
-
-    let agg_list: String = columns
-        .iter()
-        .map(|c| build_string_agg_expr(&c.name, order_expr))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let query = format!(
-        "SELECT {} FROM {} WHERE {}",
-        agg_list, part_fqn, where_clause
-    );
-
-    let result = client
-        .select(&query, None, &[])
-        .expect("failed to read segment data");
-
-    let mut typed_cols: Vec<TypedColumn> = Vec::new();
-    if let Some(row) = result.into_iter().next() {
-        typed_cols = columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                match row
-                    .get_datum_by_ordinal(i + 1)
-                    .unwrap()
-                    .value::<String>()
-                    .unwrap()
-                {
-                    Some(agg_str) => parse_agg_to_typed(&agg_str, &col.data_type),
-                    None => new_typed_column(classify_column(&col.data_type, col.is_segment_by)),
-                }
-            })
-            .collect();
-    }
-
-    let row_count = typed_cols
-        .iter()
-        .map(typed_column_len)
-        .max()
-        .unwrap_or(0);
-    if row_count == 0 {
-        return 0;
-    }
-
-    // Split into chunks of segment_size rows
-    let mut total_size: i64 = 0;
-    let mut offset = 0;
-    while offset < row_count {
-        let chunk_end = (offset + segment_size).min(row_count);
-        let chunk_rows = (chunk_end - offset) as u32;
-
-        if offset == 0 && chunk_end == row_count {
-            total_size += flush_segment_data(
-                client,
-                companion_fqn,
-                columns,
-                &typed_cols,
-                &[],
-                chunk_rows,
-            );
-        } else {
-            let chunk_cols: Vec<TypedColumn> = typed_cols
-                .iter()
-                .map(|tc| slice_typed_column(tc, offset, chunk_end))
-                .collect();
-            total_size += flush_segment_data(
-                client,
-                companion_fqn,
-                columns,
-                &chunk_cols,
-                &[],
-                chunk_rows,
-            );
-        }
-        offset = chunk_end;
-    }
-    total_size
-}
-
 /// Compress a column's values based on the PostgreSQL data type.
-fn compress_column_values(values: &[Option<String>], data_type: &str, _col_name: &str) -> Vec<u8> {
-    let dt = data_type.to_lowercase();
+/// Only used for Text columns now — numeric/timestamp types go through compress_typed_column.
+fn compress_column_values(values: &[Option<String>], _data_type: &str, _col_name: &str) -> Vec<u8> {
+    // Only used for Text columns now — numeric/timestamp types go through compress_typed_column
+    let (non_null, null_bitmap) = compression::extract_nulls(values);
+    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
 
-    if dt.contains("timestamp") {
-        // Parse as i64 microseconds and use Gorilla timestamp encoding
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        let timestamps: Vec<i64> = non_null
-            .iter()
-            .map(|v| parse_timestamp_to_usec(v))
-            .collect();
-        let data = compression::gorilla::encode_timestamps(&timestamps);
+    if compression::dictionary::should_use_dictionary(&refs) {
+        let encoded = compression::dictionary::encode(&refs);
         CompressedColumn {
-            type_tag: CompressionType::Gorilla,
+            type_tag: CompressionType::Dictionary,
             row_count: values.len() as u32,
             null_bitmap,
-            data,
-        }
-        .to_bytes()
-    } else if dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4" {
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        if dt == "real" || dt == "float4" {
-            let floats: Vec<f32> = non_null.iter().map(|v| v.parse::<f32>().unwrap_or(0.0)).collect();
-            let data = compression::gorilla::encode_floats_f32(&floats);
-            CompressedColumn {
-                type_tag: CompressionType::Gorilla,
-                row_count: values.len() as u32,
-                null_bitmap,
-                data,
-            }
-            .to_bytes()
-        } else {
-            let floats: Vec<f64> = non_null.iter().map(|v| v.parse::<f64>().unwrap_or(0.0)).collect();
-            let data = compression::gorilla::encode_floats(&floats);
-            CompressedColumn {
-                type_tag: CompressionType::Gorilla,
-                row_count: values.len() as u32,
-                null_bitmap,
-                data,
-            }
-            .to_bytes()
-        }
-    } else if dt == "smallint" || dt == "int2" {
-        // Upcast smallint to i32 for delta-varint encoding
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        let ints: Vec<i32> = non_null.iter().map(|v| v.parse::<i16>().unwrap_or(0) as i32).collect();
-        let data = compression::integer::encode_i32(&ints);
-        CompressedColumn {
-            type_tag: CompressionType::DeltaVarint,
-            row_count: values.len() as u32,
-            null_bitmap,
-            data,
-        }
-        .to_bytes()
-    } else if dt == "date" {
-        // Treat date as timestamp for Gorilla encoding
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        let timestamps: Vec<i64> = non_null
-            .iter()
-            .map(|v| parse_timestamp_to_usec(v))
-            .collect();
-        let data = compression::gorilla::encode_timestamps(&timestamps);
-        CompressedColumn {
-            type_tag: CompressionType::Gorilla,
-            row_count: values.len() as u32,
-            null_bitmap,
-            data,
-        }
-        .to_bytes()
-    } else if dt == "integer" || dt == "int4" {
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        let ints: Vec<i32> = non_null.iter().map(|v| v.parse::<i32>().unwrap_or(0)).collect();
-        let data = compression::integer::encode_i32(&ints);
-        CompressedColumn {
-            type_tag: CompressionType::DeltaVarint,
-            row_count: values.len() as u32,
-            null_bitmap,
-            data,
-        }
-        .to_bytes()
-    } else if dt == "bigint" || dt == "int8" {
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        let ints: Vec<i64> = non_null.iter().map(|v| v.parse::<i64>().unwrap_or(0)).collect();
-        let data = compression::integer::encode_i64(&ints);
-        CompressedColumn {
-            type_tag: CompressionType::DeltaVarint,
-            row_count: values.len() as u32,
-            null_bitmap,
-            data,
-        }
-        .to_bytes()
-    } else if dt == "boolean" || dt == "bool" {
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        let bools: Vec<bool> = non_null.iter().map(|v| v == "t" || v == "true" || v == "1").collect();
-        let data = compression::boolean::encode(&bools);
-        CompressedColumn {
-            type_tag: CompressionType::BooleanBitmap,
-            row_count: values.len() as u32,
-            null_bitmap,
-            data,
+            data: encoded,
         }
         .to_bytes()
     } else {
-        // TEXT and other types
-        let (non_null, null_bitmap) = compression::extract_nulls(values);
-        let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-
-        if compression::dictionary::should_use_dictionary(&refs) {
-            let encoded = compression::dictionary::encode(&refs);
-            // Wrap with Dictionary tag
-            CompressedColumn {
-                type_tag: CompressionType::Dictionary,
-                row_count: values.len() as u32,
-                null_bitmap,
-                data: encoded,
-            }
-            .to_bytes()
-        } else {
-            let encoded = compression::lz4::encode_blocked(&refs, compression::lz4::DEFAULT_BLOCK_SIZE);
-            CompressedColumn {
-                type_tag: CompressionType::Lz4Blocked,
-                row_count: values.len() as u32,
-                null_bitmap,
-                data: encoded,
-            }
-            .to_bytes()
+        let encoded = compression::lz4::encode_blocked(&refs, compression::lz4::DEFAULT_BLOCK_SIZE);
+        CompressedColumn {
+            type_tag: CompressionType::Lz4Blocked,
+            row_count: values.len() as u32,
+            null_bitmap,
+            data: encoded,
         }
+        .to_bytes()
     }
-}
-
-fn parse_timestamp_to_usec(s: &str) -> i64 {
-    crate::timeparse::parse_timestamp_to_usec(s)
 }
 
 /// Get column metadata for a table.
