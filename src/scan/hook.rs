@@ -1743,6 +1743,162 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             0.0
         };
 
+        // === Top-N detection: ORDER BY <agg> [ASC|DESC] LIMIT N ===
+        let mut topn_active = false;
+        if has_group_by {
+            let mut topn_limit: i64 = 0;
+            let mut topn_sort_col: i32 = -1;
+            let mut topn_ascending: bool = true;
+
+            // 1. Extract LIMIT constant
+            if !(*parse).limitCount.is_null() {
+                let lnode = (*parse).limitCount as *const pg_sys::Node;
+                if (*lnode).type_ == pg_sys::NodeTag::T_Const {
+                    let c = lnode as *const pg_sys::Const;
+                    if !(*c).constisnull {
+                        topn_limit = (*c).constvalue.value() as i64;
+                    }
+                }
+            }
+
+            // Add OFFSET if present (we need top LIMIT+OFFSET rows internally)
+            if topn_limit > 0 && !(*parse).limitOffset.is_null() {
+                let onode = (*parse).limitOffset as *const pg_sys::Node;
+                if (*onode).type_ == pg_sys::NodeTag::T_Const {
+                    let c = onode as *const pg_sys::Const;
+                    if !(*c).constisnull {
+                        topn_limit += (*c).constvalue.value() as i64;
+                    } else {
+                        topn_limit = 0;
+                    }
+                } else {
+                    topn_limit = 0;
+                }
+            }
+
+            // Cap at reasonable limit
+            if topn_limit > 10000 {
+                topn_limit = 0;
+            }
+
+            // 2. Check sortClause: single entry referencing an aggregate
+            if topn_limit > 0 {
+                let sort_clause = (*parse).sortClause;
+                if !sort_clause.is_null() && (*sort_clause).length == 1 {
+                    let sc = pg_sys::list_nth(sort_clause, 0)
+                        as *const pg_sys::SortGroupClause;
+                    if !sc.is_null() {
+                        // Find target entry for this sort key
+                        let tle_ref = (*sc).tleSortGroupRef;
+                        let mut sort_tle: *const pg_sys::TargetEntry = std::ptr::null();
+                        for i in 0..nentries {
+                            let te = pg_sys::list_nth(tlist, i)
+                                as *const pg_sys::TargetEntry;
+                            if !te.is_null() && (*te).ressortgroupref == tle_ref {
+                                sort_tle = te;
+                                break;
+                            }
+                        }
+                        if !sort_tle.is_null() {
+                            let sort_expr =
+                                (*sort_tle).expr as *const pg_sys::Node;
+                            if !sort_expr.is_null()
+                                && (*sort_expr).type_ == pg_sys::NodeTag::T_Aggref
+                            {
+                                let sort_aggref =
+                                    sort_expr as *const pg_sys::Aggref;
+                                // Find which classified_agg this corresponds to
+                                let mut sort_agg_idx: Option<usize> = None;
+                                for (i, &ar) in aggrefs.iter().enumerate() {
+                                    if std::ptr::eq(ar, sort_aggref) {
+                                        sort_agg_idx = Some(i);
+                                        break;
+                                    }
+                                }
+                                // Fallback: match by aggfnoid + aggstar
+                                if sort_agg_idx.is_none() {
+                                    for (i, &ar) in aggrefs.iter().enumerate() {
+                                        if (*ar).aggfnoid == (*sort_aggref).aggfnoid
+                                            && (*ar).aggstar == (*sort_aggref).aggstar
+                                        {
+                                            sort_agg_idx = Some(i);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if let Some(agg_idx) = sort_agg_idx {
+                                    let spec = &classified_aggs[agg_idx];
+                                    // Only for i64-comparable result types
+                                    let is_i64 = match spec.agg_type {
+                                        AggType::CountStar
+                                        | AggType::Count
+                                        | AggType::CountDistinct => true,
+                                        AggType::Sum => matches!(
+                                            spec.col_type_oid,
+                                            pg_sys::INT2OID | pg_sys::INT4OID
+                                        ),
+                                        AggType::Min | AggType::Max => matches!(
+                                            spec.col_type_oid,
+                                            pg_sys::INT2OID
+                                                | pg_sys::INT4OID
+                                                | pg_sys::INT8OID
+                                        ),
+                                        _ => false,
+                                    };
+                                    if is_i64 {
+                                        // Determine sort direction
+                                        let opname_ptr =
+                                            pg_sys::get_opname((*sc).sortop);
+                                        if !opname_ptr.is_null() {
+                                            let opname =
+                                                std::ffi::CStr::from_ptr(opname_ptr)
+                                                    .to_str()
+                                                    .unwrap_or("");
+                                            topn_ascending = opname == "<";
+                                            // Find output column index
+                                            // (position among non-resjunk tlist entries)
+                                            let resno = (*sort_tle).resno;
+                                            let mut non_junk = 0i32;
+                                            for j in 0..nentries {
+                                                let te2 = pg_sys::list_nth(
+                                                    tlist, j,
+                                                )
+                                                    as *const pg_sys::TargetEntry;
+                                                if te2.is_null() || (*te2).resjunk
+                                                {
+                                                    continue;
+                                                }
+                                                if (*te2).resno == resno {
+                                                    topn_sort_col = non_junk;
+                                                    break;
+                                                }
+                                                non_junk += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if topn_sort_col < 0 {
+                    topn_limit = 0;
+                }
+            }
+
+            if topn_limit > 0 {
+                path::set_agg_topn_info(topn_limit, topn_sort_col, topn_ascending);
+                topn_active = true;
+            }
+        }
+
+        let pathkeys = if topn_active {
+            (*root).sort_pathkeys
+        } else {
+            std::ptr::null_mut()
+        };
+
         path::add_agg_path(
             root,
             output_rel,
@@ -1751,6 +1907,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             &group_specs,
             &having_filters,
             pg_estimated_groups,
+            pathkeys,
         );
     }
 }

@@ -21,6 +21,23 @@ pub(super) fn take_agg_having_filters() -> Vec<super::exec::HavingFilter> {
     AGG_HAVING_FILTERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
+thread_local! {
+    /// Top-N info for SeaTurtleAgg: (limit, sort_output_col, ascending).
+    /// Set in hook (seaturtle_create_upper_paths), consumed in plan_agg_path.
+    static AGG_TOPN_INFO: std::cell::RefCell<Option<(i64, i32, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Store top-N info for the next SeaTurtleAgg plan.
+pub(super) fn set_agg_topn_info(limit: i64, sort_col: i32, ascending: bool) {
+    AGG_TOPN_INFO.with(|cell| *cell.borrow_mut() = Some((limit, sort_col, ascending)));
+}
+
+/// Take (consume) the stored top-N info.
+fn take_agg_topn_info() -> Option<(i64, i32, bool)> {
+    AGG_TOPN_INFO.with(|cell| cell.borrow_mut().take())
+}
+
 // ============================================================================
 // SeaTurtleAppend path/plan methods
 // ============================================================================
@@ -580,6 +597,7 @@ pub struct AggSpec {
 }
 
 /// Add a SeaTurtleAgg custom path to the grouped relation's pathlist.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn add_agg_path(
     _root: *mut pg_sys::PlannerInfo,
     output_rel: *mut pg_sys::RelOptInfo,
@@ -588,6 +606,7 @@ pub unsafe fn add_agg_path(
     group_specs: &[super::exec::GroupByColSpec],
     having_filters: &[super::exec::HavingFilter],
     pg_estimated_groups: f64,
+    pathkeys: *mut pg_sys::List,
 ) {
     unsafe {
         let cpath =
@@ -612,6 +631,7 @@ pub unsafe fn add_agg_path(
         (*cpath).path.parallel_workers = 0;
         (*cpath).path.parallel_aware = false;
         (*cpath).path.parallel_safe = false;
+        (*cpath).path.pathkeys = if pathkeys.is_null() { std::ptr::null_mut() } else { pathkeys };
 
         // Store in custom_private:
         // [oid1, oid2, ..., -1, num_aggs,
@@ -1034,6 +1054,16 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                 private_list = pg_sys::lappend_int(private_list, b as i32);
             }
             pg_sys::pfree(s as *mut _);
+        } else {
+            private_list = pg_sys::lappend_int(private_list, 0);
+        }
+
+        // Top-N info: [topn_limit, topn_sort_col, topn_ascending] or [0]
+        let topn = take_agg_topn_info();
+        if let Some((limit, sort_col, ascending)) = topn {
+            private_list = pg_sys::lappend_int(private_list, limit as i32);
+            private_list = pg_sys::lappend_int(private_list, sort_col);
+            private_list = pg_sys::lappend_int(private_list, if ascending { 1 } else { 0 });
         } else {
             private_list = pg_sys::lappend_int(private_list, 0);
         }

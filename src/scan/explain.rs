@@ -190,6 +190,23 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                     stats_str.as_ptr(),
                     es,
                 );
+
+                if state.topn_limit > 0 {
+                    let direction = if state.topn_ascending { "ASC" } else { "DESC" };
+                    let topn_str = std::ffi::CString::new(format!(
+                        "limit={} sort_col={} direction={} pre_topn_groups={}",
+                        state.topn_limit,
+                        state.topn_sort_col,
+                        direction,
+                        state.pre_topn_groups,
+                    ))
+                    .unwrap();
+                    pg_sys::ExplainPropertyText(
+                        c"TopN".as_ptr(),
+                        topn_str.as_ptr(),
+                        es,
+                    );
+                }
             }
         }
     }

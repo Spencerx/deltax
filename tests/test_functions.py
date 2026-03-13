@@ -1,6 +1,53 @@
-"""Integration tests for time_bucket, first, and last functions."""
+"""Integration tests for time_bucket, first, last, and top-N functions."""
 
 from datetime import datetime, timezone
+
+MOCK_NOW = "2025-01-15 12:00:00+00"
+BASE_TS = "2025-01-15 00:00:00+00"
+
+
+def _setup_topn_table(db):
+    """Create a compressed seaturtle table with multiple groups for top-N tests."""
+    db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+    db.execute("""
+        CREATE TABLE topn_test (
+            ts TIMESTAMPTZ NOT NULL,
+            category TEXT NOT NULL,
+            val INT NOT NULL
+        )
+    """)
+    db.execute("SELECT seaturtle_create_table('topn_test', 'ts', '1 day'::interval)")
+    db.commit()
+
+    # Insert data: 5 categories with different row counts
+    # cat-A: 50 rows, cat-B: 40 rows, cat-C: 30 rows, cat-D: 20 rows, cat-E: 10 rows
+    values = []
+    counts = {"cat-A": 50, "cat-B": 40, "cat-C": 30, "cat-D": 20, "cat-E": 10}
+    for cat, n in counts.items():
+        for i in range(n):
+            values.append(
+                f"('{BASE_TS}'::timestamptz + interval '{i} seconds', '{cat}', {i})"
+            )
+    db.execute(
+        f"INSERT INTO topn_test (ts, category, val) VALUES {', '.join(values)}"
+    )
+    db.commit()
+
+    # Enable compression and compress
+    db.execute(
+        "SELECT seaturtle_enable_compression('topn_test', "
+        "segment_by => ARRAY['category'], order_by => ARRAY['ts'])"
+    )
+    db.commit()
+
+    partitions = db.execute(
+        "SELECT partition_name FROM seaturtle_partition_info('topn_test') "
+        "WHERE range_start <= '2025-01-15'::timestamptz "
+        "AND range_end > '2025-01-15'::timestamptz"
+    ).fetchall()
+    for row in partitions:
+        db.execute(f"SELECT seaturtle_compress_partition('{row[0]}')")
+    db.commit()
 
 
 def _setup_metrics(db):
@@ -106,3 +153,68 @@ def test_first_last_with_groups(db):
 
     assert rows[0] == ("a", 10.0, 30.0)
     assert rows[1] == ("b", 20.0, 40.0)
+
+
+class TestTopN:
+    def test_topn_desc(self, db):
+        """Top-3 categories by count, DESC order."""
+        _setup_topn_table(db)
+        rows = db.execute(
+            "SELECT category, COUNT(*) AS cnt FROM topn_test "
+            "GROUP BY category ORDER BY COUNT(*) DESC LIMIT 3"
+        ).fetchall()
+        assert len(rows) == 3
+        assert rows[0] == ("cat-A", 50)
+        assert rows[1] == ("cat-B", 40)
+        assert rows[2] == ("cat-C", 30)
+
+        # Verify EXPLAIN shows SeaTurtleAgg with TopN info
+        explain = db.execute(
+            "EXPLAIN ANALYZE SELECT category, COUNT(*) AS cnt FROM topn_test "
+            "GROUP BY category ORDER BY COUNT(*) DESC LIMIT 3"
+        ).fetchall()
+        explain_text = "\n".join(r[0] for r in explain)
+        assert "SeaTurtleAgg" in explain_text, (
+            f"Expected SeaTurtleAgg in plan:\n{explain_text}"
+        )
+        assert "TopN" in explain_text, (
+            f"Expected TopN in EXPLAIN output:\n{explain_text}"
+        )
+
+    def test_topn_asc(self, db):
+        """Top-3 categories by count, ASC order."""
+        _setup_topn_table(db)
+        rows = db.execute(
+            "SELECT category, COUNT(*) AS cnt FROM topn_test "
+            "GROUP BY category ORDER BY COUNT(*) ASC LIMIT 3"
+        ).fetchall()
+        assert len(rows) == 3
+        assert rows[0] == ("cat-E", 10)
+        assert rows[1] == ("cat-D", 20)
+        assert rows[2] == ("cat-C", 30)
+
+    def test_topn_with_offset(self, db):
+        """LIMIT 2 OFFSET 1 skips the top result."""
+        _setup_topn_table(db)
+        rows = db.execute(
+            "SELECT category, COUNT(*) AS cnt FROM topn_test "
+            "GROUP BY category ORDER BY COUNT(*) DESC LIMIT 2 OFFSET 1"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0] == ("cat-B", 40)
+        assert rows[1] == ("cat-C", 30)
+
+    def test_no_topn_without_limit(self, db):
+        """Without LIMIT, no TopN should appear in EXPLAIN."""
+        _setup_topn_table(db)
+        explain = db.execute(
+            "EXPLAIN ANALYZE SELECT category, COUNT(*) AS cnt FROM topn_test "
+            "GROUP BY category"
+        ).fetchall()
+        explain_text = "\n".join(r[0] for r in explain)
+        assert "SeaTurtleAgg" in explain_text, (
+            f"Expected SeaTurtleAgg in plan:\n{explain_text}"
+        )
+        assert "TopN" not in explain_text, (
+            f"TopN should not appear without LIMIT:\n{explain_text}"
+        )

@@ -314,6 +314,86 @@ struct ColMinMax {
     type_oid: pg_sys::Oid,
 }
 
+/// Check whether a segment can be skipped based on dictionary pruning for LIKE quals.
+///
+/// For each LIKE/NOT LIKE batch qual, finds the corresponding compressed blob and
+/// checks if it's dictionary-encoded. If so, tests dictionary entries against the
+/// LIKE pattern. If no entry matches (for LIKE) or all entries match (for NOT LIKE),
+/// the segment definitely has zero matching rows and can be skipped entirely.
+///
+/// Returns `true` if the segment should be skipped.
+fn segment_skippable_by_dict_like(
+    batch_quals: &[BatchQual],
+    col_names: &[String],
+    segment_by: &[String],
+    compressed_blobs: &[Vec<u8>],
+) -> bool {
+    // Find LIKE/NOT LIKE quals
+    for bq in batch_quals {
+        let (strategy, negate) = match (&bq.op, &bq.like_strategy) {
+            (BatchCompareOp::Like, Some(s)) => (s, false),
+            (BatchCompareOp::NotLike, Some(s)) => (s, true),
+            _ => continue,
+        };
+
+        // Compute blob index for this column
+        let mut blob_idx = 0;
+        for (ci, cn) in col_names.iter().enumerate() {
+            if ci == bq.col_idx {
+                break;
+            }
+            if !segment_by.contains(cn) {
+                blob_idx += 1;
+            }
+        }
+
+        let blob = &compressed_blobs[blob_idx];
+        if blob.len() < 6 {
+            continue;
+        }
+
+        // Check if dictionary-encoded
+        let type_tag = compression::CompressionType::from_u8(blob[0]);
+        let is_dict = matches!(
+            type_tag,
+            compression::CompressionType::Dictionary | compression::CompressionType::DictionaryLz4
+        );
+        if !is_dict {
+            continue;
+        }
+
+        // Parse the compressed column header to get the data portion
+        let cc = compression::CompressedColumnRef::from_bytes(blob);
+
+        // Normalize DictionaryLz4 → Dictionary format for header parsing
+        let norm_buf;
+        let dict_data = if type_tag == compression::CompressionType::DictionaryLz4 {
+            norm_buf = compression::dictionary::normalize_lz4(cc.data);
+            &norm_buf[..]
+        } else {
+            cc.data
+        };
+
+        // Check if any dictionary entry matches the LIKE pattern
+        let any_match = compression::dictionary::any_entry_matches(dict_data, |text| {
+            let matched = match strategy {
+                LikeStrategy::Contains(s) => text.contains(s.as_str()),
+                LikeStrategy::StartsWith(s) => text.starts_with(s.as_str()),
+                LikeStrategy::EndsWith(s) => text.ends_with(s.as_str()),
+                LikeStrategy::Exact(s) => text == s.as_str(),
+                LikeStrategy::General(p) => sql_like_match(text, p),
+            };
+            if negate { !matched } else { matched }
+        });
+
+        if !any_match {
+            return true; // No rows can match — skip segment
+        }
+    }
+
+    false
+}
+
 struct SegmentData {
     segment_values: Vec<Option<String>>,
     compressed_blobs: Vec<Vec<u8>>,
@@ -556,6 +636,10 @@ pub(super) struct AggScanState {
     pub(super) where_quals_null: bool,
     pub(super) regex_cache_size: u64,
     pub(super) regex_cache_calls: u64,
+    pub(super) topn_limit: u64,
+    pub(super) topn_sort_col: i64,
+    pub(super) topn_ascending: bool,
+    pub(super) pre_topn_groups: u64,
 }
 
 /// Static CustomExecMethods struct for SeaTurtleAgg.
@@ -1585,6 +1669,21 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         } else {
             std::ptr::null_mut()
         };
+        // Parse top-N info
+        let mut topn_limit: i64 = 0;
+        let mut topn_sort_col: usize = 0;
+        let mut topn_ascending: bool = true;
+        if idx < list_len {
+            let limit_val = pg_sys::list_nth_int(custom_private, idx);
+            idx += 1;
+            if limit_val > 0 {
+                topn_limit = limit_val as i64;
+                topn_sort_col = pg_sys::list_nth_int(custom_private, idx) as usize;
+                idx += 1;
+                topn_ascending = pg_sys::list_nth_int(custom_private, idx) != 0;
+                idx += 1;
+            }
+        }
         let _ = idx;
 
         if companion_oids.is_empty() {
@@ -1671,6 +1770,10 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     where_quals_null: true,
                     regex_cache_size: 0,
                     regex_cache_calls: 0,
+                    topn_limit: 0,
+                    topn_sort_col: 0,
+                    topn_ascending: true,
+                    pre_topn_groups: 0,
                 };
                 let state_ptr = Box::into_raw(Box::new(state));
                 (*node).custom_ps = state_ptr as *mut pg_sys::List;
@@ -1846,6 +1949,13 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
                 if time_min.is_some_and(|query_min| seg_max < query_min) { continue; }
                 if time_max.is_some_and(|query_max| seg_min > query_max) { continue; }
+            }
+
+            // Dictionary-based LIKE pruning: skip segment if no dict entry matches
+            if segment_skippable_by_dict_like(
+                &batch_quals, &meta.col_names, &meta.segment_by, &seg.compressed_blobs,
+            ) {
+                continue;
             }
 
             total_segments += 1;
@@ -2491,7 +2601,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
 
         // Finalize results using output mapping, applying HAVING filters
-        let result_rows = if has_group_by {
+        let mut result_rows = if has_group_by {
             let mut rows = Vec::new();
             // Pre-finalize all agg results keyed by group
             'group_loop: for (key, accumulators) in &group_map {
@@ -2571,6 +2681,27 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             vec![]
         };
 
+        // Apply top-N: sort by the specified output column and truncate
+        let pre_topn_groups = result_rows.len();
+        if topn_limit > 0 && has_group_by && result_rows.len() > topn_limit as usize {
+            let si = topn_sort_col;
+            if topn_ascending {
+                result_rows.sort_by_key(|row| {
+                    let (datum, is_null) = row[si];
+                    if is_null { i64::MAX } else { datum.value() as i64 }
+                });
+            } else {
+                result_rows.sort_by(|a, b| {
+                    let (da, na) = a[si];
+                    let (db, nb) = b[si];
+                    let va = if na { i64::MIN } else { da.value() as i64 };
+                    let vb = if nb { i64::MIN } else { db.value() as i64 };
+                    vb.cmp(&va) // reverse order for DESC
+                });
+            }
+            result_rows.truncate(topn_limit as usize);
+        }
+
         // Clean up segment memory context
         if !segment_mcxt.is_null() {
             pg_sys::MemoryContextDelete(segment_mcxt);
@@ -2592,6 +2723,10 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             where_quals_null: where_quals.is_null(),
             regex_cache_size: regex_cache.len() as u64,
             regex_cache_calls,
+            topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
+            topn_sort_col: topn_sort_col as i64,
+            topn_ascending,
+            pre_topn_groups: pre_topn_groups as u64,
         };
 
         let state_box = Box::new(state);
@@ -4467,6 +4602,14 @@ unsafe fn exec_topn_two_pass(
                 }
             }
 
+            // Dictionary-based LIKE pruning
+            if segment_skippable_by_dict_like(
+                &state.batch_quals, &state.col_names, &state.segment_by, &seg.compressed_blobs,
+            ) {
+                state.timing.segments_skipped += 1;
+                continue;
+            }
+
             let t_decompress = if instrument { Some(Instant::now()) } else { None };
 
             // Reset segment memory context for Phase 1
@@ -5051,6 +5194,14 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     state.timing.segments_skipped += 1;
                     continue;
                 }
+            }
+
+            // Dictionary-based LIKE pruning
+            if segment_skippable_by_dict_like(
+                &state.batch_quals, &state.col_names, &state.segment_by, &seg.compressed_blobs,
+            ) {
+                state.timing.segments_skipped += 1;
+                continue;
             }
 
             let t_decompress = if instrument { Some(Instant::now()) } else { None };

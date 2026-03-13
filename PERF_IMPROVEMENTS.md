@@ -162,203 +162,189 @@ BYTEA blobs detoasted only for surviving segments.
 `SeaTurtleAgg` node computes aggregates directly on decompressed columns. Handles
 `SUM`, `AVG`, `COUNT`, `COUNT(DISTINCT)`, `GROUP BY` on segment_by columns.
 
+### 11. Lazy column decompression (two-phase decompress) [DONE]
+
+**Impact: Q24 756ms -> improved, Q22/Q23 improved**
+
+Split decompression into two phases. Phase 1 decompresses only filter columns
+(referenced in WHERE), applies batch quals, and builds a selection vector.
+Phase 2 decompresses remaining columns, skipping text varlena allocation for
+rows that don't pass the filter. When no rows survive Phase 1, Phase 2 is
+skipped entirely (`phase2_skipped` counter in EXPLAIN ANALYZE).
+
+For Top-N queries, Phase 2 columns are marked as lazy for TOAST detoasting —
+only segments that contribute to the top-N result set have their deferred
+columns materialized.
+
+### 12. Expression aggregate pushdown — SUM(col + const) [DONE]
+
+**Impact: Q30 425ms -> improved**
+
+Detect `SUM(col + const)` pattern (`AggExpr::AddConst`) in planner hook.
+SeaTurtleAgg computes all sums in a single pass over the decoded column,
+applying the constant offset algebraically: `result = base_sum + const * count`.
+When all agg specs reference the same column, the column is decoded once and
+all results derived from a single accumulator.
+
+### 13. String function pushdown — length() [DONE]
+
+**Impact: Q28 207ms -> improved**
+
+`AggExpr::LengthOf` variant computes string length on raw `&str` slices during
+decompression without varlena allocation. Combined with aggregate pushdown,
+`AVG(length(URL))` is computed entirely inside SeaTurtleAgg — zero text
+materialization.
+
+### 14. Regex pushdown via Rust regex crate [DONE]
+
+**Impact: Q29 2837ms -> improved**
+
+`GroupByExpr::RegexpReplace` detected in planner when GROUP BY contains
+`regexp_replace(col, const_pattern, const_replacement)`. At scan time, the
+Rust `regex` crate compiles the pattern once and applies it on raw `&str`
+slices from LZ4/dictionary decompression. A cross-segment regex result cache
+(`HashMap<String, String>`) avoids redundant regex calls for repeated input
+values — tracked via `regex_cache_size` and `regex_cache_calls` in EXPLAIN.
+
+### 15. IN list batch quals [DONE]
+
+**Impact: Faster filtering for `col IN (v1, v2, ...)` predicates**
+
+`BatchCompareOp::InList` evaluates IN-list predicates in vectorized Rust loops
+over decoded datum arrays. The constant values are stored as `Vec<i64>` and
+checked per-row. Also integrates with min/max segment pruning — segments whose
+min/max range doesn't overlap any IN-list value are skipped entirely.
+
+### 16. GROUP BY expression pushdown [DONE]
+
+**Impact: Queries with date_trunc/extract/regexp_replace in GROUP BY**
+
+SeaTurtleAgg handles GROUP BY on expressions, not just plain columns:
+
+- **`date_trunc(unit, col)`** — truncation computed on epoch microseconds
+  using pure arithmetic (`date_trunc_unit_to_usecs`). Supports second, minute,
+  hour, day, week, month, year.
+- **`extract(field FROM col)`** — field extraction from epoch microseconds
+  (`extract_field_from_usecs`). Supports microsecond through epoch.
+- **`regexp_replace(col, pattern, replacement)`** — regex applied on raw
+  `&str` slices via Rust `regex` crate (see #14).
+
+All three are serialized to `custom_private` and round-trip through plan
+caching.
+
+### 17. HAVING filter pushdown [DONE]
+
+**Impact: Eliminates post-aggregation filtering in PG executor**
+
+Simple HAVING clauses of the form `HAVING agg_result <op> const` (where `<op>`
+is `>`, `<`, `>=`, `<=`, `=`, `<>`) are pushed into SeaTurtleAgg. Filters are
+applied immediately after aggregation, before result rows are emitted. Encoded
+as `HavingFilter { agg_idx, op, const_val }` in `custom_private`.
+
+### 18. Min/max segment pruning [DONE]
+
+**Impact: Skips segments whose value ranges don't match WHERE predicates**
+
+Per-segment `_min_`/`_max_` metadata for all orderable types (INT2/INT4/INT8,
+FLOAT4/FLOAT8, TIMESTAMP/TIMESTAMPTZ, DATE) is checked before decompression.
+Segments that can't contain matching rows are skipped entirely. Supports `=`,
+`<`, `<=`, `>`, `>=`, and `IN` list predicates. Tracked via
+`segments_minmax_skipped` in EXPLAIN ANALYZE.
+
+### 19. Dictionary-based segment pruning for LIKE [DONE]
+
+**Impact: Skips segments where no dictionary entry matches the LIKE pattern**
+
+For dictionary-compressed text columns, the dictionary (small, at the start of
+the blob) is loaded and tested against the LIKE/NOT LIKE pattern before
+decompressing indices. If no dictionary entry matches, the entire segment is
+skipped. Implemented in `segment_skippable_by_dict_like()`.
+
+### 20. Top-N pushdown for DecompressState [DONE]
+
+**Impact: ORDER BY col LIMIT N on compressed scans**
+
+When `ORDER BY col LIMIT N` is detected, DecompressState maintains a bounded
+heap of top-N candidates during Phase 1. Segments are processed in min/max
+order; once enough candidates are collected and a segment's min (or max for
+DESC) can't beat the current worst candidate, remaining segments are skipped.
+Phase 2 decompression is deferred and only performed for winning segments.
+Pathkeys are advertised so PG eliminates the Sort node.
+
+### 21. Top-N pushdown for AggScan [DONE]
+
+**Impact: GROUP BY col ORDER BY agg(...) LIMIT N on aggregate queries**
+
+When `ORDER BY <aggregate> [ASC|DESC] LIMIT N` is detected on a SeaTurtleAgg
+query, the aggregation result is sorted by the specified aggregate column and
+truncated to N rows inside the scan node. Pathkeys are set on the CustomPath
+so PG eliminates the redundant Sort node above SeaTurtleAgg. EXPLAIN ANALYZE
+shows `TopN: limit=N sort_col=X direction=ASC|DESC pre_topn_groups=M`.
+
+### 22. Dictionary compression for text columns [DONE]
+
+**Impact: Better compression ratio and faster decompression for low-cardinality text**
+
+Text columns with `ndistinct < 10% of row_count AND < 65536 distinct values`
+use dictionary encoding: fixed-width indices into a deduplicated string table.
+Falls back to LZ4 for high-cardinality columns. Dictionary entries also serve
+as a perfect filter for LIKE pruning (see #19).
+
+### 23. Ndistinct statistics tracking [DONE]
+
+**Impact: Enables cardinality-aware compression strategy selection**
+
+Per-column `ndistinct` counts maintained in the catalog during compression.
+Used to switch between dictionary encoding (low cardinality) and LZ4 (high
+cardinality) for text columns. Also available via `get_column_ndistinct()`
+for cost estimation.
+
 ---
 
 ## Regression Queries (Compressed Slower Than Uncompressed)
 
-Seven queries are slower with compression. Root causes fall into three categories:
+Several queries were slower with compression. Many have been addressed:
 
-### Category A: Decompressing columns that aren't needed for filtering
+### Fixed regressions
 
-**Q24 (0.13x):** `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`
-- 95 rows match, but ALL ~100 columns decompressed for ALL 1M rows
-- Decompress=640ms (all columns), Emit=649ms (all columns in slot)
-- Fix: **Lazy column decompression** (improvement #11)
+**Q24 (was 0.13x):** Fixed by lazy column decompression (#11). Phase 2
+skips text varlena allocation for non-matching rows.
 
-### Category B: PG executor overhead above the scan
+**Q30 (was 0.48x):** Fixed by expression aggregate pushdown (#12). `SUM(col + N)`
+computed algebraically inside SeaTurtleAgg.
 
-**Q30 (0.48x):** `SUM(ResolutionWidth + 0..89)` — 89 SUM expressions
-- SeaTurtle scan=8ms, but PG evaluates 89 exprs × 1M rows = 417ms overhead
-- Fix: **Expression aggregate pushdown** (improvement #12)
+**Q28 (was 0.57x):** Fixed by length() pushdown (#13). `AVG(length(URL))`
+computed on raw `&str` slices without varlena allocation.
 
-**Q33 (0.66x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg
-- SeaTurtle scan=15ms, but PG hash agg on 1M rows with ~1M groups = 881ms
-- Fix: Push hash agg into scan (very hard) or accept this as inherent
+**Q29 (was 0.37x):** Fixed by regex pushdown (#14). `REGEXP_REPLACE` in GROUP BY
+runs via Rust `regex` crate on raw slices with cross-segment caching.
 
-**Q36 (0.78x):** `GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3`
-- Same pattern: fast scan, slow PG hash agg on expressions
-- Fix: Same as Q33
+### Remaining regressions
 
-**Q18 (0.98x):** `GROUP BY UserID, SearchPhrase`
-- Marginal regression; emit overhead for 1M rows with large text column
+**Q33 (0.66x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg.
+SeaTurtle scan=15ms, but PG hash agg on 1M rows with ~1M groups = 881ms.
+Push hash agg into scan (very hard) or accept this as inherent.
 
-### Category C: Expensive text operations on many rows
+**Q36 (0.78x):** `GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3`.
+Same pattern: fast scan, slow PG hash agg on expressions.
 
-**Q28 (0.57x):** `AVG(length(URL)) GROUP BY CounterID`
-- Full URL varlena allocated for 999K rows just to compute `length()`
-- Fix: **length() pushdown** — compute on raw `&str`, return int (improvement #13)
+**Q18 (0.98x):** `GROUP BY UserID, SearchPhrase`. Marginal regression; emit
+overhead for 1M rows with large text column.
 
-**Q29 (0.37x):** `REGEXP_REPLACE(Referer, ...) GROUP BY`
-- SeaTurtle scan=110ms (921K text rows), but PG REGEXP_REPLACE=2727ms
-- PG's regex engine is slow; varlena allocation overhead on top
-- Fix: **Regex pushdown** via Rust `regex` crate (improvement #14)
+These are bottlenecked by PG's hash aggregation on high-cardinality GROUP BY
+keys (WatchID has ~1M unique values). The scan is already fast (8-15ms). The
+only fix is pushing the entire GROUP BY hash table into the scan node —
+essentially reimplementing PG's hash aggregate in Rust. Very high effort,
+marginal return since PG's hash agg is already well-optimized. Best left as-is
+unless we move to a full vectorized execution engine.
 
 ---
 
 ## Planned Improvements
 
-### 11. Lazy column decompression (two-phase decompress)
+### 24. Late text materialization
 
-**Target: Q24 756ms -> ~100ms (0.13x -> ~1x), also helps Q22/Q23**
-**Complexity: Medium-High**
-
-Currently all needed columns are decompressed for all rows before filtering
-(`exec.rs:2977` loop). For Q24, that's ~100 columns × 1M rows, but only 95 rows
-match the LIKE filter.
-
-Split decompression into two phases:
-
-1. **Phase 1 — Filter columns:** Decompress only columns referenced in WHERE
-   (URL for Q24). Apply LIKE/batch quals. Build selection vector with ~95 true
-   entries out of 1M.
-
-2. **Phase 2 — Remaining columns:** Decompress non-filter columns, but only
-   allocate datums for rows passing the selection vector.
-
-For **pass-by-value types** (int, float, timestamp): full decode is cheap
-(gorilla/varint are sequential), but skip `Datum` creation for non-matching rows
-— minor saving.
-
-For **text types** (the big win): decode LZ4/dictionary to get `&str` slices
-(cheap), but only call `str_slices_to_text_datums_arena()` for the ~95 matching
-rows. This eliminates the dominant cost: varlena allocation for ~100 text columns
-× 1M rows.
-
-**Implementation sketch:**
-```rust
-// Phase 1: decompress filter columns, build selection vector
-let mut selection = vec![true; row_count];
-for col_idx in filter_columns {
-    decompress_column(col_idx, &seg);
-    apply_batch_qual(col_idx, &mut selection);
-}
-
-// Phase 2: decompress remaining columns with selection
-for col_idx in non_filter_columns {
-    if is_text_type(col_idx) {
-        decompress_text_with_selection(col_idx, &seg, &selection);
-    } else {
-        decompress_column(col_idx, &seg); // cheap, full decode ok
-    }
-}
-```
-
-**Expected impact on other queries:**
-- Q22 (1.66x -> ~3x): URL+SearchPhrase decompressed for 1M rows, only 2 match
-- Q23 (1.15x -> ~2x): Title+URL+SearchPhrase for 1M rows, only 217 match
-- Q21 (1.43x -> ~2x): URL for 1M rows, 95 match (single column, smaller win)
-
-**Files:** `src/scan/exec.rs` (decompression loop at line 2977)
-
-### 12. Expression aggregate pushdown (SUM/AVG with arithmetic)
-
-**Target: Q30 425ms -> ~10ms (0.48x -> ~20x)**
-**Complexity: Medium**
-
-Q30 computes 89 expressions of the form `SUM(ResolutionWidth + N)`. The
-SeaTurtle scan emits 1M rows in 8ms, then PG spends 417ms evaluating 89
-expressions per row through its tuple-at-a-time executor.
-
-Extend `SeaTurtleAgg` to detect `SUM(col + const)` and `SUM(col * const)`
-patterns. Inside the scan node, compute all sums in a single pass:
-
-```rust
-let values = decode_i32(blob);  // decode ResolutionWidth once
-let mut sums = vec![0i64; 89];
-for &v in &values {
-    for i in 0..89 {
-        sums[i] += v as i64 + i as i64;
-    }
-}
-// Emit 1 row with 89 columns
-```
-
-This eliminates 89M expression evaluations in PG. The pattern detection happens
-in `seaturtle_create_upper_paths` by walking the Aggregate target list for
-`SUM(OpExpr(Var, Const))`.
-
-More generally, this extends to any aggregate over a simple expression on a
-single column. Patterns to detect:
-- `SUM(col + const)`, `SUM(col * const)`, `SUM(col - const)`
-- `AVG(col + const)` (sum + count, divide at end)
-- Could extend to `SUM(col1 + col2)` later
-
-**Files:** `src/scan/hook.rs` (upper path detection), `src/scan/exec.rs`
-(aggregate computation in SeaTurtleAgg)
-
-### 13. String function pushdown (length, lower, upper)
-
-**Target: Q28 207ms -> ~50ms (0.57x -> ~2.5x)**
-**Complexity: Medium**
-
-Q28 is `SELECT CounterID, AVG(length(URL)) ... GROUP BY CounterID`. The scan
-decompresses full URL text (LZ4, 33ms) and allocates varlena for 999K rows
-(33ms emit), just so PG can call `length()` on each — which only needs the
-byte count.
-
-Push `length()` into the scan: during LZ4/dictionary decompression, we already
-have `(offset, len)` ranges or `&str` slices. Emit `len as i32` as an integer
-datum instead of the full text.
-
-**Detection:** In the planner, look for `FuncExpr` wrapping a `Var` on a text
-column. If the function is `length` (oid 1317/1318/1319), replace the text
-column in the scan output with a synthetic integer column computed during
-decompression.
-
-**Combined with aggregate pushdown (#12):** If the full expression is
-`AVG(length(URL))`, push the entire computation into SeaTurtleAgg. Compute
-string lengths on raw `&str` slices → accumulate sum + count → emit single row.
-Zero text varlena allocation.
-
-**Generalization:** Same approach works for `lower()`, `upper()`, `substr()`,
-`position()` — any function that can operate on `&str` slices and return a
-simple value.
-
-**Files:** `src/scan/hook.rs` (function detection), `src/scan/exec.rs`
-(decompression with function application)
-
-### 14. Regex pushdown via Rust regex crate
-
-**Target: Q29 2837ms -> ~500ms (0.37x -> ~2x)**
-**Complexity: High**
-
-Q29 is `SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1')
-AS k, AVG(length(Referer)), COUNT(*), MIN(Referer) FROM hits WHERE Referer <> ''
-GROUP BY k ...`. The SeaTurtle scan emits 921K text rows in 110ms; PG's regex
-engine spends ~2727ms on REGEXP_REPLACE.
-
-Rust's `regex` crate is typically 5-10x faster than PG's regex engine and can
-operate on raw `&str` slices without varlena allocation.
-
-**Approach:** Detect `REGEXP_REPLACE(Var, const_pattern, const_replacement)` in
-the target list during planning. At scan time:
-1. Compile the regex once with `regex::Regex::new()`
-2. During decompression, apply regex on raw `&str` slices from LZ4/dictionary
-3. Emit the replacement string as a text datum (only for GROUP BY key)
-
-**Combined with `length()` pushdown:** The `AVG(length(Referer))` can also be
-computed on raw slices. And `MIN(Referer)` can use byte-level comparison on
-slices. The entire query could potentially run without emitting any rows
-through PG's executor.
-
-**Adds dependency:** `regex` crate (widely used, no-std compatible).
-
-**Files:** `src/scan/hook.rs` (detect REGEXP_REPLACE in target list),
-`src/scan/exec.rs` (regex evaluation during decompression)
-
-### 15. Late text materialization
-
-**Target: 10-30% improvement on all text-heavy queries (Q17, Q19, Q29, Q34, Q35)**
+**Target: 10-30% improvement on all text-heavy queries (Q17, Q19, Q34, Q35)**
 **Complexity: High**
 
 Currently, text decompression always allocates PG varlena datums (even with
@@ -381,7 +367,7 @@ rows that survive filtering.
 
 **Files:** `src/scan/exec.rs` (new `LazyTextColumn` type, decompression paths)
 
-### 16. Bloom filters for text column segment pruning
+### 25. Bloom filters for text column segment pruning
 
 **Target: Q21 64ms -> ~30ms, Q22/Q23 moderate improvement**
 **Complexity: High**
@@ -390,50 +376,9 @@ Store a per-segment bloom filter in the companion table for text columns with
 moderate cardinality. During segment loading, test the bloom filter against
 WHERE constants to skip segments that definitely don't contain the value.
 
-For Q21 (`WHERE URL LIKE '%google%'`), a substring bloom filter could prune
-segments where no URL contains "google". For dictionary-compressed columns,
-the dictionary itself serves as a perfect filter — if the pattern doesn't
-match any dictionary entry, the entire segment can be skipped.
-
-**Quick win — dictionary-based pruning:** For dictionary-compressed text columns,
-load just the dictionary (small, at the start of the blob) and test the LIKE
-pattern against it before decompressing indices. If no dictionary entry matches,
-skip the segment entirely. No bloom filter storage needed.
+Dictionary-based pruning (#19) already handles dictionary-compressed columns.
+Bloom filters would extend pruning to LZ4-compressed (high-cardinality) text
+columns where the dictionary approach doesn't apply.
 
 **Files:** `src/compress.rs` (bloom filter in companion table schema),
-`src/scan/exec.rs` (bloom filter test in segment loading),
-`src/compression/dictionary.rs` (dictionary-only decode for pruning)
-
----
-
-## Priority Order
-
-Ranked by estimated time savings × feasibility:
-
-1. **Lazy column decompression (#11)** — Fixes the worst regression (Q24 0.13x).
-   Medium-high effort but clear implementation path. Also improves Q22/Q23.
-
-2. **Expression aggregate pushdown (#12)** — Fixes Q30 (0.48x → ~20x).
-   Medium effort, extends existing SeaTurtleAgg infrastructure.
-
-3. **String function pushdown (#13)** — Fixes Q28 (0.57x → ~2.5x).
-   Medium effort, pairs well with aggregate pushdown.
-
-4. **Regex pushdown (#14)** — Fixes Q29 (0.37x → ~2x). Largest absolute time
-   savings (2300ms) but adds a dependency and high complexity.
-
-5. **Late text materialization (#15)** — Broad 10-30% improvement across many
-   queries. High effort, architectural change to decompression.
-
-6. **Bloom/dictionary pruning (#16)** — Moderate improvement on LIKE queries.
-   Dictionary-based pruning is a quick win; full bloom filters are high effort.
-
-### Queries that remain hard to optimize
-
-**Q33 (0.66x), Q36 (0.78x), Q18 (0.98x):** These are bottlenecked by PG's hash
-aggregation on high-cardinality GROUP BY keys (WatchID has ~1M unique values).
-The scan is already fast (8-15ms). The only fix is pushing the entire GROUP BY
-hash table into the scan node — essentially reimplementing PG's hash aggregate
-in Rust. Very high effort, marginal return since PG's hash agg is already
-well-optimized. These are best left as-is unless we move to a full vectorized
-execution engine (VECTORIZE.md Phase 4).
+`src/scan/exec.rs` (bloom filter test in segment loading)

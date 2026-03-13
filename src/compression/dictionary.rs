@@ -331,6 +331,16 @@ pub fn check_ne_empty(data: &[u8], count: usize) -> Vec<bool> {
     sel
 }
 
+/// Check whether any dictionary entry satisfies the given predicate.
+///
+/// Parses only the dictionary header (not the per-row indices), so this is
+/// O(dict_size) regardless of row count. Useful for segment pruning: if no
+/// dictionary entry matches a LIKE pattern, the entire segment can be skipped.
+pub fn any_entry_matches(data: &[u8], predicate: impl Fn(&str) -> bool) -> bool {
+    let hdr = parse_header(data);
+    hdr.dict.iter().any(|&s| predicate(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
