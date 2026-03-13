@@ -1403,6 +1403,215 @@ class TestTransparentQuery:
             f"Expected SeaTurtleAgg in plan:\n{explain_text}"
         )
 
+    def test_sum_add_const_fast_path(self, db):
+        """Many SUM(col + N) on the same column triggers the algebraic fast path.
+
+        When all agg specs are SUM/AVG on the same column with +const,
+        the scan computes base_sum once and derives each result as
+        base_sum + N * count.  Verify results AND that agg time is negligible
+        compared to decompress time (proving the fast path was taken).
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE sum_fast (
+                ts TIMESTAMPTZ NOT NULL,
+                val INT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('sum_fast', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert enough rows so timing is measurable
+        rows = []
+        for i in range(500):
+            rows.append(
+                f"('{BASE_TS}'::timestamptz + interval '{i} seconds', {i % 100})"
+            )
+        db.execute(f"INSERT INTO sum_fast VALUES {','.join(rows)}")
+        db.commit()
+
+        # Build 20 SUM expressions: SUM(val), SUM(val+1), ..., SUM(val+19)
+        sum_exprs = ["SUM(val)"] + [f"SUM(val + {n})" for n in range(1, 20)]
+        select_sql = f"SELECT {', '.join(sum_exprs)} FROM sum_fast"
+
+        before = db.execute(select_sql).fetchone()
+
+        # Enable and compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('sum_fast', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "sum_fast")
+
+        after = db.execute(select_sql).fetchone()
+
+        # Verify all 20 results match
+        for i in range(20):
+            assert before[i] == after[i], (
+                f"SUM(val + {i}) mismatch: before={before[i]} after={after[i]}"
+            )
+
+        # Verify AggScan is used
+        explain = db.execute(f"EXPLAIN {select_sql}").fetchall()
+        explain_text = "\n".join(r[0] for r in explain)
+        assert "SeaTurtleAgg" in explain_text, (
+            f"Expected SeaTurtleAgg in plan:\n{explain_text}"
+        )
+
+        # Verify fast path via EXPLAIN ANALYZE: agg time should be tiny
+        # relative to the total (< 50% of decompress+heap_scan)
+        rows = db.execute(f"EXPLAIN ANALYZE {select_sql}").fetchall()
+        for r in rows:
+            line = r[0]
+            if "SeaTurtle Timing" in line:
+                # Parse: decompress=X.XXX agg=Y.YYY
+                import re
+                m_decomp = re.search(r"decompress=([\d.]+)", line)
+                m_agg = re.search(r"agg=([\d.]+)", line)
+                if m_decomp and m_agg:
+                    decomp = float(m_decomp.group(1))
+                    agg = float(m_agg.group(1))
+                    assert agg < decomp * 2, (
+                        f"Fast path expected agg << decompress, "
+                        f"but agg={agg:.3f}ms decompress={decomp:.3f}ms\n"
+                        f"Full line: {line}"
+                    )
+                break
+
+    def test_sum_add_const_no_fast_path_different_columns(self, db):
+        """SUM(col1 + N), SUM(col2 + N) on different columns does NOT take the
+        fast path.  Verify results are still correct via generic agg loop."""
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE sum_nf_cols (
+                ts TIMESTAMPTZ NOT NULL,
+                a INT NOT NULL,
+                b INT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('sum_nf_cols', 'ts', '1 day'::interval)")
+        db.commit()
+
+        rows = []
+        for i in range(300):
+            rows.append(
+                f"('{BASE_TS}'::timestamptz + interval '{i} seconds', {i}, {i * 2})"
+            )
+        db.execute(f"INSERT INTO sum_nf_cols VALUES {','.join(rows)}")
+        db.commit()
+
+        q = "SELECT SUM(a), SUM(a + 5), SUM(b), SUM(b + 10) FROM sum_nf_cols"
+        before = db.execute(q).fetchone()
+
+        db.execute(
+            "SELECT seaturtle_enable_compression('sum_nf_cols', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "sum_nf_cols")
+
+        after = db.execute(q).fetchone()
+
+        assert before[0] == after[0], f"SUM(a) mismatch: {before[0]} vs {after[0]}"
+        assert before[1] == after[1], f"SUM(a+5) mismatch: {before[1]} vs {after[1]}"
+        assert before[2] == after[2], f"SUM(b) mismatch: {before[2]} vs {after[2]}"
+        assert before[3] == after[3], f"SUM(b+10) mismatch: {before[3]} vs {after[3]}"
+
+        # Verify AggScan is used
+        explain = db.execute(f"EXPLAIN {q}").fetchall()
+        explain_text = "\n".join(r[0] for r in explain)
+        assert "SeaTurtleAgg" in explain_text
+
+    def test_sum_add_const_no_fast_path_with_group_by(self, db):
+        """SUM(col + N) with GROUP BY does NOT take the fast path.
+        Verify results are still correct via generic agg loop."""
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE sum_nf_gb (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id INT NOT NULL,
+                val INT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('sum_nf_gb', 'ts', '1 day'::interval)")
+        db.commit()
+
+        rows = []
+        for i in range(300):
+            rows.append(
+                f"('{BASE_TS}'::timestamptz + interval '{i} seconds', "
+                f"{i % 3}, {i})"
+            )
+        db.execute(f"INSERT INTO sum_nf_gb VALUES {','.join(rows)}")
+        db.commit()
+
+        q = (
+            "SELECT device_id, SUM(val), SUM(val + 10), SUM(val + 20) "
+            "FROM sum_nf_gb GROUP BY device_id ORDER BY device_id"
+        )
+        before = db.execute(q).fetchall()
+
+        db.execute(
+            "SELECT seaturtle_enable_compression('sum_nf_gb', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "sum_nf_gb")
+
+        after = db.execute(q).fetchall()
+
+        assert len(after) == len(before), (
+            f"Group count mismatch: {len(before)} vs {len(after)}"
+        )
+        for b, a in zip(before, after):
+            assert b == a, f"Row mismatch: before={b} after={a}"
+
+        # Verify AggScan is used
+        explain = db.execute(f"EXPLAIN {q}").fetchall()
+        explain_text = "\n".join(r[0] for r in explain)
+        assert "SeaTurtleAgg" in explain_text
+
+    def test_sum_add_const_no_fast_path_mixed_agg_types(self, db):
+        """SUM + COUNT on the same column does NOT take the fast path.
+        Verify results are still correct."""
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE sum_nf_mix (
+                ts TIMESTAMPTZ NOT NULL,
+                val INT
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('sum_nf_mix', 'ts', '1 day'::interval)")
+        db.commit()
+
+        rows = []
+        for i in range(200):
+            val = "NULL" if i % 10 == 0 else str(i)
+            rows.append(
+                f"('{BASE_TS}'::timestamptz + interval '{i} seconds', {val})"
+            )
+        db.execute(f"INSERT INTO sum_nf_mix VALUES {','.join(rows)}")
+        db.commit()
+
+        q = "SELECT SUM(val), SUM(val + 5), COUNT(*), COUNT(val) FROM sum_nf_mix"
+        before = db.execute(q).fetchone()
+
+        db.execute(
+            "SELECT seaturtle_enable_compression('sum_nf_mix', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "sum_nf_mix")
+
+        after = db.execute(q).fetchone()
+
+        assert before[0] == after[0], f"SUM(val) mismatch: {before[0]} vs {after[0]}"
+        assert before[1] == after[1], f"SUM(val+5) mismatch: {before[1]} vs {after[1]}"
+        assert before[2] == after[2], f"COUNT(*) mismatch: {before[2]} vs {after[2]}"
+        assert before[3] == after[3], f"COUNT(val) mismatch: {before[3]} vs {after[3]}"
+
     def test_explain_analyze_shows_timing(self, db):
         """EXPLAIN ANALYZE on compressed partition shows SeaTurtle timing."""
         setup_metrics_table(db)

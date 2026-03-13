@@ -30,15 +30,23 @@ make logs-follow                      # Follow logs in real-time
 make cargo CMD="<cmd>"                # Run arbitrary cargo command in dev container
 make clean                            # Clean Docker volumes
 make bench-clickbench                 # Run Clickbench benchmark
-make bench-clickbench-keep            # Run Clickbench benchmark, and keep the image for troubleshooting
-make bench-clickbench-persist         # Full benchmark with persistent data volume for reruns
-make bench-clickbench-rerun           # Quick rerun: reuse data, compressed queries only (~3-4 min)
-make bench-clean                      # Remove persisted benchmark data volume
+make bench-clickbench-keep            # Run Clickbench benchmark, keep container running
+make bench-clean                      # Remove benchmark data volume
 make bench-all                        # Compare benchmarks with timescale
 ```
 
+### Benchmark Workflow
+
+The normal loop for testing performance changes:
+
+1. `make image-fresh` — rebuild the production image with your code changes
+2. `make bench-clickbench-keep` — run the full benchmark (~2 min), keeps container running
+3. Use the connection string printed at the end to run EXPLAIN ANALYZE or ad-hoc queries against the benchmark DB
+
+The benchmark prints a `psql postgres://...` connection string at the end. Use it to investigate specific queries with EXPLAIN ANALYZE, verify plan choices, etc.
+
 If you need to reference pgrx source code, it is in ~/src/pgrx.
-If you need to reference the postgres source code, is in ~/src/postgres. 
+If you need to reference the postgres source code, is in ~/src/postgres.
 Use the source there, it's much faster than looking into the docker images.
 
 ## Architecture

@@ -374,66 +374,19 @@ def print_compression_stats(conn):
 # Pytest fixtures & test class
 # ---------------------------------------------------------------------------
 
-SKIP_LOAD = os.environ.get("SKIP_LOAD")
-SKIP_UNCOMPR = os.environ.get("SKIP_UNCOMPR")
-SKIP_COMPRESS = os.environ.get("SKIP_COMPRESS")
-FIXED_DB_NAME = "bench_clickbench"
-
-
-def _db_exists(admin_conn, db_name: str) -> bool:
-    """Check if a database exists."""
-    row = admin_conn.execute(
-        "SELECT 1 FROM pg_database WHERE datname = %s", (db_name,)
-    ).fetchone()
-    return row is not None
-
-
 @pytest.fixture(scope="class")
 def clickbench_db(pg_container):
     """Create a database, load ClickBench data, enable compression.
 
     Scoped to class so data is loaded once for all benchmark tests.
-
-    When SKIP_LOAD is set, reuses the existing FIXED_DB_NAME database
-    (requires a prior run with BENCH_PERSIST).
-    When BENCH_PERSIST is set (without SKIP_LOAD), uses FIXED_DB_NAME
-    for stable naming so future reruns can reuse it.
     """
     from conftest import HOST_PORT, PG_PASSWORD, PG_USER, _admin_conn
 
-    persist = os.environ.get("BENCH_PERSIST")
-    reuse_db = False
-
-    if SKIP_LOAD:
-        # Reuse mode: try to connect to existing database
-        db_name = FIXED_DB_NAME
-        admin = _admin_conn()
-        if not _db_exists(admin, db_name):
-            admin.close()
-            pytest.fail(
-                f"SKIP_LOAD is set but database '{db_name}' does not exist. "
-                f"Run 'make bench-clickbench-persist' first to create it."
-            )
-        admin.close()
-        reuse_db = True
-        print(f"\n  Reusing existing database: {db_name}")
-    elif persist:
-        # Persist mode: use fixed name for future reuse
-        db_name = FIXED_DB_NAME
-        admin = _admin_conn()
-        if _db_exists(admin, db_name):
-            # DB already exists from a previous persist run — drop and recreate
-            # to ensure clean state with new extension version
-            admin.execute(f'DROP DATABASE "{db_name}"')
-        admin.execute(f'CREATE DATABASE "{db_name}"')
-        admin.close()
-    else:
-        # Normal mode: unique name
-        import uuid
-        db_name = "bench_clickbench_" + uuid.uuid4().hex[:8]
-        admin = _admin_conn()
-        admin.execute(f'CREATE DATABASE "{db_name}"')
-        admin.close()
+    import uuid
+    db_name = "bench_clickbench_" + uuid.uuid4().hex[:8]
+    admin = _admin_conn()
+    admin.execute(f'CREATE DATABASE "{db_name}"')
+    admin.close()
 
     conn = psycopg.connect(
         host="localhost",
@@ -445,18 +398,18 @@ def clickbench_db(pg_container):
     conn.execute("SET jit = off")
     conn.commit()
 
-    if not reuse_db:
-        conn.execute("CREATE EXTENSION pg_seaturtle")
-        conn.commit()
-        # Setup: create table, partition, load data
-        setup_clickbench(conn, NUM_FILES)
-        enable_compression(conn)
+    conn.execute("CREATE EXTENSION pg_seaturtle")
+    conn.commit()
+    # Setup: create table, partition, load data
+    setup_clickbench(conn, NUM_FILES)
+    enable_compression(conn)
 
     yield conn
 
     conn.close()
-    if persist or os.environ.get("KEEP_CONTAINER"):
+    if os.environ.get("KEEP_CONTAINER"):
         print(f"\n  Keeping database {db_name} for reuse")
+        print(f"  Connect with: psql postgres://{PG_USER}:{PG_PASSWORD}@localhost:{HOST_PORT}/{db_name}")
     else:
         admin = _admin_conn()
         admin.execute(f'DROP DATABASE "{db_name}"')
@@ -467,13 +420,7 @@ class TestClickBench:
     """ClickBench real-world benchmark for pg_seaturtle compression."""
 
     def test_benchmark(self, clickbench_db):
-        """Run full benchmark: uncompressed queries, compress, compressed queries.
-
-        Phases can be skipped via env vars for fast iteration:
-          SKIP_UNCOMPR=1  — skip uncompressed queries (Phase 1)
-          SKIP_COMPRESS=1 — skip compression (Phase 2)
-          SKIP_LOAD=1     — skip data loading (handled in fixture)
-        """
+        """Run full benchmark: uncompressed queries, compress, compressed queries."""
         conn = clickbench_db
 
         uncompr_results = {}
@@ -481,38 +428,32 @@ class TestClickBench:
         compress_timings = []
 
         # Phase 1: Query uncompressed data
-        if SKIP_UNCOMPR:
-            print("\n\n=== Phase 1: Uncompressed Queries (SKIPPED) ===")
-        else:
-            print("\n\n=== Phase 1: Uncompressed Queries ===")
-            uncompr_results = run_queries(conn, QUERIES, label="uncompr")
+        print("\n\n=== Phase 1: Uncompressed Queries ===")
+        uncompr_results = run_queries(conn, QUERIES, label="uncompr")
 
         # Phase 2: Compress all partitions
-        if SKIP_COMPRESS:
-            print("\n=== Phase 2: Compressing Partitions (SKIPPED) ===")
-        else:
-            print("\n=== Phase 2: Compressing Partitions ===")
-            compress_timings = compress_all_partitions(conn)
-            total_compress_time = sum(t for _, t in compress_timings)
-            print(f"\n  Total compression time: {total_compress_time:.1f}s "
-                  f"({len(compress_timings)} partitions)")
+        print("\n=== Phase 2: Compressing Partitions ===")
+        compress_timings = compress_all_partitions(conn)
+        total_compress_time = sum(t for _, t in compress_timings)
+        print(f"\n  Total compression time: {total_compress_time:.1f}s "
+              f"({len(compress_timings)} partitions)")
 
-            # Diagnostic: verify basic query works after compression
-            print("\n=== Diagnostic: Post-compression check ===")
-            try:
-                count = conn.execute("SELECT count(*) FROM hits").fetchone()[0]
-                print(f"  count(*) = {count}")
-            except Exception as e:
-                print(f"  count(*) FAILED: {e}")
-                conn.rollback()
+        # Diagnostic: verify basic query works after compression
+        print("\n=== Diagnostic: Post-compression check ===")
+        try:
+            count = conn.execute("SELECT count(*) FROM hits").fetchone()[0]
+            print(f"  count(*) = {count}")
+        except Exception as e:
+            print(f"  count(*) FAILED: {e}")
+            conn.rollback()
 
-            try:
-                plan = conn.execute("EXPLAIN SELECT count(*) FROM hits").fetchall()
-                for row in plan:
-                    print(f"  {row[0]}")
-            except Exception as e:
-                print(f"  EXPLAIN FAILED: {e}")
-                conn.rollback()
+        try:
+            plan = conn.execute("EXPLAIN SELECT count(*) FROM hits").fetchall()
+            for row in plan:
+                print(f"  {row[0]}")
+        except Exception as e:
+            print(f"  EXPLAIN FAILED: {e}")
+            conn.rollback()
 
         # Phase 3: Query compressed data
         print("\n=== Phase 3: Compressed Queries ===")

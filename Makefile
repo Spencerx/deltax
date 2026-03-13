@@ -9,7 +9,7 @@ PG_VERSIONS ?= 17 18
 VENV         = .venv
 
 .PHONY: dev-image image image-fresh test build clippy run psql cargo clean integration-test \
-       bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clickbench-persist bench-clickbench-rerun bench-clean \
+       bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
        bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow
 
@@ -124,18 +124,7 @@ bench-clickbench-full: $(VENV)/.stamp image
 bench-clickbench-keep: $(VENV)/.stamp image
 	PG_SEATURTLE_IMAGE=pg_seaturtle:pg$(PG_MAJOR) KEEP_CONTAINER=1 $(VENV)/bin/pytest tests/bench_clickbench.py -v -s
 
-# Full benchmark with persistent data volume for future reruns
-bench-clickbench-persist: $(VENV)/.stamp image
-	PG_SEATURTLE_IMAGE=pg_seaturtle:pg$(PG_MAJOR) BENCH_PERSIST=1 \
-	$(VENV)/bin/pytest tests/bench_clickbench.py -v -s
-
-# Quick rerun: rebuild image, reuse persisted data, compressed queries only
-bench-clickbench-rerun: $(VENV)/.stamp image
-	PG_SEATURTLE_IMAGE=pg_seaturtle:pg$(PG_MAJOR) BENCH_PERSIST=1 \
-	SKIP_LOAD=1 SKIP_UNCOMPR=1 SKIP_COMPRESS=1 \
-	$(VENV)/bin/pytest tests/bench_clickbench.py -v -s
-
-# Remove persisted benchmark data volume
+# Remove benchmark containers
 bench-clean:
 	docker volume rm pg_seaturtle_bench_pgdata 2>/dev/null || true
 
