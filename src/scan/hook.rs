@@ -1116,6 +1116,42 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             return; // OR in WHERE — not pushable
                         }
                     }
+                    pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                        // col IN (...) / col = ANY(ARRAY[...])
+                        let saop = qn as *const pg_sys::ScalarArrayOpExpr;
+                        if !(*saop).useOr {
+                            return; // ALL semantics not supported
+                        }
+                        let sa_args = (*saop).args;
+                        if sa_args.is_null() || (*sa_args).length != 2 {
+                            return;
+                        }
+                        let sa_arg0 = (*(*sa_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        let sa_arg1 = (*(*sa_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                        if sa_arg0.is_null() || sa_arg1.is_null() {
+                            return;
+                        }
+                        let sa_a0 = unwrap_relabel(sa_arg0);
+                        if (*sa_a0).type_ != pg_sys::NodeTag::T_Var {
+                            return;
+                        }
+                        if (*sa_arg1).type_ != pg_sys::NodeTag::T_Const {
+                            return;
+                        }
+                        let sa_const = sa_arg1 as *const pg_sys::Const;
+                        if (*sa_const).constisnull {
+                            return;
+                        }
+                        let sa_var = sa_a0 as *const pg_sys::Var;
+                        let sa_type_oid = (*sa_var).vartype;
+                        if !matches!(
+                            sa_type_oid,
+                            pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                            | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+                        ) {
+                            return; // only numeric/date/timestamp IN lists
+                        }
+                    }
                     _ => {
                         return; // Unknown qual type — bail
                     }
@@ -1293,6 +1329,66 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             type_oid,
                             expr: GroupByExpr::DateTrunc { unit, unit_usecs, func_oid },
                         });
+                    } else if fn_name == "extract" {
+                        // Validate: extract(Const text, Var timestamp/tz)
+                        let fn_args = (*funcexpr).args;
+                        if fn_args.is_null() || (*fn_args).length != 2 {
+                            return;
+                        }
+                        let arg0 = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        let arg1 = (*(*fn_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+
+                        if arg0.is_null() || (*arg0).type_ != pg_sys::NodeTag::T_Const {
+                            return;
+                        }
+                        if arg1.is_null() || (*arg1).type_ != pg_sys::NodeTag::T_Var {
+                            return;
+                        }
+
+                        let var_node = arg1 as *const pg_sys::Var;
+                        let col_idx = (*var_node).varattno as i32 - 1;
+
+                        // Get column type — must be timestamp or timestamptz
+                        let rte = *(*root).simple_rte_array.add((*var_node).varno as usize);
+                        if rte.is_null() {
+                            return;
+                        }
+                        let mut type_oid = pg_sys::InvalidOid;
+                        let mut typmod: i32 = -1;
+                        let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+                        pg_sys::get_atttypetypmodcoll((*rte).relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
+                        if type_oid != pg_sys::TIMESTAMPOID && type_oid != pg_sys::TIMESTAMPTZOID {
+                            return;
+                        }
+
+                        // Extract unit string from Const
+                        let unit_const = arg0 as *const pg_sys::Const;
+                        if (*unit_const).constisnull {
+                            return;
+                        }
+                        let unit_cstr = pg_sys::text_to_cstring((*unit_const).constvalue.cast_mut_ptr());
+                        let unit = std::ffi::CStr::from_ptr(unit_cstr).to_string_lossy().into_owned();
+                        pg_sys::pfree(unit_cstr as *mut _);
+
+                        // Only accept fields computable with pure arithmetic
+                        match unit.as_str() {
+                            "microsecond" | "microseconds"
+                            | "millisecond" | "milliseconds"
+                            | "second" | "seconds"
+                            | "minute" | "minutes"
+                            | "hour" | "hours"
+                            | "dow"
+                            | "epoch" => {}
+                            _ => return, // calendar-based fields not supported
+                        }
+
+                        let func_oid = u32::from((*funcexpr).funcid);
+
+                        group_specs.push(super::exec::GroupByColSpec {
+                            col_idx,
+                            type_oid: pg_sys::NUMERICOID,
+                            expr: GroupByExpr::Extract { unit, func_oid },
+                        });
                     } else {
                         return; // Unsupported function in GROUP BY
                     }
@@ -1329,6 +1425,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     let spec_func_oid = match &gs.expr {
                         GroupByExpr::RegexpReplace { func_oid, .. } => Some(*func_oid),
                         GroupByExpr::DateTrunc { func_oid, .. } => Some(*func_oid),
+                        GroupByExpr::Extract { func_oid, .. } => Some(*func_oid),
                         _ => None,
                     };
                     if let Some(foid) = spec_func_oid {
@@ -1576,26 +1673,48 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         }
                     }
 
-                    // Compute ndistinct-based group estimate for all-Column GROUP BY
-                    let all_column = group_specs.iter().all(|gs| matches!(gs.expr, GroupByExpr::Column));
-                    if all_column {
+                    // Compute ndistinct-based group estimate for GROUP BY
+                    {
                         let mut product: f64 = 1.0;
                         let mut all_found = true;
                         for gs in &group_specs {
-                            let attno = (gs.col_idx + 1) as i16;
-                            let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
-                            if name_ptr.is_null() {
-                                all_found = false;
-                                break;
-                            }
-                            let col_name = std::ffi::CStr::from_ptr(name_ptr)
-                                .to_str()
-                                .unwrap_or("");
-                            if let Some(&nd) = merged_ndistinct.get(col_name) {
-                                product *= nd as f64;
-                            } else {
-                                all_found = false;
-                                break;
+                            match &gs.expr {
+                                GroupByExpr::Extract { unit, .. } => {
+                                    // Bounded cardinality for extract fields
+                                    let card = match unit.as_str() {
+                                        "microsecond" | "microseconds" => 60_000_000.0,
+                                        "millisecond" | "milliseconds" => 60_000.0,
+                                        "second" | "seconds" => 60.0,
+                                        "minute" | "minutes" => 60.0,
+                                        "hour" | "hours" => 24.0,
+                                        "dow" => 7.0,
+                                        "epoch" => total_uncompressed_rows, // unique per row
+                                        _ => total_uncompressed_rows,
+                                    };
+                                    product *= card;
+                                }
+                                GroupByExpr::DateTrunc { .. } | GroupByExpr::RegexpReplace { .. } => {
+                                    // Can't easily estimate, skip ndistinct estimate
+                                    all_found = false;
+                                    break;
+                                }
+                                GroupByExpr::Column => {
+                                    let attno = (gs.col_idx + 1) as i16;
+                                    let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
+                                    if name_ptr.is_null() {
+                                        all_found = false;
+                                        break;
+                                    }
+                                    let col_name = std::ffi::CStr::from_ptr(name_ptr)
+                                        .to_str()
+                                        .unwrap_or("");
+                                    if let Some(&nd) = merged_ndistinct.get(col_name) {
+                                        product *= nd as f64;
+                                    } else {
+                                        all_found = false;
+                                        break;
+                                    }
+                                }
                             }
                         }
                         if all_found {

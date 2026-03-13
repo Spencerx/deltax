@@ -86,7 +86,7 @@ const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
 const PG_EPOCH_OFFSET_DAYS: i32 = 10_957;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum BatchCompareOp { Eq, Ne, Lt, Le, Gt, Ge, Like, NotLike }
+enum BatchCompareOp { Eq, Ne, Lt, Le, Gt, Ge, Like, NotLike, InList }
 
 #[derive(Debug, Clone)]
 enum LikeStrategy {
@@ -105,6 +105,7 @@ struct BatchQual {
     type_oid: pg_sys::Oid,       // column type OID
     like_strategy: Option<LikeStrategy>, // pre-compiled LIKE pattern
     text_const: Option<String>,  // text constant for Eq/Ne pushdown
+    in_list_i64: Option<Vec<i64>>, // constant values for IN list (stored as i64)
 }
 
 /// Decompression state stored as a raw pointer in the CustomScanState.
@@ -225,9 +226,10 @@ pub(super) struct ScanTiming {
 struct MinMaxFilter {
     min_attno: usize,          // attno of _min_{col} in companion tuple
     max_attno: usize,          // attno of _max_{col} in companion tuple
-    op: BatchCompareOp,        // Eq, Lt, Le, Gt, Ge
+    op: BatchCompareOp,        // Eq, Lt, Le, Gt, Ge, InList
     const_datum: pg_sys::Datum,
     type_oid: pg_sys::Oid,
+    in_list_i64: Option<Vec<i64>>, // for InList op
 }
 
 /// Check whether a segment might contain rows matching the filter.
@@ -251,14 +253,26 @@ fn segment_passes_minmax_filter(
         | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID | pg_sys::DATEOID => {
             let seg_min = seg_min_datum.value() as i64;
             let seg_max = seg_max_datum.value() as i64;
-            let c = f.const_datum.value() as i64;
             match f.op {
-                BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
-                BatchCompareOp::Lt => seg_min < c,
-                BatchCompareOp::Le => seg_min <= c,
-                BatchCompareOp::Gt => seg_max > c,
-                BatchCompareOp::Ge => seg_max >= c,
-                _ => true, // Ne, Like, NotLike — can't prune
+                BatchCompareOp::InList => {
+                    // Skip segment if NO value in the list falls within [seg_min, seg_max]
+                    if let Some(ref values) = f.in_list_i64 {
+                        values.iter().any(|&v| v >= seg_min && v <= seg_max)
+                    } else {
+                        true
+                    }
+                }
+                _ => {
+                    let c = f.const_datum.value() as i64;
+                    match f.op {
+                        BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                        BatchCompareOp::Lt => seg_min < c,
+                        BatchCompareOp::Le => seg_min <= c,
+                        BatchCompareOp::Gt => seg_max > c,
+                        BatchCompareOp::Ge => seg_max >= c,
+                        _ => true, // Ne, Like, NotLike — can't prune
+                    }
+                }
             }
         }
         pg_sys::FLOAT4OID => {
@@ -448,6 +462,8 @@ pub(super) enum GroupByExpr {
     RegexpReplace { pattern: String, replacement: String, func_oid: u32, collation: u32 },
     /// date_trunc(unit, timestamp_col): GROUP BY date_trunc('minute', ts)
     DateTrunc { unit: String, unit_usecs: i64, func_oid: u32 },
+    /// extract(field FROM timestamp_col): GROUP BY extract(minute FROM ts)
+    Extract { unit: String, func_oid: u32 },
 }
 
 /// Convert a date_trunc unit string to microseconds.
@@ -461,6 +477,47 @@ pub(super) fn date_trunc_unit_to_usecs(unit: &str) -> i64 {
         "hour" | "hours" => 3_600_000_000,
         "day" | "days" => 86_400_000_000,
         _ => 1, // fallback — should not happen (validated in hook)
+    }
+}
+
+/// Extract a time field from PG epoch microseconds using pure arithmetic.
+/// Only supports sub-day fields + dow + epoch (validated in hook).
+fn extract_field_from_usecs(pg_usec: i64, unit: &str) -> i64 {
+    match unit {
+        "microsecond" | "microseconds" => {
+            // PG returns second * 1_000_000 (including whole seconds within the minute)
+            let usec_in_day = pg_usec.rem_euclid(86_400_000_000);
+            let sec_of_min = (usec_in_day / 1_000_000) % 60;
+            let frac_usec = usec_in_day.rem_euclid(1_000_000);
+            sec_of_min * 1_000_000 + frac_usec
+        }
+        "millisecond" | "milliseconds" => {
+            // PG returns second * 1000 (including whole seconds within the minute)
+            let usec_in_day = pg_usec.rem_euclid(86_400_000_000);
+            let sec_of_min = (usec_in_day / 1_000_000) % 60;
+            let frac_ms = usec_in_day.rem_euclid(1_000_000) / 1_000;
+            sec_of_min * 1_000 + frac_ms
+        }
+        "second" | "seconds" => {
+            (pg_usec.rem_euclid(86_400_000_000) / 1_000_000) % 60
+        }
+        "minute" | "minutes" => {
+            (pg_usec.rem_euclid(86_400_000_000) / 60_000_000) % 60
+        }
+        "hour" | "hours" => {
+            pg_usec.rem_euclid(86_400_000_000) / 3_600_000_000
+        }
+        "dow" => {
+            // Day of week (0=Sunday..6=Saturday)
+            // PG epoch 2000-01-01 is a Saturday (dow=6)
+            let days = pg_usec.div_euclid(86_400_000_000);
+            (days + 6).rem_euclid(7)
+        }
+        "epoch" => {
+            // PG epoch is 2000-01-01, Unix epoch offset = 946684800 seconds
+            (pg_usec / 1_000_000) + 946_684_800
+        }
+        _ => 0, // Should not happen (validated in hook)
     }
 }
 
@@ -1439,6 +1496,19 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
                     let unit_usecs = date_trunc_unit_to_usecs(&unit);
                     GroupByExpr::DateTrunc { unit, unit_usecs, func_oid }
+                } else if expr_tag == 3 {
+                    // Extract: func_oid, unit_len, unit_bytes...
+                    let func_oid = pg_sys::list_nth_int(custom_private, idx) as u32;
+                    idx += 1;
+                    let unit_len = pg_sys::list_nth_int(custom_private, idx) as usize;
+                    idx += 1;
+                    let mut unit_bytes = Vec::with_capacity(unit_len);
+                    for _ in 0..unit_len {
+                        unit_bytes.push(pg_sys::list_nth_int(custom_private, idx) as u8);
+                        idx += 1;
+                    }
+                    let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
+                    GroupByExpr::Extract { unit, func_oid }
                 } else {
                     GroupByExpr::Column
                 };
@@ -2155,6 +2225,11 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     let truncated = pg_usec.div_euclid(*unit_usecs) * *unit_usecs;
                                     key.push(GroupKeyVal::Int(truncated));
                                 }
+                                GroupByExpr::Extract { unit, .. } => {
+                                    let pg_usec = col[row].0.value() as i64;
+                                    let extracted = extract_field_from_usecs(pg_usec, unit);
+                                    key.push(GroupKeyVal::Int(extracted));
+                                }
                                 GroupByExpr::Column => {
                                     // Dictionary-index-level text GROUP BY: lookup from pre-built map
                                     if let Some((ref dict_key_map, ref full_indices)) = seg_dict_groups[gs.col_idx as usize] {
@@ -2400,7 +2475,12 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     row.push((pg_sys::Datum::from(0usize), true));
                                 }
                                 GroupKeyVal::Int(v) => {
-                                    row.push((pg_sys::Datum::from(*v as usize), false));
+                                    if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                                        // extract() returns numeric — convert i64 to numeric datum
+                                        row.push((i128_to_numeric_datum(*v as i128), false));
+                                    } else {
+                                        row.push((pg_sys::Datum::from(*v as usize), false));
+                                    }
                                 }
                                 GroupKeyVal::Str(s) => {
                                     let datum = string_to_datum(s, group_specs[*gi].type_oid);
@@ -2905,6 +2985,7 @@ unsafe fn load_segments_heap(
                     op: bq.op,
                     const_datum: bq.const_datum,
                     type_oid: bq.type_oid,
+                    in_list_i64: bq.in_list_i64.clone(),
                 });
             }
         }
@@ -3458,6 +3539,7 @@ fn flip_compare_op(op: BatchCompareOp) -> BatchCompareOp {
         BatchCompareOp::Ge => BatchCompareOp::Le,
         BatchCompareOp::Like => BatchCompareOp::Like,
         BatchCompareOp::NotLike => BatchCompareOp::NotLike,
+        BatchCompareOp::InList => BatchCompareOp::InList,
     }
 }
 
@@ -3494,7 +3576,7 @@ fn apply_batch_filter_i64(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
         };
     }
 }
@@ -3516,7 +3598,7 @@ fn apply_batch_filter_i32(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
         };
     }
 }
@@ -3538,7 +3620,7 @@ fn apply_batch_filter_i16(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
         };
     }
 }
@@ -3560,7 +3642,7 @@ fn apply_batch_filter_f64(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
         };
     }
 }
@@ -3582,7 +3664,7 @@ fn apply_batch_filter_f32(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
         };
     }
 }
@@ -3600,9 +3682,45 @@ fn apply_batch_filter_bool(
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
             BatchCompareOp::Ne => v != constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
             _ => v == constant, // bool only supports = / <>
         };
+    }
+}
+
+/// Batch filter for IN list: checks if each row's value is in the given list.
+/// Values are stored as i64; the actual comparison width is determined by type_oid.
+fn apply_batch_filter_in_list(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    values: &[i64],
+    type_oid: pg_sys::Oid,
+) {
+    match type_oid {
+        pg_sys::INT2OID => {
+            let vals: Vec<i16> = values.iter().map(|&v| v as i16).collect();
+            for (i, &(datum, is_null)) in col.iter().enumerate() {
+                if !sel[i] { continue; }
+                if is_null { sel[i] = false; continue; }
+                sel[i] = vals.contains(&(datum.value() as i16));
+            }
+        }
+        pg_sys::INT4OID | pg_sys::DATEOID => {
+            let vals: Vec<i32> = values.iter().map(|&v| v as i32).collect();
+            for (i, &(datum, is_null)) in col.iter().enumerate() {
+                if !sel[i] { continue; }
+                if is_null { sel[i] = false; continue; }
+                sel[i] = vals.contains(&(datum.value() as i32));
+            }
+        }
+        pg_sys::INT8OID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+            for (i, &(datum, is_null)) in col.iter().enumerate() {
+                if !sel[i] { continue; }
+                if is_null { sel[i] = false; continue; }
+                sel[i] = values.contains(&(datum.value() as i64));
+            }
+        }
+        _ => {} // unsupported type, skip
     }
 }
 
@@ -3751,6 +3869,13 @@ fn evaluate_batch_quals(
             // Column wasn't decompressed (not needed) — can't evaluate, skip
             continue;
         }
+        // Handle IN list filter separately
+        if bq.op == BatchCompareOp::InList {
+            if let Some(ref values) = bq.in_list_i64 {
+                apply_batch_filter_in_list(col, &mut sel, values, bq.type_oid);
+            }
+            continue;
+        }
         match bq.type_oid {
             pg_sys::INT8OID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
                 apply_batch_filter_i64(col, &mut sel, bq.op, bq.const_datum.value() as i64);
@@ -3826,6 +3951,7 @@ unsafe fn extract_batch_quals(
                             type_oid: pg_sys::BOOLOID,
                             like_strategy: None,
                             text_const: None,
+                            in_list_i64: None,
                         });
                     }
                 }
@@ -3852,12 +3978,121 @@ unsafe fn extract_batch_quals(
                                         type_oid: pg_sys::BOOLOID,
                                         like_strategy: None,
                                         text_const: None,
+                                        in_list_i64: None,
                                     });
                                 }
                             }
                         }
                     }
                 }
+                continue;
+            }
+
+            // Handle ScalarArrayOpExpr: col = ANY(ARRAY[...]) / col IN (...)
+            if tag == pg_sys::NodeTag::T_ScalarArrayOpExpr {
+                let saop = node as *const pg_sys::ScalarArrayOpExpr;
+                // Only support OR semantics (IN), not AND (ALL)
+                if !(*saop).useOr {
+                    continue;
+                }
+                let sa_args = (*saop).args;
+                if sa_args.is_null() || (*sa_args).length != 2 {
+                    continue;
+                }
+                let raw_arg0 = (*(*sa_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                let raw_arg1 = (*(*sa_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                if raw_arg0.is_null() || raw_arg1.is_null() {
+                    continue;
+                }
+                // Unwrap RelabelType on the scalar side
+                let sa_a0 = if (*raw_arg0).type_ == pg_sys::NodeTag::T_RelabelType {
+                    let rlt = raw_arg0 as *const pg_sys::RelabelType;
+                    (*rlt).arg as *const pg_sys::Node
+                } else {
+                    raw_arg0
+                };
+                // arg0 must be a Var, arg1 must be a Const (array)
+                if (*sa_a0).type_ != pg_sys::NodeTag::T_Var {
+                    continue;
+                }
+                if (*raw_arg1).type_ != pg_sys::NodeTag::T_Const {
+                    continue;
+                }
+                let sa_var = sa_a0 as *const pg_sys::Var;
+                let sa_const = raw_arg1 as *const pg_sys::Const;
+                if (*sa_const).constisnull {
+                    continue;
+                }
+                let sa_varattno = (*sa_var).varattno as i32;
+                if sa_varattno < 1 || sa_varattno as usize > col_names.len() {
+                    continue;
+                }
+                let sa_col_idx = (sa_varattno - 1) as usize;
+                let sa_type_oid = col_types[sa_col_idx];
+                // Only support numeric/date/timestamp types for IN list
+                if !matches!(
+                    sa_type_oid,
+                    pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                    | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+                ) {
+                    continue;
+                }
+                // Deconstruct the array constant to extract element values
+                let array_datum = (*sa_const).constvalue;
+                let array_ptr = array_datum.cast_mut_ptr::<pg_sys::ArrayType>();
+                let ndim = (*array_ptr).ndim;
+                if ndim != 1 {
+                    continue; // only 1-D arrays
+                }
+                let mut sa_elems: *mut pg_sys::Datum = std::ptr::null_mut();
+                let mut sa_nulls: *mut bool = std::ptr::null_mut();
+                let mut sa_nelems: i32 = 0;
+                // Get element type info for deconstruct_array
+                let sa_elem_type = (*array_ptr).elemtype;
+                let mut sa_elem_len: i16 = 0;
+                let mut sa_elem_byval: bool = false;
+                let mut sa_elem_align: i8 = 0;
+                pg_sys::get_typlenbyvalalign(
+                    sa_elem_type,
+                    &mut sa_elem_len as *mut i16 as *mut _,
+                    &mut sa_elem_byval,
+                    &mut sa_elem_align as *mut i8 as *mut _,
+                );
+                pg_sys::deconstruct_array(
+                    array_ptr,
+                    sa_elem_type,
+                    sa_elem_len as _,
+                    sa_elem_byval,
+                    sa_elem_align as _,
+                    &mut sa_elems,
+                    &mut sa_nulls,
+                    &mut sa_nelems,
+                );
+                if sa_nelems <= 0 || sa_elems.is_null() {
+                    continue;
+                }
+                // Collect values as i64, skip if any element is null
+                let mut in_values: Vec<i64> = Vec::with_capacity(sa_nelems as usize);
+                let mut sa_has_null = false;
+                for ei in 0..sa_nelems as usize {
+                    if !sa_nulls.is_null() && *sa_nulls.add(ei) {
+                        sa_has_null = true;
+                        break;
+                    }
+                    in_values.push((*sa_elems.add(ei)).value() as i64);
+                }
+                if sa_has_null {
+                    continue;
+                }
+                batch_quals.push(BatchQual {
+                    col_idx: sa_col_idx,
+                    op: BatchCompareOp::InList,
+                    const_datum: pg_sys::Datum::from(0usize), // unused
+                    type_oid: sa_type_oid,
+                    like_strategy: None,
+                    text_const: None,
+                    in_list_i64: Some(in_values),
+                });
                 continue;
             }
 
@@ -3968,6 +4203,7 @@ unsafe fn extract_batch_quals(
                     type_oid,
                     like_strategy: Some(strategy),
                     text_const: None,
+                    in_list_i64: None,
                 });
             } else if matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID)
                 && matches!(cmp_op, BatchCompareOp::Eq | BatchCompareOp::Ne)
@@ -3993,6 +4229,7 @@ unsafe fn extract_batch_quals(
                     type_oid,
                     like_strategy: None,
                     text_const: Some(const_str),
+                    in_list_i64: None,
                 });
             } else {
                 if !is_batch_comparable_type(type_oid) {
@@ -4008,6 +4245,7 @@ unsafe fn extract_batch_quals(
                     type_oid,
                     like_strategy: None,
                     text_const: None,
+                    in_list_i64: None,
                 });
             }
         }
