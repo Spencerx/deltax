@@ -1261,9 +1261,15 @@ fn compress_column_values(values: &[Option<String>], _data_type: &str, _col_name
     let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
 
     if compression::dictionary::should_use_dictionary(&refs) {
-        let encoded = compression::dictionary::encode(&refs);
+        let dict_encoded = compression::dictionary::encode(&refs);
+        let lz4_encoded = compression::dictionary::encode_lz4(&refs);
+        let (tag, encoded) = if lz4_encoded.len() < dict_encoded.len() {
+            (CompressionType::DictionaryLz4, lz4_encoded)
+        } else {
+            (CompressionType::Dictionary, dict_encoded)
+        };
         CompressedColumn {
-            type_tag: CompressionType::Dictionary,
+            type_tag: tag,
             row_count: values.len() as u32,
             null_bitmap,
             data: encoded,
@@ -1578,6 +1584,11 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
         }
         CompressionType::Dictionary => {
             let strings = compression::dictionary::decode(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+            compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+        }
+        CompressionType::DictionaryLz4 => {
+            let normalized = compression::dictionary::normalize_lz4(&cc.data);
+            let strings = compression::dictionary::decode(&normalized, count_non_null(&cc.null_bitmap, total_count));
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
         CompressionType::Lz4 => {

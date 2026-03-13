@@ -17,6 +17,7 @@ pub enum CompressionType {
     Lz4Blocked = 6,
     Constant = 7,
     ForBitpacked = 8,
+    DictionaryLz4 = 9,
 }
 
 impl CompressionType {
@@ -30,6 +31,7 @@ impl CompressionType {
             6 => Self::Lz4Blocked,
             7 => Self::Constant,
             8 => Self::ForBitpacked,
+            9 => Self::DictionaryLz4,
             _ => panic!("unknown compression type tag: {}", v),
         }
     }

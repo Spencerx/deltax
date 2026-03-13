@@ -189,6 +189,125 @@ pub fn decode(data: &[u8], count: usize) -> Vec<String> {
     values
 }
 
+/// Encode with LZ4-compressed dictionary entries.
+///
+/// Same as `encode()` but sorts dictionary entries alphabetically (improves LZ4 ratio
+/// for strings sharing common prefixes like URLs) and LZ4-compresses the dictionary blob.
+///
+/// Wire format:
+///   [4B dict_size][1B index_width][2B empty_string_idx]
+///   [4B lz4_blob_len]
+///   [LZ4 blob: compress_prepend_size([4B len_0][str_0][4B len_1][str_1]...)]
+///   [indices: index_width × value_count bytes]
+pub fn encode_lz4(values: &[&str]) -> Vec<u8> {
+    if values.is_empty() {
+        let mut buf = 0u32.to_le_bytes().to_vec();
+        buf.push(1); // index_width = 1
+        buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // no empty string
+        buf.extend_from_slice(&0u32.to_le_bytes()); // lz4_blob_len = 0
+        return buf;
+    }
+
+    // Build dictionary
+    let mut dict: HashMap<&str, u16> = HashMap::new();
+    let mut dict_entries: Vec<&str> = Vec::new();
+
+    for &v in values {
+        if !dict.contains_key(v) {
+            dict.insert(v, dict_entries.len() as u16);
+            dict_entries.push(v);
+        }
+    }
+
+    // Sort entries alphabetically for better LZ4 prefix compression
+    let mut sorted_entries = dict_entries.clone();
+    sorted_entries.sort_unstable();
+
+    // Build remap: old_idx → new_idx
+    let mut remap = vec![0u16; dict_entries.len()];
+    let mut sorted_map: HashMap<&str, u16> = HashMap::new();
+    for (new_idx, &entry) in sorted_entries.iter().enumerate() {
+        sorted_map.insert(entry, new_idx as u16);
+    }
+    for (old_idx, &entry) in dict_entries.iter().enumerate() {
+        remap[old_idx] = sorted_map[entry];
+    }
+
+    let dict_size = sorted_entries.len();
+    let index_width: u8 = if dict_size <= 255 { 1 } else { 2 };
+
+    // Find empty string index in sorted order
+    let empty_string_idx: u16 = sorted_entries
+        .iter()
+        .position(|&s| s.is_empty())
+        .map(|i| i as u16)
+        .unwrap_or(0xFFFF);
+
+    // Serialize dictionary entries into raw buffer for LZ4 compression
+    let total_raw: usize = sorted_entries.iter().map(|s| 4 + s.len()).sum();
+    let mut raw = Vec::with_capacity(total_raw);
+    for &entry in &sorted_entries {
+        let bytes = entry.as_bytes();
+        raw.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        raw.extend_from_slice(bytes);
+    }
+
+    let compressed = lz4_flex::compress_prepend_size(&raw);
+
+    // Build output
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(dict_size as u32).to_le_bytes());
+    buf.push(index_width);
+    buf.extend_from_slice(&empty_string_idx.to_le_bytes());
+    buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&compressed);
+
+    // Remapped indices
+    for &v in values {
+        let old_idx = dict[v];
+        let new_idx = remap[old_idx as usize];
+        if index_width == 1 {
+            buf.push(new_idx as u8);
+        } else {
+            buf.extend_from_slice(&new_idx.to_le_bytes());
+        }
+    }
+
+    buf
+}
+
+/// Decompress DictionaryLz4 data back to plain Dictionary wire format.
+///
+/// Reads the LZ4-compressed dictionary entries, decompresses them, and returns
+/// a byte vector in the same layout as plain Dictionary encoding. This allows
+/// all existing Dictionary code paths to work unchanged.
+pub fn normalize_lz4(data: &[u8]) -> Vec<u8> {
+    let dict_size_bytes = &data[0..4];
+    let index_width = data[4];
+    let empty_string_idx_bytes = &data[5..7];
+
+    let lz4_blob_len =
+        u32::from_le_bytes(data[7..11].try_into().unwrap()) as usize;
+
+    let decompressed = if lz4_blob_len > 0 {
+        lz4_flex::decompress_size_prepended(&data[11..11 + lz4_blob_len])
+            .expect("LZ4 decompression failed in DictionaryLz4")
+    } else {
+        Vec::new()
+    };
+
+    let indices = &data[11 + lz4_blob_len..];
+
+    // Reconstruct plain Dictionary format: header + decompressed entries + indices
+    let mut buf = Vec::with_capacity(7 + decompressed.len() + indices.len());
+    buf.extend_from_slice(dict_size_bytes);
+    buf.push(index_width);
+    buf.extend_from_slice(empty_string_idx_bytes);
+    buf.extend_from_slice(&decompressed);
+    buf.extend_from_slice(indices);
+    buf
+}
+
 /// Check `<> ''` for each row using the precomputed empty_string_idx.
 /// Returns a Vec<bool> where true = non-empty (passes filter).
 /// Returns empty Vec if no empty string in dictionary (all pass).
@@ -362,5 +481,141 @@ mod tests {
 
         let sel = check_ne_empty(&encoded, values.len());
         assert!(sel.is_empty()); // All pass — no filtering needed
+    }
+
+    // ==================== DictionaryLz4 tests ====================
+
+    #[test]
+    fn test_lz4_roundtrip_basic() {
+        let values = vec!["hello", "world", "hello", "world", "hello"];
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+        let decoded = decode(&normalized, values.len());
+        let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_lz4_roundtrip_empty_values() {
+        let encoded = encode_lz4(&[]);
+        let normalized = normalize_lz4(&encoded);
+        let decoded = decode(&normalized, 0);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_lz4_roundtrip_single() {
+        let values = vec!["test"];
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+        let decoded = decode(&normalized, 1);
+        assert_eq!(decoded, vec!["test".to_string()]);
+    }
+
+    #[test]
+    fn test_lz4_sorted_dictionary() {
+        let values = vec!["cherry", "apple", "banana", "apple", "cherry"];
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+
+        // Dictionary should be sorted alphabetically
+        let hdr = parse_header(&normalized);
+        assert_eq!(hdr.dict, vec!["apple", "banana", "cherry"]);
+
+        // But decoded values preserve original order
+        let decoded = decode(&normalized, values.len());
+        let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_lz4_with_empty_strings() {
+        let values = vec!["hello", "", "world", ""];
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+
+        let hdr = parse_header(&normalized);
+        // Empty string sorts first alphabetically
+        assert_eq!(hdr.empty_string_idx, 0);
+
+        let decoded = decode(&normalized, values.len());
+        let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_lz4_check_ne_empty() {
+        let values = vec!["hello", "", "world", "", "hello"];
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+
+        let sel = check_ne_empty(&normalized, values.len());
+        assert_eq!(sel, vec![true, false, true, false, true]);
+    }
+
+    #[test]
+    fn test_lz4_decode_dict_and_indices() {
+        let values = vec!["banana", "apple", "banana"];
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+        let (dict, indices) = decode_dict_and_indices(&normalized, values.len());
+        // Sorted: apple=0, banana=1
+        assert_eq!(dict, vec!["apple", "banana"]);
+        assert_eq!(indices, vec![1u16, 0, 1]);
+    }
+
+    #[test]
+    fn test_lz4_compression_benefit() {
+        // URLs sharing common prefixes should compress well with sorted dictionary
+        let urls: Vec<String> = (0..100)
+            .map(|i| format!("https://www.example.com/page/{}/content", i))
+            .collect();
+        let mut values: Vec<&str> = Vec::new();
+        for _ in 0..10 {
+            for u in &urls {
+                values.push(u.as_str());
+            }
+        }
+
+        let dict_encoded = encode(&values);
+        let lz4_encoded = encode_lz4(&values);
+        assert!(
+            lz4_encoded.len() < dict_encoded.len(),
+            "LZ4 dictionary ({}) should be smaller than plain dictionary ({})",
+            lz4_encoded.len(),
+            dict_encoded.len()
+        );
+    }
+
+    #[test]
+    fn test_lz4_u16_indices() {
+        // Dict size > 255 → index_width = 2
+        let strings: Vec<String> = (0..300).map(|i| format!("val-{:04}", i)).collect();
+        let mut values: Vec<&str> = Vec::new();
+        for _ in 0..3 {
+            for s in &strings {
+                values.push(s.as_str());
+            }
+        }
+
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+        let hdr = parse_header(&normalized);
+        assert_eq!(hdr.index_width, 2);
+        assert_eq!(hdr.dict.len(), 300);
+
+        let decoded = decode(&normalized, values.len());
+        let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_lz4_utf8_strings() {
+        let values = vec!["héllo", "wörld", "日本語", "🎉"];
+        let encoded = encode_lz4(&values);
+        let normalized = normalize_lz4(&encoded);
+        let decoded = decode(&normalized, values.len());
+        let expected: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+        assert_eq!(decoded, expected);
     }
 }

@@ -1824,11 +1824,20 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     if raw_string_cols[col_idx] {
                         // Dictionary-optimized path: pre-warm regex cache from dict entries only
                         let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
-                        if cc_ref.type_tag == compression::CompressionType::Dictionary {
+                        if cc_ref.type_tag == compression::CompressionType::Dictionary
+                            || cc_ref.type_tag == compression::CompressionType::DictionaryLz4
+                        {
                             let total_count = cc_ref.row_count as usize;
                             let non_null_count = count_non_null(cc_ref.null_bitmap, total_count);
+                            let norm_buf;
+                            let dict_data = if cc_ref.type_tag == compression::CompressionType::DictionaryLz4 {
+                                norm_buf = compression::dictionary::normalize_lz4(cc_ref.data);
+                                &norm_buf[..]
+                            } else {
+                                cc_ref.data
+                            };
                             let (dict_entries, indices) =
-                                compression::dictionary::decode_dict_and_indices(cc_ref.data, non_null_count);
+                                compression::dictionary::decode_dict_and_indices(dict_data, non_null_count);
 
                             // Pre-warm regex cache from dict entries only — O(dict_size) calls
                             for &entry in &dict_entries {
@@ -1867,7 +1876,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     && bq.op == BatchCompareOp::Ne
                             });
                             let ne_sel = if has_ne_empty {
-                                compression::dictionary::check_ne_empty(cc_ref.data, non_null_count)
+                                compression::dictionary::check_ne_empty(dict_data, non_null_count)
                             } else {
                                 Vec::new()
                             };
@@ -2041,11 +2050,20 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                         let blob = &seg.compressed_blobs[blob_idx2];
                         if !blob.is_empty() {
                             let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
-                            if cc_ref.type_tag == compression::CompressionType::Dictionary {
+                            if cc_ref.type_tag == compression::CompressionType::Dictionary
+                                || cc_ref.type_tag == compression::CompressionType::DictionaryLz4
+                            {
                                 let total = cc_ref.row_count as usize;
                                 let nn_count = count_non_null(cc_ref.null_bitmap, total);
+                                let norm_buf;
+                                let dict_data = if cc_ref.type_tag == compression::CompressionType::DictionaryLz4 {
+                                    norm_buf = compression::dictionary::normalize_lz4(cc_ref.data);
+                                    &norm_buf[..]
+                                } else {
+                                    cc_ref.data
+                                };
                                 let (dict_entries, nn_indices) =
-                                    compression::dictionary::decode_dict_and_indices(cc_ref.data, nn_count);
+                                    compression::dictionary::decode_dict_and_indices(dict_data, nn_count);
 
                                 // Build dict_key_map: one String allocation per unique value
                                 let dict_key_map: Vec<GroupKeyVal> = dict_entries
@@ -5265,8 +5283,15 @@ unsafe fn decompress_blob_to_datums(
                     .collect()
             }
         }
-        CompressionType::Dictionary => {
-            let slices = compression::dictionary::decode_to_slices(cc.data, non_null_count);
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
             unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
         }
         CompressionType::Lz4 => {
@@ -5427,8 +5452,15 @@ unsafe fn decompress_blob_to_datums_truncated(
                     .collect()
             }
         }
-        CompressionType::Dictionary => {
-            let slices = compression::dictionary::decode_to_slices(cc.data, non_null_count);
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
             str_slices_to_text_datums_arena(&slices, type_oid, typmod)
         }
         CompressionType::Lz4 => {
@@ -5545,9 +5577,16 @@ unsafe fn decompress_text_blob_with_like_filter(
 
     // Build (non-null datums, non-null selection) — only non-null values
     let (nn_datums, nn_sel): (Vec<pg_sys::Datum>, Vec<bool>) = match cc.type_tag {
-        CompressionType::Dictionary => {
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
             let (dict_entries, indices) =
-                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+                compression::dictionary::decode_dict_and_indices(dict_data, non_null_count);
 
             // Pre-match each dictionary entry (tiny vec, e.g. a few thousand)
             let dict_matches: Vec<bool> = dict_entries.iter().map(|s| matches_like(s)).collect();
@@ -5687,13 +5726,20 @@ fn decompress_text_blob_to_raw_strings(
     });
 
     let (nn_strings, nn_sel): (Vec<String>, Vec<bool>) = match cc.type_tag {
-        CompressionType::Dictionary => {
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
             let (dict_entries, indices) =
-                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+                compression::dictionary::decode_dict_and_indices(dict_data, non_null_count);
 
             let strings: Vec<String> = indices.iter().map(|&idx| dict_entries[idx as usize].to_string()).collect();
             let sel: Vec<bool> = if has_ne_empty {
-                compression::dictionary::check_ne_empty(cc.data, non_null_count)
+                compression::dictionary::check_ne_empty(dict_data, non_null_count)
             } else {
                 Vec::new()
             };
@@ -5784,8 +5830,15 @@ unsafe fn decompress_text_blob_with_eq_filter(
     };
 
     let (nn_datums, nn_sel): (Vec<pg_sys::Datum>, Vec<bool>) = match cc.type_tag {
-        CompressionType::Dictionary => {
-            let hdr = compression::dictionary::parse_header(cc.data);
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let hdr = compression::dictionary::parse_header(dict_data);
 
             // Fast path for empty-string comparison: use precomputed empty_string_idx
             let dict_matches: Vec<bool> = if const_str.is_empty() && hdr.empty_string_idx != 0xFFFF {
@@ -5801,7 +5854,7 @@ unsafe fn decompress_text_blob_with_eq_filter(
 
             let mut indices = Vec::with_capacity(non_null_count);
             for i in 0..non_null_count {
-                indices.push(compression::dictionary::read_index(cc.data, hdr.indices_start, hdr.index_width, i));
+                indices.push(compression::dictionary::read_index(dict_data, hdr.indices_start, hdr.index_width, i));
             }
 
             let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
@@ -5929,16 +5982,23 @@ fn decompress_text_blob_to_lengths(
 
     // Compute non-null lengths and selection
     let (nn_lengths, nn_sel): (Vec<i32>, Vec<bool>) = match cc.type_tag {
-        CompressionType::Dictionary => {
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
             let (dict_entries, indices) =
-                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+                compression::dictionary::decode_dict_and_indices(dict_data, non_null_count);
 
             // Pre-compute lengths (character count, not byte count) for each dict entry
             let dict_lengths: Vec<i32> = dict_entries.iter().map(|s| s.chars().count() as i32).collect();
 
             let lengths: Vec<i32> = indices.iter().map(|&idx| dict_lengths[idx as usize]).collect();
             let sel: Vec<bool> = if filter_empty {
-                compression::dictionary::check_ne_empty(cc.data, non_null_count)
+                compression::dictionary::check_ne_empty(dict_data, non_null_count)
             } else {
                 Vec::new()
             };
@@ -6045,9 +6105,16 @@ unsafe fn decompress_text_blob_with_selection(
     };
 
     let nn_datums: Vec<pg_sys::Datum> = match cc.type_tag {
-        CompressionType::Dictionary => {
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
             let (dict_entries, indices) =
-                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+                compression::dictionary::decode_dict_and_indices(dict_data, non_null_count);
 
             // Collect only selected slices for arena allocation
             let matched_slices: Vec<&str> = indices
