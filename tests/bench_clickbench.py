@@ -296,6 +296,79 @@ def print_compression_stats(conn):
     total_ratio = total_raw / total_comp if total_comp > 0 else 0
     print(f"| {'TOTAL':<20} | {total_raw / 1e6:>9.1f} | {total_comp / 1e6:>11.1f} | {total_ratio:.1f}x | {total_rows:>10,} |")
 
+    # Per-column-type size breakdown
+    try:
+        compressed_cols = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = '_seaturtle_compressed' AND table_name = 'hits_p20130714' "
+            "AND column_name LIKE '\\_%\\_compressed' ESCAPE '\\' "
+            "ORDER BY ordinal_position"
+        ).fetchall()
+        if compressed_cols:
+            # Get original column types from the parent table
+            orig_types = {}
+            for row in conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'hits' ORDER BY ordinal_position"
+            ).fetchall():
+                orig_types[row[0].lower()] = row[1].lower()
+
+            # Query per-column compressed sizes
+            col_exprs = []
+            col_names_clean = []
+            for (cname,) in compressed_cols:
+                col_exprs.append(f'sum(octet_length("{cname}"))::bigint')
+                # Strip _..._compressed wrapper to get original name
+                clean = cname[1:]  # remove leading _
+                if clean.endswith("_compressed"):
+                    clean = clean[:-len("_compressed")]
+                col_names_clean.append(clean)
+
+            size_query = f"SELECT {', '.join(col_exprs)} FROM \"_seaturtle_compressed\".hits_p20130714"
+            sizes = conn.execute(size_query).fetchone()
+
+            # Group by type
+            type_sizes = {}
+            col_details = []
+            for i, clean_name in enumerate(col_names_clean):
+                sz = sizes[i] or 0
+                dt = orig_types.get(clean_name, "unknown")
+                col_details.append((clean_name, dt, sz))
+                bucket = dt
+                if "smallint" in dt:
+                    bucket = "smallint"
+                elif "integer" in dt:
+                    bucket = "integer"
+                elif "bigint" in dt:
+                    bucket = "bigint"
+                elif "timestamp" in dt:
+                    bucket = "timestamp"
+                elif dt in ("text", "character varying", "character"):
+                    bucket = "text"
+                type_sizes[bucket] = type_sizes.get(bucket, 0) + sz
+
+            print("\n### Compressed Size by Column Type")
+            print()
+            print(f"| {'Type':<20} | {'Size (MB)':>10} | {'% of Total':>10} |")
+            print(f"|{'-'*22}|{'-'*12}|{'-'*12}|")
+            grand_total = sum(type_sizes.values())
+            for bucket in sorted(type_sizes, key=lambda k: -type_sizes[k]):
+                sz = type_sizes[bucket]
+                pct = 100.0 * sz / grand_total if grand_total > 0 else 0
+                print(f"| {bucket:<20} | {sz / 1e6:>10.1f} | {pct:>9.1f}% |")
+            print(f"| {'TOTAL':<20} | {grand_total / 1e6:>10.1f} | {'100.0%':>10} |")
+
+            # Top 10 largest columns
+            col_details.sort(key=lambda x: -x[2])
+            print("\n### Top 15 Largest Compressed Columns")
+            print()
+            print(f"| {'Column':<25} | {'Type':<15} | {'Size (KB)':>10} |")
+            print(f"|{'-'*27}|{'-'*17}|{'-'*12}|")
+            for name, dt, sz in col_details[:15]:
+                print(f"| {name:<25} | {dt:<15} | {sz / 1e3:>10.1f} |")
+    except Exception as e:
+        print(f"\n(Per-column breakdown failed: {e})")
+
 
 # ---------------------------------------------------------------------------
 # Pytest fixtures & test class

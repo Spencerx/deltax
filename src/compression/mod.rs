@@ -1,3 +1,4 @@
+pub mod bitpacked;
 pub mod boolean;
 pub mod dictionary;
 pub mod gorilla;
@@ -14,6 +15,8 @@ pub enum CompressionType {
     Lz4 = 4,
     BooleanBitmap = 5,
     Lz4Blocked = 6,
+    Constant = 7,
+    ForBitpacked = 8,
 }
 
 impl CompressionType {
@@ -25,6 +28,8 @@ impl CompressionType {
             4 => Self::Lz4,
             5 => Self::BooleanBitmap,
             6 => Self::Lz4Blocked,
+            7 => Self::Constant,
+            8 => Self::ForBitpacked,
             _ => panic!("unknown compression type tag: {}", v),
         }
     }

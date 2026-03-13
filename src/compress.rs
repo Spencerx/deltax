@@ -1102,9 +1102,9 @@ fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<u8> {
         TypedColumn::Int16(values) => {
             let (non_null, null_bitmap) = compression::extract_nulls(values);
             let ints: Vec<i32> = non_null.iter().map(|&v| v as i32).collect();
-            let encoded = compression::integer::encode_i32(&ints);
+            let (type_tag, encoded) = compression::bitpacked::best_encoding_i32(&ints);
             CompressedColumn {
-                type_tag: CompressionType::DeltaVarint,
+                type_tag,
                 row_count: values.len() as u32,
                 null_bitmap,
                 data: encoded,
@@ -1113,9 +1113,9 @@ fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<u8> {
         }
         TypedColumn::Int32(values) => {
             let (non_null, null_bitmap) = compression::extract_nulls(values);
-            let encoded = compression::integer::encode_i32(&non_null);
+            let (type_tag, encoded) = compression::bitpacked::best_encoding_i32(&non_null);
             CompressedColumn {
-                type_tag: CompressionType::DeltaVarint,
+                type_tag,
                 row_count: values.len() as u32,
                 null_bitmap,
                 data: encoded,
@@ -1136,10 +1136,10 @@ fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<u8> {
                 }
                 .to_bytes()
             } else {
-                // Integer: use DeltaVarint encoding
-                let encoded = compression::integer::encode_i64(&non_null);
+                // Integer: try Constant, FOR, DeltaVarint — pick smallest
+                let (type_tag, encoded) = compression::bitpacked::best_encoding_i64(&non_null);
                 CompressedColumn {
-                    type_tag: CompressionType::DeltaVarint,
+                    type_tag,
                     row_count: values.len() as u32,
                     null_bitmap,
                     data: encoded,
@@ -1592,6 +1592,38 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
             let bools = compression::boolean::decode(&cc.data, count_non_null(&cc.null_bitmap, total_count));
             let strings: Vec<String> = bools.iter().map(|&b| if b { "t".to_string() } else { "f".to_string() }).collect();
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+        }
+        CompressionType::Constant => {
+            let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+            if dt == "smallint" || dt == "int2" {
+                let ints = compression::bitpacked::decode_constant_i32(&cc.data, non_null_count);
+                let strings: Vec<String> = ints.iter().map(|v| (*v as i16).to_string()).collect();
+                compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+            } else if dt == "integer" || dt == "int4" {
+                let ints = compression::bitpacked::decode_constant_i32(&cc.data, non_null_count);
+                let strings: Vec<String> = ints.iter().map(|v| v.to_string()).collect();
+                compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(&cc.data, non_null_count);
+                let strings: Vec<String> = ints.iter().map(|v| v.to_string()).collect();
+                compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+            }
+        }
+        CompressionType::ForBitpacked => {
+            let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+            if dt == "smallint" || dt == "int2" {
+                let ints = compression::bitpacked::decode_for_i32(&cc.data, non_null_count);
+                let strings: Vec<String> = ints.iter().map(|v| (*v as i16).to_string()).collect();
+                compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+            } else if dt == "integer" || dt == "int4" {
+                let ints = compression::bitpacked::decode_for_i32(&cc.data, non_null_count);
+                let strings: Vec<String> = ints.iter().map(|v| v.to_string()).collect();
+                compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(&cc.data, non_null_count);
+                let strings: Vec<String> = ints.iter().map(|v| v.to_string()).collect();
+                compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
+            }
         }
     }
 }

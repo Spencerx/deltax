@@ -5298,6 +5298,44 @@ unsafe fn decompress_blob_to_datums(
                 .map(|&b| pg_sys::Datum::from(b as usize))
                 .collect()
         }
+        CompressionType::Constant => {
+            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
+                        .collect()
+                } else {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as usize))
+                        .collect()
+                }
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                ints.iter()
+                    .map(|&v| pg_sys::Datum::from(v as usize))
+                    .collect()
+            }
+        }
+        CompressionType::ForBitpacked => {
+            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
+                        .collect()
+                } else {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as usize))
+                        .collect()
+                }
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
+                ints.iter()
+                    .map(|&v| pg_sys::Datum::from(v as usize))
+                    .collect()
+            }
+        }
     };
 
     reinsert_nulls_datum(&datums, cc.null_bitmap, total_count)
@@ -5421,6 +5459,44 @@ unsafe fn decompress_blob_to_datums_truncated(
                 .iter()
                 .map(|&b| pg_sys::Datum::from(b as usize))
                 .collect()
+        }
+        CompressionType::Constant => {
+            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
+                        .collect()
+                } else {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as usize))
+                        .collect()
+                }
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                ints.iter()
+                    .map(|&v| pg_sys::Datum::from(v as usize))
+                    .collect()
+            }
+        }
+        CompressionType::ForBitpacked => {
+            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
+                        .collect()
+                } else {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as usize))
+                        .collect()
+                }
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
+                ints.iter()
+                    .map(|&v| pg_sys::Datum::from(v as usize))
+                    .collect()
+            }
         }
     };
 
