@@ -2173,6 +2173,63 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             // datums are never dereferenced).
             let selection = evaluate_batch_quals(&decompressed, row_count, &batch_quals, pre_selection);
 
+            // Fast path: when no GROUP BY and all agg specs are SUM/AVG on the
+            // same column with Column or AddConst expr, compute base_sum once
+            // and derive each result as base_sum + const_offset * non_null_count.
+            // This turns O(N * num_aggs) into O(N + num_aggs).
+            if !has_group_by && agg_specs.len() > 1 {
+                let first_col = agg_specs[0].col_idx;
+                let first_type = agg_specs[0].col_type_oid;
+                let all_same_col_sum = agg_specs.iter().all(|s| {
+                    s.col_idx == first_col
+                        && (s.agg_type == AggType::Sum || s.agg_type == AggType::Avg)
+                        && (s.expr_kind == AggExpr::Column || s.expr_kind == AggExpr::AddConst)
+                });
+                if all_same_col_sum {
+                    let col = &decompressed[first_col as usize];
+                    if !col.is_empty() {
+                        let accumulators = global_accumulators.as_mut().unwrap();
+                        let mut base_sum: i128 = 0;
+                        let mut non_null_count: i64 = 0;
+                        let use_float = matches!(first_type, pg_sys::FLOAT4OID | pg_sys::FLOAT8OID);
+                        let mut base_sum_f: f64 = 0.0;
+                        for row in 0..row_count {
+                            if !selection.is_empty() && !selection[row] {
+                                continue;
+                            }
+                            if !col[row].1 {
+                                if use_float {
+                                    base_sum_f += datum_to_f64(col[row].0, first_type);
+                                } else {
+                                    base_sum += datum_to_i128(col[row].0, first_type);
+                                }
+                                non_null_count += 1;
+                            }
+                        }
+                        total_rows_processed += if selection.is_empty() {
+                            row_count as u64
+                        } else {
+                            selection.iter().filter(|&&v| v).count() as u64
+                        };
+                        for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                            let acc = &mut accumulators[spec_idx];
+                            if use_float {
+                                if let AggAccumulator::SumFloat { sum, count } = acc {
+                                    *sum += base_sum_f + spec.const_offset as f64 * non_null_count as f64;
+                                    *count += non_null_count;
+                                }
+                            } else {
+                                if let AggAccumulator::SumInt { sum, count } = acc {
+                                    *sum += base_sum + spec.const_offset as i128 * non_null_count as i128;
+                                    *count += non_null_count;
+                                }
+                            }
+                        }
+                        continue; // skip the generic aggregate loop for this segment
+                    }
+                }
+            }
+
             // Aggregate loop
             for row in 0..row_count {
                 if !selection.is_empty() && !selection[row] {
