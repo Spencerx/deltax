@@ -155,6 +155,8 @@ pub(super) struct DecompressState {
 
     /// Batch quals extracted from plan qual for vectorized evaluation.
     batch_quals: Vec<BatchQual>,
+    /// Whether all plan quals are handled by batch eval (allows skipping ExecQual).
+    all_quals_batch_handled: bool,
     /// Selection vector: true = row passes batch quals. Empty = all pass.
     selection_vector: Vec<bool>,
 
@@ -760,6 +762,11 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         let plan_qual = (*(*node).ss.ps.plan).qual;
         let mut state = load_decompress_state(companion_oid, &companion_name, &needed_indices, plan_qual, topn_limit);
 
+        // If all plan quals are handled by batch eval, skip PG's per-row ExecQual
+        if state.all_quals_batch_handled {
+            (*node).ss.ps.qual = std::ptr::null_mut();
+        }
+
         // Set Top-N fields
         state.topn_limit = if topn_limit > 0 { topn_limit as usize } else { 0 };
         state.topn_ascending = topn_ascending;
@@ -875,7 +882,13 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
 
         // Extract batch quals early — we need to know which extra columns to load
         let plan_qual = (*(*node).ss.ps.plan).qual;
-        let batch_quals = extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types);
+        let (batch_quals, handled_count) = extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types);
+        let nquals = if plan_qual.is_null() { 0 } else { (*plan_qual).length as usize };
+        let all_quals_batch_handled = handled_count > 0 && handled_count == nquals;
+        if all_quals_batch_handled {
+            // All quals are handled by batch eval — skip PG's per-row ExecQual
+            (*node).ss.ps.qual = std::ptr::null_mut();
+        }
 
         // Build needed_cols and needed_col_indices (includes batch qual columns)
         let num_cols = meta.col_names.len();
@@ -998,6 +1011,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
             time_min: t_min,
             time_max: t_max,
             batch_quals,
+            all_quals_batch_handled,
             selection_vector: Vec::new(),
             topn_limit: if topn_limit > 0 { topn_limit as usize } else { 0 },
             topn_ascending,
@@ -1808,7 +1822,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             .collect();
 
         // Extract batch quals and segment filters from WHERE clause (quals from custom_private)
-        let batch_quals = extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
+        let (batch_quals, _handled_count) = extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
 
         for bq in &batch_quals {
             if bq.col_idx < num_cols {
@@ -3426,7 +3440,9 @@ fn load_decompress_state(
     let metadata_us = t0.elapsed().as_micros() as u64;
 
     // Extract batch quals early — we need to know which extra columns to load
-    let batch_quals = unsafe { extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types) };
+    let (batch_quals, handled_count) = unsafe { extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types) };
+    let nquals = if plan_qual.is_null() { 0 } else { (unsafe { (*plan_qual).length }) as usize };
+    let all_quals_batch_handled = handled_count > 0 && handled_count == nquals;
 
     // Build needed_cols and needed_col_indices from needed_indices + batch qual columns
     let num_cols = meta.col_names.len();
@@ -3532,6 +3548,7 @@ fn load_decompress_state(
         time_min: t_min,
         time_max: t_max,
         batch_quals,
+        all_quals_batch_handled,
         selection_vector: Vec::new(),
         topn_limit: 0,
         topn_ascending: true,
@@ -4013,30 +4030,6 @@ fn sql_like_match_inner(text: &[u8], pattern: &[u8]) -> bool {
     pi == pattern.len()
 }
 
-unsafe fn apply_batch_filter_like(
-    col: &[(pg_sys::Datum, bool)],
-    sel: &mut [bool],
-    strategy: &LikeStrategy,
-    negate: bool,
-) {
-    for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] { continue; }
-        if is_null { sel[i] = false; continue; }
-        let varlena_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
-        let len = unsafe { pgrx::varsize_any_exhdr(varlena_ptr) };
-        let data = unsafe { pgrx::vardata_any(varlena_ptr) };
-        let text = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(data, len)) };
-        let matched = match strategy {
-            LikeStrategy::Contains(s) => text.contains(s.as_str()),
-            LikeStrategy::StartsWith(s) => text.starts_with(s.as_str()),
-            LikeStrategy::EndsWith(s) => text.ends_with(s.as_str()),
-            LikeStrategy::Exact(s) => text == s.as_str(),
-            LikeStrategy::General(p) => sql_like_match(text, p),
-        };
-        sel[i] = if negate { !matched } else { matched };
-    }
-}
-
 /// Evaluate all batch quals against the current decompressed segment.
 /// Returns a selection vector (one bool per row). Empty vec means "no batch quals".
 fn evaluate_batch_quals(
@@ -4091,10 +4084,10 @@ fn evaluate_batch_quals(
                 apply_batch_filter_bool(col, &mut sel, bq.op, c);
             }
             pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
-                if let Some(ref strategy) = bq.like_strategy {
-                    let negate = bq.op == BatchCompareOp::NotLike;
-                    unsafe { apply_batch_filter_like(col, &mut sel, strategy, negate); }
-                }
+                // Text LIKE/NotLike and Eq/Ne are already handled during Phase 1
+                // decompression (decompress_text_blob_with_like_filter /
+                // decompress_text_blob_with_eq_filter) and their results are
+                // folded into pre_selection. Skip to avoid redundant evaluation.
             }
             _ => {} // unsupported type, skip
         }
@@ -4107,17 +4100,23 @@ fn evaluate_batch_quals(
 ///
 /// Looks for `OpExpr` nodes with `Var op Const` (or `Const op Var`) where the
 /// operator is a simple comparison and the column type is pass-by-value.
+///
+/// Returns `(batch_quals, handled_count)` where `handled_count` is the number
+/// of qual list nodes that were successfully converted to batch quals. When
+/// `handled_count == list_length(qual_list)`, all quals are handled by batch
+/// evaluation and PG's per-row ExecQual can be skipped.
 unsafe fn extract_batch_quals(
     qual_list: *mut pg_sys::List,
     col_names: &[String],
     col_types: &[pg_sys::Oid],
-) -> Vec<BatchQual> {
+) -> (Vec<BatchQual>, usize) {
     let mut batch_quals = Vec::new();
 
     if qual_list.is_null() {
-        return batch_quals;
+        return (batch_quals, 0);
     }
 
+    let mut handled_count: usize = 0;
     unsafe {
         let nquals = (*qual_list).length;
         for i in 0..nquals {
@@ -4126,6 +4125,7 @@ unsafe fn extract_batch_quals(
             if node.is_null() {
                 continue;
             }
+            let prev_len = batch_quals.len();
 
             let tag = (*node).type_;
 
@@ -4440,10 +4440,15 @@ unsafe fn extract_batch_quals(
                     in_list_i64: None,
                 });
             }
+
+            // Track whether this qual node was handled
+            if batch_quals.len() > prev_len {
+                handled_count += 1;
+            }
         }
     }
 
-    batch_quals
+    (batch_quals, handled_count)
 }
 
 /// Candidate row for Top-N selection.
@@ -6069,22 +6074,91 @@ unsafe fn decompress_text_blob_with_like_filter(
                 compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None)
             };
 
-            // First pass: determine which rows match
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            let sel: Vec<bool> = slices.iter().map(|s| matches_like(s)).collect();
+            // First pass: determine which rows match.
+            // For Contains patterns, use SIMD-accelerated memmem search on the
+            // raw decompressed buffer to find all needle positions, then map
+            // positions to string ranges. Avoids per-string branching overhead.
+            let sel: Vec<bool> = match (strategy, negate) {
+                (LikeStrategy::Contains(needle), false) => {
+                    let needle_len = needle.len();
+                    let finder = memchr::memmem::Finder::new(needle.as_bytes());
+                    let mut sel = vec![false; non_null_count];
+                    // SIMD scan: find all needle positions in the raw buffer,
+                    // then map each hit to the string range it belongs to.
+                    let mut search_start = 0;
+                    let mut range_idx = 0;
+                    while let Some(pos) = finder.find(&buf[search_start..]) {
+                        let abs_pos = search_start + pos;
+                        // Advance range_idx past ranges that end before this hit
+                        while range_idx < ranges.len() {
+                            let (off, len) = ranges[range_idx];
+                            if abs_pos < off + len {
+                                // Hit starts within (or before) this range.
+                                // Verify the full needle fits within this string
+                                // to avoid false positives from cross-boundary matches.
+                                if abs_pos >= off && abs_pos + needle_len <= off + len {
+                                    sel[range_idx] = true;
+                                }
+                                break;
+                            }
+                            range_idx += 1;
+                        }
+                        if range_idx >= ranges.len() {
+                            break;
+                        }
+                        search_start = abs_pos + 1;
+                    }
+                    sel
+                }
+                (LikeStrategy::Contains(needle), true) => {
+                    // NOT LIKE '%needle%': mark rows that DO contain the needle
+                    // as false, rest stays true.
+                    let needle_len = needle.len();
+                    let finder = memchr::memmem::Finder::new(needle.as_bytes());
+                    let mut sel = vec![true; non_null_count];
+                    let mut search_start = 0;
+                    let mut range_idx = 0;
+                    while let Some(pos) = finder.find(&buf[search_start..]) {
+                        let abs_pos = search_start + pos;
+                        while range_idx < ranges.len() {
+                            let (off, len) = ranges[range_idx];
+                            if abs_pos < off + len {
+                                if abs_pos >= off && abs_pos + needle_len <= off + len {
+                                    sel[range_idx] = false;
+                                }
+                                break;
+                            }
+                            range_idx += 1;
+                        }
+                        if range_idx >= ranges.len() {
+                            break;
+                        }
+                        search_start = abs_pos + 1;
+                    }
+                    sel
+                }
+                _ => {
+                    // Other strategies: per-string evaluation
+                    ranges
+                        .iter()
+                        .map(|&(off, len)| {
+                            let text = std::str::from_utf8(&buf[off..off + len])
+                                .expect("invalid UTF-8 in LZ4 data");
+                            matches_like(text)
+                        })
+                        .collect()
+                }
+            };
 
             // Collect matched slices for arena allocation
-            let matched_slices: Vec<&str> = slices
+            let matched_slices: Vec<&str> = ranges
                 .iter()
                 .zip(sel.iter())
                 .filter(|&(_, &pass)| pass)
-                .map(|(&s, _)| s)
+                .map(|(&(off, len), _)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
                 .collect();
             let matched_datums = unsafe {
                 str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)

@@ -941,6 +941,7 @@ name = "pg_seaturtle"
 version = "0.1.0"
 dependencies = [
  "lz4_flex",
+ "memchr",
  "pgrx",
  "pgrx-tests",
  "serde",

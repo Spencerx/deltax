@@ -747,6 +747,247 @@ class TestTransparentQuery:
             f"count with LIKE WHERE: {before_count} vs {after_count}"
         )
 
+    def test_like_qual_removal_decompresss_path(self, db):
+        """SELECT with LIKE must return correct rows when ps.qual is nulled.
+
+        Regression test for ExecQual removal: when all plan quals are handled
+        by batch eval, ps.qual is set to NULL. If a qual is removed but not
+        properly evaluated in batch, wrong rows are returned.
+
+        Uses high-cardinality text (>500 distinct values) to force LZ4
+        compression instead of dictionary, exercising the memmem SIMD path.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE like_decompress (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                val INTEGER
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('like_decompress', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert enough distinct URLs to trigger LZ4 (not dictionary)
+        for i in range(600):
+            # ~10 rows match 'needle', rest don't
+            if i % 60 == 0:
+                url = f"https://site-{i}.com/needle/path/{i}"
+                title = f"Page about needle topic {i}"
+            else:
+                url = f"https://site-{i}.com/path/to/resource/{i}?q={i*7}"
+                title = f"Title for page {i} with unique content {i*13}"
+            db.execute(
+                f"INSERT INTO like_decompress VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 5}', '{url}', '{title}', {i})"
+            )
+        db.commit()
+
+        # Collect ground truth before compression
+        before = {}
+        before["like_count"] = db.execute(
+            "SELECT count(*) FROM like_decompress WHERE url LIKE '%needle%'"
+        ).fetchone()[0]
+        before["not_like_count"] = db.execute(
+            "SELECT count(*) FROM like_decompress WHERE url NOT LIKE '%needle%'"
+        ).fetchone()[0]
+        before["like_rows"] = db.execute(
+            "SELECT url, val FROM like_decompress WHERE url LIKE '%needle%' ORDER BY val"
+        ).fetchall()
+        before["combined"] = db.execute(
+            "SELECT count(*) FROM like_decompress "
+            "WHERE title LIKE '%needle%' AND url NOT LIKE '%.com/path%' AND device_id <> 'dev-3'"
+        ).fetchone()[0]
+        before["select_star"] = db.execute(
+            "SELECT * FROM like_decompress WHERE url LIKE '%needle%' ORDER BY ts LIMIT 5"
+        ).fetchall()
+
+        assert before["like_count"] == 10
+        assert before["not_like_count"] == 590
+
+        db.execute(
+            "SELECT seaturtle_enable_compression('like_decompress', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "like_decompress")
+
+        # Verify all query patterns after compression
+        after_like_count = db.execute(
+            "SELECT count(*) FROM like_decompress WHERE url LIKE '%needle%'"
+        ).fetchone()[0]
+        assert after_like_count == before["like_count"], (
+            f"LIKE count: {before['like_count']} vs {after_like_count}"
+        )
+
+        after_not_like_count = db.execute(
+            "SELECT count(*) FROM like_decompress WHERE url NOT LIKE '%needle%'"
+        ).fetchone()[0]
+        assert after_not_like_count == before["not_like_count"], (
+            f"NOT LIKE count: {before['not_like_count']} vs {after_not_like_count}"
+        )
+
+        after_like_rows = db.execute(
+            "SELECT url, val FROM like_decompress WHERE url LIKE '%needle%' ORDER BY val"
+        ).fetchall()
+        assert after_like_rows == before["like_rows"], (
+            "LIKE row content mismatch after compression"
+        )
+
+        after_combined = db.execute(
+            "SELECT count(*) FROM like_decompress "
+            "WHERE title LIKE '%needle%' AND url NOT LIKE '%.com/path%' AND device_id <> 'dev-3'"
+        ).fetchone()[0]
+        assert after_combined == before["combined"], (
+            f"Combined LIKE+NOT LIKE+<>: {before['combined']} vs {after_combined}"
+        )
+
+        after_select_star = db.execute(
+            "SELECT * FROM like_decompress WHERE url LIKE '%needle%' ORDER BY ts LIMIT 5"
+        ).fetchall()
+        assert after_select_star == before["select_star"], (
+            "SELECT * with LIKE mismatch after compression"
+        )
+
+    def test_like_memmem_cross_boundary(self, db):
+        """LIKE must not produce false positives from cross-string matches.
+
+        When memmem scans the raw LZ4 buffer, the needle could appear to
+        match across the boundary of two adjacent strings. E.g. string A
+        ends with 'goo' and string B starts with 'gle' — the buffer has
+        'goo|gle' which contains 'google' but neither string does.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE like_boundary (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                data TEXT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('like_boundary', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert strings designed to create cross-boundary false positives.
+        # Each pair: string[i] ends with prefix of needle, string[i+1] starts
+        # with the remainder. Use enough distinct strings for LZ4.
+        boundary_pairs = [
+            ("ends-with-goo", "gle-starts-here"),        # goo|gle = google
+            ("data-abcnee", "dle-xyz-suffix"),            # nee|dle = needle
+            ("prefix-sear", "ch-engine-data"),            # sear|ch = search
+            ("no-match-at-all", "completely-different"),   # no boundary issue
+        ]
+        # Also add many unique strings to force LZ4
+        idx = 0
+        for i in range(500):
+            if i < len(boundary_pairs) * 2:
+                pair_idx = i // 2
+                text = boundary_pairs[pair_idx][i % 2]
+            else:
+                text = f"unique-string-{i}-padding-{i*17}"
+            db.execute(
+                f"INSERT INTO like_boundary VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{idx} minutes', "
+                f"'dev-0', '{text}')"
+            )
+            idx += 1
+        db.commit()
+
+        before_google = db.execute(
+            "SELECT count(*) FROM like_boundary WHERE data LIKE '%google%'"
+        ).fetchone()[0]
+        before_needle = db.execute(
+            "SELECT count(*) FROM like_boundary WHERE data LIKE '%needle%'"
+        ).fetchone()[0]
+        before_search = db.execute(
+            "SELECT count(*) FROM like_boundary WHERE data LIKE '%search%'"
+        ).fetchone()[0]
+
+        # None of the individual strings contain these substrings
+        assert before_google == 0, f"expected 0 google matches, got {before_google}"
+        assert before_needle == 0, f"expected 0 needle matches, got {before_needle}"
+        assert before_search == 0, f"expected 0 search matches, got {before_search}"
+
+        db.execute(
+            "SELECT seaturtle_enable_compression('like_boundary', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "like_boundary")
+
+        after_google = db.execute(
+            "SELECT count(*) FROM like_boundary WHERE data LIKE '%google%'"
+        ).fetchone()[0]
+        after_needle = db.execute(
+            "SELECT count(*) FROM like_boundary WHERE data LIKE '%needle%'"
+        ).fetchone()[0]
+        after_search = db.execute(
+            "SELECT count(*) FROM like_boundary WHERE data LIKE '%search%'"
+        ).fetchone()[0]
+
+        assert after_google == 0, (
+            f"Cross-boundary false positive for 'google': got {after_google}"
+        )
+        assert after_needle == 0, (
+            f"Cross-boundary false positive for 'needle': got {after_needle}"
+        )
+        assert after_search == 0, (
+            f"Cross-boundary false positive for 'search': got {after_search}"
+        )
+
+    def test_like_prepared_statement_caching(self, db):
+        """LIKE qual removal must survive prepared statement plan caching.
+
+        ps.qual is nulled at BeginCustomScan time. With psycopg3's default
+        prepare_threshold=5, the plan is cached after 5 executions. The
+        nulled qual must still be correctly handled on re-execution.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE like_prepared (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                val INTEGER
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('like_prepared', 'ts', '1 day'::interval)")
+        db.commit()
+
+        for i in range(200):
+            url = f"https://google.com/{i}" if i % 20 == 0 else f"https://other-{i}.com/{i}"
+            db.execute(
+                f"INSERT INTO like_prepared VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', '{url}', {i})"
+            )
+        db.commit()
+
+        db.execute(
+            "SELECT seaturtle_enable_compression('like_prepared', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "like_prepared")
+
+        # Execute same query 10 times — psycopg3 auto-prepares after 5
+        results = []
+        for _ in range(10):
+            count = db.execute(
+                "SELECT count(*) FROM like_prepared WHERE url LIKE '%google%'"
+            ).fetchone()[0]
+            results.append(count)
+
+        assert all(r == 10 for r in results), (
+            f"Prepared statement caching broke LIKE: results={results}"
+        )
+
     def test_transparent_query_agg_where_numeric(self, db):
         """Aggregate with WHERE on numeric column (supported by batch quals).
 

@@ -2,72 +2,105 @@
 
 Tracking SeaTurtle compressed vs uncompressed performance on ClickBench.
 
-## Current Benchmark (2026-03-07)
+## Current Benchmark (2026-03-13)
 
 ### Compressed vs Uncompressed
 
 | Query  | Description               |  Uncompr (ms) |  Compr (ms) |  Ratio |
 |--------|---------------------------|---------------|-------------|--------|
-| Q1     | COUNT(*)                  |          52.1 |         0.5 | 107.40x |
-| Q2     | COUNT WHERE AdvEngineID   |          81.2 |         5.2 | 15.64x |
-| Q3     | SUM/AVG full scan         |          86.3 |        11.7 |  7.36x |
-| Q4     | AVG UserID                |          61.3 |         9.2 |  6.64x |
-| Q5     | COUNT DISTINCT UserID     |         205.4 |        20.8 |  9.86x |
-| Q6     | COUNT DISTINCT SearchPhrase |       355.8 |        52.1 |  6.83x |
-| Q7     | MIN/MAX EventDate         |          59.9 |         0.6 | 101.80x |
-| Q8     | GROUP BY AdvEngineID      |          81.8 |         4.7 | 17.45x |
-| Q9     | GROUP BY RegionID         |         299.9 |        77.7 |  3.86x |
-| Q10    | RegionID multi-agg        |         385.2 |        88.6 |  4.35x |
-| Q11    | MobilePhoneModel users    |         206.8 |        17.1 | 12.06x |
-| Q12    | MobilePhone+Model users   |         233.9 |        22.2 | 10.52x |
-| Q13    | Top SearchPhrase          |         195.9 |        18.0 | 10.86x |
-| Q14    | SearchPhrase users        |         341.1 |       103.7 |  3.29x |
-| Q15    | SearchEngine+Phrase       |         234.2 |        21.8 | 10.76x |
-| Q16    | Top UserID                |         107.9 |        68.2 |  1.58x |
-| Q17    | UserID+SearchPhrase top   |         344.5 |       168.2 |  2.05x |
-| Q18    | UserID+SearchPhrase       |         125.7 |       128.0 |  0.98x |
-| Q19    | UserID+minute+Phrase      |         551.6 |       340.5 |  1.62x |
-| Q20    | Point lookup UserID       |          65.6 |         7.1 |  9.20x |
-| Q21    | URL LIKE google           |          91.4 |        64.0 |  1.43x |
-| Q22    | SearchPhrase+URL google   |         116.3 |        70.2 |  1.66x |
-| Q23    | Title LIKE Google         |         132.1 |       114.6 |  1.15x |
-| Q24    | SELECT * google sorted    |          96.8 |       756.8 |  0.13x |
-| Q25    | SearchPhrase by time      |          91.3 |        24.1 |  3.79x |
-| Q26    | SearchPhrase sorted       |          86.4 |        13.2 |  6.53x |
-| Q27    | SearchPhrase time+phrase  |          88.5 |        23.6 |  3.75x |
-| Q28    | CounterID avg URL len     |         118.1 |       207.8 |  0.57x |
-| Q29    | Referer domain regex      |        1039.6 |      2837.6 |  0.37x |
-| Q30    | Wide SUM 89 cols          |         203.2 |       425.9 |  0.48x |
-| Q31    | SearchEngine+ClientIP     |         240.8 |        35.5 |  6.78x |
-| Q32    | WatchID+ClientIP filter   |         267.1 |        53.4 |  5.00x |
-| Q33    | WatchID+ClientIP all      |         592.3 |       896.6 |  0.66x |
-| Q34    | Top URLs                  |        1142.3 |       299.7 |  3.81x |
-| Q35    | Top URLs with const       |        1122.7 |       300.9 |  3.73x |
-| Q36    | ClientIP arithmetic       |         103.5 |       133.3 |  0.78x |
-| Q37    | CounterID=62 URLs         |        1758.2 |       139.4 | 12.62x |
-| Q38    | CounterID=62 Titles       |         495.4 |        65.6 |  7.55x |
-| Q39    | CounterID=62 links        |         148.0 |        38.9 |  3.81x |
-| Q40    | CounterID=62 traffic src  |        2182.2 |       290.1 |  7.52x |
-| Q41    | CounterID=62 URLHash      |         145.0 |        21.5 |  6.73x |
-| Q42    | CounterID=62 window dim   |         145.3 |        19.8 |  7.33x |
-| Q43    | CounterID=62 by minute    |         134.7 |        59.7 |  2.26x |
+| Q1     | COUNT(*)                  |          45.0 |         0.8 | 58.77x |
+| Q2     | COUNT WHERE AdvEngineID   |          75.0 |         4.0 | 18.84x |
+| Q3     | SUM/AVG full scan         |          84.9 |        11.2 |  7.60x |
+| Q4     | AVG UserID                |          52.9 |         7.5 |  7.05x |
+| Q5     | COUNT DISTINCT UserID     |         185.6 |         0.6 | 305.40x |
+| Q6     | COUNT DISTINCT SearchPhrase |         357.3 |         0.5 | 755.71x |
+| Q7     | MIN/MAX EventDate         |          51.5 |         0.9 | 56.21x |
+| Q8     | GROUP BY AdvEngineID      |          72.9 |         4.9 | 14.77x |
+| Q9     | GROUP BY RegionID         |         289.8 |        50.0 |  5.80x |
+| Q10    | RegionID multi-agg        |         446.0 |        55.8 |  7.99x |
+| Q11    | MobilePhoneModel users    |         200.0 |         9.2 | 21.73x |
+| Q12    | MobilePhone+Model users   |         215.4 |        12.7 | 16.99x |
+| Q13    | Top SearchPhrase          |         104.0 |        20.3 |  5.13x |
+| Q14    | SearchPhrase users        |         284.8 |        25.3 | 11.24x |
+| Q15    | SearchEngine+Phrase       |         216.9 |        23.3 |  9.29x |
+| Q16    | Top UserID                |          84.6 |        45.8 |  1.85x |
+| Q17    | UserID+SearchPhrase top   |         319.6 |        86.2 |  3.71x |
+| Q18    | UserID+SearchPhrase       |         110.3 |        86.8 |  1.27x |
+| Q19    | UserID+minute+Phrase      |         505.8 |       351.5 |  1.44x |
+| Q20    | Point lookup UserID       |          70.4 |         1.5 | 46.31x |
+| Q21    | URL LIKE google           |          90.6 |        59.6 |  1.52x |
+| Q22    | SearchPhrase+URL google   |         120.5 |        63.8 |  1.89x |
+| Q23    | Title LIKE Google         |         125.1 |       132.7 |  0.94x |
+| Q24    | SELECT * google sorted    |          89.6 |       127.0 |  0.71x |
+| Q25    | SearchPhrase by time      |          81.4 |        35.4 |  2.30x |
+| Q26    | SearchPhrase sorted       |          81.4 |        12.6 |  6.46x |
+| Q27    | SearchPhrase time+phrase  |          80.9 |        10.4 |  7.78x |
+| Q28    | CounterID avg URL len     |         102.9 |        65.6 |  1.57x |
+| Q29    | Referer domain regex      |         954.5 |      1191.2 |  0.80x |
+| Q30    | Wide SUM 89 cols          |         204.3 |         4.8 | 42.56x |
+| Q31    | SearchEngine+ClientIP     |         222.0 |        27.7 |  8.01x |
+| Q32    | WatchID+ClientIP filter   |         291.9 |        59.6 |  4.90x |
+| Q33    | WatchID+ClientIP all      |         625.7 |       452.8 |  1.38x |
+| Q34    | Top URLs                  |        1194.7 |       326.2 |  3.66x |
+| Q35    | Top URLs with const       |        1123.7 |       299.1 |  3.76x |
+| Q36    | ClientIP arithmetic       |          98.7 |       143.1 |  0.69x |
+| Q37    | CounterID=62 URLs         |        1785.5 |       145.0 | 12.32x |
+| Q38    | CounterID=62 Titles       |         494.4 |        68.6 |  7.21x |
+| Q39    | CounterID=62 links        |         143.8 |        28.8 |  4.99x |
+| Q40    | CounterID=62 traffic src  |        2218.2 |       298.7 |  7.43x |
+| Q41    | CounterID=62 URLHash      |         149.3 |        27.2 |  5.48x |
+| Q42    | CounterID=62 window dim   |         144.2 |        21.9 |  6.59x |
+| Q43    | CounterID=62 by minute    |         129.4 |        28.8 |  4.49x |
+|--------|---------------------------|---------------|-------------|--------|
+| GMEAN  | Geometric Mean            |         189.1 |        28.6 |  6.62x |
 
 ### SeaTurtle Scan Timing Breakdown (EXPLAIN ANALYZE)
 
-| Query  | SeaTurtle Total |   Metadata |  Heap Scan |  Decompress | Batch Eval |       Emit |
-|--------|---------------|------------|------------|-------------|------------|------------|
-| Q1     |      0.427 ms |      0.349 |      0.078 |       0.000 |      0.000 |      0.000 |
-| Q2     |      5.927 ms |      0.294 |      0.339 |       1.743 |      0.887 |      2.664 |
-| Q3     |      7.049 ms |      0.360 |      2.044 |       4.645 |      0.000 |      0.000 |
-| Q7     |      0.426 ms |      0.313 |      0.113 |       0.000 |      0.000 |      0.000 |
-| Q21    |    110.115 ms |      0.272 |     12.937 |      48.018 |      0.361 |     48.527 |
-| Q24    |   1414.831 ms |      0.290 |    125.529 |     639.753 |      0.396 |    648.863 |
-| Q28    |     79.866 ms |      0.356 |     12.557 |      33.180 |      0.002 |     33.771 |
-| Q29    |    110.050 ms |      0.290 |      3.666 |      52.605 |      0.002 |     53.487 |
-| Q30    |      8.378 ms |      0.572 |      1.800 |       2.807 |      0.000 |      3.199 |
-| Q33    |     15.518 ms |      0.287 |      3.738 |      11.493 |      0.000 |      0.000 |
-| Q36    |      7.633 ms |      0.314 |      0.503 |       3.226 |      0.000 |      3.590 |
-| Q37    |     57.610 ms |      0.341 |      2.107 |      25.663 |      1.783 |     27.716 |
+| Query  | SeaTurtle Total |   Metadata |  Heap Scan |  Decompress | Batch Eval |       Emit | Stats                                                                                 |
+|--------|---------------|------------|------------|-------------|------------|------------|---------------------------------------------------------------------------------------|
+| Q1     |      0.443 ms |      0.325 |      0.118 |       0.000 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q2     |      3.777 ms |      0.224 |      0.422 |       1.938 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q3     |     11.226 ms |      0.222 |      1.413 |       3.921 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q4     |      7.271 ms |      0.282 |      1.637 |       2.571 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q5     |      0.326 ms |      0.326 |      0.000 |       0.000 |      0.000 |      0.000 | segments=0 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch_ |
+| Q6     |      0.276 ms |      0.276 |      0.000 |       0.000 |      0.000 |      0.000 | segments=0 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch_ |
+| Q7     |      0.645 ms |      0.249 |      0.396 |       0.000 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q8     |      4.289 ms |      0.272 |      0.337 |       1.921 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q9     |     48.058 ms |      0.239 |      2.465 |       4.441 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q10    |     55.608 ms |      0.290 |      3.489 |       8.316 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q11    |      8.426 ms |      0.301 |      1.640 |       4.771 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q12    |     11.321 ms |      0.258 |      1.909 |       7.256 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q13    |     15.015 ms |      0.261 |      1.376 |       4.467 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q14    |     20.773 ms |      0.290 |      2.853 |       7.038 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q15    |     19.056 ms |      0.314 |      1.982 |       6.540 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q16    |     39.226 ms |      0.321 |      1.508 |       2.610 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q17    |     65.450 ms |      0.347 |      2.760 |       8.156 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q18    |     63.456 ms |      0.316 |      2.775 |       8.158 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q19    |    213.628 ms |      0.304 |     10.454 |      26.667 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q20    |      1.408 ms |      0.327 |      0.434 |       0.508 |      0.139 |      0.000 | segments=6 segments_skipped=28 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q21    |     56.793 ms |      0.271 |      3.702 |      22.269 |      0.000 |      0.000 | segments=17 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q22    |     61.844 ms |      0.326 |      3.793 |      25.353 |      0.000 |      0.000 | segments=17 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q23    |    125.438 ms |      0.367 |      8.012 |      67.681 |      0.000 |      0.000 | segments=24 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q24    |     91.968 ms |      0.366 |     24.093 |      67.378 |      0.131 |      0.000 | segments=17 segments_skipped=17 phase2_skipped=0 rows_out=10 rows_filtered=0 rows_bat |
+| Q25    |     26.974 ms |      0.341 |      8.727 |      17.906 |      0.000 |      0.000 | segments=28 segments_skipped=6 phase2_skipped=0 rows_out=10 rows_filtered=0 rows_batc |
+| Q26    |      6.330 ms |      0.323 |      1.443 |       4.505 |      0.000 |      0.059 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=69354 rows_filtered=0 rows_b |
+| Q27    |      9.694 ms |      0.321 |      8.642 |       0.730 |      0.000 |      0.001 | segments=1 segments_skipped=0 phase2_skipped=0 rows_out=11 rows_filtered=0 rows_batch |
+| Q28    |     64.807 ms |      0.289 |      2.282 |      36.287 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q29    |   1070.818 ms |      0.536 |      3.479 |     755.975 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q30    |      4.227 ms |      0.312 |      1.007 |       1.890 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q31    |     22.504 ms |      0.246 |      4.257 |      12.492 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q32    |     36.777 ms |      0.311 |      5.080 |      20.642 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q33    |     21.422 ms |      0.349 |      3.267 |      17.238 |      0.000 |      0.568 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
+| Q34    |     32.899 ms |      0.349 |      2.993 |      28.088 |      0.000 |      1.469 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
+| Q35    |     30.933 ms |      0.340 |      2.469 |      27.430 |      0.000 |      0.694 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
+| Q36    |      4.855 ms |      0.305 |      1.432 |       2.456 |      0.000 |      0.662 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
+| Q37    |     23.929 ms |      0.340 |      1.866 |      19.490 |      1.799 |      0.434 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=376899 rows_filtered=0 rows |
+| Q38    |     16.522 ms |      0.329 |      0.787 |      10.345 |      1.917 |      3.144 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=370550 rows_filtered=0 rows |
+| Q39    |     21.504 ms |      0.350 |      2.406 |      16.875 |      1.825 |      0.048 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=26918 rows_filtered=0 rows_ |
+| Q40    |     44.354 ms |      0.330 |      4.603 |      36.611 |      1.422 |      1.388 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=406063 rows_filtered=0 rows |
+| Q41    |     25.646 ms |      0.317 |      6.004 |      11.291 |      0.000 |      0.000 | segments=15 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q42    |     18.759 ms |      0.341 |      3.843 |       9.031 |      0.000 |      0.000 | segments=15 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| Q43    |     31.035 ms |      0.704 |      5.311 |      10.335 |      0.000 |      0.000 | segments=15 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
 
 ## Where the time goes
 
@@ -321,22 +354,28 @@ runs via Rust `regex` crate on raw slices with cross-segment caching.
 
 ### Remaining regressions
 
-**Q33 (0.66x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg.
-SeaTurtle scan=15ms, but PG hash agg on 1M rows with ~1M groups = 881ms.
-Push hash agg into scan (very hard) or accept this as inherent.
+**Q23 (0.94x):** `Title LIKE '%Google%' AND URL NOT LIKE '%.google.%'`. LIKE
+on LZ4 text columns (Title, URL) goes through PG per-row eval, not batch.
+Decompress=67.7ms dominates. See planned #26.
 
-**Q36 (0.78x):** `GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3`.
-Same pattern: fast scan, slow PG hash agg on expressions.
+**Q24 (0.71x):** `SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
+Decompresses all columns for all matching segments. Decompress=67.4ms,
+heap_scan=24ms. See planned #26 and #29.
 
-**Q18 (0.98x):** `GROUP BY UserID, SearchPhrase`. Marginal regression; emit
-overhead for 1M rows with large text column.
+**Q29 (0.80x):** `REGEXP_REPLACE(Referer, ...) GROUP BY`. Decompress=756ms on
+Referer (high-cardinality LZ4). The regex runs in Rust but decompression of
+the full Referer column dominates. See planned #24.
 
-These are bottlenecked by PG's hash aggregation on high-cardinality GROUP BY
-keys (WatchID has ~1M unique values). The scan is already fast (8-15ms). The
-only fix is pushing the entire GROUP BY hash table into the scan node —
-essentially reimplementing PG's hash aggregate in Rust. Very high effort,
-marginal return since PG's hash agg is already well-optimized. Best left as-is
-unless we move to a full vectorized execution engine.
+**Q36 (0.69x):** `GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3`.
+Expression GROUP BY not pushed into AggScan; emits 1M rows to PG hash agg.
+Scan itself is only 4.9ms. See planned #27.
+
+**Q33 (1.38x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg.
+SeaTurtle scan=21ms, but PG hash agg on 1M rows with ~1M groups dominates.
+Would require pushing hash agg into scan — very high effort.
+
+**Q18 (1.27x):** `GROUP BY UserID, SearchPhrase`. Same pattern as Q33:
+high-cardinality keys, emit overhead for 1M rows.
 
 ---
 
@@ -382,3 +421,141 @@ columns where the dictionary approach doesn't apply.
 
 **Files:** `src/compress.rs` (bloom filter in companion table schema),
 `src/scan/exec.rs` (bloom filter test in segment loading)
+
+### 26. Batch LIKE evaluation on LZ4 text columns
+
+**Target: Q21 59.6ms -> ~20ms, Q22 63.8ms -> ~25ms, Q23 132.7ms -> ~50ms, Q24 127ms -> ~50ms**
+**Complexity: Medium**
+
+Currently `batch_eval=0` for LIKE queries on text columns — the LIKE filter
+runs per-row through PG's executor, not in the vectorized Rust loop. Dictionary
+pruning (#19) skips whole segments, but for segments that *do* contain matching
+dictionary entries, every row is decompressed and evaluated one-at-a-time by PG.
+
+For LZ4 columns (URL, Title, Referer), there's no dictionary to prune against,
+so all segments are processed and every row goes through PG's per-row LIKE.
+
+**Approach:** After LZ4 decompression produces raw `&str` slices, run the LIKE
+pattern match (reuse existing `LikeStrategy` with Contains/StartsWith/EndsWith)
+as a Phase 1 batch qual over the text slices. This builds the selection vector
+*before* materializing varlena datums, skipping Phase 2 allocation for
+non-matching rows.
+
+For `Contains` patterns (the most common — `%google%`), use `memmem` or
+Aho-Corasick on the raw decompressed byte buffer for potentially SIMD-
+accelerated substring search.
+
+**Why this matters:** Q21-Q24 all have LIKE on high-cardinality LZ4 text
+columns. The timing breakdown shows decompress + PG per-row eval dominate.
+Batch eval in Rust would eliminate PG executor overhead and enable Phase 2
+skipping for non-matching rows.
+
+**Files:** `src/scan/exec.rs` (extend `BatchQual` to handle text slices from
+LZ4 decompression), `src/scan/hook.rs` (detect LIKE quals on LZ4 text columns)
+
+### 27. Expression GROUP BY pushdown (col +/- const)
+
+**Target: Q36 143.1ms -> ~10ms (fixes 0.69x regression)**
+**Complexity: Low**
+
+`GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3` emits 1M rows because
+AggScan doesn't recognize `col - const` in GROUP BY expressions. Since all
+derived columns are trivially computable from `ClientIP`, the GROUP BY is
+effectively just `GROUP BY ClientIP`.
+
+**Approach:** Add `GroupByExpr::AddConst { col_idx, offset }` similar to
+existing `AggExpr::AddConst`. Detect `col + const` / `col - const` in GROUP BY
+during planner hook. At execution time, group by the base column only and
+reconstruct derived columns during emit.
+
+The planner should also recognize that `GROUP BY a, a-1, a-2, a-3` has the
+same grouping cardinality as `GROUP BY a` alone — all derived keys are
+functionally dependent. This means the hash table only needs one key.
+
+**Files:** `src/scan/hook.rs` (detect expression GROUP BY),
+`src/scan/path.rs` (serialize to custom_private),
+`src/scan/exec.rs` (reconstruct derived columns during emit)
+
+### 28. Text GROUP BY in AggScan
+
+**Target: Q34 326ms -> ~40ms, Q35 299ms -> ~40ms**
+**Complexity: Medium-High**
+
+Q34/Q35 (`GROUP BY URL ORDER BY COUNT(*) DESC LIMIT 10`) emit **1M rows** into
+PG's hash aggregator. The SeaTurtle scan takes only ~33ms, but PG hash agg on
+1M text rows with high cardinality is ~290ms.
+
+Currently AggScan doesn't support text/varchar GROUP BY keys, so these queries
+fall back to DecompressState which emits all rows.
+
+**Approach:** Extend AggScan's hash table to support string GROUP BY keys.
+For dictionary-compressed columns, hash on dictionary index (u16) and only
+materialize the string when emitting result rows. For LZ4 columns, hash on
+raw `&str` slices during decompression, store references into the decompressed
+buffer. Combined with Top-N pushdown (#21), the hash table can be pruned
+during aggregation — only keeping entries that could make it into the top N.
+
+**Interaction with late materialization (#24):** If text columns are kept in
+raw form, the hash table can reference slices without varlena allocation.
+
+**Files:** `src/scan/hook.rs` (detect text GROUP BY),
+`src/scan/exec.rs` (extend `AggState` hash table for string keys)
+
+### 29. Partial decompression for SELECT * with LIMIT
+
+**Target: Q24 127ms -> ~10ms**
+**Complexity: Medium**
+
+`SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`
+currently decompresses all columns for all matching segments. With time-ordered
+segments, an early-termination strategy is possible:
+
+1. Process segments in time order (already supported via sorted scan #7)
+2. Apply LIKE filter in Phase 1; track number of matching rows found so far
+3. After accumulating enough candidates (LIMIT + safety margin), skip
+   remaining segments
+4. Only decompress non-filter columns (Phase 2) for the final winning rows
+
+This is essentially combining sorted scan (#7), batch LIKE (#26), and lazy
+column decompression (#11) into a LIMIT-aware pipeline where only the rows
+that actually appear in the final result set need full materialization.
+
+**Files:** `src/scan/exec.rs` (early termination in segment loop,
+deferred Phase 2 for LIMIT queries)
+
+### 30. High-cardinality integer GROUP BY optimization
+
+**Target: Q16 45.8ms -> ~30ms, Q19 351.5ms -> ~200ms**
+**Complexity: Medium**
+
+Q16 (`GROUP BY UserID`) and Q19 (`GROUP BY UserID, minute, SearchPhrase`)
+already use AggScan (rows_out=0) but are slow due to hash table pressure
+with millions of distinct UserID values.
+
+**Approach:**
+- Pre-size hash maps using per-segment `ndistinct` metadata (already tracked
+  in catalog via #23) to avoid repeated resizing
+- For `ORDER BY agg LIMIT N` queries, use a top-N heap with early pruning:
+  once a segment's contribution can't change the top-N result, skip aggregation
+  for remaining groups
+- Consider a two-pass strategy: first pass counts groups per segment to estimate
+  total cardinality, second pass allocates accordingly
+
+**Files:** `src/scan/exec.rs` (hash map sizing, top-N pruning in AggState)
+
+### 31. WHERE + AggScan combined batch evaluation
+
+**Target: Q31 27.7ms -> ~15ms, Q32 59.6ms -> ~30ms**
+**Complexity: Medium**
+
+Q31/Q32 have `WHERE SearchPhrase <> ''` combined with GROUP BY aggregation.
+Currently the filter and aggregation run in separate passes through the
+decoded data. Combining batch qual evaluation with aggregate accumulation in
+a single pass would improve cache locality and avoid redundant iteration.
+
+For dictionary columns, the `<> ''` filter can leverage `empty_string_idx`
+to skip rows by checking the 1-2 byte index array without decompressing any
+string data. Make sure `check_ne_empty()` is wired into the batch eval path
+inside AggScan, not just DecompressState.
+
+**Files:** `src/scan/exec.rs` (fused filter+aggregate loop in AggState)
