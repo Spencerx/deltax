@@ -958,7 +958,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_seaturtle"
+name = "pg_deltax"
 version = "0.1.0"
 dependencies = [
  "ahash",

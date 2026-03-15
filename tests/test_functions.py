@@ -7,8 +7,8 @@ BASE_TS = "2025-01-15 00:00:00+00"
 
 
 def _setup_topn_table(db):
-    """Create a compressed seaturtle table with multiple groups for top-N tests."""
-    db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+    """Create a compressed deltax table with multiple groups for top-N tests."""
+    db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
     db.execute("""
         CREATE TABLE topn_test (
             ts TIMESTAMPTZ NOT NULL,
@@ -16,7 +16,7 @@ def _setup_topn_table(db):
             val INT NOT NULL
         )
     """)
-    db.execute("SELECT seaturtle_create_table('topn_test', 'ts', '1 day'::interval)")
+    db.execute("SELECT deltax_create_table('topn_test', 'ts', '1 day'::interval)")
     db.commit()
 
     # Insert data: 5 categories with different row counts
@@ -35,29 +35,29 @@ def _setup_topn_table(db):
 
     # Enable compression and compress
     db.execute(
-        "SELECT seaturtle_enable_compression('topn_test', "
+        "SELECT deltax_enable_compression('topn_test', "
         "segment_by => ARRAY['category'], order_by => ARRAY['ts'])"
     )
     db.commit()
 
     partitions = db.execute(
-        "SELECT partition_name FROM seaturtle_partition_info('topn_test') "
+        "SELECT partition_name FROM deltax_partition_info('topn_test') "
         "WHERE range_start <= '2025-01-15'::timestamptz "
         "AND range_end > '2025-01-15'::timestamptz"
     ).fetchall()
     for row in partitions:
-        db.execute(f"SELECT seaturtle_compress_partition('{row[0]}')")
+        db.execute(f"SELECT deltax_compress_partition('{row[0]}')")
     db.commit()
 
 
 def _setup_metrics(db):
-    """Helper: create a seaturtle table and insert test rows."""
+    """Helper: create a deltax table and insert test rows."""
     db.execute(
         "CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8)"
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('metrics', 'ts')")
+    db.execute("SELECT deltax_create_table('metrics', 'ts')")
     db.commit()
 
     now = datetime.now(timezone.utc)
@@ -107,7 +107,7 @@ def test_first_last(db):
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('fl', 'ts')")
+    db.execute("SELECT deltax_create_table('fl', 'ts')")
     db.commit()
 
     db.execute(
@@ -132,7 +132,7 @@ def test_first_last_with_groups(db):
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('grouped', 'ts')")
+    db.execute("SELECT deltax_create_table('grouped', 'ts')")
     db.commit()
 
     db.execute(
@@ -168,14 +168,14 @@ class TestTopN:
         assert rows[1] == ("cat-B", 40)
         assert rows[2] == ("cat-C", 30)
 
-        # Verify EXPLAIN shows SeaTurtleAgg with TopN info
+        # Verify EXPLAIN shows DeltaXAgg with TopN info
         explain = db.execute(
             "EXPLAIN ANALYZE SELECT category, COUNT(*) AS cnt FROM topn_test "
             "GROUP BY category ORDER BY COUNT(*) DESC LIMIT 3"
         ).fetchall()
         explain_text = "\n".join(r[0] for r in explain)
-        assert "SeaTurtleAgg" in explain_text, (
-            f"Expected SeaTurtleAgg in plan:\n{explain_text}"
+        assert "DeltaXAgg" in explain_text, (
+            f"Expected DeltaXAgg in plan:\n{explain_text}"
         )
         assert "TopN" in explain_text, (
             f"Expected TopN in EXPLAIN output:\n{explain_text}"
@@ -212,8 +212,8 @@ class TestTopN:
             "GROUP BY category"
         ).fetchall()
         explain_text = "\n".join(r[0] for r in explain)
-        assert "SeaTurtleAgg" in explain_text, (
-            f"Expected SeaTurtleAgg in plan:\n{explain_text}"
+        assert "DeltaXAgg" in explain_text, (
+            f"Expected DeltaXAgg in plan:\n{explain_text}"
         )
         assert "TopN" not in explain_text, (
             f"TopN should not appear without LIMIT:\n{explain_text}"

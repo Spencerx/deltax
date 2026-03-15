@@ -1,4 +1,4 @@
-CREATE EXTENSION pg_seaturtle;
+CREATE EXTENSION pg_deltax;
 SET client_min_messages = log;
 
 -- Mimics clickbench schema with many columns, AdvEngineID at column ~42
@@ -51,7 +51,7 @@ CREATE TABLE hits_mini (
     ClientEventTime TIMESTAMPTZ NOT NULL
 );
 
-SELECT seaturtle_create_table('hits_mini', 'eventtime', interval '1 day', premake => 2);
+SELECT deltax_create_table('hits_mini', 'eventtime', interval '1 day', premake => 2);
 
 -- Insert 1000 rows: 99% have AdvEngineID=0, 1% have AdvEngineID=2
 INSERT INTO hits_mini
@@ -105,17 +105,17 @@ SELECT
 FROM generate_series(1, 1000) AS i;
 
 -- Compress
-SELECT seaturtle_enable_compression('hits_mini', segment_by => ARRAY['counterid'], order_by => ARRAY['eventtime']);
+SELECT deltax_enable_compression('hits_mini', segment_by => ARRAY['counterid'], order_by => ARRAY['eventtime']);
 
 DO $$
 DECLARE
     pname TEXT;
 BEGIN
     FOR pname IN
-        SELECT partition_name FROM seaturtle_partition_info('hits_mini')
+        SELECT partition_name FROM deltax_partition_info('hits_mini')
         WHERE NOT is_compressed
     LOOP
-        PERFORM seaturtle_compress_partition(pname);
+        PERFORM deltax_compress_partition(pname);
     END LOOP;
 END $$;
 

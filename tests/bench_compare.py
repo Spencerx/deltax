@@ -81,14 +81,14 @@ def print_compression_table(results):
     """Table 1: Compression comparison across systems."""
     rows = []
 
-    seaturtle = results.get("pg_seaturtle")
-    if seaturtle:
+    deltax = results.get("pg_deltax")
+    if deltax:
         rows.append((
-            "pg_seaturtle",
-            seaturtle.get("raw_bytes"),
-            seaturtle.get("compressed_bytes"),
-            seaturtle.get("compression_ratio"),
-            seaturtle.get("compression_time_s"),
+            "pg_deltax",
+            deltax.get("raw_bytes"),
+            deltax.get("compressed_bytes"),
+            deltax.get("compression_ratio"),
+            deltax.get("compression_time_s"),
         ))
 
     tsdb = results.get("timescaledb_tsl")
@@ -115,15 +115,15 @@ def print_compression_table(results):
 
 def print_query_table(results):
     """Table 2: Query performance comparison across systems."""
-    seaturtle = results.get("pg_seaturtle")
+    deltax = results.get("pg_deltax")
     tsdb = results.get("timescaledb_tsl")
 
     # Build column list dynamically based on available data
     columns = []  # (header, getter)
 
-    if seaturtle:
-        columns.append(("SeaTurtle Uncompr", lambda qid: seaturtle.get("uncompressed_queries", {}).get(qid)))
-        columns.append(("SeaTurtle Compr", lambda qid: seaturtle.get("compressed_queries", {}).get(qid)))
+    if deltax:
+        columns.append(("DeltaX Uncompr", lambda qid: deltax.get("uncompressed_queries", {}).get(qid)))
+        columns.append(("DeltaX Compr", lambda qid: deltax.get("compressed_queries", {}).get(qid)))
     if tsdb:
         columns.append(("TSDB Uncompr", lambda qid: tsdb.get("uncompressed_queries", {}).get(qid)))
         columns.append(("TSDB Compr", lambda qid: tsdb.get("compressed_queries", {}).get(qid)))
@@ -162,36 +162,36 @@ def print_query_table(results):
 
 
 def print_speedup_table(results):
-    """Table 3: Compressed query speedup (pg_seaturtle vs TimescaleDB matching)."""
-    seaturtle = results.get("pg_seaturtle")
+    """Table 3: Compressed query speedup (pg_deltax vs TimescaleDB matching)."""
+    deltax = results.get("pg_deltax")
     tsdb = results.get("timescaledb_tsl")
 
-    if not seaturtle or not tsdb:
+    if not deltax or not tsdb:
         return
 
-    seaturtle_compr = seaturtle.get("compressed_queries", {})
+    deltax_compr = deltax.get("compressed_queries", {})
     tsdb_compr = tsdb.get("compressed_queries", {})
 
-    if not seaturtle_compr or not tsdb_compr:
+    if not deltax_compr or not tsdb_compr:
         return
 
-    print("\n### Compressed Query Speedup (pg_seaturtle vs TimescaleDB)")
+    print("\n### Compressed Query Speedup (pg_deltax vs TimescaleDB)")
     print()
-    print(f"| {'Query':<6} | {'Description':<25} | {'SeaTurtle (ms)':>12} | {'TSDB (ms)':>10} | {'Speedup':>8} |")
+    print(f"| {'Query':<6} | {'Description':<25} | {'DeltaX (ms)':>12} | {'TSDB (ms)':>10} | {'Speedup':>8} |")
     print(f"|{'-'*8}|{'-'*27}|{'-'*14}|{'-'*12}|{'-'*10}|")
 
-    seaturtle_vals = []
+    deltax_vals = []
     tsdb_vals = []
     for qid, desc, _ in QUERIES:
-        c = seaturtle_compr.get(qid)
+        c = deltax_compr.get(qid)
         t = tsdb_compr.get(qid)
         speedup = fmt_speedup(c, t)
         print(f"| {qid:<6} | {desc:<25} | {fmt_ms(c):>12} | {fmt_ms(t):>10} | {speedup:>8} |")
-        seaturtle_vals.append(c)
+        deltax_vals.append(c)
         tsdb_vals.append(t)
 
     # Summary
-    gm_c = geometric_mean(seaturtle_vals)
+    gm_c = geometric_mean(deltax_vals)
     gm_t = geometric_mean(tsdb_vals)
     speedup = fmt_speedup(gm_c, gm_t)
     print(f"| {'':.<6} | {'Geometric Mean':<25} | {fmt_ms(gm_c):>12} | {fmt_ms(gm_t):>10} | {speedup:>8} |")

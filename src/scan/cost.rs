@@ -27,7 +27,7 @@ pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid) -> (f64, f64, f64) {
     (startup, total, rows)
 }
 
-/// Get partition stats from seaturtle_partition catalog.
+/// Get partition stats from deltax_partition catalog.
 fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     let name = unsafe {
         let name_ptr = pg_sys::get_rel_name(companion_oid);
@@ -40,7 +40,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     };
 
     let result = Spi::get_one_with_args::<i64>(
-        "SELECT row_count FROM seaturtle_partition WHERE table_name = $1 AND is_compressed = true",
+        "SELECT row_count FROM deltax_partition WHERE table_name = $1 AND is_compressed = true",
         &[name.as_str().into()],
     );
 
@@ -71,14 +71,14 @@ pub(super) unsafe fn get_relpages(rel_oid: pg_sys::Oid) -> i32 {
     }
 }
 
-/// Get the uncompressed row count for a companion OID from seaturtle_partition catalog.
+/// Get the uncompressed row count for a companion OID from deltax_partition catalog.
 /// Returns Some(row_count) if positive, None otherwise.
 pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
     let (row_count, _) = get_partition_stats(companion_oid);
     if row_count > 0 { Some(row_count) } else { None }
 }
 
-/// Get per-column ndistinct from seaturtle_partition catalog for a companion OID.
+/// Get per-column ndistinct from deltax_partition catalog for a companion OID.
 /// Returns a map from column name to ndistinct count, or empty if unavailable.
 pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collections::HashMap<String, i64> {
     let name = unsafe {
@@ -92,7 +92,7 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
     };
 
     let result = Spi::get_one_with_args::<pgrx::JsonB>(
-        "SELECT column_ndistinct FROM seaturtle_partition WHERE table_name = $1 AND is_compressed = true",
+        "SELECT column_ndistinct FROM deltax_partition WHERE table_name = $1 AND is_compressed = true",
         &[name.as_str().into()],
     );
 

@@ -5,13 +5,13 @@ use super::cost;
 use super::SyncStatic;
 
 thread_local! {
-    /// Temporary storage for HAVING filters during SeaTurtleAgg planning.
+    /// Temporary storage for HAVING filters during DeltaXAgg planning.
     /// Set in add_agg_path (hook), consumed in plan_agg_path.
     static AGG_HAVING_FILTERS: std::cell::RefCell<Vec<super::exec::HavingFilter>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Store HAVING filters for the next SeaTurtleAgg plan.
+/// Store HAVING filters for the next DeltaXAgg plan.
 pub(super) fn set_agg_having_filters(filters: Vec<super::exec::HavingFilter>) {
     AGG_HAVING_FILTERS.with(|cell| *cell.borrow_mut() = filters);
 }
@@ -22,13 +22,13 @@ pub(super) fn take_agg_having_filters() -> Vec<super::exec::HavingFilter> {
 }
 
 thread_local! {
-    /// Top-N info for SeaTurtleAgg: (limit, sort_output_col, ascending).
-    /// Set in hook (seaturtle_create_upper_paths), consumed in plan_agg_path.
+    /// Top-N info for DeltaXAgg: (limit, sort_output_col, ascending).
+    /// Set in hook (deltax_create_upper_paths), consumed in plan_agg_path.
     static AGG_TOPN_INFO: std::cell::RefCell<Option<(i64, i32, bool)>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Store top-N info for the next SeaTurtleAgg plan.
+/// Store top-N info for the next DeltaXAgg plan.
 pub(super) fn set_agg_topn_info(limit: i64, sort_col: i32, ascending: bool) {
     AGG_TOPN_INFO.with(|cell| *cell.borrow_mut() = Some((limit, sort_col, ascending)));
 }
@@ -39,22 +39,22 @@ fn take_agg_topn_info() -> Option<(i64, i32, bool)> {
 }
 
 // ============================================================================
-// SeaTurtleAppend path/plan methods
+// DeltaXAppend path/plan methods
 // ============================================================================
 
-/// Static CustomPathMethods for SeaTurtleAppend.
-static SEATURTLE_APPEND_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for DeltaXAppend.
+static DELTAX_APPEND_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::SEATURTLE_APPEND_NAME.as_ptr(),
-        PlanCustomPath: Some(plan_seaturtle_append_path),
+        CustomName: super::DELTAX_APPEND_NAME.as_ptr(),
+        PlanCustomPath: Some(plan_deltax_append_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for SeaTurtleAppend.
-static SEATURTLE_APPEND_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for DeltaXAppend.
+static DELTAX_APPEND_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::SEATURTLE_APPEND_NAME.as_ptr(),
-        CreateCustomScanState: Some(super::exec::create_seaturtle_append_state),
+        CustomName: super::DELTAX_APPEND_NAME.as_ptr(),
+        CreateCustomScanState: Some(super::exec::create_deltax_append_state),
     });
 
 /// Static CustomPathMethods struct.
@@ -78,7 +78,7 @@ thread_local! {
     static TOPN_INFO: std::cell::Cell<(i64, bool)> = const { std::cell::Cell::new((0, true)) };
 }
 
-/// Add a SeaTurtleDecompress custom path to the relation's pathlist.
+/// Add a DeltaXDecompress custom path to the relation's pathlist.
 pub unsafe fn add_decompress_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
@@ -202,25 +202,25 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
 }
 
 // ============================================================================
-// SeaTurtleCount: COUNT(*) aggregate pushdown
+// DeltaXCount: COUNT(*) aggregate pushdown
 // ============================================================================
 
-/// Static CustomPathMethods for SeaTurtleCount.
-static SEATURTLE_COUNT_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for DeltaXCount.
+static DELTAX_COUNT_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::SEATURTLE_COUNT_NAME.as_ptr(),
+        CustomName: super::DELTAX_COUNT_NAME.as_ptr(),
         PlanCustomPath: Some(plan_count_star_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for SeaTurtleCount.
-static SEATURTLE_COUNT_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for DeltaXCount.
+static DELTAX_COUNT_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::SEATURTLE_COUNT_NAME.as_ptr(),
+        CustomName: super::DELTAX_COUNT_NAME.as_ptr(),
         CreateCustomScanState: Some(super::exec::create_count_scan_state),
     });
 
-/// Add a SeaTurtleCount custom path to the grouped relation's pathlist.
+/// Add a DeltaXCount custom path to the grouped relation's pathlist.
 ///
 /// This replaces the Aggregate → Scan pipeline with a single CustomScan
 /// that returns the pre-computed row count from segment metadata.
@@ -255,13 +255,13 @@ pub unsafe fn add_count_star_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &SEATURTLE_COUNT_PATH_METHODS.0;
+        (*cpath).methods = &DELTAX_COUNT_PATH_METHODS.0;
 
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
 }
 
-/// PlanCustomPath callback for SeaTurtleCount.
+/// PlanCustomPath callback for DeltaXCount.
 ///
 /// Creates a CustomScan with scanrelid=0 that outputs a single INT8 column
 /// containing the pre-computed COUNT(*) result.
@@ -334,7 +334,7 @@ pub unsafe extern "C-unwind" fn plan_count_star_path(
         (*cscan).custom_private = private_list;
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &SEATURTLE_COUNT_SCAN_METHODS.0;
+        (*cscan).methods = &DELTAX_COUNT_SCAN_METHODS.0;
         (*cscan).flags = 0;
         (*cscan).scan.plan.qual = std::ptr::null_mut();
 
@@ -343,21 +343,21 @@ pub unsafe extern "C-unwind" fn plan_count_star_path(
 }
 
 // ============================================================================
-// SeaTurtleMinMax: MIN/MAX aggregate pushdown on time column
+// DeltaXMinMax: MIN/MAX aggregate pushdown on time column
 // ============================================================================
 
-/// Static CustomPathMethods for SeaTurtleMinMax.
-static SEATURTLE_MINMAX_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for DeltaXMinMax.
+static DELTAX_MINMAX_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::SEATURTLE_MINMAX_NAME.as_ptr(),
+        CustomName: super::DELTAX_MINMAX_NAME.as_ptr(),
         PlanCustomPath: Some(plan_minmax_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for SeaTurtleMinMax.
-static SEATURTLE_MINMAX_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for DeltaXMinMax.
+static DELTAX_MINMAX_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::SEATURTLE_MINMAX_NAME.as_ptr(),
+        CustomName: super::DELTAX_MINMAX_NAME.as_ptr(),
         CreateCustomScanState: Some(super::exec::create_minmax_scan_state),
     });
 
@@ -370,7 +370,7 @@ pub struct MinMaxAggSpec {
     pub typbyval: bool,
 }
 
-/// Add a SeaTurtleMinMax custom path to the grouped relation's pathlist.
+/// Add a DeltaXMinMax custom path to the grouped relation's pathlist.
 ///
 /// This replaces the Aggregate → Scan pipeline with a single CustomScan
 /// that returns the pre-computed MIN/MAX values from segment metadata.
@@ -419,7 +419,7 @@ pub unsafe fn add_minmax_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &SEATURTLE_MINMAX_PATH_METHODS.0;
+        (*cpath).methods = &DELTAX_MINMAX_PATH_METHODS.0;
 
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
@@ -434,7 +434,7 @@ struct PlanAggSpec {
     typbyval: bool,
 }
 
-/// PlanCustomPath callback for SeaTurtleMinMax.
+/// PlanCustomPath callback for DeltaXMinMax.
 ///
 /// Creates a CustomScan with scanrelid=0 that outputs N columns,
 /// one per MIN/MAX aggregate, containing the pre-computed results.
@@ -559,7 +559,7 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
         (*cscan).custom_private = plan_private;
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &SEATURTLE_MINMAX_SCAN_METHODS.0;
+        (*cscan).methods = &DELTAX_MINMAX_SCAN_METHODS.0;
         (*cscan).flags = 0;
         (*cscan).scan.plan.qual = std::ptr::null_mut();
 
@@ -568,25 +568,25 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
 }
 
 // ============================================================================
-// SeaTurtleAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
+// DeltaXAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
 // ============================================================================
 
-/// Static CustomPathMethods for SeaTurtleAgg.
-static SEATURTLE_AGG_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for DeltaXAgg.
+static DELTAX_AGG_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::SEATURTLE_AGG_NAME.as_ptr(),
+        CustomName: super::DELTAX_AGG_NAME.as_ptr(),
         PlanCustomPath: Some(plan_agg_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for SeaTurtleAgg.
-static SEATURTLE_AGG_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for DeltaXAgg.
+static DELTAX_AGG_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::SEATURTLE_AGG_NAME.as_ptr(),
+        CustomName: super::DELTAX_AGG_NAME.as_ptr(),
         CreateCustomScanState: Some(super::exec::create_agg_scan_state),
     });
 
-/// Specification for one aggregate in a SeaTurtleAgg pushdown.
+/// Specification for one aggregate in a DeltaXAgg pushdown.
 pub struct AggSpec {
     pub agg_type: super::exec::AggType,
     pub col_idx: i32,               // 0-based column index, -1 for COUNT(*)
@@ -596,7 +596,7 @@ pub struct AggSpec {
     pub const_offset: i64,          // Only used when expr_kind == AddConst
 }
 
-/// Add a SeaTurtleAgg custom path to the grouped relation's pathlist.
+/// Add a DeltaXAgg custom path to the grouped relation's pathlist.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_agg_path(
     _root: *mut pg_sys::PlannerInfo,
@@ -706,13 +706,13 @@ pub unsafe fn add_agg_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &SEATURTLE_AGG_PATH_METHODS.0;
+        (*cpath).methods = &DELTAX_AGG_PATH_METHODS.0;
 
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
 }
 
-/// PlanCustomPath callback for SeaTurtleAgg.
+/// PlanCustomPath callback for DeltaXAgg.
 ///
 /// Uses PG's provided _tlist for both plan.targetlist and custom_scan_tlist
 /// so that PG's setrefs and sort/pathkey matching work correctly.
@@ -1144,7 +1144,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
 
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &SEATURTLE_AGG_SCAN_METHODS.0;
+        (*cscan).methods = &DELTAX_AGG_SCAN_METHODS.0;
         (*cscan).flags = 0;
 
         let _ = root;
@@ -1200,19 +1200,19 @@ unsafe fn extract_quals_from_baserestrictinfo(
 }
 
 // ============================================================================
-// SeaTurtleAppend: replaces Append with single CustomScan for all compressed partitions
+// DeltaXAppend: replaces Append with single CustomScan for all compressed partitions
 // ============================================================================
 
-// Thread-local to pass Top-N info from add_seaturtle_append_path to plan_seaturtle_append_path.
+// Thread-local to pass Top-N info from add_deltax_append_path to plan_deltax_append_path.
 thread_local! {
     static APPEND_TOPN_INFO: std::cell::Cell<(i64, bool)> = const { std::cell::Cell::new((0, true)) };
 }
 
-/// Add a SeaTurtleAppend custom path to the parent relation's pathlist.
+/// Add a DeltaXAppend custom path to the parent relation's pathlist.
 ///
 /// This replaces the Append node with a single CustomScan that internally
 /// iterates all compressed companion tables.
-pub unsafe fn add_seaturtle_append_path(
+pub unsafe fn add_deltax_append_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
@@ -1256,7 +1256,7 @@ pub unsafe fn add_seaturtle_append_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &SEATURTLE_APPEND_PATH_METHODS.0;
+        (*cpath).methods = &DELTAX_APPEND_PATH_METHODS.0;
 
         // Store Top-N info. Caller validates ORDER BY matches time column.
         if effective_limit > 0 {
@@ -1273,9 +1273,9 @@ pub unsafe fn add_seaturtle_append_path(
     }
 }
 
-/// PlanCustomPath callback for SeaTurtleAppend.
+/// PlanCustomPath callback for DeltaXAppend.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn plan_seaturtle_append_path(
+pub unsafe extern "C-unwind" fn plan_deltax_append_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     best_path: *mut pg_sys::CustomPath,
@@ -1344,7 +1344,7 @@ pub unsafe extern "C-unwind" fn plan_seaturtle_append_path(
         (*cscan).custom_scan_tlist = std::ptr::null_mut();
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &SEATURTLE_APPEND_SCAN_METHODS.0;
+        (*cscan).methods = &DELTAX_APPEND_SCAN_METHODS.0;
         (*cscan).flags = 0;
 
         &mut (*cscan).scan.plan as *mut pg_sys::Plan

@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::compression::{self, CompressionType, CompressedColumnRef};
 use super::SyncStatic;
 
-/// Static CustomExecMethods struct for SeaTurtleDecompress.
+/// Static CustomExecMethods struct for DeltaXDecompress.
 pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
         CustomName: super::CUSTOM_NAME.as_ptr(),
@@ -27,10 +27,10 @@ pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
         ExplainCustomScan: Some(super::explain::explain_custom_scan),
     });
 
-/// Static CustomExecMethods struct for SeaTurtleCount (COUNT(*) pushdown).
-pub(crate) static SEATURTLE_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for DeltaXCount (COUNT(*) pushdown).
+pub(crate) static DELTAX_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::SEATURTLE_COUNT_NAME.as_ptr(),
+        CustomName: super::DELTAX_COUNT_NAME.as_ptr(),
         BeginCustomScan: Some(begin_count_scan),
         ExecCustomScan: Some(exec_count_scan),
         EndCustomScan: Some(end_count_scan),
@@ -45,10 +45,10 @@ pub(crate) static SEATURTLE_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMet
         ExplainCustomScan: Some(super::explain::explain_count_scan),
     });
 
-/// Static CustomExecMethods struct for SeaTurtleMinMax (MIN/MAX pushdown).
-pub(crate) static SEATURTLE_MINMAX_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for DeltaXMinMax (MIN/MAX pushdown).
+pub(crate) static DELTAX_MINMAX_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::SEATURTLE_MINMAX_NAME.as_ptr(),
+        CustomName: super::DELTAX_MINMAX_NAME.as_ptr(),
         BeginCustomScan: Some(begin_minmax_scan),
         ExecCustomScan: Some(exec_minmax_scan),
         EndCustomScan: Some(end_minmax_scan),
@@ -63,11 +63,11 @@ pub(crate) static SEATURTLE_MINMAX_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMe
         ExplainCustomScan: Some(super::explain::explain_minmax_scan),
     });
 
-/// Static CustomExecMethods struct for SeaTurtleAppend.
-pub(crate) static SEATURTLE_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for DeltaXAppend.
+pub(crate) static DELTAX_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::SEATURTLE_APPEND_NAME.as_ptr(),
-        BeginCustomScan: Some(begin_seaturtle_append),
+        CustomName: super::DELTAX_APPEND_NAME.as_ptr(),
+        BeginCustomScan: Some(begin_deltax_append),
         ExecCustomScan: Some(exec_custom_scan),
         EndCustomScan: Some(end_custom_scan),
         ReScanCustomScan: Some(rescan_custom_scan),
@@ -78,7 +78,7 @@ pub(crate) static SEATURTLE_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMe
         ReInitializeDSMCustomScan: None,
         InitializeWorkerCustomScan: None,
         ShutdownCustomScan: None,
-        ExplainCustomScan: Some(super::explain::explain_seaturtle_append),
+        ExplainCustomScan: Some(super::explain::explain_deltax_append),
     });
 
 // Epoch offset: microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
@@ -143,7 +143,7 @@ pub(super) struct DecompressState {
     /// Set lazily on first exec call (PG sets PlanState.instrument after BeginCustomScan).
     instrument: Option<bool>,
 
-    /// Time column name (from hypertable metadata).
+    /// Time column name (from deltatable metadata).
     _time_column: String,
 
     // Segment pruning filters extracted from plan qual
@@ -423,7 +423,7 @@ struct SegmentData {
     toast_pointers: Vec<Vec<u8>>,
 }
 
-/// State for SeaTurtleCount (COUNT(*) pushdown).
+/// State for DeltaXCount (COUNT(*) pushdown).
 pub(super) struct CountScanState {
     pub(super) total_count: i64,
     returned: bool,
@@ -441,7 +441,7 @@ pub(super) struct MinMaxResult {
     pub(super) type_oid: pg_sys::Oid,
 }
 
-/// State for SeaTurtleMinMax (MIN/MAX pushdown on any column, multi-aggregate).
+/// State for DeltaXMinMax (MIN/MAX pushdown on any column, multi-aggregate).
 pub(super) struct MinMaxScanState {
     /// Results: one per aggregate.
     pub(super) results: Vec<MinMaxResult>,
@@ -452,7 +452,7 @@ pub(super) struct MinMaxScanState {
 }
 
 // ============================================================================
-// SeaTurtleAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
+// DeltaXAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -635,7 +635,7 @@ pub(super) struct HavingFilter {
     pub(super) const_val: i64,    // constant value (int8)
 }
 
-/// State for SeaTurtleAgg (aggregate pushdown).
+/// State for DeltaXAgg (aggregate pushdown).
 pub(super) struct AggScanState {
     pub(super) _agg_specs: Vec<AggExecSpec>,
     pub(super) _group_specs: Vec<GroupByColSpec>,
@@ -658,10 +658,10 @@ pub(super) struct AggScanState {
     pub(super) pre_topn_groups: u64,
 }
 
-/// Static CustomExecMethods struct for SeaTurtleAgg.
-pub(crate) static SEATURTLE_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for DeltaXAgg.
+pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::SEATURTLE_AGG_NAME.as_ptr(),
+        CustomName: super::DELTAX_AGG_NAME.as_ptr(),
         BeginCustomScan: Some(begin_agg_scan),
         ExecCustomScan: Some(exec_agg_scan),
         EndCustomScan: Some(end_agg_scan),
@@ -676,7 +676,7 @@ pub(crate) static SEATURTLE_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMetho
         ExplainCustomScan: Some(super::explain::explain_agg_scan),
     });
 
-/// CreateCustomScanState callback for SeaTurtleCount.
+/// CreateCustomScanState callback for DeltaXCount.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn create_count_scan_state(
     cscan: *mut pg_sys::CustomScan,
@@ -686,7 +686,7 @@ pub unsafe extern "C-unwind" fn create_count_scan_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &SEATURTLE_COUNT_EXEC_METHODS.0;
+        (*css).methods = &DELTAX_COUNT_EXEC_METHODS.0;
 
         // Copy custom_private for use in BeginCustomScan
         (*css).custom_ps = (*cscan).custom_private;
@@ -725,7 +725,7 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         // Get custom_private (stored as IntList: [oid, -1, col0, col1, ...])
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_seaturtle: missing companion table OID in custom scan state");
+            pgrx::error!("pg_deltax: missing companion table OID in custom scan state");
         }
 
         let companion_oid =
@@ -762,7 +762,7 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oid);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_seaturtle: companion table not found for OID {}",
+                    "pg_deltax: companion table not found for OID {}",
                     u32::from(companion_oid)
                 );
             }
@@ -793,7 +793,7 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
         state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
             query_ctx,
-            c"SeaTurtleSegment".as_ptr(),
+            c"DeltaXSegment".as_ptr(),
             pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
@@ -809,9 +809,9 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
     }
 }
 
-/// CreateCustomScanState callback for SeaTurtleAppend.
+/// CreateCustomScanState callback for DeltaXAppend.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn create_seaturtle_append_state(
+pub unsafe extern "C-unwind" fn create_deltax_append_state(
     cscan: *mut pg_sys::CustomScan,
 ) -> *mut pg_sys::Node {
     unsafe {
@@ -819,7 +819,7 @@ pub unsafe extern "C-unwind" fn create_seaturtle_append_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &SEATURTLE_APPEND_EXEC_METHODS.0;
+        (*css).methods = &DELTAX_APPEND_EXEC_METHODS.0;
 
         // Copy custom_private for use in BeginCustomScan
         (*css).custom_ps = (*cscan).custom_private;
@@ -828,9 +828,9 @@ pub unsafe extern "C-unwind" fn create_seaturtle_append_state(
     }
 }
 
-/// BeginCustomScan callback for SeaTurtleAppend: load segments from all companion tables.
+/// BeginCustomScan callback for DeltaXAppend: load segments from all companion tables.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn begin_seaturtle_append(
+pub unsafe extern "C-unwind" fn begin_deltax_append(
     node: *mut pg_sys::CustomScanState,
     _estate: *mut pg_sys::EState,
     _eflags: i32,
@@ -838,7 +838,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_seaturtle: missing companion table OIDs in SeaTurtleAppend state");
+            pgrx::error!("pg_deltax: missing companion table OIDs in DeltaXAppend state");
         }
 
         let list_len = (*custom_private).length;
@@ -872,7 +872,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
         }
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_seaturtle: SeaTurtleAppend has no companion tables");
+            pgrx::error!("pg_deltax: DeltaXAppend has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -880,7 +880,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_seaturtle: companion table not found for OID {}",
+                    "pg_deltax: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -1039,7 +1039,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
         state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
             query_ctx,
-            c"SeaTurtleSegment".as_ptr(),
+            c"DeltaXSegment".as_ptr(),
             pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
@@ -1054,7 +1054,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
     }
 }
 
-/// BeginCustomScan callback for SeaTurtleCount: load segment metadata and sum row counts.
+/// BeginCustomScan callback for DeltaXCount: load segment metadata and sum row counts.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn begin_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1064,7 +1064,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_seaturtle: missing companion table OIDs in SeaTurtleCount state");
+            pgrx::error!("pg_deltax: missing companion table OIDs in DeltaXCount state");
         }
 
         let list_len = (*custom_private).length;
@@ -1080,7 +1080,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
         }
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_seaturtle: SeaTurtleCount has no companion tables");
+            pgrx::error!("pg_deltax: DeltaXCount has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -1088,7 +1088,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_seaturtle: companion table not found for OID {}",
+                    "pg_deltax: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -1146,7 +1146,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
     }
 }
 
-/// ExecCustomScan callback for SeaTurtleCount: return one row with the count.
+/// ExecCustomScan callback for DeltaXCount: return one row with the count.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn exec_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1170,7 +1170,7 @@ pub unsafe extern "C-unwind" fn exec_count_scan(
     }
 }
 
-/// EndCustomScan callback for SeaTurtleCount: cleanup state.
+/// EndCustomScan callback for DeltaXCount: cleanup state.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn end_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1181,7 +1181,7 @@ pub unsafe extern "C-unwind" fn end_count_scan(
             let state = Box::from_raw(state_ptr);
             let total_us = state.metadata_us + state.heap_scan_us;
             pgrx::log!(
-                "pg_seaturtle SeaTurtleCount timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
+                "pg_deltax DeltaXCount timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
                  total_count={} segments={}",
                 total_us as f64 / 1000.0,
                 state.metadata_us as f64 / 1000.0,
@@ -1194,7 +1194,7 @@ pub unsafe extern "C-unwind" fn end_count_scan(
     }
 }
 
-/// ReScanCustomScan callback for SeaTurtleCount: reset returned flag.
+/// ReScanCustomScan callback for DeltaXCount: reset returned flag.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn rescan_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1205,7 +1205,7 @@ pub unsafe extern "C-unwind" fn rescan_count_scan(
     }
 }
 
-/// CreateCustomScanState callback for SeaTurtleMinMax.
+/// CreateCustomScanState callback for DeltaXMinMax.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn create_minmax_scan_state(
     cscan: *mut pg_sys::CustomScan,
@@ -1215,7 +1215,7 @@ pub unsafe extern "C-unwind" fn create_minmax_scan_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &SEATURTLE_MINMAX_EXEC_METHODS.0;
+        (*css).methods = &DELTAX_MINMAX_EXEC_METHODS.0;
 
         // Copy custom_private for use in BeginCustomScan
         (*css).custom_ps = (*cscan).custom_private;
@@ -1230,7 +1230,7 @@ struct ExecAggSpec {
     varattno: i32,
 }
 
-/// BeginCustomScan callback for SeaTurtleMinMax: load segment metadata and find global min/max.
+/// BeginCustomScan callback for DeltaXMinMax: load segment metadata and find global min/max.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn begin_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1240,7 +1240,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_seaturtle: missing companion table OIDs in SeaTurtleMinMax state");
+            pgrx::error!("pg_deltax: missing companion table OIDs in DeltaXMinMax state");
         }
 
         let list_len = (*custom_private).length;
@@ -1281,7 +1281,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
         let _ = num_aggs;
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_seaturtle: SeaTurtleMinMax has no companion tables");
+            pgrx::error!("pg_deltax: DeltaXMinMax has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -1289,7 +1289,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_seaturtle: companion table not found for OID {}",
+                    "pg_deltax: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -1311,7 +1311,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
                 if idx < meta.col_names.len() {
                     meta.col_names[idx].clone()
                 } else {
-                    pgrx::error!("pg_seaturtle: SeaTurtleMinMax varattno {} out of range", spec.varattno);
+                    pgrx::error!("pg_deltax: DeltaXMinMax varattno {} out of range", spec.varattno);
                 }
             })
             .collect();
@@ -1400,7 +1400,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
     }
 }
 
-/// ExecCustomScan callback for SeaTurtleMinMax: return one row with N min/max values.
+/// ExecCustomScan callback for DeltaXMinMax: return one row with N min/max values.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn exec_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1426,7 +1426,7 @@ pub unsafe extern "C-unwind" fn exec_minmax_scan(
     }
 }
 
-/// EndCustomScan callback for SeaTurtleMinMax: cleanup state.
+/// EndCustomScan callback for DeltaXMinMax: cleanup state.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn end_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1441,7 +1441,7 @@ pub unsafe extern "C-unwind" fn end_minmax_scan(
                 format!("{}({})=null={}", agg_name, r.col_name, r.is_null)
             }).collect();
             pgrx::log!(
-                "pg_seaturtle SeaTurtleMinMax timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
+                "pg_deltax DeltaXMinMax timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
                  {} segments={}",
                 total_us as f64 / 1000.0,
                 state.metadata_us as f64 / 1000.0,
@@ -1454,7 +1454,7 @@ pub unsafe extern "C-unwind" fn end_minmax_scan(
     }
 }
 
-/// ReScanCustomScan callback for SeaTurtleMinMax: reset returned flag.
+/// ReScanCustomScan callback for DeltaXMinMax: reset returned flag.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn rescan_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1466,10 +1466,10 @@ pub unsafe extern "C-unwind" fn rescan_minmax_scan(
 }
 
 // ============================================================================
-// SeaTurtleAgg execution callbacks
+// DeltaXAgg execution callbacks
 // ============================================================================
 
-/// CreateCustomScanState callback for SeaTurtleAgg.
+/// CreateCustomScanState callback for DeltaXAgg.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn create_agg_scan_state(
     cscan: *mut pg_sys::CustomScan,
@@ -1479,7 +1479,7 @@ pub unsafe extern "C-unwind" fn create_agg_scan_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &SEATURTLE_AGG_EXEC_METHODS.0;
+        (*css).methods = &DELTAX_AGG_EXEC_METHODS.0;
         (*css).custom_ps = (*cscan).custom_private;
 
         css as *mut pg_sys::Node
@@ -1493,7 +1493,7 @@ enum OutputEntry {
     Group(usize),  // index into group_specs
 }
 
-/// BeginCustomScan callback for SeaTurtleAgg: decompress and aggregate.
+/// BeginCustomScan callback for DeltaXAgg: decompress and aggregate.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn begin_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1503,7 +1503,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_seaturtle: missing custom_private in SeaTurtleAgg state");
+            pgrx::error!("pg_deltax: missing custom_private in DeltaXAgg state");
         }
 
         let list_len = (*custom_private).length;
@@ -1723,7 +1723,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let _ = idx;
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_seaturtle: SeaTurtleAgg has no companion tables");
+            pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -1731,7 +1731,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_seaturtle: companion table not found for OID {}",
+                    "pg_deltax: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -2093,7 +2093,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
         let segment_mcxt = pg_sys::AllocSetContextCreateInternal(
             query_ctx,
-            c"SeaTurtleAggSegment".as_ptr(),
+            c"DeltaXAggSegment".as_ptr(),
             pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
@@ -3408,7 +3408,7 @@ unsafe fn finalize_accumulator(acc: &AggAccumulator, spec: &AggExecSpec) -> (pg_
     }
 }
 
-/// ExecCustomScan callback for SeaTurtleAgg: return result rows.
+/// ExecCustomScan callback for DeltaXAgg: return result rows.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn exec_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -3435,7 +3435,7 @@ pub unsafe extern "C-unwind" fn exec_agg_scan(
     }
 }
 
-/// EndCustomScan callback for SeaTurtleAgg.
+/// EndCustomScan callback for DeltaXAgg.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn end_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -3446,7 +3446,7 @@ pub unsafe extern "C-unwind" fn end_agg_scan(
             let state = Box::from_raw(state_ptr);
             let total_us = state.metadata_us + state.heap_scan_us + state.decompress_us + state.agg_us;
             pgrx::log!(
-                "pg_seaturtle SeaTurtleAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
+                "pg_deltax DeltaXAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
                  decompress={:.1}ms  agg={:.1}ms  | \
                  segments={} rows_processed={} result_rows={}",
                 total_us as f64 / 1000.0,
@@ -3463,7 +3463,7 @@ pub unsafe extern "C-unwind" fn end_agg_scan(
     }
 }
 
-/// ReScanCustomScan callback for SeaTurtleAgg.
+/// ReScanCustomScan callback for DeltaXAgg.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn rescan_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -3488,12 +3488,12 @@ fn load_metadata(
     client: &pgrx::spi::SpiClient<'_>,
     companion_name: &str,
 ) -> MetadataInfo {
-    // Get the partition's hypertable info
+    // Get the partition's deltatable info
     let mut ht_result = client
         .select(
             "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name
-             FROM seaturtle_partition p
-             JOIN seaturtle_hypertable h ON h.id = p.hypertable_id
+             FROM deltax_partition p
+             JOIN deltax_deltatable h ON h.id = p.deltatable_id
              WHERE p.table_name = $1 AND p.is_compressed = true",
             None,
             &[companion_name.into()],
@@ -3502,7 +3502,7 @@ fn load_metadata(
 
     let ht_row = ht_result.next().unwrap_or_else(|| {
         pgrx::error!(
-            "pg_seaturtle: no compressed partition info found for {}",
+            "pg_deltax: no compressed partition info found for {}",
             companion_name
         );
     });
@@ -5032,7 +5032,7 @@ unsafe fn exec_topn_two_pass(
             let num_batch_quals = state.batch_quals.len();
             if num_plan_quals > num_batch_quals {
                 pgrx::log!(
-                    "pg_seaturtle topn: disabled (plan_quals={} > batch_quals={})",
+                    "pg_deltax topn: disabled (plan_quals={} > batch_quals={})",
                     num_plan_quals,
                     num_batch_quals,
                 );
@@ -5043,7 +5043,7 @@ unsafe fn exec_topn_two_pass(
         }
 
         pgrx::log!(
-            "pg_seaturtle topn: limit={} ascending={} sort_col={} segments={}",
+            "pg_deltax topn: limit={} ascending={} sort_col={} segments={}",
             effective_limit,
             state.topn_ascending,
             sort_col,
@@ -5574,7 +5574,7 @@ unsafe fn exec_topn_two_pass(
         pg_sys::MemoryContextSetParent(phase1_persist_mcxt, state.segment_mcxt);
 
         pgrx::log!(
-            "pg_seaturtle topn: candidates={} top_n={} phase2_segments={}",
+            "pg_deltax topn: candidates={} top_n={} phase2_segments={}",
             state.timing.topn_candidates,
             state.topn_buffer.len(),
             state.timing.topn_phase2_segments,
@@ -5964,7 +5964,7 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
             let t = &state.timing;
             let total_us = t.metadata_us + t.heap_scan_us + t.decompress_us + t.batch_eval_us + t.emit_us;
             pgrx::log!(
-                "pg_seaturtle timing: total={:.1}ms meta={:.1} heap={:.1} decomp={:.1} batch={:.1} emit={:.1}",
+                "pg_deltax timing: total={:.1}ms meta={:.1} heap={:.1} decomp={:.1} batch={:.1} emit={:.1}",
                 total_us as f64 / 1000.0,
                 t.metadata_us as f64 / 1000.0,
                 t.heap_scan_us as f64 / 1000.0,
@@ -5973,7 +5973,7 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
                 t.emit_us as f64 / 1000.0,
             );
             pgrx::log!(
-                "pg_seaturtle decomp: p1={:.1}ms p2={:.1}ms(text={:.1}/{} nontext={:.1}/{}) \
+                "pg_deltax decomp: p1={:.1}ms p2={:.1}ms(text={:.1}/{} nontext={:.1}/{}) \
                  segs={}/{} mmskip={} p2skip={} rows={}/{}/{} topn={}/{}",
                 t.phase1_us as f64 / 1000.0,
                 t.phase2_us as f64 / 1000.0,

@@ -1,9 +1,9 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
 
-/// Metadata for a seaturtle-managed hypertable.
+/// Metadata for a deltax-managed deltatable.
 #[derive(Debug, Clone)]
-pub struct HypertableInfo {
+pub struct DeltatableInfo {
     pub id: i32,
     pub schema_name: String,
     pub table_name: String,
@@ -21,7 +21,7 @@ pub struct HypertableInfo {
 #[allow(dead_code)]
 pub struct PartitionInfo {
     pub id: i32,
-    pub hypertable_id: i32,
+    pub deltatable_id: i32,
     pub schema_name: String,
     pub table_name: String,
     pub range_start: TimestampWithTimeZone,
@@ -29,8 +29,8 @@ pub struct PartitionInfo {
     pub is_compressed: bool,
 }
 
-/// Register a new hypertable in the catalog. Returns the new hypertable id.
-pub fn register_hypertable(
+/// Register a new deltatable in the catalog. Returns the new deltatable id.
+pub fn register_deltatable(
     client: &mut SpiClient,
     schema_name: &str,
     table_name: &str,
@@ -38,7 +38,7 @@ pub fn register_hypertable(
     partition_interval: &pgrx::datum::Interval,
 ) -> spi::SpiResult<i32> {
     let result = client.update(
-        "INSERT INTO seaturtle_hypertable (schema_name, table_name, time_column, partition_interval)
+        "INSERT INTO deltax_deltatable (schema_name, table_name, time_column, partition_interval)
          VALUES ($1, $2, $3, $4)
          RETURNING id",
         None,
@@ -55,19 +55,19 @@ pub fn register_hypertable(
 /// Register a partition in the catalog.
 pub fn register_partition(
     client: &mut SpiClient,
-    hypertable_id: i32,
+    deltatable_id: i32,
     schema_name: &str,
     table_name: &str,
     range_start: TimestampWithTimeZone,
     range_end: TimestampWithTimeZone,
 ) -> spi::SpiResult<()> {
     client.update(
-        "INSERT INTO seaturtle_partition (hypertable_id, schema_name, table_name, range_start, range_end)
+        "INSERT INTO deltax_partition (deltatable_id, schema_name, table_name, range_start, range_end)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (schema_name, table_name) DO NOTHING",
         None,
         &[
-            hypertable_id.into(),
+            deltatable_id.into(),
             schema_name.into(),
             table_name.into(),
             range_start.into(),
@@ -77,15 +77,15 @@ pub fn register_partition(
     Ok(())
 }
 
-/// Look up a hypertable by schema + table name.
-pub fn get_hypertable(
+/// Look up a deltatable by schema + table name.
+pub fn get_deltatable(
     client: &SpiClient,
     schema_name: &str,
     table_name: &str,
-) -> spi::SpiResult<Option<HypertableInfo>> {
+) -> spi::SpiResult<Option<DeltatableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval
-         FROM seaturtle_hypertable
+         FROM deltax_deltatable
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],
@@ -101,18 +101,18 @@ pub fn get_hypertable(
         None => return Ok(None),
     };
 
-    get_hypertable_by_id(client, id)
+    get_deltatable_by_id(client, id)
 }
 
-/// Look up a hypertable by its catalog id.
-pub fn get_hypertable_by_id(
+/// Look up a deltatable by its catalog id.
+pub fn get_deltatable_by_id(
     client: &SpiClient,
     id: i32,
-) -> spi::SpiResult<Option<HypertableInfo>> {
+) -> spi::SpiResult<Option<DeltatableInfo>> {
     let mut result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size
-         FROM seaturtle_hypertable
+         FROM deltax_deltatable
          WHERE id = $1",
         None,
         &[id.into()],
@@ -137,7 +137,7 @@ pub fn get_hypertable_by_id(
         let drop_after: Option<pgrx::datum::Interval> =
             row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?;
         let segment_size: i32 = row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000);
-        return Ok(Some(HypertableInfo {
+        return Ok(Some(DeltatableInfo {
             id: ht_id,
             schema_name: s,
             table_name: t,
@@ -154,21 +154,21 @@ pub fn get_hypertable_by_id(
     Ok(None)
 }
 
-/// Get all hypertables.
-pub fn get_all_hypertables(
+/// Get all deltatables.
+pub fn get_all_deltatables(
     client: &SpiClient,
-) -> spi::SpiResult<Vec<HypertableInfo>> {
+) -> spi::SpiResult<Vec<DeltatableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size
-         FROM seaturtle_hypertable",
+         FROM deltax_deltatable",
         None,
         &[],
     )?;
 
-    let mut hypertables = Vec::new();
+    let mut deltatables = Vec::new();
     for row in result {
-        hypertables.push(HypertableInfo {
+        deltatables.push(DeltatableInfo {
             id: row.get_datum_by_ordinal(1)?.value::<i32>()?.unwrap(),
             schema_name: row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
@@ -181,28 +181,28 @@ pub fn get_all_hypertables(
             segment_size: row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000),
         });
     }
-    Ok(hypertables)
+    Ok(deltatables)
 }
 
-/// Get partitions for a hypertable, ordered by range_start.
+/// Get partitions for a deltatable, ordered by range_start.
 pub fn get_partitions(
     client: &SpiClient,
-    hypertable_id: i32,
+    deltatable_id: i32,
 ) -> spi::SpiResult<Vec<PartitionInfo>> {
     let result = client.select(
-        "SELECT id, hypertable_id, schema_name, table_name, range_start, range_end, is_compressed
-         FROM seaturtle_partition
-         WHERE hypertable_id = $1
+        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
+         FROM deltax_partition
+         WHERE deltatable_id = $1
          ORDER BY range_start",
         None,
-        &[hypertable_id.into()],
+        &[deltatable_id.into()],
     )?;
 
     let mut partitions = Vec::new();
     for row in result {
         partitions.push(PartitionInfo {
             id: row.get_datum_by_ordinal(1)?.value::<i32>()?.unwrap(),
-            hypertable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
+            deltatable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
             schema_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
             range_start: row.get_datum_by_ordinal(5)?.value::<TimestampWithTimeZone>()?.unwrap(),
@@ -213,10 +213,10 @@ pub fn get_partitions(
     Ok(partitions)
 }
 
-/// Update compression settings for a hypertable.
-pub fn update_hypertable_compression(
+/// Update compression settings for a deltatable.
+pub fn update_deltatable_compression(
     client: &mut SpiClient,
-    hypertable_id: i32,
+    deltatable_id: i32,
     segment_by: &[String],
     order_by: &[String],
     segment_size: i32,
@@ -224,52 +224,52 @@ pub fn update_hypertable_compression(
     let seg_vec = segment_by.to_vec();
     let ord_vec = order_by.to_vec();
     client.update(
-        "UPDATE seaturtle_hypertable
+        "UPDATE deltax_deltatable
          SET segment_by = $1, order_by = $2, segment_size = $3
          WHERE id = $4",
         None,
-        &[seg_vec.into(), ord_vec.into(), segment_size.into(), hypertable_id.into()],
+        &[seg_vec.into(), ord_vec.into(), segment_size.into(), deltatable_id.into()],
     )?;
     Ok(())
 }
 
-/// Set the compress_after interval for a hypertable.
+/// Set the compress_after interval for a deltatable.
 pub fn set_compress_after(
     client: &mut SpiClient,
-    hypertable_id: i32,
+    deltatable_id: i32,
     compress_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE seaturtle_hypertable SET compress_after = $1 WHERE id = $2",
+        "UPDATE deltax_deltatable SET compress_after = $1 WHERE id = $2",
         None,
-        &[(*compress_after).into(), hypertable_id.into()],
+        &[(*compress_after).into(), deltatable_id.into()],
     )?;
     Ok(())
 }
 
-/// Set the drop_after interval for a hypertable (retention policy).
+/// Set the drop_after interval for a deltatable (retention policy).
 pub fn set_drop_after(
     client: &mut SpiClient,
-    hypertable_id: i32,
+    deltatable_id: i32,
     drop_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE seaturtle_hypertable SET drop_after = $1 WHERE id = $2",
+        "UPDATE deltax_deltatable SET drop_after = $1 WHERE id = $2",
         None,
-        &[(*drop_after).into(), hypertable_id.into()],
+        &[(*drop_after).into(), deltatable_id.into()],
     )?;
     Ok(())
 }
 
-/// Clear the drop_after interval for a hypertable (remove retention policy).
+/// Clear the drop_after interval for a deltatable (remove retention policy).
 pub fn clear_drop_after(
     client: &mut SpiClient,
-    hypertable_id: i32,
+    deltatable_id: i32,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE seaturtle_hypertable SET drop_after = NULL WHERE id = $1",
+        "UPDATE deltax_deltatable SET drop_after = NULL WHERE id = $1",
         None,
-        &[hypertable_id.into()],
+        &[deltatable_id.into()],
     )?;
     Ok(())
 }
@@ -284,7 +284,7 @@ pub fn mark_partition_compressed(
     column_ndistinct_json: &str,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE seaturtle_partition
+        "UPDATE deltax_partition
          SET is_compressed = true, compressed_size = $1, raw_size = $2,
              row_count = $3, compressed_at = now(),
              column_ndistinct = $4::jsonb
@@ -307,7 +307,7 @@ pub fn mark_partition_decompressed(
     partition_id: i32,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE seaturtle_partition
+        "UPDATE deltax_partition
          SET is_compressed = false, compressed_size = NULL, raw_size = NULL,
              row_count = NULL, compressed_at = NULL
          WHERE id = $1",
@@ -324,8 +324,8 @@ pub fn get_partition_by_name(
     table_name: &str,
 ) -> spi::SpiResult<Option<PartitionInfo>> {
     let mut result = client.select(
-        "SELECT id, hypertable_id, schema_name, table_name, range_start, range_end, is_compressed
-         FROM seaturtle_partition
+        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
+         FROM deltax_partition
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],
@@ -334,7 +334,7 @@ pub fn get_partition_by_name(
     if let Some(row) = result.next() {
         return Ok(Some(PartitionInfo {
             id: row.get_datum_by_ordinal(1)?.value::<i32>()?.unwrap(),
-            hypertable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
+            deltatable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
             schema_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
             range_start: row.get_datum_by_ordinal(5)?.value::<TimestampWithTimeZone>()?.unwrap(),

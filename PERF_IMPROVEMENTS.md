@@ -1,6 +1,6 @@
 # Performance Improvements Roadmap
 
-Tracking SeaTurtle compressed vs uncompressed performance on ClickBench.
+Tracking DeltaX compressed vs uncompressed performance on ClickBench.
 
 ## Current Benchmark (2026-03-15)
 
@@ -56,7 +56,7 @@ Tracking SeaTurtle compressed vs uncompressed performance on ClickBench.
 
 ## Where the time goes
 
-The SeaTurtle scan has five phases: **metadata** (SPI catalog lookup), **heap_scan**
+The DeltaX scan has five phases: **metadata** (SPI catalog lookup), **heap_scan**
 (load compressed blobs from companion table), **decompress** (decode blobs to
 datums), **batch_eval** (vectorized WHERE on decoded arrays), and **emit** (fill
 slot + qual + projection, row at a time).
@@ -80,13 +80,13 @@ just to feed PG's tuple-at-a-time executor.
 **Impact: Q1 42ms -> 0.5ms**
 
 Sum `_row_count` from segment metadata. Zero decompression. Detected in planner
-hook; `SeaTurtleCount` node returns a single row.
+hook; `DeltaXCount` node returns a single row.
 
 ### 2. MIN/MAX pushdown [DONE]
 
 **Impact: Q7 65ms -> 0.6ms (generalized to all orderable columns)**
 
-Scan per-column `_min_`/`_max_` metadata in companion table. `SeaTurtleMinMax`
+Scan per-column `_min_`/`_max_` metadata in companion table. `DeltaXMinMax`
 node returns global min/max without decompressing.
 
 ### 3. Batch qual evaluation [DONE]
@@ -123,7 +123,7 @@ for arbitrary WHERE clauses.
 
 **Impact: Q25 64ms -> 24ms**
 
-Segments sorted by `min_time`; SeaTurtleDecompress paths advertise pathkeys.
+Segments sorted by `min_time`; DeltaXDecompress paths advertise pathkeys.
 PG creates MergeAppend + Incremental Sort + Limit plans.
 
 ### 8. Arena allocation for text varlena [DONE]
@@ -144,7 +144,7 @@ BYTEA blobs detoasted only for surviving segments.
 
 **Impact: Q3 11ms, Q5 20ms, Q8 4.7ms**
 
-`SeaTurtleAgg` node computes aggregates directly on decompressed columns. Handles
+`DeltaXAgg` node computes aggregates directly on decompressed columns. Handles
 `SUM`, `AVG`, `COUNT`, `COUNT(DISTINCT)`, `GROUP BY` on segment_by columns.
 
 ### 11. Lazy column decompression (two-phase decompress) [DONE]
@@ -166,7 +166,7 @@ columns materialized.
 **Impact: Q30 425ms -> improved**
 
 Detect `SUM(col + const)` pattern (`AggExpr::AddConst`) in planner hook.
-SeaTurtleAgg computes all sums in a single pass over the decoded column,
+DeltaXAgg computes all sums in a single pass over the decoded column,
 applying the constant offset algebraically: `result = base_sum + const * count`.
 When all agg specs reference the same column, the column is decoded once and
 all results derived from a single accumulator.
@@ -177,7 +177,7 @@ all results derived from a single accumulator.
 
 `AggExpr::LengthOf` variant computes string length on raw `&str` slices during
 decompression without varlena allocation. Combined with aggregate pushdown,
-`AVG(length(URL))` is computed entirely inside SeaTurtleAgg — zero text
+`AVG(length(URL))` is computed entirely inside DeltaXAgg — zero text
 materialization.
 
 ### 14. Regex pushdown via Rust regex crate [DONE]
@@ -204,7 +204,7 @@ min/max range doesn't overlap any IN-list value are skipped entirely.
 
 **Impact: Queries with date_trunc/extract/regexp_replace in GROUP BY**
 
-SeaTurtleAgg handles GROUP BY on expressions, not just plain columns:
+DeltaXAgg handles GROUP BY on expressions, not just plain columns:
 
 - **`date_trunc(unit, col)`** — truncation computed on epoch microseconds
   using pure arithmetic (`date_trunc_unit_to_usecs`). Supports second, minute,
@@ -222,7 +222,7 @@ caching.
 **Impact: Eliminates post-aggregation filtering in PG executor**
 
 Simple HAVING clauses of the form `HAVING agg_result <op> const` (where `<op>`
-is `>`, `<`, `>=`, `<=`, `=`, `<>`) are pushed into SeaTurtleAgg. Filters are
+is `>`, `<`, `>=`, `<=`, `=`, `<>`) are pushed into DeltaXAgg. Filters are
 applied immediately after aggregation, before result rows are emitted. Encoded
 as `HavingFilter { agg_idx, op, const_val }` in `custom_private`.
 
@@ -260,10 +260,10 @@ Pathkeys are advertised so PG eliminates the Sort node.
 
 **Impact: GROUP BY col ORDER BY agg(...) LIMIT N on aggregate queries**
 
-When `ORDER BY <aggregate> [ASC|DESC] LIMIT N` is detected on a SeaTurtleAgg
+When `ORDER BY <aggregate> [ASC|DESC] LIMIT N` is detected on a DeltaXAgg
 query, the aggregation result is sorted by the specified aggregate column and
 truncated to N rows inside the scan node. Pathkeys are set on the CustomPath
-so PG eliminates the redundant Sort node above SeaTurtleAgg. EXPLAIN ANALYZE
+so PG eliminates the redundant Sort node above DeltaXAgg. EXPLAIN ANALYZE
 shows `TopN: limit=N sort_col=X direction=ASC|DESC pre_topn_groups=M`.
 
 ### 22. Per-segment SUM/COUNT metadata for aggregate pushdown [DONE]
@@ -329,7 +329,7 @@ supported; for `-`, the constant is negated so the offset is always stored as
 addition. At execution time, the group key is computed as `col_value + offset`.
 
 For Q36's `GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3`, all four keys
-are pushed into SeaTurtleAgg as a 4-element key vector. The scan processes 1M
+are pushed into DeltaXAgg as a 4-element key vector. The scan processes 1M
 rows and emits only 10 (via TopN pushdown), eliminating the PG hash agg that
 previously dominated at 143ms.
 
@@ -373,7 +373,7 @@ Referer (high-cardinality LZ4). The regex runs in Rust but decompression of
 the full Referer column dominates. (#24 evaluated and deemed not worth implementing.)
 
 **Q33 (1.35x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg.
-SeaTurtle scan=21ms, but PG hash agg on 1M rows with ~1M groups dominates.
+DeltaX scan=21ms, but PG hash agg on 1M rows with ~1M groups dominates.
 Would require pushing hash agg into scan — very high effort.
 
 ---

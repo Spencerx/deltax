@@ -1,6 +1,6 @@
 """ClickBench benchmark for TimescaleDB.
 
-Compares TimescaleDB compression performance against pg_seaturtle on the same
+Compares TimescaleDB compression performance against pg_deltax on the same
 ClickBench dataset and queries. Uses the official ClickBench TimescaleDB config:
 no segment_by, order_by=counterid,userid,eventtime.
 

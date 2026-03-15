@@ -7,6 +7,6 @@ tests/__pycache__/
 .DS_Store
 
 
-pg_seaturtle_design_v03.md
+pg_deltax_design_v03.md
 tests/.data/
 tests/.bench_results/

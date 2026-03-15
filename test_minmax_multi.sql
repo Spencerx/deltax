@@ -1,6 +1,6 @@
 -- Test multi-aggregate MIN/MAX pushdown on non-time columns
-CREATE EXTENSION IF NOT EXISTS pg_seaturtle;
-SET pg_seaturtle.mock_now = '2025-01-15 12:00:00+00';
+CREATE EXTENSION IF NOT EXISTS pg_deltax;
+SET pg_deltax.mock_now = '2025-01-15 12:00:00+00';
 
 -- Create table with multiple numeric/date columns
 CREATE TABLE test_minmax (
@@ -11,8 +11,8 @@ CREATE TABLE test_minmax (
     small_val SMALLINT NOT NULL
 );
 
-SELECT seaturtle_create_table('test_minmax', 'ts');
-SELECT seaturtle_enable_compression('test_minmax', order_by => ARRAY['ts']);
+SELECT deltax_create_table('test_minmax', 'ts');
+SELECT deltax_enable_compression('test_minmax', order_by => ARRAY['ts']);
 
 -- Insert data into a single partition (2025-01-14)
 INSERT INTO test_minmax (ts, event_date, counter_id, value, small_val)
@@ -25,10 +25,10 @@ SELECT
 FROM generate_series(1, 10000) AS i;
 
 -- Show partition info
-SELECT table_name FROM seaturtle_partition WHERE table_name LIKE 'test_minmax%' ORDER BY range_start;
+SELECT table_name FROM deltax_partition WHERE table_name LIKE 'test_minmax%' ORDER BY range_start;
 
 -- Compress the partition that has data
-SELECT seaturtle_compress_partition('test_minmax_p20250114');
+SELECT deltax_compress_partition('test_minmax_p20250114');
 
 -- Test 1: Single MIN on non-time column
 EXPLAIN (COSTS OFF) SELECT MIN(event_date) FROM test_minmax;

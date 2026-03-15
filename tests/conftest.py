@@ -6,19 +6,19 @@ import uuid
 import psycopg
 import pytest
 
-CONTAINER_NAME = "pg_seaturtle_inttest"
+CONTAINER_NAME = "pg_deltax_inttest"
 HOST_PORT = 15432
 PG_PASSWORD = "postgres"
 PG_USER = "postgres"
-BENCH_VOLUME = "pg_seaturtle_bench_pgdata"
+BENCH_VOLUME = "pg_deltax_bench_pgdata"
 
 
 @pytest.fixture(scope="session")
 def pg_container():
     """Start the runtime container, wait for PG readiness, yield, then tear down."""
-    image = os.environ.get("PG_SEATURTLE_IMAGE")
+    image = os.environ.get("PG_DELTAX_IMAGE")
     if not image:
-        pytest.skip("PG_SEATURTLE_IMAGE not set")
+        pytest.skip("PG_DELTAX_IMAGE not set")
 
     # Clean up any leftover container from a previous run
     subprocess.run(
@@ -36,7 +36,7 @@ def pg_container():
     ]
     if persist:
         cmd += ["-v", f"{BENCH_VOLUME}:/var/lib/postgresql/data"]
-    cmd += [image, "-c", "shared_preload_libraries=pg_seaturtle"]
+    cmd += [image, "-c", "shared_preload_libraries=pg_deltax"]
     subprocess.check_call(cmd)
 
     # Wait for readiness
@@ -106,7 +106,7 @@ def db(pg_container):
         password=PG_PASSWORD,
         dbname=db_name,
     )
-    conn.execute("CREATE EXTENSION pg_seaturtle")
+    conn.execute("CREATE EXTENSION pg_deltax")
     conn.commit()
 
     yield conn
@@ -132,13 +132,13 @@ def postgres_db(pg_container):
         password=PG_PASSWORD,
         dbname="postgres",
     )
-    conn.execute("CREATE EXTENSION IF NOT EXISTS pg_seaturtle")
+    conn.execute("CREATE EXTENSION IF NOT EXISTS pg_deltax")
     conn.commit()
 
     yield conn
 
     # The connection may be in an error state after a failed test; roll back first
     conn.rollback()
-    conn.execute("RESET pg_seaturtle.mock_now")
+    conn.execute("RESET pg_deltax.mock_now")
     conn.commit()
     conn.close()

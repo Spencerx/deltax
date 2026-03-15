@@ -11,7 +11,7 @@ fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
         .unwrap_or(0);
 
     if months != 0 {
-        pgrx::error!("pg_seaturtle: monthly partition intervals are not supported; use days instead");
+        pgrx::error!("pg_deltax: monthly partition intervals are not supported; use days instead");
     }
 
     let days: i64 = interval
@@ -74,7 +74,7 @@ fn align_to_interval(ts_usec: i64, interval_usec: i64) -> i64 {
 }
 
 /// Get current time as microseconds since Unix epoch via SPI.
-/// Respects the `pg_seaturtle.mock_now` GUC when set.
+/// Respects the `pg_deltax.mock_now` GUC when set.
 fn now_usec() -> i64 {
     if let Some(mock_cstr) = crate::MOCK_NOW.get() {
         let mock_val = mock_cstr.to_str().unwrap_or("");
@@ -83,7 +83,7 @@ fn now_usec() -> i64 {
                 "SELECT (EXTRACT(EPOCH FROM $1::timestamptz) * 1000000)::int8",
                 &[mock_val.into()],
             )
-            .expect("failed to parse pg_seaturtle.mock_now")
+            .expect("failed to parse pg_deltax.mock_now")
             .unwrap();
         }
     }
@@ -134,12 +134,12 @@ pub fn create_partition(
     Ok(())
 }
 
-/// Core logic: create initial partitions for a hypertable.
+/// Core logic: create initial partitions for a deltatable.
 pub fn create_initial_partitions(
     client: &mut SpiClient,
     schema_name: &str,
     table_name: &str,
-    hypertable_id: i32,
+    deltatable_id: i32,
     interval: &pgrx::datum::Interval,
     premake: i32,
 ) -> spi::SpiResult<i32> {
@@ -162,7 +162,7 @@ pub fn create_initial_partitions(
         let start_tstz = usec_to_tstz(start_usec);
         let end_tstz = usec_to_tstz(end_usec);
 
-        catalog::register_partition(client, hypertable_id, schema_name, &part_name, start_tstz, end_tstz)?;
+        catalog::register_partition(client, deltatable_id, schema_name, &part_name, start_tstz, end_tstz)?;
         count += 1;
     }
 
@@ -179,10 +179,10 @@ pub fn create_initial_partitions(
     Ok(count)
 }
 
-/// Ensure future partitions exist for a hypertable. Called by the background worker.
+/// Ensure future partitions exist for a deltatable. Called by the background worker.
 pub fn ensure_future_partitions(
     client: &mut SpiClient,
-    ht: &catalog::HypertableInfo,
+    ht: &catalog::DeltatableInfo,
     premake: i32,
 ) -> spi::SpiResult<i32> {
     let interval_usec = interval_to_usec(&ht.partition_interval);
@@ -197,7 +197,7 @@ pub fn ensure_future_partitions(
 
         // Check if partition already registered
         let exists = client.select(
-            "SELECT 1 FROM seaturtle_partition WHERE schema_name = $1 AND table_name = $2",
+            "SELECT 1 FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
             None,
             &[ht.schema_name.as_str().into(), part_name.as_str().into()],
         )?;
@@ -223,7 +223,7 @@ pub fn ensure_future_partitions(
 // ============================================================================
 
 #[pg_extern]
-fn seaturtle_create_table(
+fn deltax_create_table(
     relation: &str,
     time_column: &str,
     partition_interval: default!(pgrx::datum::Interval, "'1 day'"),
@@ -233,12 +233,12 @@ fn seaturtle_create_table(
         // 1. Resolve schema and table name
         let (schema, table) = resolve_relation(client, relation);
 
-        // 2. Check if already registered as a seaturtle table
-        if catalog::get_hypertable(client, &schema, &table)
+        // 2. Check if already registered as a deltax table
+        if catalog::get_deltatable(client, &schema, &table)
             .unwrap_or(None)
             .is_some()
         {
-            return format!("Table {}.{} is already a seaturtle table", schema, table);
+            return format!("Table {}.{} is already a deltax table", schema, table);
         }
 
         // 3. Validate the time column exists and is a timestamp type
@@ -266,7 +266,7 @@ fn seaturtle_create_table(
 
             if has_rows {
                 pgrx::error!(
-                    "pg_seaturtle: table {}.{} is not empty. Only empty tables are supported.",
+                    "pg_deltax: table {}.{} is not empty. Only empty tables are supported.",
                     schema,
                     table
                 );
@@ -277,14 +277,14 @@ fn seaturtle_create_table(
         }
 
         // 7. Register in catalog
-        let ht_id = catalog::register_hypertable(
+        let ht_id = catalog::register_deltatable(
             client,
             &schema,
             &table,
             time_column,
             &partition_interval,
         )
-        .expect("failed to register hypertable");
+        .expect("failed to register deltatable");
 
         // 8. Create initial partitions
         let count = create_initial_partitions(
@@ -298,7 +298,7 @@ fn seaturtle_create_table(
         .expect("failed to create initial partitions");
 
         format!(
-            "Created seaturtle table {}.{} with {} partitions",
+            "Created deltax table {}.{} with {} partitions",
             schema, table, count
         )
     })
@@ -315,13 +315,13 @@ pub fn resolve_relation(_client: &SpiClient, relation: &str) -> (String, String)
             )
             .expect("failed to look up table schema")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table '{}' not found", relation);
+                pgrx::error!("pg_deltax: table '{}' not found", relation);
             });
             (schema, parts[0].to_string())
         }
         2 => (parts[0].to_string(), parts[1].to_string()),
         _ => {
-            pgrx::error!("pg_seaturtle: invalid relation name '{}'", relation);
+            pgrx::error!("pg_deltax: invalid relation name '{}'", relation);
         }
     }
 }
@@ -338,7 +338,7 @@ fn validate_time_column(_client: &SpiClient, schema: &str, table: &str, time_col
     match data_type {
         None => {
             pgrx::error!(
-                "pg_seaturtle: column '{}' not found in table {}.{}",
+                "pg_deltax: column '{}' not found in table {}.{}",
                 time_column,
                 schema,
                 table
@@ -349,7 +349,7 @@ fn validate_time_column(_client: &SpiClient, schema: &str, table: &str, time_col
         }
         Some(ref dt) => {
             pgrx::error!(
-                "pg_seaturtle: column '{}' has type '{}', expected a timestamp type",
+                "pg_deltax: column '{}' has type '{}', expected a timestamp type",
                 time_column,
                 dt
             );
@@ -378,7 +378,7 @@ fn convert_to_partitioned(
     time_column: &str,
 ) {
     let table_fqn = fqn(schema, table);
-    let tmp_name = format!("_seaturtle_tmp_{}", table);
+    let tmp_name = format!("_deltax_tmp_{}", table);
     let tmp_fqn = fqn(schema, &tmp_name);
 
     // Rename original table
@@ -413,7 +413,7 @@ fn convert_to_partitioned(
 // ============================================================================
 
 #[pg_extern]
-fn seaturtle_partition_info(
+fn deltax_partition_info(
     relation: &str,
 ) -> TableIterator<
     'static,
@@ -426,10 +426,10 @@ fn seaturtle_partition_info(
 > {
     let rows = Spi::connect(|client| {
         let (schema, table) = resolve_relation(client, relation);
-        let ht = catalog::get_hypertable(client, &schema, &table)
-            .expect("failed to query hypertable")
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
             });
 
         let partitions = catalog::get_partitions(client, ht.id).expect("failed to query partitions");
@@ -443,7 +443,7 @@ fn seaturtle_partition_info(
 }
 
 #[pg_extern]
-fn seaturtle_hypertable_info(
+fn deltax_deltatable_info(
     relation: &str,
 ) -> TableIterator<
     'static,
@@ -457,10 +457,10 @@ fn seaturtle_hypertable_info(
 > {
     let rows = Spi::connect(|client| {
         let (schema, table) = resolve_relation(client, relation);
-        let ht = catalog::get_hypertable(client, &schema, &table)
-            .expect("failed to query hypertable")
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
             });
 
         let partitions = catalog::get_partitions(client, ht.id).expect("failed to query partitions");
@@ -478,15 +478,15 @@ fn seaturtle_hypertable_info(
     TableIterator::new(rows)
 }
 
-/// Set a retention policy on a hypertable.
+/// Set a retention policy on a deltatable.
 #[pg_extern]
-fn seaturtle_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> String {
+fn deltax_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = resolve_relation(client, relation);
-        let ht = catalog::get_hypertable(client, &schema, &table)
-            .expect("failed to query hypertable")
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
             });
 
         catalog::set_drop_after(client, ht.id, &drop_after)
@@ -499,15 +499,15 @@ fn seaturtle_set_retention(relation: &str, drop_after: pgrx::datum::Interval) ->
     })
 }
 
-/// Remove the retention policy from a hypertable.
+/// Remove the retention policy from a deltatable.
 #[pg_extern]
-fn seaturtle_remove_retention(relation: &str) -> String {
+fn deltax_remove_retention(relation: &str) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = resolve_relation(client, relation);
-        let ht = catalog::get_hypertable(client, &schema, &table)
-            .expect("failed to query hypertable")
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
             });
 
         catalog::clear_drop_after(client, ht.id)
@@ -519,21 +519,21 @@ fn seaturtle_remove_retention(relation: &str) -> String {
 
 /// Drop partitions whose range_end is older than now() - drop_after.
 /// Called by the background worker. Returns the number of partitions dropped.
-pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::HypertableInfo) -> i32 {
+pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo) -> i32 {
     let drop_after = match &ht.drop_after {
         Some(interval) => interval,
         None => return 0,
     };
 
     // Compute cutoff using mock-aware now_usec() so the background worker
-    // respects pg_seaturtle.mock_now (important for tests and deterministic behaviour).
+    // respects pg_deltax.mock_now (important for tests and deterministic behaviour).
     let now = usec_to_tstz(now_usec());
 
     // Find partitions eligible for dropping: range_end < now() - drop_after
     let eligible = client
         .select(
-            "SELECT schema_name, table_name, is_compressed FROM seaturtle_partition
-             WHERE hypertable_id = $1 AND range_end < $2::timestamptz - $3::interval",
+            "SELECT schema_name, table_name, is_compressed FROM deltax_partition
+             WHERE deltatable_id = $1 AND range_end < $2::timestamptz - $3::interval",
             None,
             &[ht.id.into(), now.into(), (*drop_after).into()],
         )
@@ -552,7 +552,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::HypertableInfo
     for (schema, name, is_compressed) in &partitions {
         // If compressed, drop the companion table
         if *is_compressed {
-            let companion = format!("\"_seaturtle_compressed\".\"{}\"", name);
+            let companion = format!("\"_deltax_compressed\".\"{}\"", name);
             client
                 .update(&format!("DROP TABLE IF EXISTS {}", companion), None, &[])
                 .expect("failed to drop compressed companion table");
@@ -577,7 +577,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::HypertableInfo
         // Remove from catalog
         client
             .update(
-                "DELETE FROM seaturtle_partition WHERE schema_name = $1 AND table_name = $2",
+                "DELETE FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema.as_str().into(), name.as_str().into()],
             )

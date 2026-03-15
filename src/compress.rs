@@ -22,15 +22,15 @@ struct ColumnMeta {
 // SQL-callable functions
 // ============================================================================
 
-/// Enable compression on a seaturtle hypertable.
+/// Enable compression on a deltax deltatable.
 ///
 /// ```sql
-/// SELECT seaturtle_enable_compression('metrics',
+/// SELECT deltax_enable_compression('metrics',
 ///     segment_by => ARRAY['device_id'],
 ///     order_by => ARRAY['ts']);
 /// ```
 #[pg_extern]
-fn seaturtle_enable_compression(
+fn deltax_enable_compression(
     relation: &str,
     segment_by: default!(Vec<String>, "ARRAY[]::text[]"),
     order_by: default!(Vec<String>, "ARRAY[]::text[]"),
@@ -38,10 +38,10 @@ fn seaturtle_enable_compression(
 ) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
-        let ht = catalog::get_hypertable(client, &schema, &table)
-            .expect("failed to query hypertable")
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
             });
 
         // Validate segment_by columns exist
@@ -55,7 +55,7 @@ fn seaturtle_enable_compression(
                 )
                 .expect("failed to check column");
             if exists.is_empty() {
-                pgrx::error!("pg_seaturtle: segment_by column '{}' not found in {}.{}", col, schema, table);
+                pgrx::error!("pg_deltax: segment_by column '{}' not found in {}.{}", col, schema, table);
             }
         }
 
@@ -68,7 +68,7 @@ fn seaturtle_enable_compression(
 
         let effective_segment_size = if segment_size <= 0 { 30000 } else { segment_size };
 
-        catalog::update_hypertable_compression(client, ht.id, &segment_by, &effective_order_by, effective_segment_size)
+        catalog::update_deltatable_compression(client, ht.id, &segment_by, &effective_order_by, effective_segment_size)
             .expect("failed to update compression settings");
 
         format!(
@@ -78,22 +78,22 @@ fn seaturtle_enable_compression(
     })
 }
 
-/// Set the automatic compression policy for a hypertable.
+/// Set the automatic compression policy for a deltatable.
 #[pg_extern]
-fn seaturtle_set_compression_policy(
+fn deltax_set_compression_policy(
     relation: &str,
     compress_after: pgrx::datum::Interval,
 ) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
-        let ht = catalog::get_hypertable(client, &schema, &table)
-            .expect("failed to query hypertable")
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
             });
 
         if ht.segment_by.is_empty() && ht.order_by.is_empty() {
-            pgrx::error!("pg_seaturtle: enable compression first with seaturtle_enable_compression()");
+            pgrx::error!("pg_deltax: enable compression first with deltax_enable_compression()");
         }
 
         catalog::set_compress_after(client, ht.id, &compress_after)
@@ -108,7 +108,7 @@ fn seaturtle_set_compression_policy(
 
 /// Compress a single partition.
 #[pg_extern]
-fn seaturtle_compress_partition(partition: &str) -> String {
+fn deltax_compress_partition(partition: &str) -> String {
     Spi::connect_mut(|client| {
         compress_partition_impl(client, partition)
     })
@@ -116,16 +116,16 @@ fn seaturtle_compress_partition(partition: &str) -> String {
 
 /// Decompress a single partition.
 #[pg_extern]
-fn seaturtle_decompress_partition(partition: &str) -> String {
+fn deltax_decompress_partition(partition: &str) -> String {
     Spi::connect_mut(|client| {
         decompress_partition_impl(client, partition)
     })
 }
 
-/// Show compression statistics for a hypertable.
+/// Show compression statistics for a deltatable.
 #[pg_extern]
 #[allow(clippy::type_complexity)]
-fn seaturtle_compression_stats(
+fn deltax_compression_stats(
     relation: &str,
 ) -> TableIterator<
     'static,
@@ -140,17 +140,17 @@ fn seaturtle_compression_stats(
 > {
     let rows = Spi::connect(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
-        let ht = catalog::get_hypertable(client, &schema, &table)
-            .expect("failed to query hypertable")
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
             });
 
         let result = client
             .select(
                 "SELECT table_name, is_compressed, raw_size, compressed_size, row_count
-                 FROM seaturtle_partition
-                 WHERE hypertable_id = $1
+                 FROM deltax_partition
+                 WHERE deltatable_id = $1
                  ORDER BY range_start",
                 None,
                 &[ht.id.into()],
@@ -186,27 +186,27 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
         .expect("failed to query partition")
         .unwrap_or_else(|| {
-            pgrx::error!("pg_seaturtle: partition {}.{} not found in catalog", schema, part_table)
+            pgrx::error!("pg_deltax: partition {}.{} not found in catalog", schema, part_table)
         });
 
     if part_info.is_compressed {
         return format!("Partition {}.{} is already compressed", schema, part_table);
     }
 
-    // 2. Get hypertable info (compression settings)
-    let ht = catalog::get_hypertable_by_id(client, part_info.hypertable_id)
-        .expect("failed to query hypertable")
+    // 2. Get deltatable info (compression settings)
+    let ht = catalog::get_deltatable_by_id(client, part_info.deltatable_id)
+        .expect("failed to query deltatable")
         .unwrap();
 
     if ht.order_by.is_empty() && ht.segment_by.is_empty() {
-        pgrx::error!("pg_seaturtle: compression not enabled on {}.{}. Call seaturtle_enable_compression() first.",
+        pgrx::error!("pg_deltax: compression not enabled on {}.{}. Call deltax_enable_compression() first.",
             ht.schema_name, ht.table_name);
     }
 
     // 3. Get column metadata
     let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by);
     if columns.is_empty() {
-        pgrx::error!("pg_seaturtle: no columns found for {}.{}", schema, part_table);
+        pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
     }
 
     // 4. Count rows
@@ -224,7 +224,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     }
 
     // 5. Build companion table DDL
-    let companion_schema = "_seaturtle_compressed";
+    let companion_schema = "_deltax_compressed";
     let companion_fqn = format!("\"{}\".\"{}\"", companion_schema, part_table);
 
     let mut create_cols = Vec::new();
@@ -1391,21 +1391,21 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
         .expect("failed to query partition")
         .unwrap_or_else(|| {
-            pgrx::error!("pg_seaturtle: partition {}.{} not found in catalog", schema, part_table)
+            pgrx::error!("pg_deltax: partition {}.{} not found in catalog", schema, part_table)
         });
 
     if !part_info.is_compressed {
         return format!("Partition {}.{} is not compressed", schema, part_table);
     }
 
-    let ht = catalog::get_hypertable_by_id(client, part_info.hypertable_id)
-        .expect("failed to query hypertable")
+    let ht = catalog::get_deltatable_by_id(client, part_info.deltatable_id)
+        .expect("failed to query deltatable")
         .unwrap();
 
     // 2. Get column metadata (from the parent table, since partition is truncated)
     let columns = get_column_metadata(client, &ht.schema_name, &ht.table_name, &ht.segment_by);
 
-    let companion_schema = "_seaturtle_compressed";
+    let companion_schema = "_deltax_compressed";
     let companion_fqn = format!("\"{}\".\"{}\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
 
@@ -1863,7 +1863,7 @@ fn format_minmax_for_insert(val: &str, data_type: &str) -> String {
 }
 
 /// Public function used by the background worker for auto-compression.
-pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::HypertableInfo) -> i32 {
+pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::DeltatableInfo) -> i32 {
     let compress_after = match &ht.compress_after {
         Some(interval) => interval,
         None => return 0,
@@ -1877,8 +1877,8 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Hypert
     // range_end < now() - compress_after AND NOT is_compressed
     let eligible = client
         .select(
-            "SELECT table_name FROM seaturtle_partition
-             WHERE hypertable_id = $1 AND is_compressed = false
+            "SELECT table_name FROM deltax_partition
+             WHERE deltatable_id = $1 AND is_compressed = false
                AND range_end < now() - $2::interval",
             None,
             &[ht.id.into(), (*compress_after).into()],

@@ -1,4 +1,4 @@
-"""All 43 official ClickBench queries for pg_seaturtle benchmark.
+"""All 43 official ClickBench queries for pg_deltax benchmark.
 
 Queries taken verbatim from the ClickBench postgresql/queries.sql reference.
 Each entry: (query_id, short_description, sql_text).

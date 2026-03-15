@@ -37,13 +37,13 @@ def load_history():
         dt, commit = parse_dir_name(d)
         entry = {"datetime": dt, "commit": commit, "dir": d}
 
-        st_path = HISTORY_DIR / d / "pg_seaturtle.json"
+        st_path = HISTORY_DIR / d / "pg_deltax.json"
         if st_path.exists():
             data = json.loads(st_path.read_text())
             comp = list(data.get("compressed_queries", {}).values())
             uncomp = list(data.get("uncompressed_queries", {}).values())
-            entry["seaturtle_geomean"] = geomean(comp)
-            entry["seaturtle_n"] = len(comp)
+            entry["deltax_geomean"] = geomean(comp)
+            entry["deltax_n"] = len(comp)
             entry["postgres_geomean"] = geomean(uncomp)
             entry["postgres_n"] = len(uncomp)
 
@@ -74,11 +74,11 @@ def build_annotations(dates, counts, label):
 def main():
     history = load_history()
 
-    # SeaTurtle
-    st_dates = [e["datetime"] for e in history if e.get("seaturtle_geomean")]
-    st_vals = [e["seaturtle_geomean"] for e in history if e.get("seaturtle_geomean")]
-    st_n = [e["seaturtle_n"] for e in history if e.get("seaturtle_geomean")]
-    st_commits = [e["commit"] for e in history if e.get("seaturtle_geomean")]
+    # DeltaX
+    st_dates = [e["datetime"] for e in history if e.get("deltax_geomean")]
+    st_vals = [e["deltax_geomean"] for e in history if e.get("deltax_geomean")]
+    st_n = [e["deltax_n"] for e in history if e.get("deltax_geomean")]
+    st_commits = [e["commit"] for e in history if e.get("deltax_geomean")]
 
     # Postgres
     pg_dates = [e["datetime"] for e in history if e.get("postgres_geomean")]
@@ -101,7 +101,7 @@ def main():
         ]
 
     fig.add_trace(go.Scatter(
-        x=st_dates, y=st_vals, mode="lines+markers", name="SeaTurtle (compressed)",
+        x=st_dates, y=st_vals, mode="lines+markers", name="DeltaX (compressed)",
         line=dict(color="#2ecc71", width=2), marker=dict(size=4),
         hovertext=hover_text(st_dates, st_commits, st_vals, st_n), hoverinfo="text",
     ))

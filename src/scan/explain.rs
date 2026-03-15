@@ -12,30 +12,30 @@ pub unsafe extern "C-unwind" fn explain_custom_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (SeaTurtleDecompress)";
+        let value = c"Compressed (DeltaXDecompress)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         explain_timing(node, es);
     }
 }
 
-/// ExplainCustomScan callback for SeaTurtleAppend.
+/// ExplainCustomScan callback for DeltaXAppend.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn explain_seaturtle_append(
+pub unsafe extern "C-unwind" fn explain_deltax_append(
     node: *mut pg_sys::CustomScanState,
     _ancestors: *mut pg_sys::List,
     es: *mut pg_sys::ExplainState,
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (SeaTurtleAppend)";
+        let value = c"Compressed (DeltaXAppend)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         explain_timing(node, es);
     }
 }
 
-/// ExplainCustomScan callback for SeaTurtleCount (COUNT(*) pushdown).
+/// ExplainCustomScan callback for DeltaXCount (COUNT(*) pushdown).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn explain_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -44,7 +44,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (SeaTurtleCount - COUNT(*) pushdown)";
+        let value = c"Compressed (DeltaXCount - COUNT(*) pushdown)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         if (*es).analyze {
@@ -62,7 +62,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Timing".as_ptr(),
+                    c"DeltaX Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -74,7 +74,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Stats".as_ptr(),
+                    c"DeltaX Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );
@@ -83,7 +83,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
     }
 }
 
-/// ExplainCustomScan callback for SeaTurtleMinMax (MIN/MAX pushdown).
+/// ExplainCustomScan callback for DeltaXMinMax (MIN/MAX pushdown).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn explain_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -92,7 +92,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (SeaTurtleMinMax - MIN/MAX pushdown)";
+        let value = c"Compressed (DeltaXMinMax - MIN/MAX pushdown)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         if (*es).analyze {
@@ -110,7 +110,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Timing".as_ptr(),
+                    c"DeltaX Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -126,7 +126,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Stats".as_ptr(),
+                    c"DeltaX Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );
@@ -135,7 +135,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
     }
 }
 
-/// ExplainCustomScan callback for SeaTurtleAgg (aggregate pushdown).
+/// ExplainCustomScan callback for DeltaXAgg (aggregate pushdown).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn explain_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -144,7 +144,7 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (SeaTurtleAgg)";
+        let value = c"Compressed (DeltaXAgg)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         if (*es).analyze {
@@ -165,7 +165,7 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Timing".as_ptr(),
+                    c"DeltaX Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -186,7 +186,7 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Stats".as_ptr(),
+                    c"DeltaX Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );
@@ -236,7 +236,7 @@ unsafe fn explain_timing(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Timing".as_ptr(),
+                    c"DeltaX Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -260,7 +260,7 @@ unsafe fn explain_timing(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"SeaTurtle Stats".as_ptr(),
+                    c"DeltaX Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );

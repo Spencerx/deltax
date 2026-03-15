@@ -1,23 +1,23 @@
-"""Integration tests for seaturtle_create_table, partition_info, and hypertable_info."""
+"""Integration tests for deltax_create_table, partition_info, and deltatable_info."""
 
 from datetime import datetime, timezone
 
 
 def test_create_table_basic(db):
-    """seaturtle_create_table with defaults creates 5 partitions (1 past + 1 current + 3 future)."""
+    """deltax_create_table with defaults creates 5 partitions (1 past + 1 current + 3 future)."""
     db.execute(
         "CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8)"
     )
     db.commit()
 
-    row = db.execute("SELECT seaturtle_create_table('metrics', 'ts')").fetchone()
+    row = db.execute("SELECT deltax_create_table('metrics', 'ts')").fetchone()
     db.commit()
 
-    assert "Created seaturtle table" in row[0]
+    assert "Created deltax table" in row[0]
     assert "5 partitions" in row[0]
 
     partitions = db.execute(
-        "SELECT * FROM seaturtle_partition_info('metrics')"
+        "SELECT * FROM deltax_partition_info('metrics')"
     ).fetchall()
     assert len(partitions) == 5
 
@@ -29,11 +29,11 @@ def test_create_table_custom_interval(db):
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('hourly', 'ts', '1 hour')")
+    db.execute("SELECT deltax_create_table('hourly', 'ts', '1 hour')")
     db.commit()
 
     partitions = db.execute(
-        "SELECT partition_name FROM seaturtle_partition_info('hourly')"
+        "SELECT partition_name FROM deltax_partition_info('hourly')"
     ).fetchall()
     assert len(partitions) == 5
 
@@ -52,32 +52,32 @@ def test_create_table_custom_premake(db):
     db.commit()
 
     row = db.execute(
-        "SELECT seaturtle_create_table('few', 'ts', '1 day', 1)"
+        "SELECT deltax_create_table('few', 'ts', '1 day', 1)"
     ).fetchone()
     db.commit()
 
     assert "3 partitions" in row[0]
 
     partitions = db.execute(
-        "SELECT * FROM seaturtle_partition_info('few')"
+        "SELECT * FROM deltax_partition_info('few')"
     ).fetchall()
     assert len(partitions) == 3
 
 
 def test_create_table_already_exists(db):
-    """Calling seaturtle_create_table twice returns 'already a seaturtle table'."""
+    """Calling deltax_create_table twice returns 'already a deltax table'."""
     db.execute(
         "CREATE TABLE dup (ts TIMESTAMPTZ NOT NULL, val FLOAT8)"
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('dup', 'ts')")
+    db.execute("SELECT deltax_create_table('dup', 'ts')")
     db.commit()
 
-    row = db.execute("SELECT seaturtle_create_table('dup', 'ts')").fetchone()
+    row = db.execute("SELECT deltax_create_table('dup', 'ts')").fetchone()
     db.commit()
 
-    assert "already a seaturtle table" in row[0]
+    assert "already a deltax table" in row[0]
 
 
 def test_insert_and_query(db):
@@ -87,7 +87,7 @@ def test_insert_and_query(db):
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('sensor', 'ts')")
+    db.execute("SELECT deltax_create_table('sensor', 'ts')")
     db.commit()
 
     now = datetime.now(timezone.utc)
@@ -105,19 +105,19 @@ def test_insert_and_query(db):
     assert rows[1] == ("dev2", 20.0)
 
 
-def test_hypertable_info(db):
-    """seaturtle_hypertable_info returns correct metadata."""
+def test_deltatable_info(db):
+    """deltax_deltatable_info returns correct metadata."""
     db.execute(
         "CREATE TABLE ht_test (ts TIMESTAMPTZ NOT NULL, val FLOAT8)"
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('ht_test', 'ts', '1 day')")
+    db.execute("SELECT deltax_create_table('ht_test', 'ts', '1 day')")
     db.commit()
 
     row = db.execute(
         "SELECT schema_name, table_name, time_column, partition_interval, num_partitions "
-        "FROM seaturtle_hypertable_info('ht_test')"
+        "FROM deltax_deltatable_info('ht_test')"
     ).fetchone()
 
     assert row[0] == "public"
@@ -135,11 +135,11 @@ def test_partition_info_ordering(db):
     )
     db.commit()
 
-    db.execute("SELECT seaturtle_create_table('ordered', 'ts')")
+    db.execute("SELECT deltax_create_table('ordered', 'ts')")
     db.commit()
 
     rows = db.execute(
-        "SELECT range_start FROM seaturtle_partition_info('ordered')"
+        "SELECT range_start FROM deltax_partition_info('ordered')"
     ).fetchall()
 
     starts = [r[0] for r in rows]

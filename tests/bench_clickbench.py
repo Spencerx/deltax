@@ -1,4 +1,4 @@
-"""ClickBench real-world benchmark for pg_seaturtle compression.
+"""ClickBench real-world benchmark for pg_deltax compression.
 
 Uses the ClickBench dataset (Yandex Metrica web analytics, 100M rows, 107 columns)
 to stress-test compression with realistic data.
@@ -6,10 +6,10 @@ to stress-test compression with realistic data.
 Default: 1 parquet file (~1M rows, ~1GB in PG). Scale via CLICKBENCH_FILES=N env var.
 
 Run with:
-    PG_SEATURTLE_IMAGE=pg_seaturtle:pg17 pytest tests/bench_clickbench.py -v -s
+    PG_DELTAX_IMAGE=pg_deltax:pg17 pytest tests/bench_clickbench.py -v -s
 
 Scale up:
-    PG_SEATURTLE_IMAGE=pg_seaturtle:pg17 CLICKBENCH_FILES=5 pytest tests/bench_clickbench.py -v -s
+    PG_DELTAX_IMAGE=pg_deltax:pg17 CLICKBENCH_FILES=5 pytest tests/bench_clickbench.py -v -s
 """
 
 import math
@@ -40,10 +40,10 @@ from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, LIMIT
 def setup_clickbench(conn, n_files: int):
     """Create the hits table, set up partitioning, and load data."""
     # Pin time to July 2013 so partitions cover the data range
-    conn.execute("SET pg_seaturtle.mock_now = '2013-07-01 12:00:00+00'")
+    conn.execute("SET pg_deltax.mock_now = '2013-07-01 12:00:00+00'")
     conn.execute(CREATE_TABLE_SQL)
     conn.execute(
-        "SELECT seaturtle_create_table('hits', 'eventtime', '3 days'::interval, 15)"
+        "SELECT deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
     )
     conn.commit()
 
@@ -59,7 +59,7 @@ def enable_compression(conn):
     """Enable compression matching ClickBench TimescaleDB config."""
     segment_size = int(os.environ.get("SEGMENT_SIZE", "30000"))
     conn.execute(
-        "SELECT seaturtle_enable_compression('hits', "
+        "SELECT deltax_enable_compression('hits', "
         "order_by => ARRAY['counterid', 'userid', 'eventtime'], "
         f"segment_size => {segment_size})"
     )
@@ -70,7 +70,7 @@ def enable_compression(conn):
 def compress_all_partitions(conn):
     """Compress all non-empty, non-default partitions. Returns per-partition stats."""
     partitions = conn.execute(
-        "SELECT partition_name FROM seaturtle_partition_info('hits') "
+        "SELECT partition_name FROM deltax_partition_info('hits') "
         "WHERE partition_name NOT LIKE '%default%' "
         "ORDER BY partition_name"
     ).fetchall()
@@ -84,7 +84,7 @@ def compress_all_partitions(conn):
             continue
 
         t0 = time.monotonic()
-        conn.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
+        conn.execute(f"SELECT deltax_compress_partition('{part_name}')")
         conn.commit()
         elapsed = time.monotonic() - t0
 
@@ -95,11 +95,11 @@ def compress_all_partitions(conn):
 
 
 # ---------------------------------------------------------------------------
-# Query profiling (pg_seaturtle specific)
+# Query profiling (pg_deltax specific)
 # ---------------------------------------------------------------------------
 
 def run_explain_analyze(conn, queries):
-    """Run EXPLAIN ANALYZE for each query and extract SeaTurtle timing/stats.
+    """Run EXPLAIN ANALYZE for each query and extract DeltaX timing/stats.
 
     Returns {qid: {"timing": str, "stats": str}} with the raw property values,
     or empty dict entries for queries that don't hit compressed partitions.
@@ -112,14 +112,14 @@ def run_explain_analyze(conn, queries):
             ).fetchall()
             explain_text = "\n".join(r[0] for r in rows)
 
-            # Collect all SeaTurtle Timing/Stats lines (one per compressed partition)
+            # Collect all DeltaX Timing/Stats lines (one per compressed partition)
             timings = []
             stats_lines = []
             for line in explain_text.split("\n"):
                 line = line.strip()
-                if line.startswith("SeaTurtle Timing:"):
+                if line.startswith("DeltaX Timing:"):
                     timings.append(line.split(":", 1)[1].strip())
-                elif line.startswith("SeaTurtle Stats:"):
+                elif line.startswith("DeltaX Stats:"):
                     stats_lines.append(line.split(":", 1)[1].strip())
 
             if not timings:
@@ -186,7 +186,7 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
 
     Accepts results in the format {qid: (median_ms, rows)}.
     If uncompr_results is empty, prints compressed-only table.
-    If profile_results is provided, also prints SeaTurtle timing breakdown.
+    If profile_results is provided, also prints DeltaX timing breakdown.
     """
     print("\n### Query Performance")
     print()
@@ -234,9 +234,9 @@ def print_query_results(uncompr_results, compr_results, profile_results=None):
             print(f"| {'GMEAN':<6} | {'Geometric Mean':<25} | {c_gmean:>11.1f} |")
 
     if profile_results:
-        print("\n### SeaTurtle Scan Timing Breakdown (EXPLAIN ANALYZE)")
+        print("\n### DeltaX Scan Timing Breakdown (EXPLAIN ANALYZE)")
         print()
-        print(f"| {'Query':<6} | {'SeaTurtle Total':>13} | {'Metadata':>10} | {'Heap Scan':>10} | {'Decompress':>11} | {'Batch Eval':>10} | {'Emit':>10} | {'Stats':<85} |")
+        print(f"| {'Query':<6} | {'DeltaX Total':>13} | {'Metadata':>10} | {'Heap Scan':>10} | {'Decompress':>11} | {'Batch Eval':>10} | {'Emit':>10} | {'Stats':<85} |")
         print(f"|{'-'*8}|{'-'*15}|{'-'*12}|{'-'*12}|{'-'*13}|{'-'*12}|{'-'*12}|{'-'*87}|")
 
         for qid, desc, _ in QUERIES:
@@ -265,7 +265,7 @@ def print_compression_stats(conn):
     """Print markdown table of per-partition compression stats."""
     stats = conn.execute(
         "SELECT partition_name, raw_size, compressed_size, compression_ratio, row_count "
-        "FROM seaturtle_compression_stats('hits') "
+        "FROM deltax_compression_stats('hits') "
         "WHERE compressed_size IS NOT NULL "
         "ORDER BY partition_name"
     ).fetchall()
@@ -300,7 +300,7 @@ def print_compression_stats(conn):
     try:
         compressed_cols = conn.execute(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = '_seaturtle_compressed' AND table_name = 'hits_p20130714' "
+            "WHERE table_schema = '_deltax_compressed' AND table_name = 'hits_p20130714' "
             "AND column_name LIKE '\\_%\\_compressed' ESCAPE '\\' "
             "ORDER BY ordinal_position"
         ).fetchall()
@@ -324,7 +324,7 @@ def print_compression_stats(conn):
                     clean = clean[:-len("_compressed")]
                 col_names_clean.append(clean)
 
-            size_query = f"SELECT {', '.join(col_exprs)} FROM \"_seaturtle_compressed\".hits_p20130714"
+            size_query = f"SELECT {', '.join(col_exprs)} FROM \"_deltax_compressed\".hits_p20130714"
             sizes = conn.execute(size_query).fetchone()
 
             # Group by type
@@ -398,7 +398,7 @@ def clickbench_db(pg_container):
     conn.execute("SET jit = off")
     conn.commit()
 
-    conn.execute("CREATE EXTENSION pg_seaturtle")
+    conn.execute("CREATE EXTENSION pg_deltax")
     conn.commit()
     # Setup: create table, partition, load data
     setup_clickbench(conn, NUM_FILES)
@@ -417,7 +417,7 @@ def clickbench_db(pg_container):
 
 
 class TestClickBench:
-    """ClickBench real-world benchmark for pg_seaturtle compression."""
+    """ClickBench real-world benchmark for pg_deltax compression."""
 
     def test_benchmark(self, clickbench_db):
         """Run full benchmark: uncompressed queries, compress, compressed queries."""
@@ -552,12 +552,12 @@ class TestClickBench:
         # Save results for cross-system comparison
         totals = conn.execute(
             "SELECT sum(raw_size), sum(compressed_size) "
-            "FROM seaturtle_compression_stats('hits') "
+            "FROM deltax_compression_stats('hits') "
             "WHERE compressed_size IS NOT NULL"
         ).fetchone()
         raw_bytes = int(totals[0] or 0)
         compressed_bytes = int(totals[1] or 0)
-        save_bench_results("pg_seaturtle", {
+        save_bench_results("pg_deltax", {
             "uncompressed_queries": query_results_to_dict(uncompr_results) if uncompr_results else {},
             "compressed_queries": query_results_to_dict(compr_results),
             "raw_bytes": raw_bytes,

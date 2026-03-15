@@ -15,7 +15,7 @@ thread_local! {
     static COMPRESSED_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, pg_sys::Oid>> =
         std::cell::RefCell::new(HashMap::new());
 
-    /// Cache of parent table OID → time column attribute number (0 = not a hypertable).
+    /// Cache of parent table OID → time column attribute number (0 = not a deltatable).
     static TIME_COLUMN_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, i16>> =
         std::cell::RefCell::new(HashMap::new());
 
@@ -24,7 +24,7 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 
     /// When true, the ExecutorStart hook skips the DML-on-compressed check.
-    /// Used by internal operations like seaturtle_decompress_partition.
+    /// Used by internal operations like deltax_decompress_partition.
     static DML_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -39,8 +39,8 @@ pub(crate) fn set_dml_bypass(bypass: bool) {
     DML_BYPASS.with(|flag| flag.set(bypass));
 }
 
-/// Get the time column's attribute number for a hypertable parent table.
-/// Returns None if the table is not a seaturtle hypertable. Result is cached.
+/// Get the time column's attribute number for a deltatable parent table.
+/// Returns None if the table is not a deltax deltatable. Result is cached.
 unsafe fn get_time_column_attno(parent_oid: pg_sys::Oid) -> Option<i16> {
     let cached = TIME_COLUMN_CACHE.with(|cache| cache.borrow().get(&parent_oid).copied());
     if let Some(attno) = cached {
@@ -63,7 +63,7 @@ unsafe fn get_time_column_attno(parent_oid: pg_sys::Oid) -> Option<i16> {
 
         let time_col_name: Option<String> = pgrx::Spi::connect(|client| {
             let result = client.select(
-                "SELECT time_column FROM seaturtle_hypertable WHERE schema_name = $1 AND table_name = $2",
+                "SELECT time_column FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema_name.as_str().into(), table_name.as_str().into()],
             );
@@ -126,7 +126,7 @@ unsafe fn find_parent_oid(
     }
 }
 
-/// Check whether a hypertable has segment_by configured. When segment_by is
+/// Check whether a deltatable has segment_by configured. When segment_by is
 /// used, segments within a partition have overlapping time ranges, so we cannot
 /// advertise sorted output via pathkeys. Result is cached.
 unsafe fn has_segment_by(parent_oid: pg_sys::Oid) -> bool {
@@ -151,7 +151,7 @@ unsafe fn has_segment_by(parent_oid: pg_sys::Oid) -> bool {
 
         let result: bool = pgrx::Spi::connect(|client| {
             let result = client.select(
-                "SELECT segment_by FROM seaturtle_hypertable WHERE schema_name = $1 AND table_name = $2",
+                "SELECT segment_by FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema_name.as_str().into(), table_name.as_str().into()],
             );
@@ -388,7 +388,7 @@ unsafe fn extract_topn_info(
 
 /// The planner hook. Called for each relation during path generation.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
+pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     rti: pg_sys::Index,
@@ -413,7 +413,7 @@ pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
         let parse = (*root).parse;
         let (effective_limit, sort_ascending) = extract_topn_info(root, parse);
 
-        // Check if this is the parent of a partitioned table (for SeaTurtleAppend)
+        // Check if this is the parent of a partitioned table (for DeltaXAppend)
         if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL
             && (*rte).inh
             && let Some(companion_oids) = collect_compressed_children(root, rti)
@@ -432,7 +432,7 @@ pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
             } else {
                 0
             };
-            path::add_seaturtle_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending);
+            path::add_deltax_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending);
             return;
         }
 
@@ -501,13 +501,13 @@ pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
     }
 }
 
-/// The create_upper_paths hook. Detects aggregate patterns over seaturtle
+/// The create_upper_paths hook. Detects aggregate patterns over deltax
 /// scans and injects optimized custom paths:
-/// - COUNT(*) alone → SeaTurtleCount (sum of segment row_counts, metadata-only)
-/// - MIN/MAX(col) alone → SeaTurtleMinMax (global min/max from segment metadata)
-/// - SUM/AVG/COUNT/COUNT(DISTINCT) with optional GROUP BY and WHERE → SeaTurtleAgg
+/// - COUNT(*) alone → DeltaXCount (sum of segment row_counts, metadata-only)
+/// - MIN/MAX(col) alone → DeltaXMinMax (global min/max from segment metadata)
+/// - SUM/AVG/COUNT/COUNT(DISTINCT) with optional GROUP BY and WHERE → DeltaXAgg
 #[pg_guard]
-pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
+pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
     root: *mut pg_sys::PlannerInfo,
     stage: pg_sys::UpperRelationKind::Type,
     input_rel: *mut pg_sys::RelOptInfo,
@@ -628,7 +628,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
         };
 
         // =====================================================================
-        // Fast path: Single COUNT(*) with no GROUP BY, no WHERE → SeaTurtleCount
+        // Fast path: Single COUNT(*) with no GROUP BY, no WHERE → DeltaXCount
         // =====================================================================
         if aggrefs.len() == 1 && (*aggrefs[0]).aggstar && !has_group_by && !has_where {
             path::add_count_star_path(root, output_rel, &companion_oids);
@@ -897,7 +897,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
 
 
         // =====================================================================
-        // Fast path: All MIN/MAX, no GROUP BY, no WHERE → SeaTurtleMinMax
+        // Fast path: All MIN/MAX, no GROUP BY, no WHERE → DeltaXMinMax
         // =====================================================================
         if all_minmax && !has_group_by && !has_where {
             let mut minmax_specs: Vec<path::MinMaxAggSpec> = Vec::new();
@@ -951,7 +951,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
         }
 
         // =====================================================================
-        // SeaTurtleAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY ± WHERE ± HAVING
+        // DeltaXAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY ± WHERE ± HAVING
         // =====================================================================
 
         // Verify all WHERE quals are batch-pushable.  Each qual must be
@@ -2036,7 +2036,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
 /// Extract companion OIDs from a planner path for aggregate pushdown.
 ///
 /// Handles:
-/// - SeaTurtleDecompress/SeaTurtleAppend CustomPath: extract OIDs from custom_private
+/// - DeltaXDecompress/DeltaXAppend CustomPath: extract OIDs from custom_private
 /// - AppendPath: walk subpaths, try CustomPath extraction first, then fall back
 ///   to catalog lookup via the child rel OID (handles ProjectionPath wrapping
 ///   where PG may use SeqScan instead of our CustomPath as the inner path)
@@ -2190,7 +2190,7 @@ unsafe fn subpath_has_data(
     }
 }
 
-/// Check if a single qual node is pushable to SeaTurtleAgg's batch filter.
+/// Check if a single qual node is pushable to DeltaXAgg's batch filter.
 ///
 /// Requirements (must ALL be true):
 /// 1. Node is T_OpExpr with exactly 2 args
@@ -2270,7 +2270,7 @@ unsafe fn is_pushable_qual(node: *const pg_sys::Node) -> bool {
     }
 }
 
-/// Extract companion OIDs from a SeaTurtleDecompress or SeaTurtleAppend CustomPath.
+/// Extract companion OIDs from a DeltaXDecompress or DeltaXAppend CustomPath.
 unsafe fn extract_oids_from_custom_path(
     cpath: *const pg_sys::CustomPath,
 ) -> Option<Vec<pg_sys::Oid>> {
@@ -2280,7 +2280,7 @@ unsafe fn extract_oids_from_custom_path(
             return None;
         }
         let name = std::ffi::CStr::from_ptr((*methods).CustomName);
-        if name != super::SEATURTLE_APPEND_NAME && name != super::CUSTOM_NAME {
+        if name != super::DELTAX_APPEND_NAME && name != super::CUSTOM_NAME {
             return None;
         }
         let private_list = (*cpath).custom_private;
@@ -2301,7 +2301,7 @@ unsafe fn extract_oids_from_custom_path(
 /// Iterates `root->append_rel_list` for children of `parent_rti`.
 /// - If a child has a compressed companion, adds its OID to the list.
 /// - If a child has no companion AND has uncompressed rows (reltuples > 0),
-///   returns None (cannot use SeaTurtleAppend).
+///   returns None (cannot use DeltaXAppend).
 /// - Empty partitions (reltuples <= 0) are safely skipped.
 ///
 /// Returns `Some(companion_oids)` if we found at least one compressed child
@@ -2350,7 +2350,7 @@ unsafe fn collect_compressed_children(
                 // Not compressed — check if partition has data
                 let reltuples = cost::get_reltuples(child_oid);
                 if reltuples > 0.0 {
-                    // Uncompressed partition with data — cannot use SeaTurtleAppend
+                    // Uncompressed partition with data — cannot use DeltaXAppend
                     return None;
                 }
                 // Empty partition, safe to skip
@@ -2366,7 +2366,7 @@ unsafe fn collect_compressed_children(
 }
 
 /// Check if a relation OID corresponds to a compressed partition
-/// by looking for a companion table in _seaturtle_compressed schema.
+/// by looking for a companion table in _deltax_compressed schema.
 pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
     unsafe {
         // Get the relation name
@@ -2378,20 +2378,20 @@ pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys:
             .to_string_lossy()
             .into_owned();
 
-        // Look up _seaturtle_compressed schema OID
-        let schema_cstr = c"_seaturtle_compressed";
+        // Look up _deltax_compressed schema OID
+        let schema_cstr = c"_deltax_compressed";
         let compressed_ns_oid = pg_sys::get_namespace_oid(schema_cstr.as_ptr(), true);
         if compressed_ns_oid == pg_sys::InvalidOid {
             return pg_sys::InvalidOid;
         }
 
-        // Skip tables already in the _seaturtle_compressed schema to avoid recursion
+        // Skip tables already in the _deltax_compressed schema to avoid recursion
         let rel_ns_oid = pg_sys::get_rel_namespace(rel_oid);
         if rel_ns_oid == compressed_ns_oid {
             return pg_sys::InvalidOid;
         }
 
-        // Check if _seaturtle_compressed.<rel_name> exists
+        // Check if _deltax_compressed.<rel_name> exists
         let companion_cname = std::ffi::CString::new(rel_name).unwrap();
         pg_sys::get_relname_relid(companion_cname.as_ptr(), compressed_ns_oid)
     }
@@ -2403,7 +2403,7 @@ pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys:
 /// incorrect results (writes go to the truncated heap, reads come from the
 /// companion table). This hook raises an error before execution begins.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn seaturtle_executor_start(
+pub unsafe extern "C-unwind" fn deltax_executor_start(
     query_desc: *mut pg_sys::QueryDesc,
     eflags: c_int,
 ) {
