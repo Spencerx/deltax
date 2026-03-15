@@ -1928,8 +1928,8 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         // Also check if any agg references a raw_string_col for Min/Max on text
         // (e.g. MIN(Referer) where Referer is also the regexp GROUP BY column)
 
-        // Identify text GROUP BY columns that use dictionary-index-level grouping
-        let mut dict_group_cols: Vec<bool> = vec![false; meta.col_names.len()];
+        // Identify text GROUP BY columns (dictionary or LZ4)
+        let mut text_group_cols: Vec<bool> = vec![false; meta.col_names.len()];
         for gs in &group_specs {
             if matches!(gs.expr, GroupByExpr::Column)
                 && (gs.type_oid == pg_sys::TEXTOID
@@ -1937,13 +1937,19 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     || gs.type_oid == pg_sys::BPCHAROID
                     || gs.type_oid == pg_sys::NAMEOID)
             {
-                dict_group_cols[gs.col_idx as usize] = true;
+                text_group_cols[gs.col_idx as usize] = true;
             }
         }
 
-        // Per-segment storage for dict GROUP BY: (dict_key_map, indices) per column
-        // dict_key_map maps dict_idx → GroupKeyVal::Str, built once per segment per column
-        let mut seg_dict_groups: Vec<Option<(Vec<GroupKeyVal>, Vec<u16>)>> = Vec::new();
+        // String intern table for text GROUP BY — maps strings to u32 IDs
+        // across all segments, avoiding String cloning per row.
+        let mut intern_table = StringInternTable::new();
+
+        // Per-segment storage for text GROUP BY: Vec<u32> of interned string IDs per row.
+        // For dictionary columns: dict entries are interned once per segment.
+        // For LZ4 columns: each decompressed string is interned.
+        // u32::MAX = null sentinel.
+        let mut seg_text_groups: Vec<Option<Vec<u32>>> = Vec::new();
 
         let t2 = Instant::now();
         let mut total_segments: u64 = 0;
@@ -2238,61 +2244,95 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
 
             let row_count = seg.row_count as usize;
 
-            // Extract dict GROUP BY info for text columns (dict_idx → GroupKeyVal mapping + per-row indices)
-            seg_dict_groups.clear();
-            seg_dict_groups.resize_with(meta.col_names.len(), || None);
+            // Extract text GROUP BY info: intern strings and build per-row u32 ID vectors.
+            // Handles both dictionary-encoded and LZ4-encoded text columns.
+            seg_text_groups.clear();
+            seg_text_groups.resize_with(meta.col_names.len(), || None);
             {
                 let mut blob_idx2 = 0;
+                let mut seg_val_idx2 = 0;
                 for (col_idx, col_name) in meta.col_names.iter().enumerate() {
                     if meta.segment_by.contains(col_name) {
-                        // segment_by columns don't have blobs
+                        // Intern segment_by text columns: same value for all rows
+                        if needed_cols[col_idx] && text_group_cols[col_idx] {
+                            let val = &seg.segment_values[seg_val_idx2];
+                            let id = match val {
+                                Some(s) => intern_table.intern(s),
+                                None => u32::MAX,
+                            };
+                            let full_ids = vec![id; row_count];
+                            seg_text_groups[col_idx] = Some(full_ids);
+                        }
+                        seg_val_idx2 += 1;
                         continue;
                     }
-                    if needed_cols[col_idx] && dict_group_cols[col_idx] {
+                    if needed_cols[col_idx] && text_group_cols[col_idx] {
                         let blob = &seg.compressed_blobs[blob_idx2];
                         if !blob.is_empty() {
                             let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
-                            if cc_ref.type_tag == compression::CompressionType::Dictionary
-                                || cc_ref.type_tag == compression::CompressionType::DictionaryLz4
-                            {
-                                let total = cc_ref.row_count as usize;
-                                let nn_count = count_non_null(cc_ref.null_bitmap, total);
-                                let norm_buf;
-                                let dict_data = if cc_ref.type_tag == compression::CompressionType::DictionaryLz4 {
-                                    norm_buf = compression::dictionary::normalize_lz4(cc_ref.data);
-                                    &norm_buf[..]
-                                } else {
-                                    cc_ref.data
-                                };
-                                let (dict_entries, nn_indices) =
-                                    compression::dictionary::decode_dict_and_indices(dict_data, nn_count);
+                            let total = cc_ref.row_count as usize;
+                            let nn_count = count_non_null(cc_ref.null_bitmap, total);
 
-                                // Build dict_key_map: one String allocation per unique value
-                                let dict_key_map: Vec<GroupKeyVal> = dict_entries
-                                    .iter()
-                                    .map(|&s| GroupKeyVal::Str(s.to_string()))
-                                    .collect();
+                            // Decode strings and intern them based on compression type
+                            let nn_intern_ids: Vec<u32> = match cc_ref.type_tag {
+                                compression::CompressionType::Dictionary
+                                | compression::CompressionType::DictionaryLz4 => {
+                                    let norm_buf;
+                                    let dict_data = if cc_ref.type_tag == compression::CompressionType::DictionaryLz4 {
+                                        norm_buf = compression::dictionary::normalize_lz4(cc_ref.data);
+                                        &norm_buf[..]
+                                    } else {
+                                        cc_ref.data
+                                    };
+                                    let (dict_entries, nn_indices) =
+                                        compression::dictionary::decode_dict_and_indices(dict_data, nn_count);
 
-                                // Expand nn_indices to full-row indices (nulls get sentinel 0xFFFF)
-                                let full_indices = if cc_ref.null_bitmap.is_empty() {
-                                    nn_indices
-                                } else {
-                                    let mut fi = Vec::with_capacity(total);
-                                    let mut vi = 0;
-                                    for i in 0..total {
-                                        let is_null = (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
-                                        if is_null {
-                                            fi.push(0xFFFFu16);
-                                        } else {
-                                            fi.push(nn_indices[vi]);
-                                            vi += 1;
-                                        }
+                                    // Intern dict entries once per segment (typically small)
+                                    let dict_intern: Vec<u32> = dict_entries
+                                        .iter()
+                                        .map(|&s| intern_table.intern(s))
+                                        .collect();
+
+                                    // Map per-row nn_indices to intern IDs
+                                    nn_indices.iter().map(|&idx| dict_intern[idx as usize]).collect()
+                                }
+                                compression::CompressionType::Lz4 | compression::CompressionType::Lz4Blocked => {
+                                    let (buf, ranges) = if cc_ref.type_tag == compression::CompressionType::Lz4 {
+                                        compression::lz4::decode_to_ranges(cc_ref.data, nn_count)
+                                    } else {
+                                        compression::lz4::decode_to_ranges_blocked(cc_ref.data, nn_count, None)
+                                    };
+                                    ranges.iter().map(|&(off, len)| {
+                                        let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
+                                        intern_table.intern(s)
+                                    }).collect()
+                                }
+                                _ => {
+                                    // Unsupported compression type for text — skip
+                                    blob_idx2 += 1;
+                                    continue;
+                                }
+                            };
+
+                            // Expand to full-row IDs (u32::MAX for nulls)
+                            let full_ids = if cc_ref.null_bitmap.is_empty() {
+                                nn_intern_ids
+                            } else {
+                                let mut fi = Vec::with_capacity(total);
+                                let mut vi = 0;
+                                for i in 0..total {
+                                    let is_null = (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+                                    if is_null {
+                                        fi.push(u32::MAX);
+                                    } else {
+                                        fi.push(nn_intern_ids[vi]);
+                                        vi += 1;
                                     }
-                                    fi
-                                };
+                                }
+                                fi
+                            };
 
-                                seg_dict_groups[col_idx] = Some((dict_key_map, full_indices));
-                            }
+                            seg_text_groups[col_idx] = Some(full_ids);
                         }
                     }
                     blob_idx2 += 1;
@@ -2304,6 +2344,9 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             // filtered by LIKE during decompression are skipped (their dummy
             // datums are never dereferenced).
             let selection = evaluate_batch_quals(&decompressed, row_count, &batch_quals, pre_selection);
+
+
+
 
             // Fast path: when no GROUP BY and all agg specs are SUM/AVG on the
             // same column with Column or AddConst expr, compute base_sum once
@@ -2425,27 +2468,17 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     key.push(GroupKeyVal::Int(v + offset));
                                 }
                                 GroupByExpr::Column => {
-                                    // Dictionary-index-level text GROUP BY: lookup from pre-built map
-                                    if let Some((ref dict_key_map, ref full_indices)) = seg_dict_groups[gs.col_idx as usize] {
-                                        let idx = full_indices[row];
-                                        if idx == 0xFFFF {
+                                    // Text GROUP BY: lookup interned string ID
+                                    if let Some(ref intern_ids) = seg_text_groups[gs.col_idx as usize] {
+                                        let id = intern_ids[row];
+                                        if id == u32::MAX {
                                             key.push(GroupKeyVal::Null);
                                         } else {
-                                            key.push(dict_key_map[idx as usize].clone());
+                                            key.push(GroupKeyVal::InternedStr(id));
                                         }
                                     } else {
                                         let datum = col[row].0;
-                                        match gs.type_oid {
-                                            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID => {
-                                                let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
-                                                let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
-                                                pg_sys::pfree(cstr as *mut _);
-                                                key.push(GroupKeyVal::Str(s));
-                                            }
-                                            _ => {
-                                                key.push(GroupKeyVal::Int(datum.value() as i64));
-                                            }
-                                        }
+                                        key.push(GroupKeyVal::Int(datum.value() as i64));
                                     }
                                 }
                             }
@@ -2623,6 +2656,9 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     }
                 }
             }
+
+
+
         }
 
         let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
@@ -2677,6 +2713,11 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     }
                                 }
                                 GroupKeyVal::Str(s) => {
+                                    let datum = string_to_datum(s, group_specs[*gi].type_oid);
+                                    row.push((datum, false));
+                                }
+                                GroupKeyVal::InternedStr(id) => {
+                                    let s = intern_table.get(*id);
                                     let datum = string_to_datum(s, group_specs[*gi].type_oid);
                                     row.push((datum, false));
                                 }
@@ -2768,6 +2809,37 @@ enum GroupKeyVal {
     Null,
     Int(i64),
     Str(String),
+    InternedStr(u32),
+}
+
+/// String intern table: deduplicates strings across segments, maps to u32 IDs.
+/// Used for text GROUP BY to avoid String cloning per row in the hot loop.
+struct StringInternTable {
+    map: HashMap<String, u32>,
+    strings: Vec<String>,
+}
+
+impl StringInternTable {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            strings: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.map.get(s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        self.strings.push(s.to_string());
+        self.map.insert(s.to_string(), id);
+        id
+    }
+
+    fn get(&self, id: u32) -> &str {
+        &self.strings[id as usize]
+    }
 }
 
 /// Convert a datum to i128 for SUM accumulation.

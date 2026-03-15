@@ -394,8 +394,11 @@ in GROUP BY pushed into AggScan, eliminating 1M-row emit to PG hash agg.
 ### Remaining regressions
 
 **Q24 (0.71x):** `SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
-Decompresses all columns for all matching segments. Decompress=67.4ms,
-heap_scan=24ms. See planned #26 and #29.
+TopN two-pass skips 17/34 segments (dictionary LIKE pruning) and defers Phase 2
+to 6 winning segments. Decompress=67ms, heap_scan=24ms. Phase 2 dominates:
+decompressing ~100 columns for 6 segments with only 33 candidate rows.
+Selection-based decompression was tried (#29) but caused icache regressions.
+The fundamental issue is `SELECT *` on a wide table.
 
 **Q29 (0.80x):** `REGEXP_REPLACE(Referer, ...) GROUP BY`. Decompress=756ms on
 Referer (high-cardinality LZ4). The regex runs in Rust but decompression of
@@ -440,52 +443,63 @@ columns where the dictionary approach doesn't apply.
 **Files:** `src/compress.rs` (bloom filter in companion table schema),
 `src/scan/exec.rs` (bloom filter test in segment loading)
 
-### 28. Text GROUP BY in AggScan
+### ~~28. Text GROUP BY in AggScan~~ — Implemented, no benchmark impact
 
-**Target: Q34 326ms -> ~40ms, Q35 299ms -> ~40ms**
-**Complexity: Medium-High**
+**Status: Implemented but doesn't help ClickBench queries**
 
-Q34/Q35 (`GROUP BY URL ORDER BY COUNT(*) DESC LIMIT 10`) emit **1M rows** into
-PG's hash aggregator. The SeaTurtle scan takes only ~33ms, but PG hash agg on
-1M text rows with high cardinality is ~290ms.
+AggScan now supports text/varchar GROUP BY keys via string interning
+(`StringInternTable`). Distinct strings are mapped to `u32` IDs across
+segments, and `GroupKeyVal::InternedStr(u32)` avoids per-row String cloning.
+Handles Dictionary, DictionaryLz4, Lz4, and Lz4Blocked compression types,
+plus segment-by text columns.
 
-Currently AggScan doesn't support text/varchar GROUP BY keys, so these queries
-fall back to DecompressState which emits all rows.
+However, the ndistinct < 30K guard blocks AggScan for all ClickBench URL
+queries (~275K distinct values). Relaxing the guard (tried with a LIMIT
+bypass) made Q34/Q37/Q39 **slower** than vanilla PG — interning 275K strings
+and maintaining a 275K-entry hash table is more expensive than PG's optimized
+hash agg on emitted rows. The guard was restored.
 
-**Approach:** Extend AggScan's hash table to support string GROUP BY keys.
-For dictionary-compressed columns, hash on dictionary index (u16) and only
-materialize the string when emitting result rows. For LZ4 columns, hash on
-raw `&str` slices during decompression, store references into the decompressed
-buffer. Combined with Top-N pushdown (#21), the hash table can be pruned
-during aggregation — only keeping entries that could make it into the top N.
+The feature works correctly for low-cardinality text columns (confirmed by
+integration tests with `category` column, ndistinct=5) but has no impact on
+the benchmark.
 
-**Note:** Late materialization (#24) was evaluated and deemed not worth
-implementing, so this optimization should use standard varlena allocation.
+### ~~29. Partial decompression for SELECT * with LIMIT~~ — Tried, not effective
 
-**Files:** `src/scan/hook.rs` (detect text GROUP BY),
-`src/scan/exec.rs` (extend `AggState` hash table for string keys)
+**Status: Investigated — marginal Q24 improvement offset by icache regressions**
 
-### 29. Partial decompression for SELECT * with LIMIT
+`SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
+TopN two-pass already works (17/34 segments skipped by dictionary LIKE pruning,
+6 segments enter Phase 2 with 33 candidates). The bottleneck is Phase 2
+decompression of ~100 columns for winning segments.
 
-**Target: Q24 127ms -> ~10ms**
-**Complexity: Medium**
+**Approaches tried:**
 
-`SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`
-currently decompresses all columns for all matching segments. With time-ordered
-segments, an early-termination strategy is possible:
+1. **Min/max segment skipping on sort column:** Dead end — all 34 segments have
+   identical 24h time ranges because `order_by = {counterid, userid, eventtime}`
+   with EventTime as 3rd key. Min/max on EventTime gives no discrimination.
 
-1. Process segments in time order (already supported via sorted scan #7)
-2. Apply LIKE filter in Phase 1; track number of matching rows found so far
-3. After accumulating enough candidates (LIMIT + safety margin), skip
-   remaining segments
-4. Only decompress non-filter columns (Phase 2) for the final winning rows
+2. **Candidate truncation:** After threshold update, truncate candidate list to
+   `effective_limit + 1` when oversized. Marginal Phase 1 improvement, and must
+   keep at least `effective_limit + 1` candidates to avoid triggering the
+   TopN-disabled fallback path.
 
-This is essentially combining sorted scan (#7), batch LIKE (#26), and lazy
-column decompression (#11) into a LIMIT-aware pipeline where only the rows
-that actually appear in the final result set need full materialization.
+3. **Selective TOAST detoasting (varatt_is_1b_e):** Only defer detoasting for
+   truly external TOAST pointers; eagerly detoast inline blobs. Small improvement
+   (~5ms) on Q24 warm runs but doesn't justify the code complexity alone.
 
-**Files:** `src/scan/exec.rs` (early termination in segment loop,
-deferred Phase 2 for LIMIT queries)
+4. **Selection-based decompression for ForBitpacked columns:** O(1) random-access
+   decode for integer columns (73/105 columns) in Phase 2 — only decode the 1-3
+   winning row values per column instead of all ~30K. Phase 2 nontext time dropped
+   from 65ms to 13ms. However, adding ~200 lines of new functions (sparse decode,
+   Phase2Col enum, null bitmap scanning) increased binary size, causing **10-25%
+   icache-induced regressions across 19 unrelated queries** (confirmed by re-running
+   baseline on same commit). Net negative.
+
+**Conclusion:** The Q24 bottleneck is fundamentally that `SELECT *` on a 105-column
+table requires decompressing all columns for winning rows. The TopN two-pass already
+limits this to 6 segments × ~100 columns. Further improvements require either
+reducing the number of columns decompressed (projection pushdown) or reducing
+per-column decode cost without adding binary bloat.
 
 ### 30. High-cardinality integer GROUP BY optimization
 

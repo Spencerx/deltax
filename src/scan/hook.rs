@@ -1720,9 +1720,10 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     }
                 }
 
-                // Guard: text GROUP BY columns must be dictionary-encodable (ndistinct < 65536)
-                // AND low enough cardinality that our HashMap GROUP BY beats PG's HashAggregate.
-                // Above ~30K merged ndistinct, PG's tuple-based HashAggregate is faster.
+                // Guard: text GROUP BY columns need low cardinality
+                // (ndistinct < 30K) so the intern table stays bounded.
+                // High-cardinality text GROUP BY (e.g. URL with 275K distinct)
+                // is slower in AggScan than vanilla PG even with LIMIT.
                 let has_text_group = group_specs.iter().any(|gs| {
                     matches!(gs.expr, GroupByExpr::Column)
                         && (gs.type_oid == pg_sys::TEXTOID
