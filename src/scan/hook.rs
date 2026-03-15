@@ -1731,17 +1731,24 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             || gs.type_oid == pg_sys::BPCHAROID
                             || gs.type_oid == pg_sys::NAMEOID)
                 });
-                if has_text_group {
-                    let text_ok = group_specs.iter().all(|gs| {
+                // Text GROUP BY guard: skip AggScan when both conditions hold:
+                // 1. PG estimates < 5% of rows survive filtering (small result set)
+                // 2. The text column has very high global ndistinct (> 100K)
+                // For small filtered sets on high-cardinality columns, PG's native
+                // HashAgg on emitted rows beats AggScan's text decompression overhead.
+                if has_text_group && has_where {
+                    let estimated_rows = (*input_rel).rows;
+                    let few_rows = estimated_rows < total_uncompressed_rows as f64 * 0.05;
+                    let has_high_card_text = group_specs.iter().any(|gs| {
                         if !matches!(gs.expr, GroupByExpr::Column) {
-                            return true;
+                            return false;
                         }
                         let is_text = gs.type_oid == pg_sys::TEXTOID
                             || gs.type_oid == pg_sys::VARCHAROID
                             || gs.type_oid == pg_sys::BPCHAROID
                             || gs.type_oid == pg_sys::NAMEOID;
                         if !is_text {
-                            return true;
+                            return false;
                         }
                         let attno = (gs.col_idx + 1) as i16;
                         let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
@@ -1753,10 +1760,10 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             .unwrap_or("");
                         merged_ndistinct
                             .get(col_name)
-                            .map(|&nd| nd > 0 && nd < 30000)
+                            .map(|&nd| nd > 100_000)
                             .unwrap_or(false)
                     });
-                    if !text_ok {
+                    if few_rows && has_high_card_text {
                         return;
                     }
                 }
