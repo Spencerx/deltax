@@ -152,6 +152,156 @@ pub(super) fn pg_type_name(type_oid: pg_sys::Oid) -> String {
 // Direct datum decompression — bypasses the string round-trip
 // ============================================================================
 
+/// Decode compressed data to raw Datums (without null reinsertion).
+///
+/// This is the shared codec dispatch used by both `decompress_blob_to_datums`
+/// and `decompress_blob_to_datums_truncated`.
+unsafe fn decode_compressed_datums(
+    cc: &CompressedColumnRef,
+    dt: &str,
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+    non_null_count: usize,
+) -> Vec<pg_sys::Datum> {
+    match cc.type_tag {
+        CompressionType::Gorilla => {
+            if dt.contains("timestamp") || dt == "date" {
+                let timestamps =
+                    compression::gorilla::decode_timestamps(cc.data, non_null_count);
+                if dt == "date" {
+                    timestamps
+                        .iter()
+                        .map(|&usec| {
+                            let unix_days = (usec / 86_400_000_000) as i32;
+                            let pg_days = unix_days - PG_EPOCH_OFFSET_DAYS;
+                            pg_sys::Datum::from(pg_days as usize)
+                        })
+                        .collect()
+                } else {
+                    timestamps
+                        .iter()
+                        .map(|&usec| {
+                            let pg_usec = usec - PG_EPOCH_OFFSET_USEC;
+                            pg_sys::Datum::from(pg_usec as usize)
+                        })
+                        .collect()
+                }
+            } else if dt == "real" || dt.contains("float4") {
+                let floats =
+                    compression::gorilla::decode_floats_f32(cc.data, non_null_count);
+                floats
+                    .iter()
+                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
+                    .collect()
+            } else {
+                let floats =
+                    compression::gorilla::decode_floats(cc.data, non_null_count);
+                floats
+                    .iter()
+                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
+                    .collect()
+            }
+        }
+        CompressionType::DeltaVarint => {
+            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
+                let ints = compression::integer::decode_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
+                        .collect()
+                } else {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as usize))
+                        .collect()
+                }
+            } else {
+                let ints = compression::integer::decode_i64(cc.data, non_null_count);
+                ints.iter()
+                    .map(|&v| pg_sys::Datum::from(v as usize))
+                    .collect()
+            }
+        }
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
+            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+        }
+        CompressionType::Lz4Blocked => {
+            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+        }
+        CompressionType::BooleanBitmap => {
+            let bools = compression::boolean::decode(cc.data, non_null_count);
+            bools
+                .iter()
+                .map(|&b| pg_sys::Datum::from(b as usize))
+                .collect()
+        }
+        CompressionType::Constant => {
+            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
+                        .collect()
+                } else {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as usize))
+                        .collect()
+                }
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                ints.iter()
+                    .map(|&v| pg_sys::Datum::from(v as usize))
+                    .collect()
+            }
+        }
+        CompressionType::ForBitpacked => {
+            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
+                        .collect()
+                } else {
+                    ints.iter()
+                        .map(|&v| pg_sys::Datum::from(v as usize))
+                        .collect()
+                }
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
+                ints.iter()
+                    .map(|&v| pg_sys::Datum::from(v as usize))
+                    .collect()
+            }
+        }
+    }
+}
+
 /// Decompress a column blob directly to PostgreSQL Datums.
 ///
 /// For pass-by-value types (int, float, timestamp, date, bool), the decoded
@@ -171,146 +321,9 @@ pub(super) unsafe fn decompress_blob_to_datums(
     let cc = CompressedColumnRef::from_bytes(blob);
     let total_count = cc.row_count as usize;
     let non_null_count = count_non_null(cc.null_bitmap, total_count);
-    let dt = data_type.to_lowercase();
-
-    let datums: Vec<pg_sys::Datum> = match cc.type_tag {
-        CompressionType::Gorilla => {
-            if dt.contains("timestamp") || dt == "date" {
-                let timestamps =
-                    compression::gorilla::decode_timestamps(cc.data, non_null_count);
-                if dt == "date" {
-                    timestamps
-                        .iter()
-                        .map(|&usec| {
-                            let unix_days = (usec / 86_400_000_000) as i32;
-                            let pg_days = unix_days - PG_EPOCH_OFFSET_DAYS;
-                            pg_sys::Datum::from(pg_days as usize)
-                        })
-                        .collect()
-                } else {
-                    timestamps
-                        .iter()
-                        .map(|&usec| {
-                            let pg_usec = usec - PG_EPOCH_OFFSET_USEC;
-                            pg_sys::Datum::from(pg_usec as usize)
-                        })
-                        .collect()
-                }
-            } else if dt == "real" || dt.contains("float4") {
-                let floats =
-                    compression::gorilla::decode_floats_f32(cc.data, non_null_count);
-                floats
-                    .iter()
-                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
-                    .collect()
-            } else {
-                let floats =
-                    compression::gorilla::decode_floats(cc.data, non_null_count);
-                floats
-                    .iter()
-                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
-                    .collect()
-            }
-        }
-        CompressionType::DeltaVarint => {
-            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
-                let ints = compression::integer::decode_i32(cc.data, non_null_count);
-                if dt == "smallint" {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
-                        .collect()
-                } else {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as usize))
-                        .collect()
-                }
-            } else {
-                let ints = compression::integer::decode_i64(cc.data, non_null_count);
-                ints.iter()
-                    .map(|&v| pg_sys::Datum::from(v as usize))
-                    .collect()
-            }
-        }
-        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
-            let norm_buf;
-            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
-                norm_buf = compression::dictionary::normalize_lz4(cc.data);
-                &norm_buf
-            } else {
-                cc.data
-            };
-            let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
-            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
-        }
-        CompressionType::Lz4 => {
-            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
-        }
-        CompressionType::Lz4Blocked => {
-            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
-        }
-        CompressionType::BooleanBitmap => {
-            let bools = compression::boolean::decode(cc.data, non_null_count);
-            bools
-                .iter()
-                .map(|&b| pg_sys::Datum::from(b as usize))
-                .collect()
-        }
-        CompressionType::Constant => {
-            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
-                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
-                if dt == "smallint" {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
-                        .collect()
-                } else {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as usize))
-                        .collect()
-                }
-            } else {
-                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
-                ints.iter()
-                    .map(|&v| pg_sys::Datum::from(v as usize))
-                    .collect()
-            }
-        }
-        CompressionType::ForBitpacked => {
-            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
-                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
-                if dt == "smallint" {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
-                        .collect()
-                } else {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as usize))
-                        .collect()
-                }
-            } else {
-                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
-                ints.iter()
-                    .map(|&v| pg_sys::Datum::from(v as usize))
-                    .collect()
-            }
-        }
+    let datums = unsafe {
+        decode_compressed_datums(&cc, &data_type.to_lowercase(), type_oid, typmod, non_null_count)
     };
-
     reinsert_nulls_datum(&datums, cc.null_bitmap, total_count)
 }
 
@@ -325,7 +338,6 @@ pub(super) unsafe fn decompress_blob_to_datums_truncated(
     typmod: i32,
     max_row: usize,
 ) -> Vec<(pg_sys::Datum, bool)> {
-    unsafe {
     if blob.is_empty() {
         return Vec::new();
     }
@@ -336,152 +348,14 @@ pub(super) unsafe fn decompress_blob_to_datums_truncated(
 
     if truncated_count >= total_count {
         // No benefit from truncation — use full path
-        return decompress_blob_to_datums(blob, data_type, type_oid, typmod);
+        return unsafe { decompress_blob_to_datums(blob, data_type, type_oid, typmod) };
     }
 
     let non_null_count = count_non_null(cc.null_bitmap, truncated_count);
-    let dt = data_type.to_lowercase();
-
-    let datums: Vec<pg_sys::Datum> = match cc.type_tag {
-        CompressionType::Gorilla => {
-            if dt.contains("timestamp") || dt == "date" {
-                let timestamps =
-                    compression::gorilla::decode_timestamps(cc.data, non_null_count);
-                if dt == "date" {
-                    timestamps
-                        .iter()
-                        .map(|&usec| {
-                            let unix_days = (usec / 86_400_000_000) as i32;
-                            let pg_days = unix_days - PG_EPOCH_OFFSET_DAYS;
-                            pg_sys::Datum::from(pg_days as usize)
-                        })
-                        .collect()
-                } else {
-                    timestamps
-                        .iter()
-                        .map(|&usec| {
-                            let pg_usec = usec - PG_EPOCH_OFFSET_USEC;
-                            pg_sys::Datum::from(pg_usec as usize)
-                        })
-                        .collect()
-                }
-            } else if dt == "real" || dt.contains("float4") {
-                let floats =
-                    compression::gorilla::decode_floats_f32(cc.data, non_null_count);
-                floats
-                    .iter()
-                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
-                    .collect()
-            } else {
-                let floats =
-                    compression::gorilla::decode_floats(cc.data, non_null_count);
-                floats
-                    .iter()
-                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
-                    .collect()
-            }
-        }
-        CompressionType::DeltaVarint => {
-            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
-                let ints = compression::integer::decode_i32(cc.data, non_null_count);
-                if dt == "smallint" {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
-                        .collect()
-                } else {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as usize))
-                        .collect()
-                }
-            } else {
-                let ints = compression::integer::decode_i64(cc.data, non_null_count);
-                ints.iter()
-                    .map(|&v| pg_sys::Datum::from(v as usize))
-                    .collect()
-            }
-        }
-        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
-            let norm_buf;
-            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
-                norm_buf = compression::dictionary::normalize_lz4(cc.data);
-                &norm_buf
-            } else {
-                cc.data
-            };
-            let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
-            str_slices_to_text_datums_arena(&slices, type_oid, typmod)
-        }
-        CompressionType::Lz4 => {
-            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            str_slices_to_text_datums_arena(&slices, type_oid, typmod)
-        }
-        CompressionType::Lz4Blocked => {
-            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            str_slices_to_text_datums_arena(&slices, type_oid, typmod)
-        }
-        CompressionType::BooleanBitmap => {
-            let bools = compression::boolean::decode(cc.data, non_null_count);
-            bools
-                .iter()
-                .map(|&b| pg_sys::Datum::from(b as usize))
-                .collect()
-        }
-        CompressionType::Constant => {
-            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
-                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
-                if dt == "smallint" {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
-                        .collect()
-                } else {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as usize))
-                        .collect()
-                }
-            } else {
-                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
-                ints.iter()
-                    .map(|&v| pg_sys::Datum::from(v as usize))
-                    .collect()
-            }
-        }
-        CompressionType::ForBitpacked => {
-            if dt == "integer" || dt.contains("int4") || dt == "smallint" {
-                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
-                if dt == "smallint" {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as i16 as usize))
-                        .collect()
-                } else {
-                    ints.iter()
-                        .map(|&v| pg_sys::Datum::from(v as usize))
-                        .collect()
-                }
-            } else {
-                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
-                ints.iter()
-                    .map(|&v| pg_sys::Datum::from(v as usize))
-                    .collect()
-            }
-        }
+    let datums = unsafe {
+        decode_compressed_datums(&cc, &data_type.to_lowercase(), type_oid, typmod, non_null_count)
     };
-
     reinsert_nulls_datum(&datums, cc.null_bitmap, truncated_count)
-    }
 }
 
 /// Decompress a text column blob with LIKE filtering pushed into decompression.
