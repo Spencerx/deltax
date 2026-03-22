@@ -2347,13 +2347,16 @@ unsafe fn collect_compressed_children(
             if companion_oid != pg_sys::InvalidOid {
                 companion_oids.push(companion_oid);
             } else {
-                // Not compressed — check if partition has data
+                // Not compressed — check if partition has data.
+                // reltuples == 0.0 means ANALYZE ran and found zero rows.
+                // reltuples < 0 means never analyzed — we must assume it
+                // could contain data and bail out.
                 let reltuples = cost::get_reltuples(child_oid);
-                if reltuples > 0.0 {
-                    // Uncompressed partition with data — cannot use DeltaXAppend
+                if reltuples != 0.0 {
+                    // Has data or unknown — cannot use DeltaXAppend
                     return None;
                 }
-                // Empty partition, safe to skip
+                // ANALYZE confirmed empty, safe to skip
             }
         }
 

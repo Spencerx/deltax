@@ -3462,6 +3462,8 @@ class TestMultiPartitionQueries:
         )
         db.commit()
         _compress_all_partitions(db, table_name)
+        db.execute(f"ANALYZE {table_name}")
+        db.commit()
         return row_id  # total rows inserted
 
     def test_select_star_across_partitions(self, db):
@@ -3497,7 +3499,7 @@ class TestMultiPartitionQueries:
         ).fetchall()
         explain = "\n".join(r[0] for r in rows)
 
-        assert "DeltaXDecompress" in explain
+        assert "DeltaXAppend" in explain or "DeltaXDecompress" in explain
 
         import re
         # Each compressed partition has 3 segments (1 per device), 2 skipped
@@ -3566,8 +3568,8 @@ class TestMultiPartitionQueries:
         for r in rows:
             assert r[1] == 150  # 3 days × 50 points per device
 
-    def test_explain_shows_multiple_decompress_nodes(self, db):
-        """EXPLAIN ANALYZE shows separate DeltaXDecompress per partition."""
+    def test_explain_shows_deltax_append(self, db):
+        """EXPLAIN ANALYZE shows DeltaXAppend for all-compressed partitions."""
         self._setup_multi_partition(db)
 
         rows = db.execute(
@@ -3576,8 +3578,116 @@ class TestMultiPartitionQueries:
         ).fetchall()
         explain = "\n".join(r[0] for r in rows)
 
-        # Should have at least 3 DeltaXDecompress nodes (one per partition)
-        decompress_count = explain.count("DeltaXDecompress")
-        assert decompress_count >= 3, (
-            f"Expected >= 3 DeltaXDecompress nodes, got {decompress_count}:\n{explain}"
+        assert "DeltaXAppend" in explain, (
+            f"Expected DeltaXAppend in plan:\n{explain}"
+        )
+
+
+class TestDeltaXAppend:
+    """Tests for the DeltaXAppend single-scan path across compressed partitions.
+
+    DeltaXAppend replaces PostgreSQL's Append node with a single CustomScan
+    that loads segments from all companion tables at once.
+    """
+
+    def test_deltax_append_plan_selected(self, db):
+        """DeltaXAppend should appear in the plan for multi-partition queries."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE append_bug (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                value INTEGER NOT NULL
+            )
+        """)
+        db.execute("SELECT deltax_create_table('append_bug', 'ts', '1 day'::interval)")
+        db.commit()
+
+        for day in range(3):
+            for p in range(50):
+                ts = (f"'{BASE_TS}'::timestamptz + interval '{day} days' "
+                      f"+ interval '{p} minutes'")
+                db.execute(
+                    f"INSERT INTO append_bug VALUES ({ts}, 'dev-0', {day * 50 + p})"
+                )
+        db.commit()
+
+        db.execute(
+            "SELECT deltax_enable_compression('append_bug', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "append_bug")
+        db.execute("ANALYZE append_bug")
+        db.commit()
+
+        rows = db.execute(
+            "EXPLAIN (COSTS OFF) SELECT * FROM append_bug"
+        ).fetchall()
+        explain = "\n".join(r[0] for r in rows)
+
+        assert "DeltaXAppend" in explain, (
+            f"Expected DeltaXAppend in plan, got regular Append:\n{explain}"
+        )
+
+    def test_deltax_append_query_results(self, db):
+        """DeltaXAppend should return correct results across all compressed partitions.
+
+        Verifies that a multi-partition scan returns all rows with correct
+        values, not just that the plan is selected.
+        """
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE append_query (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                value INTEGER NOT NULL
+            )
+        """)
+        db.execute("SELECT deltax_create_table('append_query', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert 3 days × 50 rows = 150 rows total
+        expected_rows = []
+        for day in range(3):
+            for p in range(50):
+                ts_expr = (f"'{BASE_TS}'::timestamptz + interval '{day} days' "
+                           f"+ interval '{p} minutes'")
+                val = day * 50 + p
+                db.execute(
+                    f"INSERT INTO append_query VALUES ({ts_expr}, 'dev-0', {val})"
+                )
+                expected_rows.append(val)
+        db.commit()
+
+        db.execute(
+            "SELECT deltax_enable_compression('append_query', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "append_query")
+        db.execute("ANALYZE append_query")
+        db.commit()
+
+        # Verify DeltaXAppend is in the plan
+        rows = db.execute(
+            "EXPLAIN (COSTS OFF) SELECT value FROM append_query ORDER BY value"
+        ).fetchall()
+        explain = "\n".join(r[0] for r in rows)
+        assert "DeltaXAppend" in explain, (
+            f"Expected DeltaXAppend in plan, got:\n{explain}"
+        )
+
+        # Query all rows and verify count + values
+        rows = db.execute(
+            "SELECT value FROM append_query ORDER BY value"
+        ).fetchall()
+        actual_values = [r[0] for r in rows]
+
+        assert actual_values == sorted(expected_rows), (
+            f"Expected {len(expected_rows)} rows, got {len(actual_values)}. "
+            f"Missing: {set(expected_rows) - set(actual_values)}, "
+            f"Extra: {set(actual_values) - set(expected_rows)}"
         )

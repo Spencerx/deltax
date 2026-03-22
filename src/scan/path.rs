@@ -1270,6 +1270,12 @@ pub unsafe fn add_deltax_append_path(
         (*rel).partial_pathlist = std::ptr::null_mut();
 
         pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
+
+        // Mark rel as non-partitioned so that apply_scanjoin_target_to_paths()
+        // in grouping_planner does NOT discard our path and rebuild Append
+        // paths from children.  DeltaXAppend handles all partitions internally,
+        // so the planner must treat this rel as a single-scan base rel.
+        (*rel).nparts = 0;
     }
 }
 
