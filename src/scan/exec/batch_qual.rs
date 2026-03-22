@@ -772,7 +772,7 @@ pub(super) unsafe fn extract_batch_quals(
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
                 let len = pgrx::varsize_any_exhdr(varlena_ptr);
                 let data = pgrx::vardata_any(varlena_ptr);
-                let pattern_bytes = std::slice::from_raw_parts(data, len);
+                let pattern_bytes = std::slice::from_raw_parts(data as *const u8, len);
                 let pattern = match std::str::from_utf8(pattern_bytes) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -798,7 +798,7 @@ pub(super) unsafe fn extract_batch_quals(
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
                 let len = pgrx::varsize_any_exhdr(varlena_ptr);
                 let data = pgrx::vardata_any(varlena_ptr);
-                let const_bytes = std::slice::from_raw_parts(data, len);
+                let const_bytes = std::slice::from_raw_parts(data as *const u8, len);
                 let const_str = match std::str::from_utf8(const_bytes) {
                     Ok(s) => s.to_string(),
                     Err(_) => continue,

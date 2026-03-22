@@ -600,7 +600,7 @@ pub(super) unsafe fn load_segments_heap(
                                 let len = pgrx::varsize_any_exhdr(detoasted);
                                 let data = pgrx::vardata_any(detoasted);
                                 let bytes = std::slice::from_raw_parts(
-                                    data,
+                                    data as *const u8,
                                     len,
                                 )
                                 .to_vec();
@@ -684,7 +684,7 @@ pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) {
             let detoasted = pg_sys::pg_detoast_datum(ptr);
             let len = pgrx::varsize_any_exhdr(detoasted);
             let data = pgrx::vardata_any(detoasted);
-            let bytes = std::slice::from_raw_parts(data, len).to_vec();
+            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
             if detoasted != ptr {
                 pg_sys::pfree(detoasted as *mut _);
             }
