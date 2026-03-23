@@ -17,6 +17,12 @@ pg_module_magic!();
 pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
+/// Maximum distinct values tracked per column during streaming compression.
+/// Columns exceeding this limit fall back to SQL COUNT(DISTINCT).
+/// Set to 0 to always use SQL. Default: 1,000,000.
+pub(crate) static NDISTINCT_MAX_TRACK: GucSetting<i32> =
+    GucSetting::<i32>::new(1_000_000);
+
 extension_sql!(
     r#"
 CREATE SCHEMA IF NOT EXISTS _deltax_compressed;
@@ -62,6 +68,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Override current time for testing (timestamptz literal, empty = use real time)",
         c"Override current time for testing (timestamptz literal, empty = use real time)",
         &MOCK_NOW,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.ndistinct_max_track",
+        c"Max distinct values tracked per column during streaming compression (0 = always use SQL)",
+        c"Max distinct values tracked per column during streaming compression (0 = always use SQL)",
+        &NDISTINCT_MAX_TRACK,
+        0,
+        100_000_000,
         GucContext::Suset,
         GucFlags::default(),
     );
