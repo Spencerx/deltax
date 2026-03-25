@@ -1056,6 +1056,18 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let mut flat_accs: Vec<AggAccumulator> = Vec::new();
         let is_single_group_key = group_specs.len() == 1;
 
+        // Compact path: use flat byte buffer for accumulators when possible
+        let use_compact_accs = has_group_by && can_use_compact_accs(&agg_specs);
+        let mut compact_storage = if use_compact_accs {
+            Some(CompactAccStorage::new(CompactAccLayout::new(&agg_specs)))
+        } else {
+            None
+        };
+
+        // Compact keys: pack integer GROUP BY keys into u128
+        let use_compact_keys = has_group_by && can_use_compact_keys(&group_specs);
+        let mut compact_group_map: CompactGroupMap = CompactGroupMap::with_hasher(BuildHasherDefault::default());
+
         // Check if any GROUP BY uses RegexpReplace — set up cross-segment caches
         let has_regexp_group = group_specs.iter().any(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }));
 
@@ -1706,7 +1718,119 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             let mut key_ref: Vec<GroupKeyRef> = Vec::with_capacity(group_specs.len());
             let mut regex_results: Vec<Option<String>> = Vec::new();
 
-            // Aggregate loop
+            // ============================================================
+            // COMPACT PATH: packed u128 keys + flat byte-buffer accumulators
+            // ============================================================
+            if use_compact_keys && use_compact_accs {
+                let storage = compact_storage.as_mut().unwrap();
+                let num_group_keys = group_specs.len();
+
+                for row in 0..row_count {
+                    if !selection.is_empty() && !selection[row] {
+                        continue;
+                    }
+                    total_rows_processed += 1;
+
+                    // Build packed u128 key from integer GROUP BY columns
+                    let mut int_keys: [i64; 2] = [0; 2];
+                    let mut has_null = false;
+                    for (ki, gs) in group_specs.iter().enumerate() {
+                        let col = &decompressed[gs.col_idx as usize];
+                        if col.is_empty() || col[row].1 {
+                            has_null = true;
+                            break;
+                        }
+                        int_keys[ki] = match &gs.expr {
+                            GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                                let pg_usec = col[row].0.value() as i64;
+                                pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+                            }
+                            GroupByExpr::Extract { unit, .. } => {
+                                let pg_usec = col[row].0.value() as i64;
+                                extract_field_from_usecs(pg_usec, unit)
+                            }
+                            GroupByExpr::AddConst { offset, .. } => {
+                                col[row].0.value() as i64 + offset
+                            }
+                            GroupByExpr::Column => {
+                                col[row].0.value() as i64
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+
+                    // Skip null groups (they don't appear in GROUP BY results)
+                    if has_null { continue; }
+
+                    let packed = if num_group_keys == 1 {
+                        pack_int_key_1(int_keys[0])
+                    } else {
+                        pack_int_keys_2(int_keys[0], int_keys[1])
+                    };
+
+                    // Lookup or insert group
+                    let group_idx = match compact_group_map.entry(packed) {
+                        hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
+                        hashbrown::hash_map::Entry::Vacant(e) => {
+                            let idx = storage.alloc_group();
+                            e.insert(idx);
+                            idx
+                        }
+                    };
+
+                    // Update compact accumulators
+                    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                        let (_, kind) = storage.layout.slots[spec_idx];
+                        match kind {
+                            CompactAccKind::Count => {
+                                match spec.agg_type {
+                                    AggType::CountStar => {
+                                        *storage.count_mut(group_idx, spec_idx) += 1;
+                                    }
+                                    AggType::Count => {
+                                        let col = &decompressed[spec.col_idx as usize];
+                                        if !col.is_empty() && !col[row].1 {
+                                            *storage.count_mut(group_idx, spec_idx) += 1;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            CompactAccKind::SumInt => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let v = datum_to_i128(col[row].0, spec.col_type_oid);
+                                    let (sum, count) = storage.sum_int_mut(group_idx, spec_idx);
+                                    if spec.expr_kind == AggExpr::AddConst {
+                                        *sum += v + spec.const_offset as i128;
+                                    } else {
+                                        *sum += v;
+                                    }
+                                    *count += 1;
+                                }
+                            }
+                            CompactAccKind::SumFloat => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let v = datum_to_f64(col[row].0, spec.col_type_oid);
+                                    let (sum, count) = storage.sum_float_mut(group_idx, spec_idx);
+                                    if spec.expr_kind == AggExpr::AddConst {
+                                        *sum += v + spec.const_offset as f64;
+                                    } else {
+                                        *sum += v;
+                                    }
+                                    *count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // ============================================================
+            // GENERIC PATH: original GroupKey + AggAccumulator
+            // ============================================================
+            else {
+
             for row in 0..row_count {
                 if !selection.is_empty() && !selection[row] {
                     continue;
@@ -1995,14 +2119,66 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 }
             }
 
-
+            } // end generic path
 
         }
 
         let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
 
         // Finalize results using output mapping, applying HAVING filters
-        let mut result_rows = if has_group_by {
+        let mut result_rows = if use_compact_keys && use_compact_accs {
+            // Compact finalization path
+            let storage = compact_storage.as_ref().unwrap();
+            let num_group_keys = group_specs.len();
+            let mut rows = Vec::new();
+            'compact_group_loop: for (&packed_key, &group_idx) in &compact_group_map {
+                let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                    agg_results.push(compact_finalize(storage, group_idx, spec_idx, spec));
+                }
+
+                // Apply HAVING filters
+                for hf in &having_filters {
+                    let (datum, is_null) = agg_results[hf.agg_idx];
+                    if is_null {
+                        continue 'compact_group_loop;
+                    }
+                    let val = datum.value() as i64;
+                    let pass = match hf.op {
+                        HavingOp::Gt => val > hf.const_val,
+                        HavingOp::Lt => val < hf.const_val,
+                        HavingOp::Ge => val >= hf.const_val,
+                        HavingOp::Le => val <= hf.const_val,
+                        HavingOp::Eq => val == hf.const_val,
+                        HavingOp::Ne => val != hf.const_val,
+                    };
+                    if !pass {
+                        continue 'compact_group_loop;
+                    }
+                }
+
+                // Unpack keys back to i64 datums
+                let keys = unpack_int_keys(packed_key, num_group_keys);
+                let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                for entry in &output_map {
+                    match entry {
+                        OutputEntry::Agg(ai) => {
+                            row.push(agg_results[*ai]);
+                        }
+                        OutputEntry::Group(gi) => {
+                            let v = keys[*gi];
+                            if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                                row.push((i128_to_numeric_datum(v as i128), false));
+                            } else {
+                                row.push((pg_sys::Datum::from(v as usize), false));
+                            }
+                        }
+                    }
+                }
+                rows.push(row);
+            }
+            rows
+        } else if has_group_by {
             let mut rows = Vec::new();
             // Pre-finalize all agg results keyed by group
             'group_loop: for (key, &group_idx) in &group_map {
@@ -2535,6 +2711,321 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
         state.result_idx = 0;
     }
 }
+
+// ============================================================================
+// Compact Accumulator Storage (Phase 1)
+// ============================================================================
+
+/// Kind of accumulator slot in compact storage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CompactAccKind {
+    Count,      // 8 bytes: i64
+    SumInt,     // 24 bytes: i128 sum (16) + i64 count (8)
+    SumFloat,   // 16 bytes: f64 sum (8) + i64 count (8)
+}
+
+impl CompactAccKind {
+    fn byte_size(self) -> usize {
+        match self {
+            CompactAccKind::Count => 8,
+            CompactAccKind::SumInt => 24,
+            CompactAccKind::SumFloat => 16,
+        }
+    }
+
+    fn alignment(self) -> usize {
+        match self {
+            CompactAccKind::Count => 8,
+            CompactAccKind::SumInt => 16, // i128 needs 16-byte alignment
+            CompactAccKind::SumFloat => 8,
+        }
+    }
+}
+
+/// Layout of compact accumulator slots for one group.
+struct CompactAccLayout {
+    /// (byte_offset, kind) per aggregate
+    slots: Vec<(usize, CompactAccKind)>,
+    /// Total bytes per group (aligned to 16)
+    group_stride: usize,
+}
+
+impl CompactAccLayout {
+    fn new(specs: &[AggExecSpec]) -> Self {
+        let mut offset: usize = 0;
+
+        // Sort by alignment (descending) to minimize padding.
+        // We need to maintain original order for indexing, so we compute
+        // offsets in alignment order then map back.
+        let mut indexed: Vec<(usize, CompactAccKind)> = specs.iter().enumerate().map(|(i, spec)| {
+            let kind = compact_acc_kind(spec);
+            (i, kind)
+        }).collect();
+        // Sort by alignment descending (i128 first, then i64/f64)
+        indexed.sort_by(|a, b| b.1.alignment().cmp(&a.1.alignment()));
+
+        let mut slots = vec![(0usize, CompactAccKind::Count); specs.len()];
+        for (orig_idx, kind) in &indexed {
+            let align = kind.alignment();
+            offset = (offset + align - 1) & !(align - 1);
+            slots[*orig_idx] = (offset, *kind);
+            offset += kind.byte_size();
+        }
+
+        // Align stride to 16 so i128 fields in next group are aligned
+        let group_stride = (offset + 15) & !15;
+
+        CompactAccLayout { slots, group_stride }
+    }
+}
+
+/// Determine the CompactAccKind for a given agg spec.
+fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
+    match spec.agg_type {
+        AggType::CountStar | AggType::Count => CompactAccKind::Count,
+        AggType::Sum | AggType::Avg => {
+            if spec.col_type_oid == pg_sys::FLOAT4OID || spec.col_type_oid == pg_sys::FLOAT8OID {
+                CompactAccKind::SumFloat
+            } else {
+                CompactAccKind::SumInt
+            }
+        }
+        _ => unreachable!("compact_acc_kind called for unsupported agg type"),
+    }
+}
+
+/// Flat byte buffer holding compact accumulators for all groups.
+struct CompactAccStorage {
+    buf: Vec<u8>,
+    layout: CompactAccLayout,
+}
+
+impl CompactAccStorage {
+    fn new(layout: CompactAccLayout) -> Self {
+        CompactAccStorage {
+            buf: Vec::new(),
+            layout,
+        }
+    }
+
+    /// Allocate accumulators for a new group. Returns the group index.
+    #[inline]
+    fn alloc_group(&mut self) -> u32 {
+        let group_idx = self.buf.len() / self.layout.group_stride;
+        self.buf.resize(self.buf.len() + self.layout.group_stride, 0);
+        group_idx as u32
+    }
+
+    /// Get a mutable i64 reference (for Count).
+    #[inline]
+    unsafe fn count_mut(&mut self, group_idx: u32, slot: usize) -> &mut i64 {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let ptr = self.buf.as_mut_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            &mut *(ptr as *mut i64)
+        }
+    }
+
+    /// Get mutable references to (sum: i128, count: i64) for SumInt.
+    #[inline]
+    unsafe fn sum_int_mut(&mut self, group_idx: u32, slot: usize) -> (&mut i128, &mut i64) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_mut_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let sum = &mut *(base as *mut i128);
+            let count = &mut *(base.add(16) as *mut i64);
+            (sum, count)
+        }
+    }
+
+    /// Get mutable references to (sum: f64, count: i64) for SumFloat.
+    #[inline]
+    unsafe fn sum_float_mut(&mut self, group_idx: u32, slot: usize) -> (&mut f64, &mut i64) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_mut_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let sum = &mut *(base as *mut f64);
+            let count = &mut *(base.add(8) as *mut i64);
+            (sum, count)
+        }
+    }
+
+    /// Read count value for finalization.
+    #[inline]
+    unsafe fn read_count(&self, group_idx: u32, slot: usize) -> i64 {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let ptr = self.buf.as_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            *(ptr as *const i64)
+        }
+    }
+
+    /// Read (sum_i128, count) for finalization.
+    #[inline]
+    unsafe fn read_sum_int(&self, group_idx: u32, slot: usize) -> (i128, i64) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let sum = *(base as *const i128);
+            let count = *(base.add(16) as *const i64);
+            (sum, count)
+        }
+    }
+
+    /// Read (sum_f64, count) for finalization.
+    #[inline]
+    unsafe fn read_sum_float(&self, group_idx: u32, slot: usize) -> (f64, i64) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let sum = *(base as *const f64);
+            let count = *(base.add(8) as *const i64);
+            (sum, count)
+        }
+    }
+
+}
+
+/// Check if all aggregates can use the compact accumulator path.
+fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
+    if agg_specs.is_empty() {
+        return false;
+    }
+    agg_specs.iter().all(|spec| {
+        match spec.agg_type {
+            AggType::CountStar | AggType::Count => true,
+            AggType::Sum | AggType::Avg => {
+                let t = spec.col_type_oid;
+                t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                    || t == pg_sys::FLOAT4OID || t == pg_sys::FLOAT8OID
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Finalize a compact accumulator slot into a (Datum, is_null) pair.
+unsafe fn compact_finalize(
+    storage: &CompactAccStorage,
+    group_idx: u32,
+    slot: usize,
+    spec: &AggExecSpec,
+) -> (pg_sys::Datum, bool) {
+    unsafe {
+        let (_, kind) = storage.layout.slots[slot];
+        match kind {
+            CompactAccKind::Count => {
+                let count = storage.read_count(group_idx, slot);
+                (pg_sys::Datum::from(count as usize), false)
+            }
+            CompactAccKind::SumInt => {
+                let (sum, count) = storage.read_sum_int(group_idx, slot);
+                if count == 0 {
+                    return (pg_sys::Datum::from(0usize), true);
+                }
+                match spec.agg_type {
+                    AggType::Sum => {
+                        if spec.col_type_oid == pg_sys::INT8OID {
+                            (i128_to_numeric_datum(sum), false)
+                        } else {
+                            (pg_sys::Datum::from(sum as i64 as usize), false)
+                        }
+                    }
+                    AggType::Avg => {
+                        let sum_numeric = i128_to_numeric_datum(sum);
+                        let count_numeric = pg_sys::OidFunctionCall1Coll(
+                            pg_sys::Oid::from(1781u32),
+                            pg_sys::InvalidOid,
+                            pg_sys::Datum::from(count as usize),
+                        );
+                        let datum = pg_sys::OidFunctionCall2Coll(
+                            pg_sys::Oid::from(1727u32),
+                            pg_sys::InvalidOid,
+                            sum_numeric,
+                            count_numeric,
+                        );
+                        (datum, false)
+                    }
+                    _ => (pg_sys::Datum::from(sum as i64 as usize), false),
+                }
+            }
+            CompactAccKind::SumFloat => {
+                let (sum, count) = storage.read_sum_float(group_idx, slot);
+                if count == 0 {
+                    return (pg_sys::Datum::from(0usize), true);
+                }
+                match spec.agg_type {
+                    AggType::Sum => {
+                        if spec.col_type_oid == pg_sys::FLOAT4OID {
+                            let f4 = sum as f32;
+                            (pg_sys::Datum::from(f4.to_bits() as usize), false)
+                        } else {
+                            (pg_sys::Datum::from(sum.to_bits() as usize), false)
+                        }
+                    }
+                    AggType::Avg => {
+                        let avg = sum / count as f64;
+                        (pg_sys::Datum::from(avg.to_bits() as usize), false)
+                    }
+                    _ => (pg_sys::Datum::from(sum.to_bits() as usize), false),
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Packed Integer Keys (Phase 2)
+// ============================================================================
+
+/// Check if all GROUP BY columns produce integer values and can be packed into u128.
+fn can_use_compact_keys(group_specs: &[GroupByColSpec]) -> bool {
+    if group_specs.is_empty() || group_specs.len() > 2 {
+        return false; // u128 fits at most 2 x i64
+    }
+    group_specs.iter().all(|gs| {
+        match &gs.expr {
+            GroupByExpr::Column => {
+                let t = gs.type_oid;
+                t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                    || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
+            }
+            GroupByExpr::DateTrunc { .. } => true, // returns i64
+            GroupByExpr::Extract { .. } => true,   // returns i64
+            GroupByExpr::AddConst { .. } => true,  // returns i64
+            GroupByExpr::RegexpReplace { .. } => false,
+        }
+    })
+}
+
+/// Pack up to 2 int64 keys into a u128.
+#[inline]
+fn pack_int_keys_2(k0: i64, k1: i64) -> u128 {
+    (k0 as u64 as u128) | ((k1 as u64 as u128) << 64)
+}
+
+/// Pack a single int64 key into u128.
+#[inline]
+fn pack_int_key_1(k0: i64) -> u128 {
+    k0 as u64 as u128
+}
+
+/// Unpack a u128 back into individual i64 keys.
+#[inline]
+fn unpack_int_keys(packed: u128, num_keys: usize) -> [i64; 2] {
+    let k0 = packed as u64 as i64;
+    let k1 = if num_keys > 1 { (packed >> 64) as u64 as i64 } else { 0 };
+    [k0, k1]
+}
+
+/// Type alias for compact group map with u128 keys.
+type CompactGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<ahash::AHasher>>;
 
 // ============================================================================
 // Tests
