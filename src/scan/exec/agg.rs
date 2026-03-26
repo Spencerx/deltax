@@ -1154,13 +1154,6 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             && all_needed_cols_numeric(&needed_cols, &meta.col_types)
             && batch_quals_all_numeric(&batch_quals);
 
-        pgrx::log!(
-            "pg_deltax parallel check: compact_keys={} compact_accs={} n_workers={} segments={} regexp={} all_numeric={} quals_numeric={} => can_parallel={}",
-            use_compact_keys, use_compact_accs, n_workers, all_segments.len(),
-            has_regexp_group, all_needed_cols_numeric(&needed_cols, &meta.col_types),
-            batch_quals_all_numeric(&batch_quals), can_parallel
-        );
-
         if can_parallel {
             let t2 = Instant::now();
             let config = ParallelCompactConfig {
@@ -1194,7 +1187,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             for result in &partial_results {
                 total_segments += result.segments_processed;
                 total_rows_processed += result.rows_processed;
-                decompress_us += result.decompress_us;
+                // Use max across workers (closest to wall-clock decompress time)
+                decompress_us = decompress_us.max(result.decompress_us);
                 merge_compact_results(
                     &mut compact_group_map,
                     storage,
@@ -1204,7 +1198,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 );
             }
 
-            let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
+            let total_parallel_us = t2.elapsed().as_micros() as u64;
+            let agg_us = total_parallel_us.saturating_sub(decompress_us);
 
             // Skip to finalization (same as single-threaded compact path)
             let mut result_rows = {
