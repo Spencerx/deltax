@@ -1154,6 +1154,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             && all_needed_cols_numeric(&needed_cols, &meta.col_types)
             && batch_quals_all_numeric(&batch_quals);
 
+        pgrx::log!(
+            "pg_deltax parallel check: compact_keys={} compact_accs={} n_workers={} segments={} regexp={} all_numeric={} quals_numeric={} => can_parallel={}",
+            use_compact_keys, use_compact_accs, n_workers, all_segments.len(),
+            has_regexp_group, all_needed_cols_numeric(&needed_cols, &meta.col_types),
+            batch_quals_all_numeric(&batch_quals), can_parallel
+        );
+
         if can_parallel {
             let t2 = Instant::now();
             let config = ParallelCompactConfig {
