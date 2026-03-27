@@ -7,6 +7,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::time::Instant;
 
+use regex::Regex;
+
 use crate::compression;
 use super::super::SyncStatic;
 use super::batch_qual::{BatchCompareOp, BatchQual,
@@ -2004,11 +2006,35 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         // ============================================================
         // PARALLEL MIXED PATH: multi-threaded with string GROUP BY
         // ============================================================
+        // Try to compile regexp patterns with Rust regex for thread-safe parallel execution
+        let mut rust_regex_infos: Vec<RustRegexInfo> = Vec::new();
+        if has_regexp_group {
+            let regexp_count = group_specs.iter()
+                .filter(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }))
+                .count();
+            for gs in group_specs.iter() {
+                if let GroupByExpr::RegexpReplace { ref pattern, ref replacement, .. } = gs.expr {
+                    if let Some(compiled) = try_compile_rust_regex(pattern) {
+                        let rust_replacement = convert_pg_replacement(replacement);
+                        rust_regex_infos.push(RustRegexInfo {
+                            regex: compiled,
+                            replacement: rust_replacement,
+                            col_idx: gs.col_idx as usize,
+                        });
+                    }
+                }
+            }
+            if rust_regex_infos.len() != regexp_count {
+                rust_regex_infos.clear(); // all-or-nothing: if any failed, fall back entirely
+            }
+        }
+        let all_regexp_compiled = !has_regexp_group || !rust_regex_infos.is_empty();
+
         let can_parallel_mixed_flag = !can_parallel
             && has_group_by
             && n_workers > 1
             && all_segments.len() > 1
-            && !has_regexp_group
+            && all_regexp_compiled
             && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &batch_quals, &agg_specs);
 
         if can_parallel_mixed_flag {
@@ -2072,6 +2098,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 topn_spec,
                 text_group_col_flags: &text_group_col_flags,
                 text_qual_infos: &text_qual_infos,
+                rust_regex_infos: &rust_regex_infos,
             };
 
             let chunk_size = all_segments.len().div_ceil(n_workers);
@@ -5661,11 +5688,205 @@ impl MixedKeyStorage {
 
 }
 
-/// Check if a GROUP BY column is a text type.
+/// Thread-safe string comparison using libc's `strcoll`.
+/// Unlike PG's `varstr_cmp`, this does NOT call `palloc`/`pfree`, so it is
+/// safe to call from non-PG worker threads.  On glibc, `strcoll` is MT-Safe
+/// and uses the process-wide locale set by `setlocale(LC_COLLATE, ...)`.
+/// Strings are null-terminated via a small stack buffer or heap fallback.
+fn strcoll_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    // Fast path: if both are equal bytes, they're equal in any collation
+    if a.as_bytes() == b.as_bytes() {
+        return std::cmp::Ordering::Equal;
+    }
+
+    unsafe extern "C" {
+        fn strcoll(s1: *const std::ffi::c_char, s2: *const std::ffi::c_char) -> std::ffi::c_int;
+    }
+
+    // Null-terminate strings for strcoll.
+    // Use stack buffers for short strings to avoid allocation in the hot path.
+    const STACK_BUF: usize = 512;
+    let mut buf_a = [0u8; STACK_BUF];
+    let mut buf_b = [0u8; STACK_BUF];
+    let mut heap_a: Vec<u8>;
+    let mut heap_b: Vec<u8>;
+
+    let ptr_a = if a.len() < STACK_BUF {
+        buf_a[..a.len()].copy_from_slice(a.as_bytes());
+        buf_a[a.len()] = 0;
+        buf_a.as_ptr() as *const std::ffi::c_char
+    } else {
+        heap_a = Vec::with_capacity(a.len() + 1);
+        heap_a.extend_from_slice(a.as_bytes());
+        heap_a.push(0);
+        heap_a.as_ptr() as *const std::ffi::c_char
+    };
+
+    let ptr_b = if b.len() < STACK_BUF {
+        buf_b[..b.len()].copy_from_slice(b.as_bytes());
+        buf_b[b.len()] = 0;
+        buf_b.as_ptr() as *const std::ffi::c_char
+    } else {
+        heap_b = Vec::with_capacity(b.len() + 1);
+        heap_b.extend_from_slice(b.as_bytes());
+        heap_b.push(0);
+        heap_b.as_ptr() as *const std::ffi::c_char
+    };
+
+    let result = unsafe { strcoll(ptr_a, ptr_b) };
+    if result < 0 {
+        std::cmp::Ordering::Less
+    } else if result > 0 {
+        std::cmp::Ordering::Greater
+    } else {
+        // Tie-break: byte comparison (matches PG's deterministic collation behavior)
+        a.as_bytes().cmp(b.as_bytes())
+    }
+}
+
+/// Check if a GROUP BY column is a text type (including RegexpReplace which produces text).
 fn is_text_group_col(gs: &GroupByColSpec) -> bool {
-    matches!(gs.expr, GroupByExpr::Column)
-        && matches!(gs.type_oid,
-            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID)
+    let is_text_type = matches!(gs.type_oid,
+        pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID);
+    match &gs.expr {
+        GroupByExpr::Column | GroupByExpr::RegexpReplace { .. } => is_text_type,
+        _ => false,
+    }
+}
+
+/// Check if pattern contains POSIX character classes like [:alpha:] inside bracket expressions.
+fn has_posix_classes(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut in_bracket = false;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'[' && !in_bracket {
+            in_bracket = true;
+        } else if bytes[i] == b']' && in_bracket {
+            in_bracket = false;
+        } else if in_bracket && bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+            return true;
+        }
+    }
+    false
+}
+
+/// Convert PG replacement syntax (\1, \2, \&) to Rust regex syntax ($1, $2, $0).
+fn convert_pg_replacement(replacement: &str) -> String {
+    let mut result = String::with_capacity(replacement.len());
+    let bytes = replacement.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next >= b'0' && next <= b'9' {
+                result.push('$');
+                result.push(next as char);
+                i += 2;
+                continue;
+            } else if next == b'&' {
+                result.push_str("$0");
+                i += 2;
+                continue;
+            } else if next == b'\\' {
+                result.push('\\');
+                i += 2;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+/// Convert a PG regex pattern to Rust regex, adjusting for semantic differences.
+/// 1. PG's ARE mode: `.` matches `\n` by default (REG_NLSTOP is NOT set).
+///    Rust regex: `.` does NOT match `\n`. Fix: prepend `(?s)` (dot-all mode).
+/// 2. PG's `$` is strict end-of-string.
+///    Rust's `$` also matches before trailing `\n`. Fix: convert trailing `$` to `\z`.
+fn pg_pattern_to_rust(pattern: &str) -> String {
+    let mut result = String::with_capacity(pattern.len() + 8);
+    // Enable dot-all mode so . matches \n (matching PG's ARE default)
+    result.push_str("(?s)");
+
+    // Replace unescaped $ at end of pattern with \z
+    if pattern.ends_with('$') {
+        let preceding_backslashes = pattern[..pattern.len() - 1]
+            .chars().rev().take_while(|&c| c == '\\').count();
+        if preceding_backslashes % 2 == 0 {
+            result.push_str(&pattern[..pattern.len() - 1]);
+            result.push_str("\\z");
+            return result;
+        }
+    }
+    result.push_str(pattern);
+    result
+}
+
+/// Try to compile a PG regex pattern for use with Rust regex crate.
+/// Returns Some(Regex) if compatible, None if incompatible (with warning logged).
+fn try_compile_rust_regex(pattern: &str) -> Option<Regex> {
+    if !crate::get_parallel_regex() {
+        return None;
+    }
+    if has_posix_classes(pattern) {
+        warning!("pg_deltax: regex pattern contains POSIX character classes, falling back to PG regex (pattern: {})", pattern);
+        return None;
+    }
+    let rust_pattern = pg_pattern_to_rust(pattern);
+    match Regex::new(&rust_pattern) {
+        Ok(re) => Some(re),
+        Err(e) => {
+            warning!("pg_deltax: regex pattern not supported by Rust regex crate, falling back to PG regex (pattern: {}, error: {})", pattern, e);
+            None
+        }
+    }
+}
+
+/// Info for a regexp GROUP BY column that compiled successfully with Rust regex.
+struct RustRegexInfo {
+    regex: Regex,
+    replacement: String,
+    col_idx: usize,
+}
+
+/// Apply a Rust regex replacement to a SegTextColumn, producing a new transformed column.
+/// The original column is not modified (needed for aggregations on the same column).
+/// For Dict columns, only applies regex to unique dict entries (O(dict_size)).
+/// For LZ4 columns, converts to Dict after applying regex.
+fn apply_regex_to_seg_col(seg_col: &SegTextColumn, regex: &Regex, replacement: &str) -> SegTextColumn {
+    match seg_col {
+        SegTextColumn::Dict { entries, row_to_entry } => {
+            let new_entries: Vec<String> = entries.iter()
+                .map(|e| regex.replace(e, replacement).into_owned())
+                .collect();
+            SegTextColumn::Dict { entries: new_entries, row_to_entry: row_to_entry.clone() }
+        }
+        SegTextColumn::Lz4 { buf, row_to_range } => {
+            let mut unique_map: HashMap<String, u32> = HashMap::new();
+            let mut entries: Vec<String> = Vec::new();
+            let mut new_row_to_entry: Vec<u32> = Vec::with_capacity(row_to_range.len());
+            for &(off, len) in row_to_range {
+                if off == u32::MAX {
+                    new_row_to_entry.push(u32::MAX);
+                } else {
+                    let s = std::str::from_utf8(&buf[off as usize..off as usize + len as usize]).unwrap_or("");
+                    let replaced = regex.replace(s, replacement).into_owned();
+                    let idx = *unique_map.entry(replaced.clone()).or_insert_with(|| {
+                        let idx = entries.len() as u32;
+                        entries.push(replaced);
+                        idx
+                    });
+                    new_row_to_entry.push(idx);
+                }
+            }
+            SegTextColumn::Dict { entries, row_to_entry: new_row_to_entry }
+        }
+        SegTextColumn::SegBy(opt) => {
+            let new_opt = opt.as_deref().map(|s| regex.replace(s, replacement).into_owned());
+            SegTextColumn::SegBy(new_opt)
+        }
+    }
 }
 
 /// Configuration for parallel mixed aggregation (read-only, shared across threads).
@@ -5685,6 +5906,8 @@ struct ParallelMixedConfig<'a> {
     text_group_col_flags: &'a [bool],
     /// Which needed_cols indices have text WHERE quals (EQ/NE/LIKE)
     text_qual_infos: &'a [TextQualInfo],
+    /// Compiled Rust regex info for RegexpReplace GROUP BY columns
+    rust_regex_infos: &'a [RustRegexInfo],
 }
 
 /// Pre-extracted text qual info for worker threads.
@@ -5837,10 +6060,11 @@ fn can_parallel_mixed(
         return false;
     }
 
-    // All GROUP BY columns must be either plain int columns or plain text columns
+    // All GROUP BY columns must be either text columns (including RegexpReplace)
+    // or integer-producing expressions
     for gs in group_specs {
         if is_text_group_col(gs) {
-            continue; // text column — OK
+            continue; // text column (or RegexpReplace with Rust regex) — OK
         }
         // Must be an integer-producing expression
         match &gs.expr {
@@ -5853,7 +6077,7 @@ fn can_parallel_mixed(
                 }
             }
             GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {}
-            GroupByExpr::RegexpReplace { .. } => return false, // not thread-safe
+            GroupByExpr::RegexpReplace { .. } => return false, // non-text RegexpReplace not supported
         }
     }
 
@@ -6015,6 +6239,20 @@ fn process_segments_mixed(
                 blob_idx += 1;
             }
         }
+        // Build regex-transformed text columns for GROUP BY keys (separate from originals,
+        // since the original column may also be needed for aggregation like MIN/AVG/length)
+        let regex_text_cols: Vec<Option<SegTextColumn>> = if config.rust_regex_infos.is_empty() {
+            Vec::new()
+        } else {
+            let mut cols: Vec<Option<SegTextColumn>> = (0..config.col_names.len()).map(|_| None).collect();
+            for ri in config.rust_regex_infos {
+                if let Some(ref seg_col) = text_seg_cols[ri.col_idx] {
+                    cols[ri.col_idx] = Some(apply_regex_to_seg_col(seg_col, &ri.regex, &ri.replacement));
+                }
+            }
+            cols
+        };
+
         decompress_us += t_dec.elapsed().as_micros() as u64;
 
         let row_count = seg.row_count as usize;
@@ -6070,7 +6308,16 @@ fn process_segments_mixed(
             for gs in config.group_specs.iter() {
                 if is_text_group_col(gs) {
                     let col_idx = gs.col_idx as usize;
-                    match &text_seg_cols[col_idx] {
+                    // For RegexpReplace columns, use the pre-transformed column;
+                    // for plain text columns, use the original
+                    let seg_col_ref = if matches!(gs.expr, GroupByExpr::RegexpReplace { .. })
+                        && !regex_text_cols.is_empty()
+                    {
+                        regex_text_cols[col_idx].as_ref()
+                    } else {
+                        text_seg_cols[col_idx].as_ref()
+                    };
+                    match seg_col_ref {
                         Some(seg_col) => {
                             str_keys[str_idx] = seg_col.get_str(row);
                             // NULL text key → skip (like compact path)
@@ -6170,6 +6417,13 @@ fn process_segments_mixed(
                                 *sum += v;
                             }
                             *count += 1;
+                        } else if spec.expr_kind == AggExpr::LengthOf {
+                            if let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
+                                && let Some(s) = seg_col.get_str(row) {
+                                let (sum, count) = unsafe { compact_storage.sum_int_mut(group_idx, spec_idx) };
+                                *sum += s.chars().count() as i128;
+                                *count += 1;
+                            }
                         }
                     }
                     CompactAccKind::SumIntNarrow => {
@@ -6183,6 +6437,13 @@ fn process_segments_mixed(
                                 *sum += v;
                             }
                             *count += 1;
+                        } else if spec.expr_kind == AggExpr::LengthOf {
+                            if let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
+                                && let Some(s) = seg_col.get_str(row) {
+                                let (sum, count) = unsafe { compact_storage.sum_int_narrow_mut(group_idx, spec_idx) };
+                                *sum += s.chars().count() as i64;
+                                *count += 1;
+                            }
                         }
                     }
                     CompactAccKind::SumFloat => {
@@ -6196,6 +6457,13 @@ fn process_segments_mixed(
                                 *sum += v;
                             }
                             *count += 1;
+                        } else if spec.expr_kind == AggExpr::LengthOf {
+                            if let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
+                                && let Some(s) = seg_col.get_str(row) {
+                                let (sum, count) = unsafe { compact_storage.sum_float_mut(group_idx, spec_idx) };
+                                *sum += s.chars().count() as f64;
+                                *count += 1;
+                            }
                         }
                     }
                     CompactAccKind::MinStr | CompactAccKind::MaxStr => {
@@ -6207,7 +6475,7 @@ fn process_segments_mixed(
                                     true // no current value
                                 } else {
                                     let cur = compact_storage.str_arena.get(cur_off, cur_len);
-                                    let cmp = s.as_bytes().cmp(cur.as_bytes()); // memcmp (thread-safe)
+                                    let cmp = strcoll_cmp(s, cur);
                                     match kind {
                                         CompactAccKind::MinStr => cmp == std::cmp::Ordering::Less,
                                         CompactAccKind::MaxStr => cmp == std::cmp::Ordering::Greater,
@@ -7817,5 +8085,126 @@ mod tests {
         let s2 = "DIFFERENT";
         let temp = [GroupKeyRef::from_str(s1), GroupKeyRef::from_str(s2)];
         assert!(!keys_match(&owned, &temp, &arena));
+    }
+
+    // -------------------------------------------------------------------
+    // Rust regex helper tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_has_posix_classes_alpha() {
+        assert!(has_posix_classes("[[:alpha:]]"));
+    }
+
+    #[pg_test]
+    fn test_has_posix_classes_digit() {
+        assert!(has_posix_classes("[[:digit:]]"));
+    }
+
+    #[pg_test]
+    fn test_has_posix_classes_plain_range() {
+        assert!(!has_posix_classes("[a-z]"));
+    }
+
+    #[pg_test]
+    fn test_has_posix_classes_no_brackets() {
+        assert!(!has_posix_classes("abc.*def"));
+    }
+
+    #[pg_test]
+    fn test_convert_pg_replacement_capture_groups() {
+        assert_eq!(convert_pg_replacement(r"\1"), "$1");
+        assert_eq!(convert_pg_replacement(r"foo\1bar\2"), "foo$1bar$2");
+    }
+
+    #[pg_test]
+    fn test_convert_pg_replacement_whole_match() {
+        assert_eq!(convert_pg_replacement(r"\&"), "$0");
+    }
+
+    #[pg_test]
+    fn test_convert_pg_replacement_literal_backslash() {
+        assert_eq!(convert_pg_replacement(r"\\"), "\\");
+    }
+
+    #[pg_test]
+    fn test_convert_pg_replacement_no_escapes() {
+        assert_eq!(convert_pg_replacement("plain text"), "plain text");
+    }
+
+    #[pg_test]
+    fn test_try_compile_safe_clickbench_pattern() {
+        // The ClickBench Q29 pattern
+        let re = try_compile_rust_regex(r"^https?://(?:www\.)?([^/]+)/.*");
+        assert!(re.is_some());
+    }
+
+    #[pg_test]
+    fn test_try_compile_posix_class_fallback() {
+        let re = try_compile_rust_regex("[[:alpha:]]+");
+        assert!(re.is_none());
+    }
+
+    #[pg_test]
+    fn test_try_compile_backreference_fallback() {
+        // Backreferences are not supported by Rust regex
+        let re = try_compile_rust_regex(r"(abc)\1");
+        assert!(re.is_none());
+    }
+
+    #[pg_test]
+    fn test_try_compile_lookahead_fallback() {
+        let re = try_compile_rust_regex(r"foo(?=bar)");
+        assert!(re.is_none());
+    }
+
+    #[pg_test]
+    fn test_clickbench_regex_replacement() {
+        // Use try_compile_rust_regex which applies pg_pattern_to_rust internally
+        let re = try_compile_rust_regex(r"^https?://(?:www\.)?([^/]+)/.*$").unwrap();
+        let replacement = convert_pg_replacement(r"\1");
+        assert_eq!(replacement, "$1");
+
+        let url = "https://www.example.com/path/to/page";
+        let result = re.replace(url, replacement.as_str());
+        assert_eq!(result, "example.com");
+
+        let url2 = "http://subdomain.test.org/index.html";
+        let result2 = re.replace(url2, replacement.as_str());
+        assert_eq!(result2, "subdomain.test.org");
+
+        let url3 = "https://bare-domain.io/";
+        let result3 = re.replace(url3, replacement.as_str());
+        assert_eq!(result3, "bare-domain.io");
+
+        // Trailing newline: PG's .* matches \n, so the whole string matches
+        // and the domain is extracted. Our (?s) + \z conversion ensures same behavior.
+        let url4 = "http://example.com/path\n";
+        let result4 = re.replace(url4, replacement.as_str());
+        assert_eq!(result4, "example.com"); // .* consumes \n, \z matches at end
+    }
+
+    #[pg_test]
+    fn test_pg_pattern_to_rust_conversions() {
+        // (?s) prefix for dot-all mode + $ → \z conversion
+        assert_eq!(pg_pattern_to_rust("foo$"), "(?s)foo\\z");
+        assert_eq!(pg_pattern_to_rust("foo\\$"), "(?s)foo\\$"); // escaped $ — no \z
+        assert_eq!(pg_pattern_to_rust("foo\\\\$"), "(?s)foo\\\\\\z"); // \\$ → $ is unescaped
+        assert_eq!(pg_pattern_to_rust("foo"), "(?s)foo"); // no $ — just (?s) prefix
+    }
+
+    #[pg_test]
+    fn test_rust_regex_dot_matches_newline() {
+        // PG's . matches \n by default; our (?s) prefix ensures Rust regex does too
+        let re = try_compile_rust_regex("^http://([^/]+)/.*$").unwrap();
+        let replacement = convert_pg_replacement(r"\1");
+        // URL with embedded \n — PG's .* matches across it
+        let url = "http://example.com/path\nmore";
+        let result = re.replace(url, replacement.as_str());
+        assert_eq!(result, "example.com");
+        // URL with embedded \r\n
+        let url2 = "http://example.com/path\r\nmore";
+        let result2 = re.replace(url2, replacement.as_str());
+        assert_eq!(result2, "example.com");
     }
 }

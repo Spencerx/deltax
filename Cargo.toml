@@ -32,6 +32,7 @@ hashbrown = "0.15"
 ahash = "0.8"
 cardinality-estimator = "1.0"
 num_cpus = "1"
+regex = "1"
 
 [dev-dependencies]
 pgrx-tests = "0.17"

@@ -19,6 +19,8 @@ pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
 
 pub(crate) static PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -28,6 +30,10 @@ pub(crate) fn get_parallel_workers() -> usize {
     } else {
         (v as usize).min(64)
     }
+}
+
+pub(crate) fn get_parallel_regex() -> bool {
+    PARALLEL_REGEX.get()
 }
 
 extension_sql!(
@@ -84,6 +90,14 @@ pub extern "C-unwind" fn _PG_init() {
         &PARALLEL_WORKERS,
         0,
         64,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.parallel_regex",
+        c"Use Rust regex for parallel REGEXP_REPLACE in GROUP BY",
+        c"When ON, compatible regex patterns use the Rust regex crate for thread-safe parallel execution",
+        &PARALLEL_REGEX,
         GucContext::Userset,
         GucFlags::default(),
     );

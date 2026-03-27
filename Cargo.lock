@@ -1007,6 +1007,7 @@ dependencies = [
  "num_cpus",
  "pgrx",
  "pgrx-tests",
+ "regex",
  "serde",
  "serde_json",
 ]

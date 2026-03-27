@@ -25,6 +25,7 @@ PG_DELTAX_SRC = $(CURDIR)/..
 
 RESULTS_DIR = results
 HISTORY_DIR = $(RESULTS_DIR)/history
+CLICKBENCH_DIR ?= $(CURDIR)/../../../ClickBench/pg-deltax
 
 AWS_PROFILE ?= management
 AWS_NAME = clickbench-pg-deltax
@@ -102,6 +103,12 @@ bench:
 	cp $(RESULTS_DIR)/pg_deltax.json $(HISTORY_DIR)/$(TS)_$(COMMIT)/pg_deltax.json
 	@echo "=== Results saved to $(RESULTS_DIR)/pg_deltax.json ==="
 	@echo "=== Archived to $(HISTORY_DIR)/$(TS)_$(COMMIT)/ ==="
+	@if [ -d "$(CLICKBENCH_DIR)" ]; then \
+		echo "=== Generating ClickBench HTML report ==="; \
+		cp $(RESULTS_DIR)/pg_deltax.json $(CLICKBENCH_DIR)/results/c6a.4xlarge.json; \
+		cd $(CLICKBENCH_DIR)/.. && ./generate-results.sh; \
+		open $(CLICKBENCH_DIR)/../index.html; \
+	fi
 
 # EXPLAIN ANALYZE a single query. Usage: make query EC2=<ip> Q=33 [SET="SET pg_deltax.parallel_workers=4"]
 query:
