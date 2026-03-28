@@ -78,6 +78,8 @@ pub(crate) struct DecompressState {
     topn_limit: usize,
     /// Sort ascending (true) or descending (false) for Top-N.
     topn_ascending: bool,
+    /// Whether ORDER BY has multiple columns (first is time, rest handled by PG Sort).
+    topn_multi_col_sort: bool,
     /// Sort column index (0-based into col_names) for Top-N.
     topn_sort_col: Option<usize>,
     /// Buffered top-N result rows (filled on first exec call).
@@ -180,6 +182,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         let mut found_sentinel = false;
         let mut topn_limit: i64 = 0;
         let mut topn_ascending: bool = true;
+        let mut topn_multi_col_sort: bool = false;
         for i in 1..list_len {
             let val = pg_sys::list_nth_int(custom_private, i);
             if val == -1 && !found_sentinel {
@@ -187,10 +190,13 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
                 continue;
             }
             if val == -2 && found_sentinel {
-                // Top-N sentinel: next two values are effective_limit, sort_ascending
+                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort
                 if i + 2 < list_len {
                     topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
                     topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
+                }
+                if i + 3 < list_len {
+                    topn_multi_col_sort = pg_sys::list_nth_int(custom_private, i + 3) != 0;
                 }
                 break;
             }
@@ -226,6 +232,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         // Set Top-N fields
         state.topn_limit = if topn_limit > 0 { topn_limit as usize } else { 0 };
         state.topn_ascending = topn_ascending;
+        state.topn_multi_col_sort = topn_multi_col_sort;
         state.timing.topn_limit = if topn_limit > 0 { topn_limit as u64 } else { 0 };
         if topn_limit > 0 {
             state.topn_sort_col = state.col_names.iter().position(|n| n == &state._time_column);
@@ -292,6 +299,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let mut found_sentinel = false;
         let mut topn_limit: i64 = 0;
         let mut topn_ascending: bool = true;
+        let mut topn_multi_col_sort: bool = false;
         for i in 0..list_len {
             let val = pg_sys::list_nth_int(custom_private, i);
             if val == -1 && !found_sentinel {
@@ -299,10 +307,13 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 continue;
             }
             if val == -2 && found_sentinel {
-                // Top-N sentinel: next two values are effective_limit, sort_ascending
+                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort
                 if i + 2 < list_len {
                     topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
                     topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
+                }
+                if i + 3 < list_len {
+                    topn_multi_col_sort = pg_sys::list_nth_int(custom_private, i + 3) != 0;
                 }
                 break;
             }
@@ -472,6 +483,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             selection_vector: Vec::new(),
             topn_limit: if topn_limit > 0 { topn_limit as usize } else { 0 },
             topn_ascending,
+            topn_multi_col_sort,
             topn_sort_col,
             topn_buffer: Vec::new(),
             topn_cursor: 0,
@@ -628,6 +640,7 @@ fn load_decompress_state(
         selection_vector: Vec::new(),
         topn_limit: 0,
         topn_ascending: true,
+        topn_multi_col_sort: false,
         topn_sort_col: None,
         topn_buffer: Vec::new(),
         topn_cursor: 0,
@@ -1168,7 +1181,21 @@ unsafe fn exec_topn_two_pass(
         } else {
             candidates.sort_by_key(|c| std::cmp::Reverse(c.sort_key));
         }
-        candidates.truncate(effective_limit);
+        if state.topn_multi_col_sort {
+            // Multi-column ORDER BY: keep all candidates whose time key could appear
+            // in the final top-N. Find the threshold at position effective_limit-1,
+            // then retain all candidates with sort_key <= that (ASC) or >= that (DESC),
+            // since ties on the time column need secondary sort by PG's Sort node.
+            let threshold_idx = std::cmp::min(effective_limit - 1, candidates.len() - 1);
+            let threshold_key = candidates[threshold_idx].sort_key;
+            if state.topn_ascending {
+                candidates.retain(|c| c.sort_key <= threshold_key);
+            } else {
+                candidates.retain(|c| c.sort_key >= threshold_key);
+            }
+        } else {
+            candidates.truncate(effective_limit);
+        }
 
         // === Pass 2: Phase 2 only for segments with top-N rows ===
         let mut segment_topn_rows: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1313,11 +1340,13 @@ unsafe fn exec_topn_two_pass(
             }
         }
 
-        // Sort result_rows by sort key
-        if state.topn_ascending {
-            result_rows.sort_by_key(|r| r.sort_key);
-        } else {
-            result_rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key));
+        // Sort result_rows by sort key (skip for multi-column: PG's Sort handles it)
+        if !state.topn_multi_col_sort {
+            if state.topn_ascending {
+                result_rows.sort_by_key(|r| r.sort_key);
+            } else {
+                result_rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key));
+            }
         }
 
         // Store in topn_buffer

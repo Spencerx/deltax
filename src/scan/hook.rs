@@ -297,16 +297,17 @@ unsafe fn order_by_matches_column(
 
 /// Extract Top-N info (effective LIMIT + sort direction) from the parse tree.
 ///
-/// Returns `(effective_limit, sort_ascending)`:
+/// Returns `(effective_limit, sort_ascending, multi_col_sort)`:
 /// - effective_limit = 0 means Top-N is disabled
+/// - multi_col_sort = true when ORDER BY has multiple columns (first must be time)
 /// - Only enabled when LIMIT is a constant integer ≤ 10000 and ORDER BY matches time column
 unsafe fn extract_topn_info(
     root: *mut pg_sys::PlannerInfo,
     parse: *mut pg_sys::Query,
-) -> (i64, bool) {
+) -> (i64, bool, bool) {
     unsafe {
         if parse.is_null() {
-            return (0, true);
+            return (0, true, false);
         }
 
         // Extract LIMIT (constant integer only)
@@ -327,7 +328,7 @@ unsafe fn extract_topn_info(
         };
 
         if limit_count <= 0 {
-            return (0, true);
+            return (0, true, false);
         }
 
         // Extract OFFSET if present, add to limit
@@ -342,7 +343,7 @@ unsafe fn extract_topn_info(
                 }
             } else {
                 // Non-constant OFFSET — disable Top-N
-                return (0, true);
+                return (0, true, false);
             }
         } else {
             0
@@ -352,20 +353,22 @@ unsafe fn extract_topn_info(
 
         // Cap at 10000 — beyond that, overhead not worth it
         if effective_limit > 10000 {
-            return (0, true);
+            return (0, true, false);
         }
 
-        // Check if ORDER BY matches time column (ASC or DESC).
-        // Only single-column ORDER BY: multi-column ORDER BY (e.g. ORDER BY
-        // EventTime, SearchPhrase) can't be satisfied by sorting on time alone.
+        // Check if ORDER BY has at least one pathkey and the first is the time column.
+        // Multi-column ORDER BY is supported: we use the time column for segment
+        // skipping and threshold, PG's Sort node handles the full multi-column sort.
         let query_pathkeys = (*root).query_pathkeys;
-        if query_pathkeys.is_null() || (*query_pathkeys).length != 1 {
-            return (0, true);
+        if query_pathkeys.is_null() || (*query_pathkeys).length < 1 {
+            return (0, true, false);
         }
+
+        let multi_col_sort = (*query_pathkeys).length > 1;
 
         let first_pk = pg_sys::list_nth(query_pathkeys, 0) as *mut pg_sys::PathKey;
         if first_pk.is_null() {
-            return (0, true);
+            return (0, true, false);
         }
 
         #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
@@ -379,10 +382,10 @@ unsafe fn extract_topn_info(
         let is_desc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_GT;
 
         if !is_asc && !is_desc {
-            return (0, true);
+            return (0, true, false);
         }
 
-        (effective_limit, is_asc)
+        (effective_limit, is_asc, multi_col_sort)
     }
 }
 
@@ -411,7 +414,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
 
         // Extract LIMIT/OFFSET from parse tree for Top-N optimization
         let parse = (*root).parse;
-        let (effective_limit, sort_ascending) = extract_topn_info(root, parse);
+        let (effective_limit, sort_ascending, multi_col_sort) = extract_topn_info(root, parse);
 
         // Check if this is the parent of a partitioned table (for DeltaXAppend)
         if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL
@@ -432,7 +435,8 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             } else {
                 0
             };
-            path::add_deltax_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending);
+            let append_multi_col = if append_topn_limit > 0 { multi_col_sort } else { false };
+            path::add_deltax_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending, append_multi_col);
             return;
         }
 
@@ -497,7 +501,8 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         };
 
         // Add the custom decompress path
-        path::add_decompress_path(root, rel, companion_oid, pathkeys, topn_effective_limit, sort_ascending);
+        let topn_multi_col = if topn_effective_limit > 0 { multi_col_sort } else { false };
+        path::add_decompress_path(root, rel, companion_oid, pathkeys, topn_effective_limit, sort_ascending, topn_multi_col);
     }
 }
 
