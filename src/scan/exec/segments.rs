@@ -6,6 +6,7 @@ use crate::compression;
 use super::batch_qual::{BatchQual, BatchCompareOp, LikeStrategy, sql_like_match};
 use super::datum_utils::{pg_type_oid, tupdesc_get_attr};
 
+
 /// Which dict check to perform in `segment_skippable_by_dict`.
 #[derive(Clone, Copy, PartialEq)]
 enum DictCheck { Eq, Ne, Like, NotLike }
@@ -55,11 +56,12 @@ pub(super) fn segment_passes_minmax_filter(
                     let c = f.const_datum.value() as i64;
                     match f.op {
                         BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                        BatchCompareOp::Ne => !(seg_min == c && seg_max == c),
                         BatchCompareOp::Lt => seg_min < c,
                         BatchCompareOp::Le => seg_min <= c,
                         BatchCompareOp::Gt => seg_max > c,
                         BatchCompareOp::Ge => seg_max >= c,
-                        _ => true, // Ne, Like, NotLike — can't prune
+                        _ => true, // Like, NotLike — can't prune
                     }
                 }
             }
@@ -70,6 +72,7 @@ pub(super) fn segment_passes_minmax_filter(
             let c = f32::from_bits(f.const_datum.value() as u32) as f64;
             match f.op {
                 BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                BatchCompareOp::Ne => !(seg_min == c && seg_max == c),
                 BatchCompareOp::Lt => seg_min < c,
                 BatchCompareOp::Le => seg_min <= c,
                 BatchCompareOp::Gt => seg_max > c,
@@ -83,6 +86,7 @@ pub(super) fn segment_passes_minmax_filter(
             let c = f64::from_bits(f.const_datum.value() as u64);
             match f.op {
                 BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                BatchCompareOp::Ne => !(seg_min == c && seg_max == c),
                 BatchCompareOp::Lt => seg_min < c,
                 BatchCompareOp::Le => seg_min <= c,
                 BatchCompareOp::Gt => seg_max > c,
@@ -359,7 +363,7 @@ pub(super) unsafe fn load_segments_heap(
     lazy_cols: Option<&[bool]>,
     batch_quals: &[BatchQual],
     load_sums: bool,
-) -> (Vec<SegmentData>, u64, u64) {
+) -> (Vec<SegmentData>, u64, u64, u64) {  // last u64 = detoast_us
     unsafe {
         // Open companion table with AccessShareLock
         let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
@@ -459,9 +463,9 @@ pub(super) unsafe fn load_segments_heap(
         // Build min/max predicate filters from batch quals
         let mut minmax_filters: Vec<MinMaxFilter> = Vec::new();
         for bq in batch_quals {
-            // Only orderable types (not BOOL, not text, not LIKE/NotLike/Ne)
+            // Only orderable types (not BOOL, not text, not LIKE/NotLike)
             match bq.op {
-                BatchCompareOp::Ne | BatchCompareOp::Like | BatchCompareOp::NotLike => continue,
+                BatchCompareOp::Like | BatchCompareOp::NotLike => continue,
                 _ => {}
             }
             match bq.type_oid {
@@ -508,25 +512,37 @@ pub(super) unsafe fn load_segments_heap(
         let mut segments = Vec::new();
         let mut segments_skipped: u64 = 0;
         let mut segments_minmax_skipped: u64 = 0;
+        let mut detoast_us: u64 = 0;
+        let mut heap_getnext_us: u64 = 0;
+        let mut deform_us: u64 = 0;
+        let mut detoast_calls: u64 = 0;
+        let mut detoast_toasted: u64 = 0;
+        let mut detoast_bytes: u64 = 0;
+        let mut compressed_some_count: u64 = 0;
+        let mut compressed_none_count: u64 = 0;
         let mut values = vec![pg_sys::Datum::from(0); natts];
         let mut nulls = vec![true; natts];
 
         loop {
+            let getnext_start = std::time::Instant::now();
             let tuple = pg_sys::heap_getnext(
                 scan,
                 pg_sys::ScanDirection::ForwardScanDirection,
             );
+            heap_getnext_us += getnext_start.elapsed().as_micros() as u64;
             if tuple.is_null() {
                 break;
             }
 
             // Deform tuple into datums + nulls arrays
+            let deform_start = std::time::Instant::now();
             pg_sys::heap_deform_tuple(
                 tuple,
                 tupdesc,
                 values.as_mut_ptr(),
                 nulls.as_mut_ptr(),
             );
+            deform_us += deform_start.elapsed().as_micros() as u64;
 
             // Extract segment_by values
             let mut segment_values: Vec<Option<String>> = Vec::new();
@@ -606,12 +622,14 @@ pub(super) unsafe fn load_segments_heap(
 
             // --- Segment passed pruning: detoast blobs ---
 
-            // Extract compressed BYTEA blobs
+            // Extract compressed BYTEA blobs (timed separately — this is the TOAST I/O)
+            let detoast_start = std::time::Instant::now();
             let mut compressed_blobs: Vec<Vec<u8>> = Vec::new();
             let mut toast_pointers: Vec<Vec<u8>> = Vec::new();
             for (bi, opt_attno) in compressed_attnos.iter().enumerate() {
                 match opt_attno {
                     Some(attno) => {
+                        compressed_some_count += 1;
                         let attno = *attno;
                         if !nulls[attno] {
                             if blob_is_lazy[bi] {
@@ -630,9 +648,15 @@ pub(super) unsafe fn load_segments_heap(
                                 // Eager: detoast immediately
                                 let varlena_ptr: *mut pg_sys::varlena =
                                     values[attno].cast_mut_ptr();
+                                detoast_calls += 1;
                                 let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
                                 let len = pgrx::varsize_any_exhdr(detoasted);
                                 let data = pgrx::vardata_any(detoasted);
+                                detoast_bytes += len as u64;
+                                let was_toasted = detoasted != varlena_ptr;
+                                if was_toasted {
+                                    detoast_toasted += 1;
+                                }
                                 // Cast needed: vardata_any returns *const i8 on Linux, *const u8 on macOS
                                 #[allow(clippy::unnecessary_cast)]
                                 let bytes = std::slice::from_raw_parts(
@@ -640,7 +664,7 @@ pub(super) unsafe fn load_segments_heap(
                                     len,
                                 )
                                 .to_vec();
-                                if detoasted != varlena_ptr {
+                                if was_toasted {
                                     pg_sys::pfree(detoasted as *mut _);
                                 }
                                 compressed_blobs.push(bytes);
@@ -652,12 +676,14 @@ pub(super) unsafe fn load_segments_heap(
                         }
                     }
                     None => {
+                        compressed_none_count += 1;
                         // Unneeded column — empty placeholder to keep blob_idx mapping
                         compressed_blobs.push(Vec::new());
                         toast_pointers.push(Vec::new());
                     }
                 }
             }
+            detoast_us += detoast_start.elapsed().as_micros() as u64;
 
             // Extract per-column min/max
             let mut col_minmax = HashMap::new();
@@ -701,7 +727,23 @@ pub(super) unsafe fn load_segments_heap(
         (*(*rel).rd_tableam).scan_end.unwrap()(scan);
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
-        (segments, segments_skipped, segments_minmax_skipped)
+        pgrx::log!(
+            "load_segments_heap: segments={} skipped={} heap_getnext={:.1}ms deform={:.1}ms detoast={:.1}ms \
+             detoast_calls={} toasted={} inline={} bytes={} blob_some={} blob_none={}",
+            segments.len(),
+            segments_skipped,
+            heap_getnext_us as f64 / 1000.0,
+            deform_us as f64 / 1000.0,
+            detoast_us as f64 / 1000.0,
+            detoast_calls,
+            detoast_toasted,
+            detoast_calls - detoast_toasted,
+            detoast_bytes,
+            compressed_some_count,
+            compressed_none_count,
+        );
+
+        (segments, segments_skipped, segments_minmax_skipped, detoast_us)
     }
 }
 

@@ -407,7 +407,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let mut total_skipped: u64 = 0;
         let mut total_minmax_skipped: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, skipped, mm_skipped) = load_segments_heap(
+            let (segs, skipped, mm_skipped, _dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, t_min, t_max,
                 lazy_cols.as_deref(), &batch_quals, false,
@@ -575,7 +575,7 @@ fn load_decompress_state(
 
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
     let t1 = Instant::now();
-    let (segments_data, segments_skipped, minmax_skipped) = unsafe {
+    let (segments_data, segments_skipped, minmax_skipped, _detoast_us) = unsafe {
         load_segments_heap(
             companion_oid, &meta.col_names, &meta.segment_by, &needed_cols,
             &meta.time_column, false, &seg_filters, t_min, t_max,

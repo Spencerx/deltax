@@ -118,6 +118,17 @@ query:
 		echo \"Q$(Q): \$$QUERY\" && echo '---' && \
 		sudo -u postgres psql $(EC2_DB) -c '$(SET)' -c \"EXPLAIN ANALYZE \$$QUERY\""
 
+# Cold EXPLAIN ANALYZE: restart PG + drop OS caches first. Usage: make query-cold EC2=<ip> Q=7
+query-cold:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> Q=<number>"; exit 1)
+	@test -n "$(Q)" || (echo "Usage: make $@ EC2=<ip> Q=<number>"; exit 1)
+	$(EC2_SSH) "sudo systemctl restart postgresql && \
+		sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null && \
+		sleep 1 && \
+		QUERY=\$$(sed -n '$$(($(Q)+1))p' ~/clickbench/queries.sql) && \
+		echo \"Q$(Q) (cold): \$$QUERY\" && echo '---' && \
+		sudo -u postgres psql $(EC2_DB) -c '$(SET)' -c \"EXPLAIN ANALYZE \$$QUERY\""
+
 # Run arbitrary SQL. Usage: make sql EC2=<ip> SQL="SHOW work_mem"
 sql:
 	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> SQL=\"...\""; exit 1)

@@ -245,6 +245,7 @@ pub(crate) struct AggScanState {
     pub(crate) _num_result_cols: usize,
     pub(crate) metadata_us: u64,
     pub(crate) heap_scan_us: u64,
+    pub(crate) detoast_us: u64,
     pub(crate) decompress_us: u64,
     pub(crate) agg_us: u64,
     pub(crate) total_segments: u64,
@@ -654,6 +655,7 @@ fn try_catalog_shortcut(
         _num_result_cols: num_result_cols,
         metadata_us,
         heap_scan_us: 0,
+        detoast_us: 0,
         decompress_us: 0,
         agg_us: 0,
         total_segments: 0,
@@ -884,6 +886,7 @@ fn try_metadata_fast_path(
         _num_result_cols: num_result_cols,
         metadata_us,
         heap_scan_us,
+        detoast_us: 0,
         decompress_us: 0,
         agg_us: 0,
         total_segments,
@@ -964,7 +967,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             let t1 = Instant::now();
             let mut all_segments: Vec<SegmentData> = Vec::new();
             for &oid in &plan.companion_oids {
-                let (segs, _, _) = load_segments_heap(
+                let (segs, _, _, _) = load_segments_heap(
                     oid, &meta.col_names, &meta.segment_by, &needed_cols,
                     &meta.time_column, needs_minmax, &[], None, None, None,
                     &[], needs_sums || needs_counts,
@@ -1071,13 +1074,15 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         // Load segments from all companion tables (with lazy pruning)
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
+        let mut total_detoast_us: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, _, _) = load_segments_heap(
+            let (segs, _, _, dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, time_min, time_max, None,
                 &batch_quals, false,
             );
             all_segments.extend(segs);
+            total_detoast_us += dt_us;
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
 
@@ -1463,6 +1468,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         _num_result_cols: num_result_cols,
                         metadata_us,
                         heap_scan_us,
+                        detoast_us: total_detoast_us,
                         decompress_us,
                         agg_us,
                         total_segments,
@@ -1628,6 +1634,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     _num_result_cols: num_result_cols,
                     metadata_us,
                     heap_scan_us,
+                    detoast_us: total_detoast_us,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -1882,6 +1889,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     _num_result_cols: num_result_cols,
                     metadata_us,
                     heap_scan_us,
+                    detoast_us: total_detoast_us,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -2026,6 +2034,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 _num_result_cols: num_result_cols,
                 metadata_us,
                 heap_scan_us,
+                detoast_us: total_detoast_us,
                 decompress_us,
                 agg_us,
                 total_segments,
@@ -2385,6 +2394,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         _num_result_cols: num_result_cols,
                         metadata_us,
                         heap_scan_us,
+                        detoast_us: total_detoast_us,
                         decompress_us,
                         agg_us,
                         total_segments,
@@ -2590,6 +2600,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     _num_result_cols: num_result_cols,
                     metadata_us,
                     heap_scan_us,
+                    detoast_us: total_detoast_us,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -2871,6 +2882,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 _num_result_cols: num_result_cols,
                 metadata_us,
                 heap_scan_us,
+                detoast_us: total_detoast_us,
                 decompress_us,
                 agg_us,
                 total_segments,
@@ -4189,6 +4201,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             _num_result_cols: num_result_cols,
             metadata_us,
             heap_scan_us,
+            detoast_us: total_detoast_us,
             decompress_us,
             agg_us,
             total_segments,
@@ -4584,12 +4597,13 @@ pub(super) unsafe extern "C-unwind" fn end_agg_scan(
             let total_us = state.metadata_us + state.heap_scan_us + state.decompress_us
                 + state.agg_us + state.merge_us + state.finalize_us + state.topn_select_us;
             pgrx::log!(
-                "pg_deltax DeltaXAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
+                "pg_deltax DeltaXAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms (detoast={:.1}ms)  \
                  decompress={:.1}ms  agg={:.1}ms  merge={:.1}ms  finalize={:.1}ms  topn_select={:.1}ms  | \
                  workers={} segments={} rows_processed={} groups={} result_rows={} topn_limit={} bare_limit={}",
                 total_us as f64 / 1000.0,
                 state.metadata_us as f64 / 1000.0,
                 state.heap_scan_us as f64 / 1000.0,
+                state.detoast_us as f64 / 1000.0,
                 state.decompress_us as f64 / 1000.0,
                 state.agg_us as f64 / 1000.0,
                 state.merge_us as f64 / 1000.0,

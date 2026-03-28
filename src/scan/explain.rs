@@ -156,10 +156,11 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                         as f64 / 1000.0;
 
                 let timing_str = std::ffi::CString::new(format!(
-                    "{:.3} ms (metadata={:.3} heap_scan={:.3} decompress={:.3} agg={:.3})",
+                    "{:.3} ms (metadata={:.3} heap_scan={:.3} [detoast={:.3}] decompress={:.3} agg={:.3})",
                     total_ms,
                     state.metadata_us as f64 / 1000.0,
                     state.heap_scan_us as f64 / 1000.0,
+                    state.detoast_us as f64 / 1000.0,
                     state.decompress_us as f64 / 1000.0,
                     state.agg_us as f64 / 1000.0,
                 ))
