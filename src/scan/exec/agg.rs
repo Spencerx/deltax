@@ -967,7 +967,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             let t1 = Instant::now();
             let mut all_segments: Vec<SegmentData> = Vec::new();
             for &oid in &plan.companion_oids {
-                let (segs, _, _, _) = load_segments_heap(
+                let (segs, _, _, _, _) = load_segments_heap(
                     oid, &meta.col_names, &meta.segment_by, &needed_cols,
                     &meta.time_column, needs_minmax, &[], None, None, None,
                     &[], needs_sums || needs_counts,
@@ -1076,7 +1076,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, _, _, dt_us) = load_segments_heap(
+            let (segs, _, _, _, dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, time_min, time_max, None,
                 &batch_quals, false,

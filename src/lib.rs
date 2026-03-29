@@ -3,6 +3,7 @@ use std::ffi::CString;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 
+mod bloom;
 mod catalog;
 mod compress;
 mod compression;
@@ -20,6 +21,8 @@ pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
 pub(crate) static PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+pub(crate) static BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
@@ -98,6 +101,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Use Rust regex for parallel REGEXP_REPLACE in GROUP BY",
         c"When ON, compatible regex patterns use the Rust regex crate for thread-safe parallel execution",
         &PARALLEL_REGEX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.bloom_filters",
+        c"Build per-segment bloom filters during compression for equality predicate pushdown",
+        c"When ON, bloom filters are built during compression and used to skip segments during scans. Size is proportional to column cardinality (~2-5% storage overhead).",
+        &BLOOM_FILTERS,
         GucContext::Userset,
         GucFlags::default(),
     );

@@ -129,6 +129,8 @@ pub(crate) struct ScanTiming {
     pub(crate) segments_skipped: u64,
     /// Total segments skipped specifically by min/max predicate filters.
     pub(crate) segments_minmax_skipped: u64,
+    /// Total segments skipped specifically by bloom filter checks.
+    pub(crate) segments_bloom_skipped: u64,
     /// Total segments where Phase 2 was skipped (no selected rows).
     pub(crate) phase2_skipped: u64,
     /// Top-N effective limit (0 = disabled).
@@ -406,8 +408,9 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_skipped: u64 = 0;
         let mut total_minmax_skipped: u64 = 0;
+        let mut total_bloom_skipped: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, skipped, mm_skipped, _dt_us) = load_segments_heap(
+            let (segs, skipped, mm_skipped, bloom_skipped, _dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, t_min, t_max,
                 lazy_cols.as_deref(), &batch_quals, false,
@@ -415,6 +418,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             all_segments.extend(segs);
             total_skipped += skipped;
             total_minmax_skipped += mm_skipped;
+            total_bloom_skipped += bloom_skipped;
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
 
@@ -467,6 +471,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 compressed_bytes,
                 segments_skipped: total_skipped,
                 segments_minmax_skipped: total_minmax_skipped,
+                segments_bloom_skipped: total_bloom_skipped,
                 phase2_skipped: 0,
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
                 topn_candidates: 0,
@@ -575,7 +580,7 @@ fn load_decompress_state(
 
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
     let t1 = Instant::now();
-    let (segments_data, segments_skipped, minmax_skipped, _detoast_us) = unsafe {
+    let (segments_data, segments_skipped, minmax_skipped, bloom_skipped, _detoast_us) = unsafe {
         load_segments_heap(
             companion_oid, &meta.col_names, &meta.segment_by, &needed_cols,
             &meta.time_column, false, &seg_filters, t_min, t_max,
@@ -624,6 +629,7 @@ fn load_decompress_state(
             compressed_bytes,
             segments_skipped,
             segments_minmax_skipped: minmax_skipped,
+            segments_bloom_skipped: bloom_skipped,
             phase2_skipped: 0,
             topn_limit: 0,
             topn_candidates: 0,

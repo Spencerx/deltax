@@ -272,6 +272,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         }
     }
     meta_cols.push("_row_count INT".to_string());
+    meta_cols.push("_blooms BYTEA".to_string());
 
     let meta_ddl = format!(
         "CREATE TABLE {} ({})",
@@ -728,6 +729,21 @@ fn flush_segment_metadata(
     insert_cols.push("_row_count".to_string());
     insert_vals.push(row_count.to_string());
 
+    // Compute and insert packed bloom filters (if enabled via GUC)
+    let bloom_data = if crate::BLOOM_FILTERS.get() {
+        compute_segment_blooms(typed_cols, columns, ndistinct_values)
+    } else {
+        Vec::new()
+    };
+    insert_cols.push("_blooms".to_string());
+    if bloom_data.is_empty() {
+        insert_vals.push("NULL".to_string());
+    } else {
+        // Encode as hex bytea literal: E'\\x...'
+        let hex: String = bloom_data.iter().map(|b| format!("{:02x}", b)).collect();
+        insert_vals.push(format!("E'\\\\x{}'", hex));
+    }
+
     let insert_sql = format!(
         "INSERT INTO {} ({}) VALUES ({})",
         meta_fqn,
@@ -793,6 +809,76 @@ fn compute_segment_ndistinct(
         result.push(hll.estimate() as i64);
     }
     result
+}
+
+/// Compute packed bloom filters for a segment.
+/// Returns packed bytes (col_idx + 128-byte bloom per column), or empty if no columns qualify.
+/// Only builds bloom filters for numeric/date/timestamp columns with ndistinct ≤ threshold.
+fn compute_segment_blooms(
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+    ndistinct_values: &[i64],
+) -> Vec<u8> {
+    use crate::bloom::{self, BloomFilter, hash_datum_i64};
+
+    let mut filters: Vec<(u16, BloomFilter)> = Vec::new();
+    let mut nd_idx: usize = 0;
+    let mut col_idx: u16 = 0;
+
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
+        }
+        let nd = if nd_idx < ndistinct_values.len() {
+            ndistinct_values[nd_idx]
+        } else {
+            0
+        };
+        nd_idx += 1;
+
+        if !supports_minmax(&col.data_type) || nd <= 0 {
+            col_idx += 1;
+            continue;
+        }
+
+        let mut bf = BloomFilter::for_ndistinct(nd as usize);
+        match &typed_cols[i] {
+            TypedColumn::Int16(v) => {
+                for x in v.iter().flatten() {
+                    bf.insert(hash_datum_i64(*x as i64));
+                }
+            }
+            TypedColumn::Int32(v) => {
+                for x in v.iter().flatten() {
+                    bf.insert(hash_datum_i64(*x as i64));
+                }
+            }
+            TypedColumn::Int64(v) => {
+                for x in v.iter().flatten() {
+                    bf.insert(hash_datum_i64(*x as i64));
+                }
+            }
+            TypedColumn::Float32(v) => {
+                for x in v.iter().flatten() {
+                    bf.insert(hash_datum_i64(x.to_bits() as i64));
+                }
+            }
+            TypedColumn::Float64(v) => {
+                for x in v.iter().flatten() {
+                    bf.insert(hash_datum_i64(x.to_bits() as i64));
+                }
+            }
+            _ => {
+                col_idx += 1;
+                continue;
+            }
+        }
+
+        filters.push((col_idx, bf));
+        col_idx += 1;
+    }
+
+    bloom::pack_blooms(&filters)
 }
 
 /// Flush typed column data, splitting into segment_size chunks if needed.

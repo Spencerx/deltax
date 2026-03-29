@@ -373,7 +373,7 @@ pub(super) unsafe fn load_segments_heap(
     lazy_cols: Option<&[bool]>,
     batch_quals: &[BatchQual],
     load_sums: bool,
-) -> (Vec<SegmentData>, u64, u64, u64) {  // last u64 = detoast_us
+) -> (Vec<SegmentData>, u64, u64, u64, u64) {  // skipped, minmax_skipped, bloom_skipped, detoast_us
     unsafe {
         // ================================================================
         // Phase 1: Scan meta table — no TOAST I/O
@@ -456,6 +456,9 @@ pub(super) unsafe fn load_segments_heap(
             }
         }
 
+        // Discover _blooms attno for bloom filter pruning
+        let blooms_attno = attno_map.get("_blooms").copied();
+
         // Build min/max predicate filters from batch quals
         let mut minmax_filters: Vec<MinMaxFilter> = Vec::new();
         for bq in batch_quals {
@@ -528,6 +531,51 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
         }
+
+        // Build bloom filter checks from batch quals (Eq and InList on numeric types)
+        struct BloomCheck {
+            col_idx: u16,
+            hashes: Vec<u64>,
+        }
+        let mut bloom_checks: Vec<BloomCheck> = Vec::new();
+        if blooms_attno.is_some() {
+            for bq in batch_quals {
+                match bq.op {
+                    BatchCompareOp::Eq | BatchCompareOp::InList => {}
+                    _ => continue,
+                }
+                match bq.type_oid {
+                    pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                    | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+                    | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {}
+                    _ => continue,
+                }
+                let col_name = &col_names[bq.col_idx];
+                if segment_by.contains(col_name) {
+                    continue;
+                }
+                let ci = match col_idx_map[bq.col_idx] {
+                    Some(ci) => ci,
+                    None => continue,
+                };
+                let hashes = if bq.op == BatchCompareOp::InList {
+                    if let Some(ref vals) = bq.in_list_i64 {
+                        vals.iter().map(|&v| crate::bloom::hash_datum_i64(v)).collect()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    let val_i64 = match bq.type_oid {
+                        pg_sys::FLOAT4OID => (bq.const_datum.value() as u32) as i64,
+                        pg_sys::FLOAT8OID => bq.const_datum.value() as i64,
+                        _ => bq.const_datum.value() as i64,
+                    };
+                    vec![crate::bloom::hash_datum_i64(val_i64)]
+                };
+                bloom_checks.push(BloomCheck { col_idx: ci, hashes });
+            }
+        }
+        let mut segments_bloom_skipped: u64 = 0;
 
         loop {
             let getnext_start = std::time::Instant::now();
@@ -626,6 +674,43 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
 
+            // Bloom filter pruning: check _blooms column for Eq/InList predicates
+            if !bloom_checks.is_empty()
+                && let Some(blooms_att) = blooms_attno
+                && !nulls[blooms_att]
+            {
+                // Detoast the _blooms BYTEA (only for segments surviving minmax)
+                let blooms_datum = values[blooms_att];
+                let detoasted = pg_sys::pg_detoast_datum(
+                    blooms_datum.cast_mut_ptr::<pg_sys::varlena>()
+                );
+                let data_ptr = pgrx::vardata_any(detoasted);
+                let data_len = pgrx::varsize_any_exhdr(detoasted);
+                #[allow(clippy::unnecessary_cast)]
+                let bloom_bytes = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
+
+                let mut bloom_skip = false;
+                for bc in &bloom_checks {
+                    if let Some(bf) = crate::bloom::lookup_packed_bloom(bloom_bytes, bc.col_idx) {
+                        let any_match = bc.hashes.iter().any(|&h| bf.might_contain(h));
+                        if !any_match {
+                            bloom_skip = true;
+                            break;
+                        }
+                    }
+                }
+
+                if detoasted != blooms_datum.cast_mut_ptr::<pg_sys::varlena>() {
+                    pg_sys::pfree(detoasted as *mut _);
+                }
+
+                if bloom_skip {
+                    segments_skipped += 1;
+                    segments_bloom_skipped += 1;
+                    continue;
+                }
+            }
+
             // --- Segment survived pruning ---
 
             // Extract per-column min/max
@@ -676,9 +761,11 @@ pub(super) unsafe fn load_segments_heap(
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
         pgrx::log!(
-            "load_segments_heap phase1: segments={} skipped={} heap_getnext={:.1}ms deform={:.1}ms",
+            "load_segments_heap phase1: segments={} skipped={} (minmax={} bloom={}) heap_getnext={:.1}ms deform={:.1}ms",
             segments.len(),
             segments_skipped,
+            segments_minmax_skipped,
+            segments_bloom_skipped,
             heap_getnext_us as f64 / 1000.0,
             deform_us as f64 / 1000.0,
         );
@@ -928,7 +1015,7 @@ pub(super) unsafe fn load_segments_heap(
             detoast_us as f64 / 1000.0,
         );
 
-        (segments, segments_skipped, segments_minmax_skipped, detoast_us)
+        (segments, segments_skipped, segments_minmax_skipped, segments_bloom_skipped, detoast_us)
     }
 }
 

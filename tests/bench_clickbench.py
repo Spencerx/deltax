@@ -148,7 +148,7 @@ def run_explain_analyze(conn, queries):
             )
 
             # Sum stats across partitions
-            stat_totals = {"segments": 0, "segments_skipped": 0, "phase2_skipped": 0, "rows_out": 0, "rows_filtered": 0, "rows_batch_filtered": 0, "compressed_bytes": 0, "rows_processed": 0, "result_rows": 0, "batch_quals": 0}
+            stat_totals = {"segments": 0, "segments_skipped": 0, "segments_minmax_skipped": 0, "segments_bloom_skipped": 0, "phase2_skipped": 0, "rows_out": 0, "rows_filtered": 0, "rows_batch_filtered": 0, "compressed_bytes": 0, "rows_processed": 0, "result_rows": 0, "batch_quals": 0}
             str_stats = {}
             for s in stats_lines:
                 for token in s.split():
