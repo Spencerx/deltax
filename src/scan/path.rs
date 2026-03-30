@@ -897,11 +897,102 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             }
         }
 
+        // Eliminate redundant GROUP BY expressions.
+        // If multiple specs reference the same col_idx and are all Column/AddConst,
+        // keep one (prefer Column) and record eliminated specs for DerivedGroup output.
+        // eliminated_specs: maps (col_idx, offset) → (base_new_idx, delta)
+        struct EliminatedSpec {
+            base_new_idx: usize,
+            delta: i64,
+        }
+        let mut eliminated_specs: Vec<((i32, i32), EliminatedSpec)> = Vec::new();
+        {
+            // Find base spec for each col_idx (prefer Column over AddConst)
+            let mut col_base: Vec<(i32, usize)> = Vec::new(); // (col_idx, parsed_groups index)
+            for (i, g) in parsed_groups.iter().enumerate() {
+                match &g.expr {
+                    ParsedGroupExpr::Column | ParsedGroupExpr::AddConst { .. } => {
+                        if let Some(entry) = col_base.iter_mut().find(|(c, _)| *c == g.col_idx) {
+                            // Already have a base for this col_idx
+                            let base_i = entry.1;
+                            let base_is_column = matches!(parsed_groups[base_i].expr, ParsedGroupExpr::Column);
+                            if matches!(g.expr, ParsedGroupExpr::Column) && !base_is_column {
+                                // This is Column, replace AddConst base
+                                entry.1 = i;
+                            }
+                        } else {
+                            col_base.push((g.col_idx, i));
+                        }
+                    }
+                    _ => {} // DateTrunc/Extract/RegexpReplace — not eligible
+                }
+            }
+            // Only eliminate if there are multiple specs for the same col_idx
+            let col_with_dupes: Vec<(i32, usize)> = col_base.iter()
+                .filter(|(col_idx, _)| {
+                    parsed_groups.iter().filter(|g| {
+                        g.col_idx == *col_idx && matches!(g.expr, ParsedGroupExpr::Column | ParsedGroupExpr::AddConst { .. })
+                    }).count() > 1
+                })
+                .cloned()
+                .collect();
+            if !col_with_dupes.is_empty() {
+                let mut to_remove: Vec<usize> = Vec::new();
+                for &(col_idx, base_i) in &col_with_dupes {
+                    let base_offset: i64 = match &parsed_groups[base_i].expr {
+                        ParsedGroupExpr::Column => 0,
+                        ParsedGroupExpr::AddConst { offset, .. } => *offset as i64,
+                        _ => unreachable!(),
+                    };
+                    for (i, g) in parsed_groups.iter().enumerate() {
+                        if g.col_idx != col_idx || i == base_i {
+                            continue;
+                        }
+                        match &g.expr {
+                            ParsedGroupExpr::Column => {
+                                let delta = 0 - base_offset;
+                                // base_new_idx will be computed after removal
+                                to_remove.push(i);
+                                eliminated_specs.push(((col_idx, 0), EliminatedSpec { base_new_idx: base_i, delta }));
+                            }
+                            ParsedGroupExpr::AddConst { offset, .. } => {
+                                let delta = *offset as i64 - base_offset;
+                                to_remove.push(i);
+                                eliminated_specs.push(((col_idx, *offset), EliminatedSpec { base_new_idx: base_i, delta }));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Sort removals in reverse order to remove from back to front
+                to_remove.sort_unstable();
+                to_remove.dedup();
+                // Build index remap: old_idx → new_idx
+                let mut remap: Vec<usize> = (0..parsed_groups.len()).collect();
+                for &ri in to_remove.iter().rev() {
+                    parsed_groups.remove(ri);
+                    // Shift all indices above ri
+                    for r in &mut remap {
+                        if *r > ri && *r > 0 {
+                            *r -= 1;
+                        }
+                    }
+                    remap[ri] = usize::MAX; // removed
+                }
+                // Fix up base_new_idx in eliminated_specs
+                for es in &mut eliminated_specs {
+                    es.1.base_new_idx = remap[es.1.base_new_idx];
+                }
+            }
+        }
+
         // Walk tlist to build output mapping:
         // For each tlist entry, determine if it's an Aggref or a group Var/FuncExpr.
         // Track which agg_spec index or group_spec index it maps to.
-        // output_map[i] = (type, index) where type=0 → agg, type=1 → group, type=2 → const
+        // output_map[i] = (type, index) where type=0 → agg, type=1 → group, type=2 → const,
+        //                  type=3 → derived group (index=base_gi)
         let mut output_map: Vec<(i32, i32)> = Vec::new();
+        let mut derived_deltas: Vec<i64> = Vec::new();
         let mut const_outputs: Vec<(pg_sys::Oid, i64, bool)> = Vec::new();
         let mut agg_counter = 0;
 
@@ -1004,7 +1095,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                             }
                         }
                     }
-                    let group_idx = parsed_groups.iter().position(|g| {
+                    let group_pos = parsed_groups.iter().position(|g| {
                         if g.col_idx != col_idx { return false; }
                         match &g.expr {
                             ParsedGroupExpr::AddConst { offset, op_oid: spec_op_oid } => {
@@ -1012,8 +1103,16 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                             }
                             _ => false,
                         }
-                    }).unwrap_or(0) as i32;
-                    output_map.push((1, group_idx));
+                    });
+                    if let Some(gi) = group_pos {
+                        output_map.push((1, gi as i32));
+                    } else if let Some(es) = eliminated_specs.iter().find(|((ci, off), _)| *ci == col_idx && *off == tlist_offset) {
+                        // Eliminated redundant GROUP BY — emit DerivedGroup
+                        output_map.push((3, es.1.base_new_idx as i32));
+                        derived_deltas.push(es.1.delta);
+                    } else {
+                        output_map.push((1, 0));
+                    }
                 } else if (*expr).type_ == pg_sys::NodeTag::T_Const {
                     // Constant in SELECT list (e.g. SELECT 1, ...) — serialize type + value
                     let c = expr as *const pg_sys::Const;
@@ -1106,6 +1205,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         // Output mapping
         private_list = pg_sys::lappend_int(private_list, output_map.len() as i32);
         let mut const_idx = 0usize;
+        let mut derived_idx = 0usize;
         for (otype, oref) in &output_map {
             private_list = pg_sys::lappend_int(private_list, *otype);
             private_list = pg_sys::lappend_int(private_list, *oref);
@@ -1117,6 +1217,12 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                 private_list = pg_sys::lappend_int(private_list, const_val as i32);
                 private_list = pg_sys::lappend_int(private_list, if is_null { 1 } else { 0 });
                 const_idx += 1;
+            } else if *otype == 3 {
+                // DerivedGroup output: append delta_hi, delta_lo
+                let delta = derived_deltas[derived_idx];
+                private_list = pg_sys::lappend_int(private_list, (delta >> 32) as i32);
+                private_list = pg_sys::lappend_int(private_list, delta as i32);
+                derived_idx += 1;
             }
         }
 

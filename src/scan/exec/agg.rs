@@ -317,6 +317,9 @@ enum OutputEntry {
     Agg(usize),    // index into agg_specs
     Group(usize),  // index into group_specs
     Const(pg_sys::Datum, bool),  // constant value + is_null
+    /// Derived from another group key: value = group_keys[base_gi] + delta.
+    /// Used for eliminated redundant GROUP BY expressions (e.g. GROUP BY col, col-1, col-2).
+    DerivedGroup { base_gi: usize, delta: i64 },
 }
 
 /// All fields deserialized from a DeltaXAgg node's custom_private list.
@@ -509,6 +512,13 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                     }
                 };
                 output_map.push(OutputEntry::Const(datum, is_null));
+            } else if otype == 3 {
+                // DerivedGroup: base_gi in oref, delta_hi, delta_lo
+                let delta_hi = pg_sys::list_nth_int(custom_private, idx) as i64;
+                let delta_lo = pg_sys::list_nth_int(custom_private, idx + 1) as u32 as i64;
+                idx += 2;
+                let delta = (delta_hi << 32) | delta_lo;
+                output_map.push(OutputEntry::DerivedGroup { base_gi: oref, delta });
             } else {
                 output_map.push(OutputEntry::Group(oref));
             }
@@ -648,7 +658,7 @@ fn try_catalog_shortcut(
     for entry in &plan.output_map {
         match entry {
             OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
-            OutputEntry::Group(_) => row.push((pg_sys::Datum::from(0usize), true)),
+            OutputEntry::Group(_) | OutputEntry::DerivedGroup { .. } => row.push((pg_sys::Datum::from(0usize), true)),
             OutputEntry::Const(d, n) => row.push((*d, *n)),
         }
     }
@@ -881,7 +891,7 @@ fn try_metadata_fast_path(
     for entry in &plan.output_map {
         match entry {
             OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
-            OutputEntry::Group(_) => row.push((pg_sys::Datum::from(0usize), true)),
+            OutputEntry::Group(_) | OutputEntry::DerivedGroup { .. } => row.push((pg_sys::Datum::from(0usize), true)),
             OutputEntry::Const(d, n) => row.push((*d, *n)),
         }
     }
@@ -1754,6 +1764,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         row.push((pg_sys::Datum::from(v as usize), false));
                                     }
                                 }
+                                OutputEntry::DerivedGroup { base_gi, delta } => {
+                                    let v = keys[*base_gi] + delta;
+                                    row.push((pg_sys::Datum::from(v as usize), false));
+                                }
                                 OutputEntry::Const(d, n) => row.push((*d, *n)),
                             }
                         }
@@ -1925,6 +1939,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 } else {
                                     row.push((pg_sys::Datum::from(v as usize), false));
                                 }
+                            }
+                            OutputEntry::DerivedGroup { base_gi, delta } => {
+                                let v = keys[*base_gi] + delta;
+                                row.push((pg_sys::Datum::from(v as usize), false));
                             }
                             OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
@@ -2183,6 +2201,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     row.push((pg_sys::Datum::from(v as usize), false));
                                 }
                             }
+                            OutputEntry::DerivedGroup { base_gi, delta } => {
+                                let v = keys[*base_gi] + delta;
+                                row.push((pg_sys::Datum::from(v as usize), false));
+                            }
                             OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
                     }
@@ -2307,6 +2329,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 } else {
                                     row.push((pg_sys::Datum::from(v as usize), false));
                                 }
+                            }
+                            OutputEntry::DerivedGroup { base_gi, delta } => {
+                                let v = keys[*base_gi] + delta;
+                                row.push((pg_sys::Datum::from(v as usize), false));
                             }
                             OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
@@ -2689,6 +2715,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         }
                                     }
                                 }
+                                OutputEntry::DerivedGroup { base_gi, delta } => {
+                                    match mixed_ks.get(source_gidx, *base_gi) {
+                                        MixedKeyVal::Int(v) => row.push((pg_sys::Datum::from((v + delta) as usize), false)),
+                                        _ => row.push((pg_sys::Datum::from(0usize), true)),
+                                    }
+                                }
                                 OutputEntry::Const(d, n) => row.push((*d, *n)),
                             }
                         }
@@ -2900,6 +2932,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     }
                                 }
                             }
+                            OutputEntry::DerivedGroup { base_gi, delta } => {
+                                match final_mixed_keys.get(group_idx, *base_gi) {
+                                    MixedKeyVal::Int(v) => row.push((pg_sys::Datum::from((v + delta) as usize), false)),
+                                    _ => row.push((pg_sys::Datum::from(0usize), true)),
+                                }
+                            }
                             OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
                     }
@@ -3089,6 +3127,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 }
                             }
                         }
+                        OutputEntry::DerivedGroup { base_gi, delta } => {
+                            match mixed_ks.get(group_idx, *base_gi) {
+                                MixedKeyVal::Int(v) => row.push((pg_sys::Datum::from((v + delta) as usize), false)),
+                                _ => row.push((pg_sys::Datum::from(0usize), true)),
+                            }
+                        }
                         OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
                 }
@@ -3160,6 +3204,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     MixedKeyVal::Null => {
                                         row.push((pg_sys::Datum::from(0usize), true));
                                     }
+                                }
+                            }
+                            OutputEntry::DerivedGroup { base_gi, delta } => {
+                                match merged_mixed_keys.get(group_idx, *base_gi) {
+                                    MixedKeyVal::Int(v) => row.push((pg_sys::Datum::from((v + delta) as usize), false)),
+                                    _ => row.push((pg_sys::Datum::from(0usize), true)),
                                 }
                             }
                             OutputEntry::Const(d, n) => row.push((*d, *n)),
@@ -4329,6 +4379,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 row.push((pg_sys::Datum::from(v as usize), false));
                             }
                         }
+                        OutputEntry::DerivedGroup { base_gi, delta } => {
+                            let v = keys[*base_gi] + delta;
+                            row.push((pg_sys::Datum::from(v as usize), false));
+                        }
                         OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
                 }
@@ -4381,6 +4435,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                             } else {
                                 row.push((pg_sys::Datum::from(v as usize), false));
                             }
+                        }
+                        OutputEntry::DerivedGroup { base_gi, delta } => {
+                            let v = keys[*base_gi] + delta;
+                            row.push((pg_sys::Datum::from(v as usize), false));
                         }
                         OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
@@ -4448,6 +4506,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 }
                             }
                         }
+                        OutputEntry::DerivedGroup { base_gi, delta } => {
+                            match &key_slice[*base_gi] {
+                                GroupKeyVal::Int(v) => row.push((pg_sys::Datum::from((*v + delta) as usize), false)),
+                                _ => row.push((pg_sys::Datum::from(0usize), true)),
+                            }
+                        }
                         OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
                 }
@@ -4468,7 +4532,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     OutputEntry::Agg(ai) => {
                         row.push(agg_results[*ai]);
                     }
-                    OutputEntry::Group(_) => {
+                    OutputEntry::Group(_) | OutputEntry::DerivedGroup { .. } => {
                         row.push((pg_sys::Datum::from(0usize), true));
                     }
                     OutputEntry::Const(d, n) => row.push((*d, *n)),
