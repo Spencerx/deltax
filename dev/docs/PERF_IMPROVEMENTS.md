@@ -2,57 +2,105 @@
 
 Tracking DeltaX compressed vs uncompressed performance on ClickBench.
 
-## Current Benchmark (2026-03-15)
+## Current Benchmark (2026-03-30)
 
-### Compressed vs Uncompressed
+### Compressed vs Uncompressed (local, 10M rows)
 
 | Query  | Description               |  Uncompr (ms) |  Compr (ms) |  Ratio |
 |--------|---------------------------|---------------|-------------|--------|
-| Q1     | COUNT(*)                  |          58.4 |         0.9 | 63.94x |
-| Q2     | COUNT WHERE AdvEngineID   |         129.4 |         5.8 | 22.44x |
-| Q3     | SUM/AVG full scan         |         106.9 |         2.2 | 48.67x |
-| Q4     | AVG UserID                |          66.0 |         1.4 | 46.30x |
-| Q5     | COUNT DISTINCT UserID     |         213.3 |         1.1 | 201.97x |
-| Q6     | COUNT DISTINCT SearchPhrase |         400.1 |         0.9 | 461.98x |
-| Q7     | MIN/MAX EventDate         |          63.4 |         1.9 | 33.04x |
-| Q8     | GROUP BY AdvEngineID      |          90.9 |         6.7 | 13.67x |
-| Q9     | GROUP BY RegionID         |         336.5 |        39.8 |  8.46x |
-| Q10    | RegionID multi-agg        |         461.6 |        43.2 | 10.69x |
-| Q11    | MobilePhoneModel users    |         226.1 |         8.7 | 26.13x |
-| Q12    | MobilePhone+Model users   |         258.2 |        11.6 | 22.27x |
-| Q13    | Top SearchPhrase          |         114.8 |        21.9 |  5.25x |
-| Q14    | SearchPhrase users        |         329.4 |        27.1 | 12.18x |
-| Q15    | SearchEngine+Phrase       |         269.7 |        26.6 | 10.13x |
-| Q16    | Top UserID                |          96.6 |        25.3 |  3.82x |
-| Q17    | UserID+SearchPhrase top   |         359.6 |        71.1 |  5.06x |
-| Q18    | UserID+SearchPhrase       |         123.2 |        69.1 |  1.78x |
-| Q19    | UserID+minute+Phrase      |         574.0 |       283.4 |  2.03x |
-| Q20    | Point lookup UserID       |          63.2 |         1.7 | 36.88x |
-| Q21    | URL LIKE google           |          99.9 |        59.0 |  1.69x |
-| Q22    | SearchPhrase+URL google   |         117.6 |        68.7 |  1.71x |
-| Q23    | Title LIKE Google         |         135.9 |       131.9 |  1.03x |
-| Q24    | SELECT * google sorted    |         100.7 |       127.3 |  0.79x |
-| Q25    | SearchPhrase by time      |          89.2 |        36.6 |  2.44x |
-| Q26    | SearchPhrase sorted       |          90.4 |        12.7 |  7.10x |
-| Q27    | SearchPhrase time+phrase  |          90.8 |        12.1 |  7.50x |
-| Q28    | CounterID avg URL len     |         112.7 |        50.4 |  2.24x |
-| Q29    | Referer domain regex      |         961.1 |      1129.0 |  0.85x |
-| Q30    | Wide SUM 89 cols          |         207.3 |         1.5 | 139.78x |
-| Q31    | SearchEngine+ClientIP     |         247.7 |        26.8 |  9.23x |
-| Q32    | WatchID+ClientIP filter   |         246.7 |        52.5 |  5.02x |
-| Q33    | WatchID+ClientIP all      |         611.6 |       459.8 |  1.33x |
-| Q34    | Top URLs                  |        1364.3 |       247.5 |  5.51x |
-| Q35    | Top URLs with const       |        1268.1 |       302.7 |  4.19x |
-| Q36    | ClientIP arithmetic       |         104.6 |        35.4 |  2.95x |
-| Q37    | CounterID=62 URLs         |        1826.1 |       145.5 | 12.55x |
-| Q38    | CounterID=62 Titles       |         528.3 |        49.4 | 10.70x |
-| Q39    | CounterID=62 links        |         152.5 |        28.5 |  5.36x |
-| Q40    | CounterID=62 traffic src  |        2288.0 |       282.5 |  8.10x |
-| Q41    | CounterID=62 URLHash      |         151.6 |        24.6 |  6.16x |
-| Q42    | CounterID=62 window dim   |         173.7 |        18.4 |  9.45x |
-| Q43    | CounterID=62 by minute    |         149.7 |        21.5 |  6.97x |
+| Q0     | COUNT(*)                  |          64.4 |         1.0 | 62.19x |
+| Q1     | COUNT WHERE AdvEngineID   |          97.4 |         4.2 | 22.94x |
+| Q2     | SUM/AVG full scan         |          96.6 |         0.8 | 125.75x |
+| Q3     | AVG UserID                |          68.6 |         0.8 | 89.83x |
+| Q4     | COUNT DISTINCT UserID     |         243.7 |        16.0 | 15.23x |
+| Q5     | COUNT DISTINCT SearchPhrase |         410.8 |         6.6 | 62.45x |
+| Q6     | MIN/MAX EventDate         |          69.2 |         0.9 | 72.98x |
+| Q7     | GROUP BY AdvEngineID      |          89.0 |         1.9 | 46.92x |
+| Q8     | GROUP BY RegionID         |         335.7 |         8.3 | 40.24x |
+| Q9     | RegionID multi-agg        |         442.2 |        10.3 | 42.73x |
+| Q10    | MobilePhoneModel users    |         241.7 |         3.9 | 61.74x |
+| Q11    | MobilePhone+Model users   |         251.9 |         4.7 | 53.63x |
+| Q12    | Top SearchPhrase          |         113.4 |         4.7 | 24.33x |
+| Q13    | SearchPhrase users        |         331.8 |        10.5 | 31.62x |
+| Q14    | SearchEngine+Phrase       |         264.2 |         5.5 | 47.91x |
+| Q15    | Top UserID                |         106.7 |         5.8 | 18.51x |
+| Q16    | UserID+SearchPhrase top   |         368.4 |         9.2 | 39.89x |
+| Q17    | UserID+SearchPhrase       |         128.0 |         7.6 | 16.91x |
+| Q18    | UserID+minute+Phrase      |         576.1 |        74.9 |  7.69x |
+| Q19    | Point lookup UserID       |          66.9 |         0.9 | 71.44x |
+| Q20    | URL LIKE google           |         102.2 |        59.0 |  1.73x |
+| Q21    | SearchPhrase+URL google   |         122.0 |        18.4 |  6.63x |
+| Q22    | Title LIKE Google         |         138.6 |        31.8 |  4.36x |
+| Q23    | SELECT * google sorted    |         101.4 |       144.5 |  0.70x |
+| Q24    | SearchPhrase by time      |          92.2 |        36.3 |  2.54x |
+| Q25    | SearchPhrase sorted       |          91.1 |        14.4 |  6.32x |
+| Q26    | SearchPhrase time+phrase  |          92.9 |        36.0 |  2.58x |
+| Q27    | CounterID avg URL len     |         117.1 |        69.5 |  1.69x |
+| Q28    | Referer domain regex      |         957.7 |       118.0 |  8.12x |
+| Q29    | Wide SUM 89 cols          |         216.5 |         1.7 | 128.46x |
+| Q30    | SearchEngine+ClientIP     |         294.5 |        22.3 | 13.18x |
+| Q31    | WatchID+ClientIP filter   |         278.1 |        35.3 |  7.88x |
+| Q32    | WatchID+ClientIP all      |         759.6 |        44.4 | 17.10x |
+| Q33    | Top URLs                  |        1247.5 |        21.7 | 57.58x |
+| Q34    | Top URLs with const       |        1118.7 |        22.2 | 50.33x |
+| Q35    | ClientIP arithmetic       |         110.6 |        35.4 |  3.13x |
+| Q36    | CounterID=62 URLs         |        1894.0 |        20.7 | 91.43x |
+| Q37    | CounterID=62 Titles       |         524.0 |        19.9 | 26.38x |
+| Q38    | CounterID=62 links        |         155.5 |        13.2 | 11.74x |
+| Q39    | CounterID=62 traffic src  |        2814.9 |       314.5 |  8.95x |
+| Q40    | CounterID=62 URLHash      |         162.9 |        42.3 |  3.85x |
+| Q41    | CounterID=62 window dim   |         158.1 |        11.8 | 13.39x |
+| Q42    | CounterID=62 by minute    |         147.0 |        15.0 |  9.80x |
 |--------|---------------------------|---------------|-------------|--------|
-| GMEAN  | Geometric Mean            |         211.4 |        24.8 |  8.51x |
+| GMEAN  | Geometric Mean            |         215.9 |        12.2 | 17.64x |
+
+### ClickBench full dataset (c6a.4xlarge, 100M rows, hot run)
+
+| Query  | Description               | pg_deltax (s) | vs ClickHouse |
+|--------|---------------------------|---------------|---------------|
+| Q0     | COUNT(*)                  |         0.020 |         2.73x |
+| Q1     | COUNT WHERE AdvEngineID   |         0.583 |        37.06x |
+| Q2     | SUM/AVG full scan         |         0.072 |         2.65x |
+| Q3     | AVG UserID                |         0.071 |         2.19x |
+| Q4     | COUNT DISTINCT UserID     |         5.632 |        15.54x |
+| Q5     | COUNT DISTINCT SearchPhrase |       3.436 |         5.44x |
+| Q6     | MIN/MAX EventDate         |         0.060 |         3.50x |
+| Q7     | GROUP BY AdvEngineID      |         0.150 |         8.42x |
+| Q8     | GROUP BY RegionID         |         2.164 |         4.71x |
+| Q9     | RegionID multi-agg        |         2.185 |         4.13x |
+| Q10    | MobilePhoneModel users    |         0.718 |         4.64x |
+| Q11    | MobilePhone+Model users   |         0.871 |         5.76x |
+| Q12    | Top SearchPhrase          |         1.935 |         3.19x |
+| Q13    | SearchPhrase users        |         8.027 |         9.87x |
+| Q14    | SearchEngine+Phrase       |         2.195 |         3.63x |
+| Q15    | Top UserID                |         1.764 |         4.50x |
+| Q16    | UserID+SearchPhrase top   |         3.361 |         1.96x |
+| Q17    | UserID+SearchPhrase       |         2.864 |         2.85x |
+| Q18    | UserID+minute+Phrase      |         7.443 |         2.44x |
+| Q19    | Point lookup UserID       |         0.221 |        17.77x |
+| Q20    | URL LIKE google           |         7.680 |        23.88x |
+| Q21    | SearchPhrase+URL google   |         4.631 |        42.97x |
+| Q22    | Title LIKE Google         |         8.078 |        11.13x |
+| Q23    | SELECT * google sorted    |         0.479 |         5.49x |
+| Q24    | SearchPhrase by time      |         0.121 |         2.47x |
+| Q25    | SearchPhrase sorted       |         4.947 |        24.54x |
+| Q26    | SearchPhrase time+phrase  |         0.121 |         2.47x |
+| Q27    | CounterID avg URL len     |        12.691 |       136.57x |
+| Q28    | Referer domain regex      |        14.239 |         1.49x |
+| Q29    | Wide SUM 89 cols          |         0.130 |         3.59x |
+| Q30    | SearchEngine+ClientIP     |         9.529 |        27.10x |
+| Q31    | WatchID+ClientIP filter   |        13.514 |        23.64x |
+| Q32    | WatchID+ClientIP all      |        10.359 |         2.73x |
+| Q33    | Top URLs                  |         5.903 |         2.12x |
+| Q34    | Top URLs with const       |         5.848 |         2.05x |
+| Q35    | ClientIP arithmetic       |        23.103 |        75.29x |
+| Q36    | CounterID=62 URLs         |         0.165 |         3.30x |
+| Q37    | CounterID=62 Titles       |         0.128 |         4.45x |
+| Q38    | CounterID=62 links        |         0.128 |         5.11x |
+| Q39    | CounterID=62 traffic src  |         0.863 |        10.03x |
+| Q40    | CounterID=62 URLHash      |         0.227 |        10.30x |
+| Q41    | CounterID=62 window dim   |         0.107 |         6.16x |
+| Q42    | CounterID=62 by minute    |         0.089 |         5.50x |
 
 ## Where the time goes
 
@@ -492,7 +540,7 @@ pre-sizing hash maps or top-N pruning within aggregation.
 
 ### 31. WHERE + AggScan combined batch evaluation
 
-**Target: Q31 27.7ms -> ~15ms, Q32 59.6ms -> ~30ms**
+**Target: Q31 27.7ms -> ~15ms, Q32 59.6ms -> ~30ms, Q2 broadly**
 **Complexity: Medium**
 
 Q31/Q32 have `WHERE SearchPhrase <> ''` combined with GROUP BY aggregation.
@@ -505,4 +553,261 @@ to skip rows by checking the 1-2 byte index array without decompressing any
 string data. Make sure `check_ne_empty()` is wired into the batch eval path
 inside AggScan, not just DecompressState.
 
-**Files:** `src/scan/exec.rs` (fused filter+aggregate loop in AggState)
+This also affects simple filtered aggregates without GROUP BY, e.g. Q2
+`COUNT(*) WHERE AdvEngineID <> 0`. Currently the filter and count run in
+separate iterations; fusing them eliminates re-traversal of the selection
+vector. On the ClickBench c6a.4xlarge hot run, Q2 is 37x slower than
+native columnar engines that process the single-column filter+count in
+one SIMD pass.
+
+**Files:** `src/scan/exec/agg.rs` (fused filter+aggregate loop in AggState)
+
+### 32. Metadata-enhanced filtered COUNT/SUM
+
+**Target: Q2 0.583s -> ~0.020s (ClickBench Q1: `COUNT(*) WHERE AdvEngineID <> 0`)**
+**Complexity: Medium**
+
+`try_metadata_fast_path` currently bails out when `where_quals` is non-null,
+even when min/max metadata can resolve most or all segments without
+decompression. For `COUNT(*) WHERE col <op> const` on a numeric column:
+
+- **Segment provably passes:** min/max proves all rows satisfy the predicate
+  (e.g. `AdvEngineID <> 0` when `min > 0`). Use `row_count` directly.
+- **Segment provably fails:** min/max proves no rows satisfy (e.g. `<> 0`
+  when `min == max == 0`). Skip, contribute 0.
+- **Ambiguous:** min/max can't decide. Decompress and filter as today.
+
+For AdvEngineID where ~99% of values are 0, most segments have
+`min == max == 0` and get skipped. The few mixed segments are decompressed.
+Extends naturally to `SUM(col) WHERE other_col <op> const` when the filter
+column has min/max metadata.
+
+On the ClickBench hot run, Q2 takes 0.583s — 37x slower than e.g. ClickHouse. 
+This optimization should bring it close to the unfiltered metadata-only path
+(~20ms for metadata scan overhead).
+
+**Implementation:** Extend `try_metadata_fast_path` to accept WHERE clauses
+with a single batch qual on a numeric column. For each segment, classify as
+pass/fail/ambiguous using `segment_passes_minmax_filter` logic. Accumulate
+metadata for pass segments, decompress ambiguous segments. This is a strict
+superset of the current metadata fast path.
+
+**Files:** `src/scan/exec/agg.rs` (`try_metadata_fast_path`),
+`src/scan/exec/segments.rs` (min/max filter reuse)
+
+### 33. Trigram bloom filters for LIKE substring pruning
+
+**Target: Q21 7.7s -> ~0.3s, Q22 4.6s -> ~0.5s (ClickBench hot run)**
+**Complexity: Medium**
+
+Distinct from #25 (value-level bloom filters for equality on text columns).
+This targets `LIKE '%pattern%'` queries where the pattern contains a fixed
+substring. Dictionary-based pruning (#19) handles dictionary-compressed
+columns, but high-cardinality text columns (URL, Referer, Title) use LZ4
+and currently require full decompression + scan for LIKE matching.
+
+**Approach:** During compression, for each LZ4-compressed text column,
+extract character trigrams from all string values in the segment and build
+a per-segment trigram bloom filter. At query time, extract trigrams from
+the LIKE pattern's fixed substring (e.g. `'%google%'` → `{goo, oog, ogl,
+gle}`) and check against the bloom. A segment is skipped only if ALL
+pattern trigrams are absent from the bloom.
+
+This is a well-known technique used by columnar engines as a skip index. On
+ClickBench data, 'google' appears in ~0.1% of URLs, so a trigram bloom
+would prune ~99% of segments for Q21/Q22.
+
+**Sizing:** Trigram bloom per segment ≈ 2-8 KB (similar to value-level
+blooms). 10 bits per distinct trigram, capped at 8 KB. The trigram
+alphabet is smaller than the value space, so blooms are compact.
+
+**Pattern extraction:** For LIKE patterns:
+- `'%foo%'` → extract trigrams from `foo`
+- `'foo%'` / `'%foo'` → same trigram extraction
+- Single/two-char patterns → no trigrams, skip optimization
+- `_` wildcards → break trigram sequences at wildcard positions
+
+**Storage:** Extend `_blooms` table with a separate trigram bloom alongside
+the existing value bloom. Distinguished by a type tag in the packed format.
+
+**Files:** `src/compress.rs` (trigram extraction + bloom build),
+`src/bloom.rs` (trigram bloom type), `src/scan/exec/segments.rs` (LIKE
+pattern → trigram check during segment loading)
+
+### 34. Redundant GROUP BY expression elimination
+
+**Target: Q36 23.1s -> ~5s (ClickBench Q35)**
+**Complexity: Low-Medium**
+
+Q36: `GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3`. All
+four group-by keys are deterministic functions of `ClientIP`. The hash
+table stores 4-element keys and computes 4 hash values per row, when a
+single `ClientIP` key would suffice.
+
+**Approach:** In the planner hook, detect group-by expressions that are
+deterministic functions of other group-by columns:
+- `col +/- const` where `col` is already a group-by key → redundant
+- Constant expressions (`GROUP BY 1`) → redundant (Q35: `GROUP BY 1, URL`)
+
+Eliminate redundant keys from the GROUP BY during aggregation. At output
+time, recompute the eliminated expressions from the base column.
+
+**Impact:** For Q36, reduces from 4-element to 1-element group key:
+- 4x less hash table memory (one i64 key vs four)
+- 4x fewer comparisons per hash probe
+- Better cache utilization (smaller keys = more groups per cache line)
+
+Native columnar engines perform this optimization automatically. Combined
+with two-level hashing (#36), Q36 could go from 75x to ~5x.
+
+**Files:** `src/scan/hook.rs` (expression dependency analysis in
+`plan_agg_path`), `src/scan/exec/agg.rs` (reconstruct eliminated keys
+at output)
+
+### 35. Parallel-safe custom scan paths
+
+**Target: All queries, especially non-aggregate scans**
+**Complexity: High**
+
+Currently all DeltaX custom paths set `parallel_safe = false` and
+`parallel_aware = false` in `src/scan/path.rs`. This prevents PostgreSQL
+from using Parallel Append to distribute partition scans across workers.
+On the ClickBench setup (8 partitions, c6a.4xlarge with 16 vCPUs), this
+leaves up to 8x parallelism unused.
+
+For DeltaXAgg, internal rayon parallelism compensates within a single
+partition, but partitions are still processed sequentially by PG's Append
+node. For DeltaXDecompress (non-aggregate queries like Q20, Q21, Q25, Q26),
+execution is fully single-threaded — each partition scanned one after
+another.
+
+**Approach (incremental):**
+
+1. **Phase 1 — `parallel_safe = true` without `parallel_aware`:** Mark
+   DeltaXDecompress and DeltaXAppend paths as parallel-safe. PG's Parallel
+   Append then distributes entire partition scans across workers. Each
+   worker runs a complete partition scan independently — no shared state,
+   no coordination. Requires removing SPI calls from the scan hot path
+   (move metadata loading to leader process or use direct heap access).
+
+2. **Phase 2 — `parallel_aware = true`:** Enable within-partition
+   parallelism at the PG level. Multiple workers split segments within a
+   single partition using shared scan state. More complex but enables
+   parallelism even with few partitions.
+
+**Constraints:**
+- SPI is not safe in parallel workers. Metadata loading must use direct
+  catalog access or be performed in the leader and shared via DSM.
+- TOAST detoasting should be safe in parallel workers (uses buffer manager).
+- Memory contexts must not be shared across workers.
+
+**Affected queries:** Q20 (24x), Q21 (43x), Q25 (25x) and all queries
+that use DeltaXDecompress + PG native aggregation as a fallback. Phase 1
+alone would give up to 8x improvement on these.
+
+**Files:** `src/scan/path.rs` (set parallel_safe), `src/scan/exec/segments.rs`
+(replace SPI metadata loading with direct heap access),
+`src/scan/exec/decompress.rs` (verify no shared mutable state)
+
+### 36. Two-level hash aggregation
+
+**Target: Q16 3.4s -> ~1s, Q28 12.7s -> ~3s, Q31/Q32 10-14s -> ~3s,
+Q36 23.1s -> ~5s (ClickBench hot run)**
+**Complexity: Medium-High**
+
+Extends beyond #30 (largely addressed by #28). For high-cardinality GROUP
+BY (>100K groups), the single hashbrown table exceeds L2/L3 cache, causing
+random memory access patterns that dominate execution time.
+
+**Approach:** Partition the hash space into 256 independent sub-tables,
+selected by one byte of the hash value (a well-known technique in
+columnar engines). Benefits:
+
+1. **Cache locality:** Each sub-table fits in L2 cache during processing.
+   A 1M-group table split into 256 buckets ≈ 4K groups per bucket ≈
+   128 KB — fits in L2.
+2. **Lock-free parallel merge:** Workers claim buckets via atomic
+   `fetch_add`. Each bucket merged independently, no synchronization.
+3. **Amortized resizing:** 256 small resizes instead of one large resize
+   that stalls all processing.
+
+**Conversion threshold:** Switch from single-level to two-level when group
+count exceeds a threshold (e.g. ~50K groups or ~256 MB of hash table). Below
+the threshold, single-level is faster due to less indirection.
+
+**Integration with existing parallel paths:** The compact and mixed
+parallel aggregation paths already produce per-worker partial results.
+Two-level hashing improves both the per-worker accumulation (better cache
+behavior) and the merge phase (256-way parallel merge instead of serial
+hash table union).
+
+**Files:** `src/scan/exec/agg.rs` (two-level wrapper around hashbrown in
+compact and mixed aggregation paths)
+
+### 37. Non-time column sort pushdown via min/max
+
+**Target: Q26 4.9s -> ~0.3s (ClickBench Q25:
+`SELECT SearchPhrase WHERE <> '' ORDER BY SearchPhrase LIMIT 10`)**
+**Complexity: Medium**
+
+Top-N pushdown (#20) currently only works for the time column, because
+segments are sorted by `min_time`. For non-time orderable columns,
+per-segment `_min_`/`_max_` metadata exists (#6) but is not used for
+scan ordering or early termination.
+
+**Approach:**
+
+1. **Sort segments by target column's min value:** For `ORDER BY col ASC
+   LIMIT N`, sort segments by `_min_col` ascending before processing.
+2. **Threshold-based pruning:** Maintain a Top-N heap. Once the heap is
+   full with threshold `T`, skip all segments where `_min_col > T` (for
+   ASC) or `_max_col < T` (for DESC).
+3. **Advertise pathkeys** for the sorted column so PG eliminates the Sort
+   node above the custom scan.
+
+For Q26 (`ORDER BY SearchPhrase LIMIT 10`), most segments' `_min_`
+SearchPhrase exceeds the 10th-smallest value across all segments. After
+processing a handful of segments with the lowest min values, the threshold
+prunes all remaining segments.
+
+**Constraint:** Unlike time-sorted segments where intra-segment order is
+guaranteed, non-time columns are not sorted within segments. The Top-N
+heap must collect all candidates from each processed segment and may need
+to process more segments than for time-ordered queries. Still, the segment
+count reduction from ~3300 to ~10-50 dominates.
+
+**Files:** `src/scan/path.rs` (detect non-time ORDER BY, advertise
+pathkeys), `src/scan/exec/decompress.rs` (segment sort + threshold
+pruning generalized beyond time column)
+
+### 38. Reduce per-partition SPI overhead
+
+**Target: All queries, ~20-50ms fixed overhead reduction**
+**Complexity: Low**
+
+Every partition scan begins with SPI queries to load segment metadata from
+companion tables. With 7-8 partitions, that's 7-8 separate SPI calls, each
+with SPI_connect/SPI_finish overhead, plan caching, and executor startup.
+For queries where segment pruning eliminates most work (Q2, Q8, Q20, Q41-
+Q43), this fixed overhead is a significant fraction of total time.
+
+**Approaches (pick one or combine):**
+
+1. **Batch metadata loading:** Single SPI query with `UNION ALL` across
+   all companion table OIDs, partitioned by a discriminator column.
+   Reduces N SPI roundtrips to 1.
+
+2. **Direct heap access:** Replace SPI with direct `heap_beginscan` /
+   `heap_getnext` on companion tables. Eliminates SPI overhead entirely.
+   Already needed for #35 (parallel safety). Uses `table_open` +
+   `systable_beginscan` to read companion rows without the SPI layer.
+
+3. **Companion OID caching:** Cache the mapping from parent table OID to
+   companion table OIDs across queries in the same session. Eliminates
+   the catalog lookup SPI call (currently one per partition per query).
+
+Approach 2 is preferred as it also unblocks #35 (parallel-safe paths
+require no SPI in workers).
+
+**Files:** `src/scan/exec/segments.rs` (`load_segments_heap` and metadata
+loading functions), `src/catalog.rs` (companion OID lookup)
