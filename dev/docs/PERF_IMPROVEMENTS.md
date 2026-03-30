@@ -624,9 +624,10 @@ the existing value bloom. Distinguished by a type tag in the packed format.
 `src/bloom.rs` (trigram bloom type), `src/scan/exec/segments.rs` (LIKE
 pattern → trigram check during segment loading)
 
-### 34. Redundant GROUP BY expression elimination
+### 34. Redundant GROUP BY expression elimination ✅
 
 **Target: Q36 23.1s -> ~5s (ClickBench Q35)**
+**Result: Q36 23.1s -> 1.4s**
 **Complexity: Low-Medium**
 
 Q36: `GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3`. All

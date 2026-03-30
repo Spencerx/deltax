@@ -3278,6 +3278,301 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         }
 
         // ============================================================
+        // PARALLEL COUNT(DISTINCT) PATH: no GROUP BY, all aggs are
+        // CountDistinct — parallelize by splitting segments across
+        // threads, each builds local HashSets, then merge.
+        // ============================================================
+        let all_count_distinct = !has_group_by
+            && n_workers > 1
+            && all_segments.len() > 1
+            && batch_quals.is_empty()
+            && !agg_specs.is_empty()
+            && agg_specs.iter().all(|s| s.agg_type == AggType::CountDistinct);
+
+        if all_count_distinct {
+            let t2 = Instant::now();
+
+            struct ParallelCdConfig<'a> {
+                agg_specs: &'a [AggExecSpec],
+                col_names: &'a [String],
+                col_types: &'a [pg_sys::Oid],
+                segment_by: &'a [String],
+                needed_cols: &'a [bool],
+                seg_filters: &'a [(usize, String)],
+                time_min: Option<i64>,
+                time_max: Option<i64>,
+                count_distinct_only_str: &'a [bool],
+                count_distinct_only_int: &'a [bool],
+            }
+            // SAFETY: contains only references to data that outlives the thread scope
+            unsafe impl Send for ParallelCdConfig<'_> {}
+            unsafe impl Sync for ParallelCdConfig<'_> {}
+
+            struct ParallelCdResult {
+                int_sets: Vec<std::collections::HashSet<i64>>,
+                str_sets: Vec<std::collections::HashSet<u128>>,
+                segments_processed: u64,
+            }
+
+            let config = ParallelCdConfig {
+                agg_specs: &agg_specs,
+                col_names: &meta.col_names,
+                col_types: &meta.col_types,
+                segment_by: &meta.segment_by,
+                needed_cols: &needed_cols,
+                seg_filters: &seg_filters,
+                time_min,
+                time_max,
+                count_distinct_only_str: &count_distinct_only_str,
+                count_distinct_only_int: &count_distinct_only_int,
+            };
+
+            fn process_cd_segments(
+                segments: &[SegmentData],
+                config: &ParallelCdConfig,
+            ) -> ParallelCdResult {
+                let n_aggs = config.agg_specs.len();
+                let mut int_sets: Vec<std::collections::HashSet<i64>> = (0..n_aggs)
+                    .map(|_| std::collections::HashSet::new())
+                    .collect();
+                let mut str_sets: Vec<std::collections::HashSet<u128>> = (0..n_aggs)
+                    .map(|_| std::collections::HashSet::new())
+                    .collect();
+                let mut segments_processed = 0u64;
+
+                for seg in segments {
+                    if seg.row_count == 0 { continue; }
+
+                    // Segment-by pruning
+                    if !config.seg_filters.is_empty() {
+                        let mut skip = false;
+                        for &(seg_val_idx, ref filter_val) in config.seg_filters {
+                            match &seg.segment_values[seg_val_idx] {
+                                Some(val) if val == filter_val => {}
+                                _ => { skip = true; break; }
+                            }
+                        }
+                        if skip { continue; }
+                    }
+
+                    // Time-range pruning
+                    if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
+                        if config.time_min.is_some_and(|query_min| seg_max < query_min) { continue; }
+                        if config.time_max.is_some_and(|query_max| seg_min > query_max) { continue; }
+                    }
+
+                    segments_processed += 1;
+
+                    // Process each needed column's compressed blob
+                    let mut blob_idx = 0;
+                    let mut _seg_val_idx = 0;
+                    for (col_idx, col_name) in config.col_names.iter().enumerate() {
+                        if !config.needed_cols[col_idx] {
+                            if config.segment_by.contains(col_name) {
+                                _seg_val_idx += 1;
+                            } else {
+                                blob_idx += 1;
+                            }
+                            continue;
+                        }
+                        if config.segment_by.contains(col_name) {
+                            // Segment-by column: one value per segment, from segment_values
+                            let spec_idx = config.agg_specs.iter().position(|s| s.col_idx as usize == col_idx);
+                            if let (Some(si), Some(val)) = (spec_idx, &seg.segment_values[_seg_val_idx]) {
+                                if config.count_distinct_only_str[col_idx] {
+                                    str_sets[si].insert(hash128_str(val.as_bytes()));
+                                } else if config.count_distinct_only_int[col_idx]
+                                    && let Ok(v) = val.parse::<i64>()
+                                {
+                                    int_sets[si].insert(v);
+                                }
+                            }
+                            _seg_val_idx += 1;
+                            continue;
+                        }
+
+                        let blob = &seg.compressed_blobs[blob_idx];
+                        let type_oid = config.col_types[col_idx];
+                        blob_idx += 1;
+
+                        // Find the agg spec for this column
+                        let spec_idx = config.agg_specs.iter().position(|s| s.col_idx as usize == col_idx);
+                        let spec_idx = match spec_idx {
+                            Some(i) => i,
+                            None => continue,
+                        };
+
+                        let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
+                        let non_null_count = count_non_null(cc_ref.null_bitmap, cc_ref.row_count as usize);
+                        if non_null_count == 0 { continue; }
+
+                        if config.count_distinct_only_str[col_idx] {
+                            let seen = &mut str_sets[spec_idx];
+                            match cc_ref.type_tag {
+                                compression::CompressionType::Dictionary
+                                | compression::CompressionType::DictionaryLz4 => {
+                                    let norm_buf;
+                                    let dict_data = if cc_ref.type_tag == compression::CompressionType::DictionaryLz4 {
+                                        norm_buf = compression::dictionary::normalize_lz4(cc_ref.data);
+                                        &norm_buf[..]
+                                    } else {
+                                        cc_ref.data
+                                    };
+                                    let hdr = compression::dictionary::parse_header(dict_data);
+                                    for entry in &hdr.dict {
+                                        seen.insert(hash128_str(entry.as_bytes()));
+                                    }
+                                }
+                                compression::CompressionType::Lz4 => {
+                                    let (buf, ranges) = compression::lz4::decode_to_ranges(cc_ref.data, non_null_count);
+                                    let empty_hash = hash128_str(b"");
+                                    let mut has_empty = false;
+                                    for &(off, len) in &ranges {
+                                        if len == 0 { has_empty = true; }
+                                        else { seen.insert(hash128_str(&buf[off..off + len])); }
+                                    }
+                                    if has_empty { seen.insert(empty_hash); }
+                                }
+                                compression::CompressionType::Lz4Blocked => {
+                                    let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc_ref.data, non_null_count, None);
+                                    let empty_hash = hash128_str(b"");
+                                    let mut has_empty = false;
+                                    for &(off, len) in &ranges {
+                                        if len == 0 { has_empty = true; }
+                                        else { seen.insert(hash128_str(&buf[off..off + len])); }
+                                    }
+                                    if has_empty { seen.insert(empty_hash); }
+                                }
+                                compression::CompressionType::Constant => {
+                                    seen.insert(hash128_str(cc_ref.data));
+                                }
+                                _ => {}
+                            }
+                        } else if config.count_distinct_only_int[col_idx] {
+                            let seen = &mut int_sets[spec_idx];
+                            let is_i64 = type_oid == pg_sys::INT8OID;
+                            match cc_ref.type_tag {
+                                compression::CompressionType::Constant => {
+                                    if is_i64 {
+                                        let v = i64::from_le_bytes(cc_ref.data[..8].try_into().unwrap());
+                                        seen.insert(v);
+                                    } else {
+                                        let v = i32::from_le_bytes(cc_ref.data[..4].try_into().unwrap());
+                                        seen.insert(v as i64);
+                                    }
+                                }
+                                compression::CompressionType::ForBitpacked => {
+                                    if is_i64 {
+                                        let vals = compression::bitpacked::decode_for_i64(cc_ref.data, non_null_count);
+                                        for v in vals { seen.insert(v); }
+                                    } else {
+                                        let vals = compression::bitpacked::decode_for_i32(cc_ref.data, non_null_count);
+                                        for v in vals { seen.insert(v as i64); }
+                                    }
+                                }
+                                compression::CompressionType::DeltaVarint => {
+                                    if is_i64 {
+                                        let vals = compression::integer::decode_i64(cc_ref.data, non_null_count);
+                                        for v in vals { seen.insert(v); }
+                                    } else {
+                                        let vals = compression::integer::decode_i32(cc_ref.data, non_null_count);
+                                        for v in vals { seen.insert(v as i64); }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                ParallelCdResult { int_sets, str_sets, segments_processed }
+            }
+
+            let chunk_size = all_segments.len().div_ceil(n_workers);
+            let partial_results: Vec<ParallelCdResult> = std::thread::scope(|s| {
+                let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
+                    s.spawn(|| process_cd_segments(chunk, &config))
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            let agg_us = t2.elapsed().as_micros() as u64;
+
+            // Merge thread-local sets into global accumulators
+            let accumulators = global_accumulators.as_mut().unwrap();
+            let mut total_segments = 0u64;
+            for partial in &partial_results {
+                total_segments += partial.segments_processed;
+                for (spec_idx, _spec) in agg_specs.iter().enumerate() {
+                    match &mut accumulators[spec_idx] {
+                        AggAccumulator::CountDistinctInt { seen } => {
+                            for &v in &partial.int_sets[spec_idx] {
+                                seen.insert(v);
+                            }
+                        }
+                        AggAccumulator::CountDistinctStr { seen } => {
+                            for &v in &partial.str_sets[spec_idx] {
+                                seen.insert(v);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Finalize
+            let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+            for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                agg_results.push(finalize_accumulator(&accumulators[spec_idx], spec));
+            }
+            let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+            for entry in &output_map {
+                match entry {
+                    OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                    OutputEntry::Group(_) | OutputEntry::DerivedGroup { .. } => row.push((pg_sys::Datum::from(0usize), true)),
+                    OutputEntry::Const(d, n) => row.push((*d, *n)),
+                }
+            }
+
+            let actual_workers = partial_results.len();
+
+            let state = AggScanState {
+                _agg_specs: agg_specs,
+                _group_specs: group_specs,
+                result_rows: vec![row],
+                result_idx: 0,
+                _num_result_cols: num_result_cols,
+                metadata_us,
+                heap_scan_us,
+                detoast_us: 0,
+                decompress_us: 0,
+                agg_us,
+                total_segments,
+                total_rows_processed: 0,
+                batch_quals_count: 0,
+                where_quals_null: where_quals.is_null(),
+                segments_metadata_resolved: 0,
+                segments_decompressed: 0,
+                regex_cache_size: 0,
+                regex_cache_calls: 0,
+                topn_limit: 0,
+                topn_sort_col: -1,
+                topn_ascending,
+                pre_topn_groups: 0,
+                merge_us: 0,
+                finalize_us: 0,
+                topn_select_us: 0,
+                n_workers: actual_workers as u64,
+                bare_limit: 0,
+            };
+
+            let state_box = Box::new(state);
+            let state_ptr = Box::into_raw(state_box);
+            (*node).custom_ps = state_ptr as *mut pg_sys::List;
+            return;
+        }
+
+        // ============================================================
         // SINGLE-THREADED PATH (original)
         // ============================================================
         let t2 = Instant::now();
