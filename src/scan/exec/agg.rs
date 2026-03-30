@@ -6663,9 +6663,20 @@ fn can_parallel_mixed(
         return false;
     }
 
-    // Must have at least one text GROUP BY column (otherwise compact path would handle it)
+    // Must have at least one text column involved (GROUP BY, qual, or agg) to justify
+    // the mixed path instead of the compact path.
     let has_text_group = group_specs.iter().any(is_text_group_col);
-    if !has_text_group {
+    let has_text_qual = batch_quals.iter().any(|bq| {
+        let t = bq.type_oid;
+        t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+    });
+    let has_text_agg = agg_specs.iter().any(|s| {
+        let t = s.col_type_oid;
+        s.expr_kind == AggExpr::LengthOf
+            || (matches!(s.agg_type, AggType::Min | AggType::Max | AggType::CountDistinct)
+                && (t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID))
+    });
+    if !has_text_group && !has_text_qual && !has_text_agg {
         return false;
     }
 
@@ -6722,7 +6733,12 @@ fn can_parallel_mixed(
                 && s.agg_type == AggType::CountDistinct
                 && (type_oid == pg_sys::TEXTOID || type_oid == pg_sys::VARCHAROID || type_oid == pg_sys::BPCHAROID)
         });
-        if !is_text_gb && !has_text_qual && !is_text_minmax_agg && !is_text_cd_agg {
+        let is_text_length_agg = agg_specs.iter().any(|s| {
+            s.col_idx as usize == i
+                && s.expr_kind == AggExpr::LengthOf
+                && (type_oid == pg_sys::TEXTOID || type_oid == pg_sys::VARCHAROID || type_oid == pg_sys::BPCHAROID)
+        });
+        if !is_text_gb && !has_text_qual && !is_text_minmax_agg && !is_text_cd_agg && !is_text_length_agg {
             return false; // unsupported column type
         }
     }
