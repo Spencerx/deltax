@@ -1535,27 +1535,16 @@ fn process_topn_text_chunk(
                     } else {
                         // Need to decompress this column — use a temporary
                         // Since we can't store the temp and reference it, decompress inline
-                        let text_sel = match decompress_text_to_seg_col(blob) {
-                            Some(ref sc) => apply_text_eq_filter(sc, const_str, *is_ne, row_count),
-                            None => vec![false; row_count],
-                        };
-                        if selection.is_empty() {
-                            selection = text_sel;
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                            apply_text_eq_filter(sc, const_str, *is_ne, row_count, &mut selection);
+                        } else if selection.is_empty() {
+                            selection = vec![false; row_count];
                         } else {
-                            for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
-                                *s = *s && *t;
-                            }
+                            selection.iter_mut().for_each(|s| *s = false);
                         }
                         continue;
                     };
-                    let text_sel = apply_text_eq_filter(seg_col, const_str, *is_ne, row_count);
-                    if selection.is_empty() {
-                        selection = text_sel;
-                    } else {
-                        for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
-                            *s = *s && *t;
-                        }
-                    }
+                    apply_text_eq_filter(seg_col, const_str, *is_ne, row_count, &mut selection);
                 }
                 TextQualInfo::Like { col_idx, strategy, negate } => {
                     let col_name = &config.col_names[*col_idx];
@@ -1567,27 +1556,16 @@ fn process_topn_text_chunk(
                     } else {
                         let blob_idx = col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
                         let blob = &seg.compressed_blobs[blob_idx];
-                        let text_sel = match decompress_text_to_seg_col(blob) {
-                            Some(ref sc) => apply_text_like_filter(sc, strategy, *negate, row_count),
-                            None => vec![false; row_count],
-                        };
-                        if selection.is_empty() {
-                            selection = text_sel;
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                            apply_text_like_filter(sc, strategy, *negate, row_count, &mut selection);
+                        } else if selection.is_empty() {
+                            selection = vec![false; row_count];
                         } else {
-                            for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
-                                *s = *s && *t;
-                            }
+                            selection.iter_mut().for_each(|s| *s = false);
                         }
                         continue;
                     };
-                    let text_sel = apply_text_like_filter(seg_col, strategy, *negate, row_count);
-                    if selection.is_empty() {
-                        selection = text_sel;
-                    } else {
-                        for (s, t) in selection.iter_mut().zip(text_sel.iter()) {
-                            *s = *s && *t;
-                        }
-                    }
+                    apply_text_like_filter(seg_col, strategy, *negate, row_count, &mut selection);
                 }
             }
         }

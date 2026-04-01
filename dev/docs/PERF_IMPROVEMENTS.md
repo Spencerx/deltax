@@ -844,3 +844,55 @@ remains serial).
 **Files:** `src/scan/exec/agg.rs` (pipelined batch loop in compact and
 mixed parallel paths), `src/scan/exec/segments.rs` (lazy loading for
 agg path)
+
+### 40. Dict-accelerated LIKE filtering + two-phase column decompression
+
+**Target: Q22 9.6s -> ~2s, Q20 7.7s -> ~2s, Q21 4.6s -> ~1s (ClickBench hot run)**
+**Complexity: Medium**
+
+For dictionary-compressed text columns, LIKE/NOT LIKE filters are currently
+evaluated row-by-row: `get_str(row)` looks up the dict entry, then
+`string.contains(pattern)` is called for each of ~30K rows per segment.
+But every row's value is one of ~500 dict entries — checking the same
+strings thousands of times.
+
+**Dict-accelerated filtering:** Check the LIKE pattern against each unique
+dict entry once, build a bitset of matching entry IDs, then produce the
+row-level selection bitmap via integer lookups into `row_to_entry`:
+
+```
+Current:  2787 segments × 30K rows × string.contains() = 83M string ops
+Proposed: 2787 segments × 500 entries × string.contains() = 1.4M string ops
+          + 83M integer lookups (matching_entries[row_to_entry[row]])
+```
+
+~60x fewer string operations. Exact (not approximate) — every non-null
+row value IS one of the dict entries.
+
+**Two-phase column decompression:** Combined with dict-accelerated
+filtering, enables skipping decompression of non-filter columns for
+segments with zero matches:
+
+- Phase 1: Parse only the filter column's dict header → check LIKE against
+  dict entries → if 0 match, skip segment entirely (no URL/SearchPhrase/
+  UserID decompression)
+- Phase 2 (matching segments only): Decompress remaining columns, apply
+  remaining filters, aggregate
+
+For Q22 (`Title LIKE '%Google%'`), 37K rows match out of 100M (0.037%).
+Dict pruning (#19) already skips segments where no dict entry matches,
+but with matches scattered across most segments, few are skipped. The
+win here is avoiding full text decompression + row-by-row matching for
+the non-filter columns in every segment.
+
+**Applies to:** `apply_text_like_filter` and `apply_text_eq_filter` in
+`text_col.rs` for the dict fast path. `process_segments_mixed` in
+`agg.rs` for two-phase column loading.
+
+**LZ4 fallback:** High-cardinality LZ4-compressed columns don't have a
+dictionary and fall back to the current row-by-row path. For those,
+trigram bloom filters (#33) are the appropriate optimization.
+
+**Files:** `src/scan/exec/text_col.rs` (dict-aware `apply_text_like_filter`
+and `apply_text_eq_filter`), `src/scan/exec/agg.rs` (`process_segments_mixed`
+two-phase column decompression)

@@ -270,6 +270,7 @@ pub(crate) struct AggScanState {
     pub(crate) topn_select_us: u64,
     pub(crate) n_workers: u64,
     pub(crate) bare_limit: i64,
+    pub(crate) wall_us: u64,
 }
 
 
@@ -691,7 +692,7 @@ fn try_catalog_shortcut(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0,
+        bare_limit: 0, wall_us: 0,
     })
 }
 
@@ -926,7 +927,7 @@ fn try_metadata_fast_path(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0,
+        bare_limit: 0, wall_us: 0,
     })
 }
 
@@ -1196,6 +1197,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
     _eflags: i32,
 ) {
     unsafe {
+        let t_wall = Instant::now();
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
             pgrx::error!("pg_deltax: missing custom_private in DeltaXAgg state");
@@ -1239,6 +1241,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         }
 
         // Fast path 2: answer from per-segment metadata (with selective decompression for filtered queries)
+        // Skip early when conditions that try_metadata_fast_path checks immediately
+        // would fail: GROUP BY, HAVING, CountDistinct, or non-numeric agg columns.
+        let t_fp2 = Instant::now();
+        if plan.group_specs.is_empty() && plan.having_filters.is_empty()
+            && plan.agg_specs.iter().all(|s| s.agg_type != AggType::CountDistinct)
         {
             let needs_sums = plan.agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Sum | AggType::Avg));
             let needs_counts = plan.agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Count));
@@ -1392,7 +1399,6 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let n_workers = crate::get_parallel_workers();
         let use_lazy = n_workers > 1 && !group_specs.is_empty();
         let lazy_cols: Vec<bool> = needed_cols.to_vec();
-        let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
         for &oid in &companion_oids {
@@ -1405,7 +1411,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             all_segments.extend(segs);
             total_detoast_us += dt_us;
         }
-        let heap_scan_us = t1.elapsed().as_micros() as u64;
+        // heap_scan_us includes fast-path-2 heap scan (eager detoast for metadata
+        // check) plus the main lazy scan.  t_fp2 was started before fast-path-2.
+        let heap_scan_us = t_fp2.elapsed().as_micros() as u64;
 
         // Create per-segment memory context
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
@@ -1592,6 +1600,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 total_detoast_us += t_detoast.elapsed().as_micros() as u64;
             }
 
+            let mut pipeline_detoast_us: u64 = 0;
             let partial_results: Vec<ParallelCompactResult> = if use_pipeline {
                 let n_batches = (n_workers * 2).max(2).min(all_segments.len());
                 let batch_size = all_segments.len().div_ceil(n_batches);
@@ -1615,9 +1624,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                         // Main thread detoasts next batch while workers run
                         if batch_end < total_segs {
+                            let t_pd = Instant::now();
                             for seg in &mut pending[..next_end - batch_end] {
                                 detoast_lazy_blobs(seg);
                             }
+                            pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
                         }
 
                         for h in handles {
@@ -1650,7 +1661,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 total_rows_processed += result.rows_processed;
                 decompress_us = decompress_us.max(result.decompress_us);
             }
-            let agg_us = scan_wall_us.saturating_sub(decompress_us);
+            total_detoast_us += pipeline_detoast_us;
+            let agg_us = scan_wall_us.saturating_sub(decompress_us + pipeline_detoast_us);
 
             // ----------------------------------------------------------
             // Speculative top-N: use pre-computed top-K candidates from
@@ -1873,7 +1885,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
                     };
 
                     let state_box = Box::new(state);
@@ -2039,7 +2051,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us: spec_fail_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
                     };
 
                     let state_box = Box::new(state);
@@ -2203,6 +2215,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
                     bare_limit,
+                    wall_us: t_wall.elapsed().as_micros() as u64,
                 };
 
                 let state_box = Box::new(state);
@@ -2463,7 +2476,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0,
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
                 };
 
                 let state_box = Box::new(state);
@@ -2614,7 +2627,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
             };
 
             let state_box = Box::new(state);
@@ -2674,7 +2687,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 group_specs.iter().any(|gs| gs.col_idx as usize == i && is_text_group_col(gs))
             }).collect();
 
-            // Build text qual infos for worker threads
+            // Build text qual infos for worker threads.
+            // Order: positive LIKE first (most selective — match a pattern),
+            // then EQ/NE, then NOT LIKE (negated patterns pass most rows).
+            // This maximizes short-circuit benefit when filters AND into selection.
             let mut text_qual_infos: Vec<TextQualInfo> = Vec::new();
             for bq in &batch_quals {
                 let t = bq.type_oid;
@@ -2702,6 +2718,15 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     }
                 }
             }
+            // Reorder: cheap filters first to maximize short-circuit benefit.
+            // EQ/NE are O(1) per row (simple comparison); LIKE requires substring
+            // search. Running cheap filters first reduces the row count for
+            // expensive LIKE checks.
+            text_qual_infos.sort_by_key(|tqi| match tqi {
+                TextQualInfo::EqNe { .. } => 0,                // EQ/NE — cheapest
+                TextQualInfo::Like { negate: false, .. } => 1,  // positive LIKE
+                TextQualInfo::Like { negate: true, .. } => 2,   // NOT LIKE
+            });
 
             let config = ParallelMixedConfig {
                 agg_specs: &agg_specs,
@@ -2720,7 +2745,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 rust_regex_infos: &rust_regex_infos,
             };
 
-            // Pipeline detoast with parallel processing when enough segments
+            // Pipeline detoast with parallel processing when enough segments.
+            // Use fewer batches than the compact path (4 vs n_workers*2) because
+            // the mixed path processes text columns which have high per-segment
+            // cost. Fewer batches = fewer thread scope synchronization points.
             let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
 
             if use_lazy {
@@ -2740,8 +2768,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 total_detoast_us += t_detoast.elapsed().as_micros() as u64;
             }
 
+            let mut pipeline_detoast_us: u64 = 0;
             let partial_results: Vec<ParallelMixedResult> = if use_pipeline {
-                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                let n_batches = 2.min(all_segments.len());
                 let batch_size = all_segments.len().div_ceil(n_batches);
                 let mut results: Vec<ParallelMixedResult> = Vec::new();
                 let mut batch_start = 0;
@@ -2762,9 +2791,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         }).collect();
 
                         if batch_end < total_segs {
+                            let t_pd = Instant::now();
                             for seg in &mut pending[..next_end - batch_end] {
                                 detoast_lazy_blobs(seg);
                             }
+                            pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
                         }
 
                         for h in handles {
@@ -2796,7 +2827,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 total_rows_processed += result.rows_processed;
                 decompress_us = decompress_us.max(result.decompress_us);
             }
-            let agg_us = scan_wall_us.saturating_sub(decompress_us);
+            total_detoast_us += pipeline_detoast_us;
+            let agg_us = scan_wall_us.saturating_sub(decompress_us + pipeline_detoast_us);
 
             // ----------------------------------------------------------
             // Speculative top-N: merge-skip using pre-computed top-K
@@ -3039,7 +3071,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
                     };
 
                     let state_box = Box::new(state);
@@ -3216,7 +3248,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
                     };
 
                     let state_box = Box::new(state);
@@ -3426,6 +3458,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
                     bare_limit,
+                    wall_us: t_wall.elapsed().as_micros() as u64,
                 };
 
                 let state_box = Box::new(state);
@@ -3721,7 +3754,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
             };
 
             let state_box = Box::new(state);
@@ -4016,7 +4049,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us: 0,
                 topn_select_us: 0,
                 n_workers: actual_workers as u64,
-                bare_limit: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
             };
 
             let state_box = Box::new(state);
@@ -5360,7 +5393,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             finalize_us,
             topn_select_us,
             n_workers: 0,
-            bare_limit: 0,
+            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
         };
 
         let state_box = Box::new(state);
@@ -5697,10 +5730,9 @@ pub(super) unsafe extern "C-unwind" fn end_agg_scan(
         let state_ptr = (*node).custom_ps as *mut AggScanState;
         if !state_ptr.is_null() {
             let state = Box::from_raw(state_ptr);
-            let total_us = state.metadata_us + state.heap_scan_us + state.decompress_us
-                + state.agg_us + state.merge_us + state.finalize_us + state.topn_select_us;
+            let total_us = state.wall_us;
             pgrx::log!(
-                "pg_deltax DeltaXAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms (detoast={:.1}ms)  \
+                "pg_deltax DeltaXAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  [detoast={:.1}ms]  \
                  decompress={:.1}ms  agg={:.1}ms  merge={:.1}ms  finalize={:.1}ms  topn_select={:.1}ms  | \
                  workers={} segments={} rows_processed={} groups={} result_rows={} topn_limit={} bare_limit={}",
                 total_us as f64 / 1000.0,
@@ -7505,34 +7537,24 @@ fn process_segments_mixed(
         // First: numeric batch quals
         let mut selection = evaluate_batch_quals(&numeric_cols, row_count, config.batch_quals, Vec::new());
 
-        // Then: text quals (applied on SegTextColumn)
+        // Then: text quals (applied on SegTextColumn, short-circuiting via selection)
         for tqi in config.text_qual_infos {
             match tqi {
                 TextQualInfo::EqNe { col_idx, const_str, is_ne } => {
                     if let Some(ref seg_col) = text_seg_cols[*col_idx] {
-                        let text_sel = apply_text_eq_filter(seg_col, const_str, *is_ne, row_count);
-                        if selection.is_empty() {
-                            selection = text_sel;
-                        } else {
-                            for (s, ts) in selection.iter_mut().zip(text_sel.iter()) {
-                                *s = *s && *ts;
-                            }
-                        }
+                        apply_text_eq_filter(seg_col, const_str, *is_ne, row_count, &mut selection);
                     }
                 }
                 TextQualInfo::Like { col_idx, strategy, negate } => {
                     if let Some(ref seg_col) = text_seg_cols[*col_idx] {
-                        let text_sel = apply_text_like_filter(seg_col, strategy, *negate, row_count);
-                        if selection.is_empty() {
-                            selection = text_sel;
-                        } else {
-                            for (s, ts) in selection.iter_mut().zip(text_sel.iter()) {
-                                *s = *s && *ts;
-                            }
-                        }
+                        apply_text_like_filter(seg_col, strategy, *negate, row_count, &mut selection);
                     }
                 }
             }
+        }
+        // Early skip: if all rows are filtered out, skip aggregation for this segment
+        if !selection.is_empty() && !selection.iter().any(|&b| b) {
+            continue;
         }
 
         // Aggregation loop

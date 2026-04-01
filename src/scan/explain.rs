@@ -151,10 +151,13 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
             let state_ptr = (*node).custom_ps as *const AggScanState;
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
-                let total_ms =
+                let total_ms = if state.wall_us > 0 {
+                    state.wall_us as f64 / 1000.0
+                } else {
                     (state.metadata_us + state.heap_scan_us + state.decompress_us + state.agg_us
                      + state.merge_us + state.finalize_us + state.topn_select_us)
-                        as f64 / 1000.0;
+                        as f64 / 1000.0
+                };
 
                 let timing_str = std::ffi::CString::new(format!(
                     "{:.3} ms (metadata={:.3} heap_scan={:.3} [detoast={:.3}] decompress={:.3} agg={:.3} merge={:.3} finalize={:.3} topn_select={:.3})",

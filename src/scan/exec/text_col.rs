@@ -125,25 +125,65 @@ pub(super) fn decompress_text_to_seg_col(blob: &[u8]) -> Option<SegTextColumn> {
     }
 }
 
-/// Apply a text EQ/NE filter to a SegTextColumn, producing a selection bitmap.
-pub(super) fn apply_text_eq_filter(seg_col: &SegTextColumn, const_str: &str, is_ne: bool, row_count: usize) -> Vec<bool> {
-    let mut sel = Vec::with_capacity(row_count);
-    for row in 0..row_count {
-        let s = seg_col.get_str(row);
-        let pass = match s {
-            Some(s) => {
-                let eq = s == const_str;
+/// Apply a text EQ/NE filter to a SegTextColumn, AND-ing into an existing selection.
+///
+/// If `sel` is empty, it is initialized (all rows evaluated).
+/// If `sel` is non-empty, rows already false are skipped (short-circuit).
+pub(super) fn apply_text_eq_filter(seg_col: &SegTextColumn, const_str: &str, is_ne: bool, row_count: usize, sel: &mut Vec<bool>) {
+    match seg_col {
+        SegTextColumn::Dict { entries, row_to_entry } => {
+            // Dict fast path: match against unique dict entries only
+            let dict_matches: Vec<bool> = entries.iter().map(|s| {
+                let eq = s.as_str() == const_str;
                 if is_ne { !eq } else { eq }
+            }).collect();
+            if sel.is_empty() {
+                sel.reserve(row_count);
+                for &idx in row_to_entry.iter().take(row_count) {
+                    sel.push(idx != u32::MAX && dict_matches[idx as usize]);
+                }
+            } else {
+                for (row, s) in sel.iter_mut().enumerate() {
+                    if !*s { continue; }
+                    let idx = row_to_entry[row];
+                    *s = idx != u32::MAX && dict_matches[idx as usize];
+                }
             }
-            None => false, // NULL doesn't pass
-        };
-        sel.push(pass);
+        }
+        _ => {
+            if sel.is_empty() {
+                sel.reserve(row_count);
+                for row in 0..row_count {
+                    let pass = match seg_col.get_str(row) {
+                        Some(s) => {
+                            let eq = s == const_str;
+                            if is_ne { !eq } else { eq }
+                        }
+                        None => false,
+                    };
+                    sel.push(pass);
+                }
+            } else {
+                for (row, s) in sel.iter_mut().enumerate() {
+                    if !*s { continue; }
+                    *s = match seg_col.get_str(row) {
+                        Some(s) => {
+                            let eq = s == const_str;
+                            if is_ne { !eq } else { eq }
+                        }
+                        None => false,
+                    };
+                }
+            }
+        }
     }
-    sel
 }
 
-/// Apply a text LIKE filter to a SegTextColumn, producing a selection bitmap.
-pub(super) fn apply_text_like_filter(seg_col: &SegTextColumn, strategy: &LikeStrategy, negate: bool, row_count: usize) -> Vec<bool> {
+/// Apply a text LIKE filter to a SegTextColumn, AND-ing into an existing selection.
+///
+/// If `sel` is empty, it is initialized (all rows evaluated).
+/// If `sel` is non-empty, rows already false are skipped (short-circuit).
+pub(super) fn apply_text_like_filter(seg_col: &SegTextColumn, strategy: &LikeStrategy, negate: bool, row_count: usize, sel: &mut Vec<bool>) {
     use super::batch_qual::sql_like_match;
 
     let matches_like = |text: &str| -> bool {
@@ -157,15 +197,44 @@ pub(super) fn apply_text_like_filter(seg_col: &SegTextColumn, strategy: &LikeStr
         if negate { !matched } else { matched }
     };
 
-    let mut sel = Vec::with_capacity(row_count);
-    for row in 0..row_count {
-        let pass = match seg_col.get_str(row) {
-            Some(s) => matches_like(s),
-            None => false,
-        };
-        sel.push(pass);
+    match seg_col {
+        SegTextColumn::Dict { entries, row_to_entry } => {
+            // Dict fast path: match against unique dict entries only
+            let dict_matches: Vec<bool> = entries.iter().map(|s| matches_like(s)).collect();
+            if sel.is_empty() {
+                sel.reserve(row_count);
+                for &idx in row_to_entry.iter().take(row_count) {
+                    sel.push(idx != u32::MAX && dict_matches[idx as usize]);
+                }
+            } else {
+                for (row, s) in sel.iter_mut().enumerate() {
+                    if !*s { continue; }
+                    let idx = row_to_entry[row];
+                    *s = idx != u32::MAX && dict_matches[idx as usize];
+                }
+            }
+        }
+        _ => {
+            if sel.is_empty() {
+                sel.reserve(row_count);
+                for row in 0..row_count {
+                    let pass = match seg_col.get_str(row) {
+                        Some(s) => matches_like(s),
+                        None => false,
+                    };
+                    sel.push(pass);
+                }
+            } else {
+                for (row, s) in sel.iter_mut().enumerate() {
+                    if !*s { continue; }
+                    *s = match seg_col.get_str(row) {
+                        Some(s) => matches_like(s),
+                        None => false,
+                    };
+                }
+            }
+        }
     }
-    sel
 }
 
 /// Collation-aware string comparison using libc `strcoll`.
