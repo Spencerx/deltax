@@ -119,7 +119,7 @@ echo "Vacuum time: $((VACUUM_END - VACUUM_START))s"
 # Keep chunks for potential re-runs (they're ~14GB but save 5+ min of re-splitting)
 
 # Capture data size (bytes)
-DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT pg_database_size('$DB')")
+DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax_table_size('hits')")
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
 
 # Save load stats for the bench target to pick up later

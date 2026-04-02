@@ -178,6 +178,51 @@ fn deltax_compression_stats(
     TableIterator::new(rows)
 }
 
+/// Return the total on-disk size of a deltatable in bytes.
+///
+/// For compressed partitions, uses the stored `compressed_size` from the catalog.
+/// For uncompressed partitions, uses `pg_total_relation_size`.
+#[pg_extern]
+fn deltax_table_size(relation: &str) -> i64 {
+    Spi::connect(|client| {
+        let (schema, table) = crate::partition::resolve_relation(client, relation);
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+            });
+
+        let result = client
+            .select(
+                "SELECT table_name, is_compressed
+                 FROM deltax_partition
+                 WHERE deltatable_id = $1",
+                None,
+                &[ht.id.into()],
+            )
+            .expect("failed to query partitions");
+
+        let companion_schema = "_deltax_compressed";
+        let mut total: i64 = 0;
+        for row in result {
+            let part_name: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
+            let compressed: bool = row.get_datum_by_ordinal(2).unwrap().value::<bool>().unwrap().unwrap_or(false);
+
+            if compressed {
+                // Measure live size of companion tables
+                for suffix in &["meta", "blobs", "blooms"] {
+                    let fqn = format!("\"{}\".\"{}_{}\"", companion_schema, part_name, suffix);
+                    total += estimate_raw_size(client, &fqn);
+                }
+            } else {
+                let fqn = crate::partition::fqn(&schema, &part_name);
+                total += estimate_raw_size(client, &fqn);
+            }
+        }
+        total
+    })
+}
+
 // ============================================================================
 // Internal implementation
 // ============================================================================
