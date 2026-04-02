@@ -39,13 +39,40 @@ make bench-all                        # Compare benchmarks with timescale
 
 ### Benchmark Workflow
 
-The normal loop for testing performance changes:
+There are two benchmark environments: **local** (Docker, small data subset, more checks) and **full** (EC2, complete ClickBench dataset). On most changes, run both.
+
+#### Local Benchmark (Docker)
 
 1. `make image-fresh` — rebuild the production image with your code changes
-2. `make bench-clickbench-keep` — run the full benchmark (~2 min), keeps container running
+2. `make bench-clickbench-keep` — run the benchmark (~2 min), keeps container running
 3. Use the connection string printed at the end to run EXPLAIN ANALYZE or ad-hoc queries against the benchmark DB
 
 The benchmark prints a `psql postgres://...` connection string at the end. Use it to investigate specific queries with EXPLAIN ANALYZE, verify plan choices, etc.
+
+#### Full Benchmark (EC2)
+
+Runs from `clickbench/Makefile` against a remote EC2 instance with the complete ClickBench dataset (~100M rows). Ask the user for the EC2 IP rather than launching a new instance.
+
+```bash
+# First-time setup (installs PG18, Rust, pgrx, builds extension, loads data, compresses)
+make -C clickbench setup EC2=<ip>
+
+# Iterating on code changes
+make -C clickbench deploy EC2=<ip>          # rsync source, recompile, restart PG
+make -C clickbench bench EC2=<ip>           # run all 43 queries (3 runs each), download results
+
+# Investigating specific queries
+make -C clickbench query EC2=<ip> Q=33      # EXPLAIN ANALYZE a single query
+make -C clickbench query-cold EC2=<ip> Q=7  # same but with cold caches (restarts PG, drops OS caches)
+make -C clickbench query EC2=<ip> Q=33 SET="SET pg_deltax.parallel_workers=4"  # with GUC overrides
+
+# Ad-hoc
+make -C clickbench sql EC2=<ip> SQL="SHOW work_mem"
+make -C clickbench psql EC2=<ip>
+make -C clickbench ssh EC2=<ip>
+```
+
+Results are saved to `clickbench/results/pg_deltax.json` and archived by timestamp+commit in `clickbench/results/history/`.
 
 If you need to reference pgrx source code, it is in ~/src/pgrx.
 If you need to reference the postgres source code, is in ~/src/postgres.
@@ -53,16 +80,10 @@ Use the source there, it's much faster than looking into the docker images.
 
 ## Architecture
 
-Overall design and plan with several phases is in pg_deltax_design_v03.md
-
-### Rust Source (`src/`)
-
-- **`lib.rs`** — Extension entry point. Defines `_PG_init()`, catalog table schemas (`deltax_deltatable`, `deltax_partition`) via `extension_sql!`, and the `pg_deltax.mock_now` GUC for testing.
-- **`partition.rs`** — Core partitioning logic. Contains `deltax_create_table()` (converts an empty table to a partitioned deltatable), `deltax_partition_info()`, `deltax_deltatable_info()`, and helpers for interval math, partition naming, and initial partition creation.
-- **`catalog.rs`** — CRUD operations against the two catalog tables using SPI. `DeltatableInfo` and `PartitionInfo` structs.
-- **`worker.rs`** — Background worker running every 60 seconds. Drains the default partition (moves rows to proper partitions) and pre-creates future partitions.
-- **`functions/time_bucket.rs`** — `time_bucket(interval, timestamp[, origin])` for bucketing timestamps.
-- **`functions/first_last.rs`** — `first(value, ts)` / `last(value, ts)` aggregates with serializable state.
+You can find some design docs under ./dev/docs:
+- ARCHITECTURE.md - high level architecture.
+- COLUMNAR_STORAGE.md - how the data is organized in PG tables.
+- PERF_IMPROVEMENTS.md - a long list of performance optimizations we applied.
 
 ### Data Flow
 1. User calls `deltax_create_table('my_table', 'ts_column')` → table is converted to PARTITION BY RANGE, initial partitions created, metadata registered in catalog.
