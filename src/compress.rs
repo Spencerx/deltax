@@ -8,16 +8,16 @@ use crate::catalog;
 use crate::compression::{self, CompressionType, CompressedColumn};
 
 /// Microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
-const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
+pub(crate) const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
 /// Days between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
-const PG_EPOCH_OFFSET_DAYS: i64 = 10_957;
+pub(crate) const PG_EPOCH_OFFSET_DAYS: i64 = 10_957;
 
 /// Column metadata from information_schema.
 #[derive(Debug, Clone)]
-struct ColumnMeta {
-    name: String,
-    data_type: String,
-    is_segment_by: bool,
+pub(crate) struct ColumnMeta {
+    pub(crate) name: String,
+    pub(crate) data_type: String,
+    pub(crate) is_segment_by: bool,
 }
 
 // ============================================================================
@@ -282,60 +282,8 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     }
 
     // 5. Build two-table DDL: meta (metadata) + blobs (column-major compressed data)
-    let companion_schema = "_deltax_compressed";
-    let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
-    let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
-
-    // Meta table: segment_by cols, min/max, sum/count, ndistinct, row_count — NO BYTEA blobs
-    let mut meta_cols = Vec::new();
-    meta_cols.push("_segment_id INT PRIMARY KEY".to_string());
-    for col in &columns {
-        if col.is_segment_by {
-            meta_cols.push(format!("\"{}\" {}", col.name, col.data_type));
-        }
-    }
-    for col in &columns {
-        if !col.is_segment_by && supports_minmax(&col.data_type) {
-            meta_cols.push(format!("\"_min_{}\" {}", col.name, col.data_type));
-            meta_cols.push(format!("\"_max_{}\" {}", col.name, col.data_type));
-        }
-    }
-    for col in &columns {
-        if !col.is_segment_by && supports_sum(&col.data_type) {
-            let sum_type = if is_float_type(&col.data_type) {
-                "DOUBLE PRECISION"
-            } else {
-                "NUMERIC"
-            };
-            meta_cols.push(format!("\"_sum_{}\" {}", col.name, sum_type));
-            meta_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
-        }
-    }
-    for col in &columns {
-        if !col.is_segment_by {
-            meta_cols.push(format!("\"_ndistinct_{}\" INT", col.name));
-        }
-    }
-    meta_cols.push("_row_count INT".to_string());
-
-    let meta_ddl = format!(
-        "CREATE TABLE {} ({})",
-        meta_fqn,
-        meta_cols.join(", ")
-    );
-
-    // Blob table: column-major storage with composite PK for sequential per-column reads
-    let blobs_ddl = format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA, PRIMARY KEY (_col_idx, _segment_id))",
-        blobs_fqn
-    );
-
-    // Blooms table: per-segment packed bloom filters, separate from meta to avoid TOAST overhead
-    let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
-    let blooms_ddl = format!(
-        "CREATE TABLE {} (_segment_id INT PRIMARY KEY, _data BYTEA NOT NULL)",
-        blooms_fqn
-    );
+    let (meta_fqn, blobs_fqn, blooms_fqn, meta_ddl, blobs_ddl, blooms_ddl) =
+        build_companion_ddl(&part_table, &columns);
     // NOTE: table creation is deferred until we confirm data exists.
     // Creating it early would cause the scan hook to intercept queries on the partition
     // (it checks for meta table existence, not is_compressed in the catalog).
@@ -410,7 +358,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
 /// Classifies how to read a column from SPI.
 #[derive(Debug, Clone, Copy)]
-enum ColumnKind {
+pub(crate) enum ColumnKind {
     Text,         // text, varchar, char — read as String
     Int16,        // smallint/int2
     Int32,        // integer/int4
@@ -424,7 +372,7 @@ enum ColumnKind {
 }
 
 /// Column data stored in native types.
-enum TypedColumn {
+pub(crate) enum TypedColumn {
     Text(Vec<Option<String>>),
     Int16(Vec<Option<i16>>),
     Int32(Vec<Option<i32>>),
@@ -434,7 +382,7 @@ enum TypedColumn {
     Bool(Vec<Option<bool>>),
 }
 
-fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKind {
+pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKind {
     if is_segment_by {
         return ColumnKind::Text; // segment_by always read as text for SQL literals
     }
@@ -462,7 +410,7 @@ fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKind {
     }
 }
 
-fn new_typed_column(kind: ColumnKind) -> TypedColumn {
+pub(crate) fn new_typed_column(kind: ColumnKind) -> TypedColumn {
     match kind {
         ColumnKind::Text => TypedColumn::Text(Vec::new()),
         ColumnKind::Int16 => TypedColumn::Int16(Vec::new()),
@@ -478,7 +426,7 @@ fn new_typed_column(kind: ColumnKind) -> TypedColumn {
 }
 
 /// Create empty TypedColumn vectors for all columns based on their ColumnKind.
-fn init_typed_columns(columns: &[ColumnMeta], kinds: &[ColumnKind]) -> Vec<TypedColumn> {
+pub(crate) fn init_typed_columns(columns: &[ColumnMeta], kinds: &[ColumnKind]) -> Vec<TypedColumn> {
     columns
         .iter()
         .zip(kinds.iter())
@@ -611,7 +559,7 @@ fn append_row_to_columns(
 
 /// Sort typed columns in-place by the given order_by column indices.
 /// Computes a permutation from the sort keys, then reorders all columns by that permutation.
-fn sort_typed_columns(typed_cols: &mut [TypedColumn], order_col_indices: &[usize], num_rows: usize) {
+pub(crate) fn sort_typed_columns(typed_cols: &mut [TypedColumn], order_col_indices: &[usize], num_rows: usize) {
     if order_col_indices.is_empty() || num_rows <= 1 {
         return;
     }
@@ -665,13 +613,13 @@ fn apply_permutation<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
 }
 
 /// Return type for flush_segment_metadata: (compressed_size, column blobs, bloom data).
-type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<u8>);
+pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<u8>);
 
 /// Compress accumulated typed column data and INSERT metadata into the meta table.
 /// Returns (compressed_size, vec of (col_idx, compressed_blob)) — blobs are NOT inserted,
 /// they are returned for column-major buffering by the caller.
 #[allow(clippy::too_many_arguments)]
-fn flush_segment_metadata(
+pub(crate) fn flush_segment_metadata(
     client: &mut SpiClient,
     meta_fqn: &str,
     columns: &[ColumnMeta],
@@ -840,7 +788,7 @@ fn hash_for_hll<T: Hash>(val: &T) -> u64 {
 
 /// Compute per-segment ndistinct using HyperLogLog estimators.
 /// Returns one estimate per non-segment-by column.
-fn compute_segment_ndistinct(
+pub(crate) fn compute_segment_ndistinct(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
 ) -> Vec<i64> {
@@ -867,7 +815,7 @@ fn compute_segment_ndistinct(
 /// Compute packed bloom filters for a segment.
 /// Returns packed bytes (col_idx + 128-byte bloom per column), or empty if no columns qualify.
 /// Only builds bloom filters for numeric/date/timestamp columns with ndistinct ≤ threshold.
-fn compute_segment_blooms(
+pub(crate) fn compute_segment_blooms(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
     ndistinct_values: &[i64],
@@ -937,7 +885,7 @@ fn compute_segment_blooms(
 /// Flush typed column data, splitting into segment_size chunks if needed.
 /// Returns compressed_size. Blobs and blooms are buffered for batch insertion.
 #[allow(clippy::too_many_arguments)]
-fn flush_with_splitting(
+pub(crate) fn flush_with_splitting(
     client: &mut SpiClient,
     meta_fqn: &str,
     columns: &[ColumnMeta],
@@ -988,6 +936,69 @@ fn flush_with_splitting(
     total_size
 }
 
+
+/// Build DDL for companion tables (meta, blobs, blooms) for a partition.
+/// Returns: (meta_fqn, blobs_fqn, blooms_fqn, meta_ddl, blobs_ddl, blooms_ddl)
+pub(crate) fn build_companion_ddl(
+    part_table: &str,
+    columns: &[ColumnMeta],
+) -> (String, String, String, String, String, String) {
+    let companion_schema = "_deltax_compressed";
+    let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
+    let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
+    let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
+
+    // Meta table: segment_by cols, min/max, sum/count, ndistinct, row_count
+    let mut meta_cols = Vec::new();
+    meta_cols.push("_segment_id INT PRIMARY KEY".to_string());
+    for col in columns {
+        if col.is_segment_by {
+            meta_cols.push(format!("\"{}\" {}", col.name, col.data_type));
+        }
+    }
+    for col in columns {
+        if !col.is_segment_by && supports_minmax(&col.data_type) {
+            meta_cols.push(format!("\"_min_{}\" {}", col.name, col.data_type));
+            meta_cols.push(format!("\"_max_{}\" {}", col.name, col.data_type));
+        }
+    }
+    for col in columns {
+        if !col.is_segment_by && supports_sum(&col.data_type) {
+            let sum_type = if is_float_type(&col.data_type) {
+                "DOUBLE PRECISION"
+            } else {
+                "NUMERIC"
+            };
+            meta_cols.push(format!("\"_sum_{}\" {}", col.name, sum_type));
+            meta_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
+        }
+    }
+    for col in columns {
+        if !col.is_segment_by {
+            meta_cols.push(format!("\"_ndistinct_{}\" INT", col.name));
+        }
+    }
+    meta_cols.push("_row_count INT".to_string());
+
+    let meta_ddl = format!(
+        "CREATE TABLE {} ({})",
+        meta_fqn,
+        meta_cols.join(", ")
+    );
+
+    // STORAGE EXTERNAL: skip TOAST pglz compression on _data — blobs are already zstd-compressed.
+    let blobs_ddl = format!(
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4, PRIMARY KEY (_col_idx, _segment_id))",
+        blobs_fqn
+    );
+
+    let blooms_ddl = format!(
+        "CREATE TABLE {} (_segment_id INT PRIMARY KEY, _data BYTEA COMPRESSION lz4 NOT NULL)",
+        blooms_fqn
+    );
+
+    (meta_fqn, blobs_fqn, blooms_fqn, meta_ddl, blobs_ddl, blooms_ddl)
+}
 
 /// Compress a partition using cursor-based streaming.
 /// Reads native PG datums directly — no text round-trip for numeric/timestamp types.
@@ -1274,7 +1285,7 @@ fn compress_partition_streaming(
 }
 
 /// Compress a typed column directly, bypassing string parsing.
-fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<u8> {
+pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<u8> {
     match data {
         TypedColumn::Int16(values) => {
             let (non_null, null_bitmap) = compression::extract_nulls(values);
@@ -1365,7 +1376,7 @@ fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<u8> {
 }
 
 /// Compute min/max for typed columns, returning string representations for SQL INSERT.
-fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Option<String>, Option<String>) {
     match data {
         TypedColumn::Int16(values) => {
             let mut min_v: Option<i16> = None;
@@ -1465,7 +1476,7 @@ fn compress_column_values(values: &[Option<String>], _data_type: &str, _col_name
 }
 
 /// Get column metadata for a table.
-fn get_column_metadata(
+pub(crate) fn get_column_metadata(
     client: &SpiClient,
     schema: &str,
     table: &str,
@@ -1870,7 +1881,7 @@ fn format_value_for_insert(value: &str, data_type: &str) -> String {
 }
 
 /// Check if a column type supports min/max metadata.
-fn supports_minmax(data_type: &str) -> bool {
+pub(crate) fn supports_minmax(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt.contains("timestamp")
         || dt == "date"
@@ -1882,7 +1893,7 @@ fn supports_minmax(data_type: &str) -> bool {
 }
 
 /// Check if a column type supports sum metadata (numeric types only, not timestamps/dates).
-fn supports_sum(data_type: &str) -> bool {
+pub(crate) fn supports_sum(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt == "integer" || dt == "int4"
         || dt == "bigint" || dt == "int8"
@@ -1892,14 +1903,14 @@ fn supports_sum(data_type: &str) -> bool {
 }
 
 /// Check if a data type is a floating-point type.
-fn is_float_type(data_type: &str) -> bool {
+pub(crate) fn is_float_type(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4"
 }
 
 /// Compute sum and non-null count for a typed column.
 /// Returns (sum_as_string, nonnull_count). Uses i128 for integer sums to avoid overflow.
-fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64) {
+pub(crate) fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64) {
     match data {
         TypedColumn::Int16(v) => {
             let mut sum: i128 = 0;
@@ -2004,7 +2015,7 @@ fn compare_values(a: &str, b: &str, data_type: &str) -> std::cmp::Ordering {
 }
 
 /// Format a min/max value for SQL INSERT based on the column type.
-fn format_minmax_for_insert(val: &str, data_type: &str) -> String {
+pub(crate) fn format_minmax_for_insert(val: &str, data_type: &str) -> String {
     let dt = data_type.to_lowercase();
     if dt.contains("timestamp") {
         format!("'{}'::timestamptz", val.replace('\'', "''"))

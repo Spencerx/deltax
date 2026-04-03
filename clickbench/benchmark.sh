@@ -1,24 +1,21 @@
 #!/bin/bash
-# Full EC2 benchmark setup: install deps, build extension, download data, load, compress.
+# Full EC2 benchmark setup: install deps, build extension, download data, load+compress.
 # Expects pg_deltax source already at ~/pg_deltax (synced via `make deploy`).
 # Expects this script to run from ~/clickbench on the EC2 instance.
 #
-# Idempotent: skips download/split if data chunks already exist.
-# Drops and recreates the DB so it can be re-run for recompression.
+# Uses direct backfill (FORMAT deltax_compress) to load and compress in a single pass.
+# Drops and recreates the DB so it can be re-run.
 
 set -euo pipefail
 
 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 DB=test
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SPLIT_DIR=/tmp/hits_chunks
-LOAD_WORKERS=8
-COMPRESS_WORKERS=16
 
 # Install PostgreSQL 18
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -y
-sudo apt-get install -y gnupg postgresql-common apt-transport-https lsb-release wget pigz parallel
+sudo apt-get install -y gnupg postgresql-common apt-transport-https lsb-release wget pigz
 sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
 sudo apt-get update -y
 sudo apt-get install -y postgresql-18 postgresql-client-18
@@ -53,29 +50,14 @@ sudo -u postgres psql "$DB" -c "CREATE EXTENSION pg_deltax"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '1GB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET min_parallel_table_scan_size TO '0'"
 
-# Download and split data (skip if chunks already exist)
-if [ -d "$SPLIT_DIR" ] && ls "$SPLIT_DIR"/chunk_* &>/dev/null; then
-    echo "Reusing existing data chunks in $SPLIT_DIR"
-    TOTAL_LINES=$(wc -l "$SPLIT_DIR"/chunk_* | tail -1 | awk '{print $1}')
-else
-    # Download data
-    if [ ! -f /tmp/hits.tsv ]; then
-        wget --continue --progress=dot:giga 'https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz'
-        pigz -d -f hits.tsv.gz
-        sudo mv hits.tsv /tmp/hits.tsv
-        sudo chmod 644 /tmp/hits.tsv
-    fi
-
-    # Split TSV into chunks for parallel loading
-    echo "Splitting data into $LOAD_WORKERS chunks..."
-    sudo rm -rf "$SPLIT_DIR"
-    sudo mkdir -p "$SPLIT_DIR"
-    TOTAL_LINES=$(wc -l < /tmp/hits.tsv)
-    LINES_PER_CHUNK=$(( (TOTAL_LINES + LOAD_WORKERS - 1) / LOAD_WORKERS ))
-    sudo split -l "$LINES_PER_CHUNK" -d -a 2 /tmp/hits.tsv "$SPLIT_DIR/chunk_"
-    sudo chmod 644 "$SPLIT_DIR"/chunk_*
-    echo "Split into $(ls "$SPLIT_DIR" | wc -l) chunks of ~$LINES_PER_CHUNK lines each"
+# Download data
+if [ ! -f /tmp/hits.tsv ]; then
+    wget --continue --progress=dot:giga 'https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz'
+    pigz -d -f hits.tsv.gz
+    sudo mv hits.tsv /tmp/hits.tsv
+    sudo chmod 644 /tmp/hits.tsv
 fi
+TOTAL_LINES=$(wc -l < /tmp/hits.tsv)
 
 # Create table
 sudo -u postgres psql "$DB" < create.sql 2>&1 | tee load_out.txt
@@ -86,28 +68,15 @@ fi
 # Set up partitioning — mock_now must be set before deltax_create_table
 sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '2013-07-01 12:00:00'; SELECT deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
 
-# Parallel data loading
-echo "Loading data with $LOAD_WORKERS parallel workers..."
-LOAD_START=$(date +%s)
-ls "$SPLIT_DIR"/chunk_* \
-    | parallel -j "$LOAD_WORKERS" \
-        "sudo -u postgres psql $DB -c \"\\copy hits FROM '{}'\""
-LOAD_END=$(date +%s)
-echo "Load time: $((LOAD_END - LOAD_START))s ($TOTAL_LINES rows, $LOAD_WORKERS workers)"
-
-# Enable compression
+# Enable compression before loading (required for direct backfill)
 sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'], segment_size => 30000)"
 
-# Parallel compression
-echo "Compressing partitions with $COMPRESS_WORKERS parallel workers..."
-COMPRESS_START=$(date +%s)
-sudo -u postgres psql "$DB" -t -A -c \
-    "SELECT partition_name FROM deltax_partition_info('hits') WHERE partition_name NOT LIKE '%default%'" \
-    | grep -v '^$' \
-    | parallel -j "$COMPRESS_WORKERS" \
-        "sudo -u postgres psql $DB -q -c \"SELECT deltax_compress_partition('{}')\" && echo '  Compressed {}'"
-COMPRESS_END=$(date +%s)
-echo "Compress time: $((COMPRESS_END - COMPRESS_START))s ($COMPRESS_WORKERS workers)"
+# Direct backfill: load and compress in a single pass using FORMAT deltax_compress
+echo "Loading data with direct backfill (FORMAT deltax_compress)..."
+LOAD_START=$(date +%s)
+sudo -u postgres psql "$DB" -c "COPY hits FROM '/tmp/hits.tsv' WITH (FORMAT deltax_compress, DELIMITER E'\t')"
+LOAD_END=$(date +%s)
+echo "Load+compress time: $((LOAD_END - LOAD_START))s ($TOTAL_LINES rows, direct backfill)"
 
 # Vacuum
 echo -n "Vacuum time: "
@@ -116,14 +85,12 @@ sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE hits"
 VACUUM_END=$(date +%s)
 echo "Vacuum time: $((VACUUM_END - VACUUM_START))s"
 
-# Keep chunks for potential re-runs (they're ~14GB but save 5+ min of re-splitting)
-
 # Capture data size (bytes)
 DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax_table_size('hits')")
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
 
 # Save load stats for the bench target to pick up later
-LOAD_TIME=$((LOAD_END - LOAD_START + COMPRESS_END - COMPRESS_START + VACUUM_END - VACUUM_START))
+LOAD_TIME=$((LOAD_END - LOAD_START + VACUUM_END - VACUUM_START))
 cat > ~/clickbench/load_stats.env <<STATS
 LOAD_TIME=$LOAD_TIME
 DATA_SIZE=$DATA_SIZE
