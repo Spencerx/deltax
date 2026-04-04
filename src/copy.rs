@@ -3,6 +3,7 @@
 //! to companion tables without touching the heap.
 
 use std::ffi::{CStr, CString, c_char};
+use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pgrx::pg_sys;
@@ -13,12 +14,16 @@ use pgrx::prelude::*;
 use crate::catalog;
 use crate::compress::{
     ColumnKind, ColumnMeta, TypedColumn,
-    PG_EPOCH_OFFSET_USEC, PG_EPOCH_OFFSET_DAYS,
+    PG_EPOCH_OFFSET_USEC,
     build_companion_ddl, classify_column, compress_typed_column,
     compute_segment_blooms, compute_segment_ndistinct,
     compute_typed_minmax, compute_typed_sum,
     format_minmax_for_insert, init_typed_columns, get_column_metadata,
     sort_typed_columns, supports_minmax, supports_sum,
+};
+use crate::copyparse::{
+    CopyLineReader, CopyTextOptions, HeaderMode, LineResult,
+    split_fields, split_field_offsets, parse_and_append, parse_raw_field_and_append,
 };
 
 static PREV_PROCESS_UTILITY_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
@@ -293,7 +298,6 @@ struct BackfillState {
     order_col_indices: Vec<usize>,
     segment_size: usize,
     time_col_index: usize,
-    time_col_kind: ColumnKind,
 }
 
 fn handle_copy_from_deltax_compress(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
@@ -308,6 +312,65 @@ fn handle_copy_from_deltax_compress(copy_stmt: *mut pg_sys::CopyStmt, format_idx
     }
 }
 
+/// Extract COPY TEXT options (DELIMITER, NULL, HEADER) from the PG options list.
+fn extract_copy_text_options(options: *mut pg_sys::List, format_idx: i32) -> CopyTextOptions {
+    let mut opts = CopyTextOptions::default();
+    if options.is_null() {
+        return opts;
+    }
+    let list = unsafe { &*options };
+    let len = list.length;
+    for i in 0..len {
+        if i == format_idx {
+            continue;
+        }
+        let cell = unsafe { &*list.elements.add(i as usize) };
+        let defelem = unsafe { cell.ptr_value } as *mut pg_sys::DefElem;
+        if defelem.is_null() {
+            continue;
+        }
+        let de = unsafe { &*defelem };
+        if de.defname.is_null() {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(de.defname) };
+        let name_bytes = name.to_bytes();
+        if name_bytes.eq_ignore_ascii_case(b"delimiter") {
+            let val_str = unsafe { pg_sys::defGetString(defelem) };
+            if !val_str.is_null() {
+                let val = unsafe { CStr::from_ptr(val_str) };
+                let bytes = val.to_bytes();
+                if !bytes.is_empty() {
+                    opts.delimiter = bytes[0];
+                }
+            }
+        } else if name_bytes.eq_ignore_ascii_case(b"null") {
+            let val_str = unsafe { pg_sys::defGetString(defelem) };
+            if !val_str.is_null() {
+                let val = unsafe { CStr::from_ptr(val_str) };
+                opts.null_string = val.to_bytes().to_vec();
+            }
+        } else if name_bytes.eq_ignore_ascii_case(b"header") {
+            // HEADER can be boolean (true/false) or 'match'
+            let val_str = unsafe { pg_sys::defGetString(defelem) };
+            if !val_str.is_null() {
+                let val = unsafe { CStr::from_ptr(val_str) };
+                let val_bytes = val.to_bytes();
+                if val_bytes.eq_ignore_ascii_case(b"match") {
+                    opts.header = HeaderMode::Match(Vec::new());
+                } else if val_bytes.eq_ignore_ascii_case(b"true")
+                    || val_bytes.eq_ignore_ascii_case(b"on")
+                    || val_bytes == b"1"
+                {
+                    opts.header = HeaderMode::Skip;
+                }
+                // false/off/0 → HeaderMode::None (default)
+            }
+        }
+    }
+    opts
+}
+
 fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
     let cs = unsafe { &*copy_stmt };
 
@@ -319,7 +382,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
 
     // 2. Validate via SPI — use a short-lived connection so its memory context
     //    is freed before the long-running COPY loop starts.
-    let (partitions, columns, kinds, time_col_index, time_col_kind, order_col_indices, segment_size) =
+    let (partitions, columns, kinds, time_col_index, order_col_indices, segment_size) =
         Spi::connect_mut(|client| {
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
@@ -366,8 +429,6 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
                     ht.time_column
                 );
             });
-        let time_col_kind = kinds[time_col_index];
-
         // Build order_by column indices
         let order_col_indices: Vec<usize> = ht.order_by
             .iter()
@@ -376,7 +437,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
 
         let segment_size = ht.segment_size as usize;
 
-        (partitions, columns, kinds, time_col_index, time_col_kind, order_col_indices, segment_size)
+        (partitions, columns, kinds, time_col_index, order_col_indices, segment_size)
     });
     // SPI connection is now closed — its memory context has been freed.
 
@@ -413,12 +474,341 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
         order_col_indices,
         segment_size,
         time_col_index,
-        time_col_kind,
     };
 
-    // 4. Open the relation and start COPY parsing
+    // Branch: file-path → pure-Rust parser, stdin → legacy PG parser
+    if !cs.filename.is_null() && !cs.is_program {
+        let filename = unsafe { CStr::from_ptr(cs.filename) }
+            .to_str()
+            .unwrap_or_else(|_| pgrx::error!("pg_deltax: filename is not valid UTF-8"));
+        let copy_opts = extract_copy_text_options(cs.options, format_idx);
+        handle_copy_from_file(
+            filename,
+            copy_opts,
+            &state,
+            &mut part_buffers,
+            &partitions,
+            &range_starts,
+            &range_ends,
+        );
+    } else {
+        handle_copy_from_legacy(
+            cs,
+            format_idx,
+            &state,
+            &mut part_buffers,
+            &partitions,
+            &range_starts,
+            &range_ends,
+        );
+    }
+
+    // End-of-COPY flush (shared by both paths)
+    for buf in &mut part_buffers {
+        if buf.row_count == 0 && buf.total_rows == 0 {
+            continue;
+        }
+
+        // Flush remaining partial segment
+        if buf.row_count > 0 {
+            flush_segment(buf, &state);
+        }
+
+        // Flush any remaining blobs (may already be flushed via partition-change logic)
+        if !buf.blob_buffer.is_empty() {
+            flush_partition_blobs(buf, &state.columns);
+        }
+
+        // ANALYZE companion tables and update catalog
+        finalize_partition(buf, &state.columns);
+    }
+
+    crate::scan::invalidate_compressed_cache();
+
+    let total_rows: i64 = part_buffers.iter().map(|b| b.total_rows).sum();
+    pgrx::notice!(
+        "pg_deltax: direct backfill complete, {} rows compressed into {} partitions",
+        total_rows,
+        part_buffers.iter().filter(|b| b.total_rows > 0).count()
+    );
+}
+
+/// Pure-Rust file-path COPY: read the file directly, parse TEXT format,
+/// convert types, and route to partition buffers.
+fn handle_copy_from_file(
+    filename: &str,
+    opts: CopyTextOptions,
+    state: &BackfillState,
+    part_buffers: &mut [PartitionBuffer],
+    partitions: &[crate::catalog::PartitionInfo],
+    range_starts: &[i64],
+    range_ends: &[i64],
+) {
+    let file = std::fs::File::open(filename).unwrap_or_else(|e| {
+        pgrx::error!("pg_deltax: cannot open file '{}': {}", filename, e);
+    });
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut line_reader = CopyLineReader::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
+
+    let mut total_rows: i64 = 0;
+    let mut last_part_idx: Option<usize> = None;
+    let mut parse_time_us: u64 = 0;
+    let copy_start = std::time::Instant::now();
+
+    // Initial fill
+    {
+        let data = reader.fill_buf().unwrap_or_else(|e| {
+            pgrx::error!("pg_deltax: read error: {}", e);
+        });
+        buf.extend_from_slice(data);
+        let n = data.len();
+        reader.consume(n);
+    }
+
+    // Handle HEADER
+    if matches!(opts.header, HeaderMode::Skip | HeaderMode::Match(_)) {
+        match line_reader.next_line(&buf, 0) {
+            LineResult::Row(_, e) => {
+                // Determine how many bytes to skip (line + EOL)
+                let eol_len = match line_reader.eol {
+                    Some(crate::copyparse::Eol::CrLf) => 2,
+                    _ => 1,
+                };
+                buf.drain(..e + eol_len);
+            }
+            LineResult::EndOfCopy => {
+                return; // empty file with just \.
+            }
+            LineResult::Incomplete => {
+                pgrx::error!("pg_deltax: file has no complete header line");
+            }
+        }
+    }
+
+    let num_columns = state.columns.len();
+    let mut pos: usize = 0;
+    // Reuse field offset buffer across rows to avoid per-row Vec allocation.
+    // Stores (start, end) offsets relative to the line start.
+    let mut field_offsets: Vec<(usize, usize)> = Vec::with_capacity(num_columns);
+
+    loop {
+        let t_parse = std::time::Instant::now();
+        match line_reader.next_line(&buf, pos) {
+            LineResult::Row(s, e) => {
+                parse_time_us += t_parse.elapsed().as_micros() as u64;
+
+                let line_start = s;
+                let line_end = e;
+                split_field_offsets(&buf[line_start..line_end], opts.delimiter, &mut field_offsets);
+
+                if field_offsets.len() != num_columns {
+                    pgrx::error!(
+                        "pg_deltax: line {}: expected {} fields, got {}",
+                        line_reader.line_number,
+                        num_columns,
+                        field_offsets.len()
+                    );
+                }
+
+                // Extract time value from raw field (no allocation needed)
+                let (ts, te) = field_offsets[state.time_col_index];
+                let time_raw = &buf[line_start + ts..line_start + te];
+                if time_raw == opts.null_string.as_slice() {
+                    pgrx::error!(
+                        "pg_deltax: time column value is NULL at line {}, cannot route to partition",
+                        line_reader.line_number
+                    );
+                }
+                let time_str = if memchr::memchr(b'\\', time_raw).is_none() {
+                    std::str::from_utf8(time_raw).unwrap_or_else(|_| {
+                        pgrx::error!("pg_deltax: invalid UTF-8 in time column at line {}", line_reader.line_number);
+                    })
+                } else {
+                    pgrx::error!("pg_deltax: unexpected escape in time column at line {}", line_reader.line_number);
+                };
+                let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
+
+                // Binary search for partition
+                let part_idx = match find_partition(range_starts, range_ends, time_usec) {
+                    Some(idx) => idx,
+                    None => {
+                        pgrx::error!(
+                            "pg_deltax: row at line {} with timestamp {} does not fit any partition",
+                            line_reader.line_number,
+                            time_usec
+                        );
+                    }
+                };
+
+                if partitions[part_idx].is_compressed {
+                    pgrx::error!(
+                        "pg_deltax: partition '{}' is already compressed. Decompress it first to load new data.",
+                        partitions[part_idx].table_name
+                    );
+                }
+
+                // Flush previous partition's blobs on partition change
+                if let Some(prev_idx) = last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty()) {
+                    flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
+                }
+                last_part_idx = Some(part_idx);
+
+                // Append each raw field directly into partition's typed columns
+                // — no intermediate Vec<Option<String>>, no per-row Vec allocation
+                let pbuf = &mut part_buffers[part_idx];
+                for (i, kind) in state.kinds.iter().enumerate() {
+                    let (fs, fe) = field_offsets[i];
+                    let raw_field = &buf[line_start + fs..line_start + fe];
+                    if let Err(e) = parse_raw_field_and_append(
+                        raw_field,
+                        &opts.null_string,
+                        *kind,
+                        &mut pbuf.typed_cols[i],
+                        i,
+                        line_reader.line_number,
+                    ) {
+                        pgrx::error!(
+                            "pg_deltax: parse error at line {}, column {} ('{}'): {}",
+                            e.line,
+                            e.column,
+                            state.columns[i].name,
+                            e.message
+                        );
+                    }
+                }
+                pbuf.row_count += 1;
+                total_rows += 1;
+
+                // Flush if segment full
+                if pbuf.row_count >= state.segment_size {
+                    flush_segment(pbuf, state);
+                }
+
+                // Advance past the line + EOL
+                let eol_len = match line_reader.eol {
+                    Some(crate::copyparse::Eol::CrLf) => 2,
+                    _ => 1,
+                };
+                pos = e + eol_len;
+            }
+            LineResult::EndOfCopy => {
+                break;
+            }
+            LineResult::Incomplete => {
+                parse_time_us += t_parse.elapsed().as_micros() as u64;
+
+                // Remove consumed bytes and read more data
+                if pos > 0 {
+                    buf.drain(..pos);
+                    pos = 0;
+                }
+
+                let data = reader.fill_buf().unwrap_or_else(|e| {
+                    pgrx::error!("pg_deltax: read error: {}", e);
+                });
+                if data.is_empty() {
+                    // EOF — process any trailing line without terminator
+                    if !buf.is_empty() {
+                        let line = &buf[..];
+                        let raw_fields = split_fields(line, opts.delimiter);
+                        if raw_fields.len() == num_columns {
+                            line_reader.line_number += 1;
+
+                            let time_raw = raw_fields[state.time_col_index];
+                            if time_raw == opts.null_string.as_slice() {
+                                pgrx::error!(
+                                    "pg_deltax: time column value is NULL at line {}",
+                                    line_reader.line_number
+                                );
+                            }
+                            let time_str = std::str::from_utf8(time_raw).unwrap_or_else(|_| {
+                                pgrx::error!("pg_deltax: invalid UTF-8 in time column");
+                            });
+                            let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
+
+                            let part_idx = match find_partition(range_starts, range_ends, time_usec) {
+                                Some(idx) => idx,
+                                None => {
+                                    pgrx::error!(
+                                        "pg_deltax: row at line {} with timestamp {} does not fit any partition",
+                                        line_reader.line_number,
+                                        time_usec
+                                    );
+                                }
+                            };
+
+                            if partitions[part_idx].is_compressed {
+                                pgrx::error!(
+                                    "pg_deltax: partition '{}' is already compressed.",
+                                    partitions[part_idx].table_name
+                                );
+                            }
+
+                            if let Some(prev_idx) = last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty()) {
+                                flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
+                            }
+
+                            let pbuf = &mut part_buffers[part_idx];
+                            for (i, (raw_field, kind)) in raw_fields.iter().zip(state.kinds.iter()).enumerate() {
+                                if let Err(e) = parse_raw_field_and_append(
+                                    raw_field,
+                                    &opts.null_string,
+                                    *kind,
+                                    &mut pbuf.typed_cols[i],
+                                    i,
+                                    line_reader.line_number,
+                                ) {
+                                    pgrx::error!(
+                                        "pg_deltax: parse error at line {}, column {}: {}",
+                                        e.line, e.column, e.message
+                                    );
+                                }
+                            }
+                            pbuf.row_count += 1;
+                            total_rows += 1;
+
+                            if pbuf.row_count >= state.segment_size {
+                                flush_segment(pbuf, state);
+                            }
+                        }
+                    }
+                    break;
+                }
+                buf.extend_from_slice(data);
+                let n = data.len();
+                reader.consume(n);
+            }
+        }
+    }
+
+    let copy_elapsed = copy_start.elapsed();
+    pgrx::notice!(
+        "pg_deltax: COPY (Rust parser) done: {} rows in {:.1}s, parse={:.1}s ({:.0}%)",
+        total_rows,
+        copy_elapsed.as_secs_f64(),
+        parse_time_us as f64 / 1e6,
+        if copy_elapsed.as_secs_f64() > 0.0 {
+            (parse_time_us as f64 / 1e6) / copy_elapsed.as_secs_f64() * 100.0
+        } else {
+            0.0
+        }
+    );
+}
+
+/// Stdin/program COPY path: use PG's BeginCopyFrom for protocol handling,
+/// but NextCopyFromRawFields for line/field parsing (skipping PG's InputFunctionCall),
+/// then Rust type conversion via `parse_and_append`.
+fn handle_copy_from_legacy(
+    cs: &pg_sys::CopyStmt,
+    format_idx: i32,
+    state: &BackfillState,
+    part_buffers: &mut [PartitionBuffer],
+    partitions: &[crate::catalog::PartitionInfo],
+    range_starts: &[i64],
+    range_ends: &[i64],
+) {
     // Strip FORMAT deltax_compress; PG defaults to TEXT format (tab-separated).
-    // Users can override with DELIMITER ',' for CSV data.
     let final_options = unsafe { strip_format_option(cs.options, format_idx) };
 
     let rel_oid = unsafe {
@@ -447,67 +837,69 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
         )
     };
 
-    // Create an ExprContext for NextCopyFrom
-    let estate = unsafe { pg_sys::CreateExecutorState() };
-    let econtext = unsafe { pg_sys::CreateExprContext(estate) };
-
-    // Get number of attributes from the relation
-    let tupdesc = unsafe { (*rel).rd_att };
-    let natts = unsafe { (*tupdesc).natts as usize };
-
-    let mut values: Vec<pg_sys::Datum> = vec![pg_sys::Datum::from(0); natts];
-    let mut nulls: Vec<bool> = vec![false; natts];
+    let num_columns = state.columns.len();
 
     let mut total_rows: i64 = 0;
     let mut last_part_idx: Option<usize> = None;
     let mut parse_time_us: u64 = 0;
     let copy_start = std::time::Instant::now();
 
-    // 5. Core COPY loop — runs outside SPI so no SPI memory context accumulates.
-    //
-    // CRITICAL: NextCopyFrom allocates result datums (especially TEXT varlenas)
-    // in CurrentMemoryContext. PostgreSQL's own CopyFrom switches to the
-    // per-tuple memory context before calling NextCopyFrom, then resets it
-    // after each row. We must do the same, otherwise every text datum leaks
-    // into the long-lived transaction context (~1.5KB/row × 100M rows = 150GB).
-    let per_tuple_ctx = unsafe { (*econtext).ecxt_per_tuple_memory };
+    // NextCopyFromRawFields returns raw char** fields — PG handles the COPY
+    // protocol and line/field splitting, but skips InputFunctionCall.
+    // We do type conversion in Rust via parse_and_append.
+    let mut raw_fields: *mut *mut std::ffi::c_char = std::ptr::null_mut();
+    let mut nfields: std::ffi::c_int = 0;
+    let mut line_number: u64 = 0;
 
-    while {
-        // Switch to per-tuple context before NextCopyFrom so all palloc'd
-        // datums (text input conversions, etc.) land in the resettable context.
+    loop {
         let t_parse = std::time::Instant::now();
-        let old_ctx = unsafe { pg_sys::MemoryContextSwitchTo(per_tuple_ctx) };
         let has_row = unsafe {
-            pg_sys::NextCopyFrom(
-                cstate,
-                econtext,
-                values.as_mut_ptr(),
-                nulls.as_mut_ptr(),
-            )
+            pg_sys::NextCopyFromRawFields(cstate, &mut raw_fields, &mut nfields)
         };
-        unsafe { pg_sys::MemoryContextSwitchTo(old_ctx) };
         parse_time_us += t_parse.elapsed().as_micros() as u64;
-        has_row
-    } {
-        // Extract time column value (reads from Datum, no palloc)
-        let time_usec = extract_time_usec(
-            values[state.time_col_index],
-            nulls[state.time_col_index],
-            state.time_col_kind,
-        );
 
-        // Binary search for partition
-        let part_idx = match find_partition(&range_starts, &range_ends, time_usec) {
+        if !has_row {
+            break;
+        }
+
+        line_number += 1;
+
+        if nfields as usize != num_columns {
+            pgrx::error!(
+                "pg_deltax: line {}: expected {} fields, got {}",
+                line_number,
+                num_columns,
+                nfields
+            );
+        }
+
+        // Convert raw C strings to Option<&str> (NULL fields have null pointer)
+        // and extract the time column value for partition routing.
+        let time_str = unsafe {
+            let ptr = *raw_fields.add(state.time_col_index);
+            if ptr.is_null() {
+                pgrx::error!(
+                    "pg_deltax: time column value is NULL at line {}, cannot route to partition",
+                    line_number
+                );
+            }
+            CStr::from_ptr(ptr).to_str().unwrap_or_else(|_| {
+                pgrx::error!("pg_deltax: invalid UTF-8 in time column at line {}", line_number);
+            })
+        };
+        let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
+
+        let part_idx = match find_partition(range_starts, range_ends, time_usec) {
             Some(idx) => idx,
             None => {
                 pgrx::error!(
-                    "pg_deltax: row with timestamp {} does not fit any partition",
+                    "pg_deltax: row at line {} with timestamp {} does not fit any partition",
+                    line_number,
                     time_usec
                 );
             }
         };
 
-        // Check if partition is already compressed
         if partitions[part_idx].is_compressed {
             pgrx::error!(
                 "pg_deltax: partition '{}' is already compressed. Decompress it first to load new data.",
@@ -515,80 +907,68 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
             );
         }
 
-        // When partition changes, flush the previous partition's blobs to free memory.
-        // For time-sorted data this means only one partition's blobs are in memory at a time.
         if let Some(prev_idx) = last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty()) {
             flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
         }
         last_part_idx = Some(part_idx);
 
-        // Append row to partition buffer — copies datum values into Rust-owned
-        // typed columns. After this, the palloc'd datums in per_tuple_ctx are
-        // no longer needed and will be freed by ResetPerTupleExprContext below.
-        append_datums_to_columns(
-            &values,
-            &nulls,
-            &state.columns,
-            &state.kinds,
-            &mut part_buffers[part_idx].typed_cols,
-        );
-        part_buffers[part_idx].row_count += 1;
+        // Append each field using Rust type conversion
+        let pbuf = &mut part_buffers[part_idx];
+        for i in 0..num_columns {
+            let field_str: Option<&str> = unsafe {
+                let ptr = *raw_fields.add(i);
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(CStr::from_ptr(ptr).to_str().unwrap_or_else(|_| {
+                        pgrx::error!(
+                            "pg_deltax: invalid UTF-8 in column {} at line {}",
+                            i, line_number
+                        );
+                    }))
+                }
+            };
+
+            if let Err(e) = parse_and_append(
+                field_str,
+                state.kinds[i],
+                &mut pbuf.typed_cols[i],
+                i,
+                line_number,
+            ) {
+                pgrx::error!(
+                    "pg_deltax: parse error at line {}, column {} ('{}'): {}",
+                    e.line,
+                    e.column,
+                    state.columns[i].name,
+                    e.message
+                );
+            }
+        }
+        pbuf.row_count += 1;
         total_rows += 1;
 
-        // Flush if buffer full
-        if part_buffers[part_idx].row_count >= state.segment_size {
-            flush_segment(&mut part_buffers[part_idx], &state);
-        }
-
-        // Reset per-tuple memory context — frees all palloc'd datums from
-        // NextCopyFrom (text varlenas, input conversion results, etc.)
-        // This is equivalent to PostgreSQL's ResetPerTupleExprContext(estate) macro.
-        unsafe {
-            pg_sys::MemoryContextReset(per_tuple_ctx);
+        if pbuf.row_count >= state.segment_size {
+            flush_segment(pbuf, state);
         }
     }
 
     let copy_elapsed = copy_start.elapsed();
     pgrx::notice!(
-        "pg_deltax: COPY loop done: {} rows in {:.1}s, parse={:.1}s ({:.0}%)",
+        "pg_deltax: COPY (Rust types, PG protocol) done: {} rows in {:.1}s, parse={:.1}s ({:.0}%)",
         total_rows,
         copy_elapsed.as_secs_f64(),
         parse_time_us as f64 / 1e6,
-        (parse_time_us as f64 / 1e6) / copy_elapsed.as_secs_f64() * 100.0
+        if copy_elapsed.as_secs_f64() > 0.0 {
+            (parse_time_us as f64 / 1e6) / copy_elapsed.as_secs_f64() * 100.0
+        } else {
+            0.0
+        }
     );
 
     unsafe { pg_sys::EndCopyFrom(cstate) };
     unsafe { pg_sys::free_parsestate(pstate) };
     unsafe { pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
-    unsafe { pg_sys::FreeExecutorState(estate) };
-
-    // 6. End-of-COPY flush
-    for buf in &mut part_buffers {
-        if buf.row_count == 0 && buf.total_rows == 0 {
-            continue;
-        }
-
-        // Flush remaining partial segment
-        if buf.row_count > 0 {
-            flush_segment(buf, &state);
-        }
-
-        // Flush any remaining blobs (may already be flushed via partition-change logic)
-        if !buf.blob_buffer.is_empty() {
-            flush_partition_blobs(buf, &state.columns);
-        }
-
-        // ANALYZE companion tables and update catalog
-        finalize_partition(buf, &state.columns);
-    }
-
-    crate::scan::invalidate_compressed_cache();
-
-    pgrx::notice!(
-        "pg_deltax: direct backfill complete, {} rows compressed into {} partitions",
-        total_rows,
-        part_buffers.iter().filter(|b| b.total_rows > 0).count()
-    );
 }
 
 /// Per-column compression result produced by worker threads.
@@ -1072,27 +1452,6 @@ fn finalize_partition(
     });
 }
 
-/// Extract time column value as Unix epoch microseconds.
-fn extract_time_usec(datum: pg_sys::Datum, is_null: bool, kind: ColumnKind) -> i64 {
-    if is_null {
-        pgrx::error!("pg_deltax: time column value is NULL, cannot route to partition");
-    }
-    match kind {
-        ColumnKind::TimestampTz | ColumnKind::Timestamp => {
-            // TimestampTz/Timestamp is i64 PG-epoch usec
-            let pg_usec = datum.value() as i64;
-            pg_usec + PG_EPOCH_OFFSET_USEC
-        }
-        ColumnKind::Date => {
-            let pg_days = datum.value() as i32 as i64;
-            (pg_days + PG_EPOCH_OFFSET_DAYS) * 86_400_000_000
-        }
-        _ => {
-            pgrx::error!("pg_deltax: time column has unsupported type for partition routing");
-        }
-    }
-}
-
 /// Binary search for partition by time value.
 fn find_partition(range_starts: &[i64], range_ends: &[i64], time_usec: i64) -> Option<usize> {
     // Partitions are sorted by range_start. Find the last partition where range_start <= time_usec
@@ -1108,95 +1467,3 @@ fn find_partition(range_starts: &[i64], range_ends: &[i64], time_usec: i64) -> O
     }
 }
 
-/// Append raw Datum/null arrays into typed column accumulators.
-fn append_datums_to_columns(
-    values: &[pg_sys::Datum],
-    nulls: &[bool],
-    columns: &[ColumnMeta],
-    kinds: &[ColumnKind],
-    typed_cols: &mut [TypedColumn],
-) {
-    for (i, (col, kind)) in columns.iter().zip(kinds.iter()).enumerate() {
-        if col.is_segment_by {
-            // For segment_by columns, read as text
-            if let TypedColumn::Text(vec) = &mut typed_cols[i] {
-                if nulls[i] {
-                    vec.push(None);
-                } else {
-                    let s = unsafe {
-                        String::from_datum(values[i], false)
-                    };
-                    vec.push(s);
-                }
-            }
-            continue;
-        }
-
-        if nulls[i] {
-            match &mut typed_cols[i] {
-                TypedColumn::Int16(v) => v.push(None),
-                TypedColumn::Int32(v) => v.push(None),
-                TypedColumn::Int64(v) => v.push(None),
-                TypedColumn::Float32(v) => v.push(None),
-                TypedColumn::Float64(v) => v.push(None),
-                TypedColumn::Bool(v) => v.push(None),
-                TypedColumn::Text(v) => v.push(None),
-            }
-            continue;
-        }
-
-        let d = values[i];
-        match kind {
-            ColumnKind::Int16 => {
-                if let TypedColumn::Int16(vec) = &mut typed_cols[i] {
-                    vec.push(Some(d.value() as i16));
-                }
-            }
-            ColumnKind::Int32 => {
-                if let TypedColumn::Int32(vec) = &mut typed_cols[i] {
-                    vec.push(Some(d.value() as i32));
-                }
-            }
-            ColumnKind::Int64 => {
-                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
-                    vec.push(Some(d.value() as i64));
-                }
-            }
-            ColumnKind::Float32 => {
-                if let TypedColumn::Float32(vec) = &mut typed_cols[i] {
-                    vec.push(Some(f32::from_bits(d.value() as u32)));
-                }
-            }
-            ColumnKind::Float64 => {
-                if let TypedColumn::Float64(vec) = &mut typed_cols[i] {
-                    vec.push(Some(f64::from_bits(d.value() as u64)));
-                }
-            }
-            ColumnKind::Bool => {
-                if let TypedColumn::Bool(vec) = &mut typed_cols[i] {
-                    vec.push(Some(d.value() != 0));
-                }
-            }
-            ColumnKind::Timestamp | ColumnKind::TimestampTz => {
-                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
-                    let pg_usec = d.value() as i64;
-                    vec.push(Some(pg_usec + PG_EPOCH_OFFSET_USEC));
-                }
-            }
-            ColumnKind::Date => {
-                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
-                    let pg_days = d.value() as i32 as i64;
-                    vec.push(Some((pg_days + PG_EPOCH_OFFSET_DAYS) * 86_400_000_000));
-                }
-            }
-            ColumnKind::Text => {
-                if let TypedColumn::Text(vec) = &mut typed_cols[i] {
-                    let s = unsafe {
-                        String::from_datum(d, false)
-                    };
-                    vec.push(s);
-                }
-            }
-        }
-    }
-}

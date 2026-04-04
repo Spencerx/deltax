@@ -3,9 +3,6 @@
 //! Replaces SPI round-trips to PostgreSQL for converting between text
 //! representations and Unix-epoch microseconds.
 
-// Parsing functions are currently only exercised by unit tests (compression
-// now reads native PG datums), but kept for future use.
-#![allow(dead_code)]
 
 /// Parse a PostgreSQL text-format timestamp/date to Unix epoch microseconds.
 ///
@@ -18,8 +15,16 @@
 pub fn parse_timestamp_to_usec(s: &str) -> i64 {
     let s = s.trim();
 
-    // Split on space to separate date from time+tz
-    let (date_part, time_tz) = match s.find(' ') {
+    // Split on space or 'T' to separate date from time+tz (ISO 8601 uses 'T')
+    let split_pos = s.find(' ').or_else(|| {
+        // Only treat 'T' as separator if it's at position 10 (after YYYY-MM-DD)
+        if s.len() > 10 && s.as_bytes()[10] == b'T' {
+            Some(10)
+        } else {
+            None
+        }
+    });
+    let (date_part, time_tz) = match split_pos {
         Some(pos) => (&s[..pos], Some(&s[pos + 1..])),
         None => (s, None),
     };

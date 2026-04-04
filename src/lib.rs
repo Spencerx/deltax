@@ -8,6 +8,7 @@ mod catalog;
 mod compress;
 mod compression;
 mod copy;
+mod copyparse;
 mod functions;
 mod partition;
 mod scan;
