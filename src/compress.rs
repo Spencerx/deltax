@@ -382,6 +382,21 @@ pub(crate) enum TypedColumn {
     Bool(Vec<Option<bool>>),
 }
 
+impl TypedColumn {
+    pub(crate) fn extend(&mut self, other: Self) {
+        match (self, other) {
+            (TypedColumn::Text(a), TypedColumn::Text(b)) => a.extend(b),
+            (TypedColumn::Int16(a), TypedColumn::Int16(b)) => a.extend(b),
+            (TypedColumn::Int32(a), TypedColumn::Int32(b)) => a.extend(b),
+            (TypedColumn::Int64(a), TypedColumn::Int64(b)) => a.extend(b),
+            (TypedColumn::Float32(a), TypedColumn::Float32(b)) => a.extend(b),
+            (TypedColumn::Float64(a), TypedColumn::Float64(b)) => a.extend(b),
+            (TypedColumn::Bool(a), TypedColumn::Bool(b)) => a.extend(b),
+            _ => panic!("TypedColumn::extend: mismatched variants"),
+        }
+    }
+}
+
 pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKind {
     if is_segment_by {
         return ColumnKind::Text; // segment_by always read as text for SQL literals

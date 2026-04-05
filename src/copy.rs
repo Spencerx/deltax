@@ -18,7 +18,7 @@ use crate::compress::{
     build_companion_ddl, classify_column, compress_typed_column,
     compute_segment_blooms, compute_segment_ndistinct,
     compute_typed_minmax, compute_typed_sum,
-    format_minmax_for_insert, init_typed_columns, get_column_metadata,
+    format_minmax_for_insert, init_typed_columns, new_typed_column, get_column_metadata,
     sort_typed_columns, supports_minmax, supports_sum,
 };
 use crate::copyparse::{
@@ -274,6 +274,9 @@ unsafe fn rangevar_to_names(rv: *const pg_sys::RangeVar) -> (String, String) {
 /// Keeps memory bounded even when multiple partitions are active simultaneously.
 const BLOB_BUFFER_THRESHOLD: usize = 256 * 1024 * 1024; // 256 MB
 
+/// Number of meta rows to batch into a single multi-row INSERT.
+const META_BATCH_SIZE: usize = 50;
+
 /// Per-partition buffer for accumulating rows during direct backfill.
 struct PartitionBuffer {
     partition_id: i32,
@@ -289,6 +292,16 @@ struct PartitionBuffer {
     meta_table_created: bool,
     blobs_table_created: bool,
     blobs_flushed: bool,
+    /// Cached meta table FQN and column list for batched INSERTs.
+    meta_fqn: Option<String>,
+    meta_insert_cols: Option<String>,
+    /// Buffered VALUES clauses for batched meta INSERTs.
+    meta_insert_rows: Vec<String>,
+    /// Cached companion table FQNs and OIDs to avoid repeated SPI lookups.
+    blobs_fqn_cached: Option<String>,
+    blooms_fqn_cached: Option<String>,
+    blobs_oid_cached: Option<pg_sys::Oid>,
+    blooms_oid_cached: Option<pg_sys::Oid>,
 }
 
 /// State for the entire backfill operation.
@@ -465,6 +478,13 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
             meta_table_created: false,
             blobs_table_created: false,
             blobs_flushed: false,
+            meta_fqn: None,
+            meta_insert_cols: None,
+            meta_insert_rows: Vec::new(),
+            blobs_fqn_cached: None,
+            blooms_fqn_cached: None,
+            blobs_oid_cached: None,
+            blooms_oid_cached: None,
         });
     }
 
@@ -514,6 +534,9 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
             flush_segment(buf, &state);
         }
 
+        // Flush any remaining buffered meta rows
+        flush_meta_buffer(buf);
+
         // Flush any remaining blobs (may already be flushed via partition-change logic)
         if !buf.blob_buffer.is_empty() {
             flush_partition_blobs(buf, &state.columns);
@@ -533,9 +556,465 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
     );
 }
 
+// ============================================================================
+// Parallel chunk parsing types
+// ============================================================================
+
+struct WorkerPartitionResult {
+    typed_cols: Vec<TypedColumn>,
+    row_count: usize,
+}
+
+struct WorkerResult {
+    partitions: Vec<Option<WorkerPartitionResult>>,
+}
+
+/// Worker function: parse a slice of lines into per-partition TypedColumn buffers.
+/// Pure Rust — no pgrx calls (workers can't access the PG backend).
+#[allow(clippy::too_many_arguments)]
+fn parse_lines_worker(
+    buf: &[u8],
+    line_ranges: &[(usize, usize)],
+    opts_delimiter: u8,
+    opts_null_string: &[u8],
+    kinds: &[ColumnKind],
+    time_col_index: usize,
+    range_starts: &[i64],
+    range_ends: &[i64],
+    is_compressed: &[bool],
+    n_partitions: usize,
+    base_line_number: u64,
+) -> Result<WorkerResult, crate::copyparse::ParseError> {
+    let num_columns = kinds.len();
+    let mut partitions: Vec<Option<WorkerPartitionResult>> = (0..n_partitions).map(|_| None).collect();
+    let mut field_offsets: Vec<(usize, usize)> = Vec::with_capacity(num_columns);
+
+    for (row_idx, &(s, e)) in line_ranges.iter().enumerate() {
+        let line_number = base_line_number + row_idx as u64 + 1;
+        let line = &buf[s..e];
+        split_field_offsets(line, opts_delimiter, &mut field_offsets);
+
+        if field_offsets.len() != num_columns {
+            return Err(crate::copyparse::ParseError {
+                message: format!(
+                    "expected {} fields, got {}",
+                    num_columns,
+                    field_offsets.len()
+                ),
+                column: 0,
+                line: line_number,
+            });
+        }
+
+        // Extract time value
+        let (ts, te) = field_offsets[time_col_index];
+        let time_raw = &line[ts..te];
+        if time_raw == opts_null_string {
+            return Err(crate::copyparse::ParseError {
+                message: "time column value is NULL, cannot route to partition".to_string(),
+                column: time_col_index,
+                line: line_number,
+            });
+        }
+        let time_str = if memchr::memchr(b'\\', time_raw).is_none() {
+            std::str::from_utf8(time_raw).map_err(|_| crate::copyparse::ParseError {
+                message: "invalid UTF-8 in time column".to_string(),
+                column: time_col_index,
+                line: line_number,
+            })?
+        } else {
+            return Err(crate::copyparse::ParseError {
+                message: "unexpected escape in time column".to_string(),
+                column: time_col_index,
+                line: line_number,
+            });
+        };
+        let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
+
+        let part_idx = match find_partition(range_starts, range_ends, time_usec) {
+            Some(idx) => idx,
+            None => {
+                return Err(crate::copyparse::ParseError {
+                    message: format!(
+                        "timestamp {} does not fit any partition",
+                        time_usec
+                    ),
+                    column: time_col_index,
+                    line: line_number,
+                });
+            }
+        };
+
+        if is_compressed[part_idx] {
+            return Err(crate::copyparse::ParseError {
+                message: "partition is already compressed. Decompress it first to load new data.".to_string(),
+                column: 0,
+                line: line_number,
+            });
+        }
+
+        // Lazily initialize partition buffers
+        let wp = partitions[part_idx].get_or_insert_with(|| {
+            let typed_cols: Vec<TypedColumn> = kinds.iter().map(|k| new_typed_column(*k)).collect();
+            WorkerPartitionResult {
+                typed_cols,
+                row_count: 0,
+            }
+        });
+
+        // Parse each field into the partition's typed columns
+        for (i, kind) in kinds.iter().enumerate() {
+            let (fs, fe) = field_offsets[i];
+            let raw_field = &line[fs..fe];
+            parse_raw_field_and_append(
+                raw_field,
+                opts_null_string,
+                *kind,
+                &mut wp.typed_cols[i],
+                i,
+                line_number,
+            )?;
+        }
+        wp.row_count += 1;
+    }
+
+    Ok(WorkerResult { partitions })
+}
+
 /// Pure-Rust file-path COPY: read the file directly, parse TEXT format,
 /// convert types, and route to partition buffers.
 fn handle_copy_from_file(
+    filename: &str,
+    opts: CopyTextOptions,
+    state: &BackfillState,
+    part_buffers: &mut [PartitionBuffer],
+    partitions: &[crate::catalog::PartitionInfo],
+    range_starts: &[i64],
+    range_ends: &[i64],
+) {
+    let n_workers = crate::get_parallel_workers();
+    if n_workers <= 1 {
+        return handle_copy_from_file_sequential(
+            filename, opts, state, part_buffers, partitions, range_starts, range_ends,
+        );
+    }
+
+    let file = std::fs::File::open(filename).unwrap_or_else(|e| {
+        pgrx::error!("pg_deltax: cannot open file '{}': {}", filename, e);
+    });
+    let mut reader = BufReader::with_capacity(128 * 1024 * 1024, file);
+    let mut line_reader = CopyLineReader::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(160 * 1024 * 1024);
+
+    let mut total_rows: i64 = 0;
+    let mut last_part_idx: Option<usize> = None;
+    let mut parse_time_us: u64 = 0;
+    let copy_start = std::time::Instant::now();
+
+    // Initial fill
+    {
+        let data = reader.fill_buf().unwrap_or_else(|e| {
+            pgrx::error!("pg_deltax: read error: {}", e);
+        });
+        buf.extend_from_slice(data);
+        let n = data.len();
+        reader.consume(n);
+    }
+
+    // Handle HEADER
+    if matches!(opts.header, HeaderMode::Skip | HeaderMode::Match(_)) {
+        match line_reader.next_line(&buf, 0) {
+            LineResult::Row(_, e) => {
+                let eol_len = match line_reader.eol {
+                    Some(crate::copyparse::Eol::CrLf) => 2,
+                    _ => 1,
+                };
+                buf.drain(..e + eol_len);
+            }
+            LineResult::EndOfCopy => {
+                return;
+            }
+            LineResult::Incomplete => {
+                pgrx::error!("pg_deltax: file has no complete header line");
+            }
+        }
+    }
+
+    let num_columns = state.columns.len();
+    let is_compressed: Vec<bool> = partitions.iter().map(|p| p.is_compressed).collect();
+    let n_partitions = part_buffers.len();
+
+    pgrx::notice!(
+        "pg_deltax: parallel COPY with {} workers",
+        n_workers
+    );
+
+    loop {
+        // Phase 1: Find all line boundaries (sequential, memchr-fast)
+        let t_parse = std::time::Instant::now();
+        let mut line_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut pos: usize = 0;
+        let mut end_of_copy = false;
+
+        loop {
+            match line_reader.next_line(&buf, pos) {
+                LineResult::Row(s, e) => {
+                    line_ranges.push((s, e));
+                    let eol_len = match line_reader.eol {
+                        Some(crate::copyparse::Eol::CrLf) => 2,
+                        _ => 1,
+                    };
+                    pos = e + eol_len;
+                }
+                LineResult::EndOfCopy => {
+                    end_of_copy = true;
+                    break;
+                }
+                LineResult::Incomplete => break,
+            }
+        }
+
+        if line_ranges.is_empty() {
+            if end_of_copy {
+                break;
+            }
+            // Need more data (line spans batch boundary)
+            let data = reader.fill_buf().unwrap_or_else(|e| {
+                pgrx::error!("pg_deltax: read error: {}", e);
+            });
+            if data.is_empty() {
+                // EOF — handle trailing line without terminator
+                if !buf.is_empty() {
+                    let line = &buf[..];
+                    let raw_fields = split_fields(line, opts.delimiter);
+                    if raw_fields.len() == num_columns {
+                        line_reader.line_number += 1;
+                        handle_trailing_line(
+                            &raw_fields, &opts, state, part_buffers, partitions,
+                            range_starts, range_ends, &mut last_part_idx,
+                            &mut total_rows, line_reader.line_number,
+                        );
+                    }
+                }
+                break;
+            }
+            buf.extend_from_slice(data);
+            let n = data.len();
+            reader.consume(n);
+            continue;
+        }
+
+        let scan_time = t_parse.elapsed().as_micros() as u64;
+
+        // Phase 2: Parallel parse
+        let t_parallel = std::time::Instant::now();
+        let chunk_size = line_ranges.len().div_ceil(n_workers);
+        let base_line = line_reader.line_number - line_ranges.len() as u64;
+
+        let buf_ref = &buf;
+        let null_string_ref = &opts.null_string;
+        let kinds_ref = &state.kinds;
+        let is_compressed_ref = &is_compressed;
+        let delimiter = opts.delimiter;
+        let time_col_index = state.time_col_index;
+
+        let worker_results: Vec<Result<WorkerResult, crate::copyparse::ParseError>> =
+            std::thread::scope(|s| {
+                line_ranges
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(chunk_idx, chunk)| {
+                        let chunk_base_line = base_line + (chunk_idx * chunk_size) as u64;
+                        s.spawn(move || {
+                            parse_lines_worker(
+                                buf_ref,
+                                chunk,
+                                delimiter,
+                                null_string_ref,
+                                kinds_ref,
+                                time_col_index,
+                                range_starts,
+                                range_ends,
+                                is_compressed_ref,
+                                n_partitions,
+                                chunk_base_line,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect()
+            });
+
+        parse_time_us += scan_time + t_parallel.elapsed().as_micros() as u64;
+
+        // Phase 3: Merge + flush (sequential, on PG backend thread)
+        merge_and_flush_results(worker_results, part_buffers, state, &mut last_part_idx, &mut total_rows);
+
+        // Drain consumed bytes
+        if pos > 0 {
+            buf.drain(..pos);
+        }
+
+        if end_of_copy {
+            break;
+        }
+
+        // Read more data
+        let data = reader.fill_buf().unwrap_or_else(|e| {
+            pgrx::error!("pg_deltax: read error: {}", e);
+        });
+        if data.is_empty() {
+            // EOF — handle trailing partial line
+            if !buf.is_empty() {
+                let line = &buf[..];
+                let raw_fields = split_fields(line, opts.delimiter);
+                if raw_fields.len() == num_columns {
+                    line_reader.line_number += 1;
+                    handle_trailing_line(
+                        &raw_fields, &opts, state, part_buffers, partitions,
+                        range_starts, range_ends, &mut last_part_idx,
+                        &mut total_rows, line_reader.line_number,
+                    );
+                }
+            }
+            break;
+        }
+        buf.extend_from_slice(data);
+        let n = data.len();
+        reader.consume(n);
+    }
+
+    let copy_elapsed = copy_start.elapsed();
+    pgrx::notice!(
+        "pg_deltax: COPY (Rust parser, {} workers) done: {} rows in {:.1}s, parse={:.1}s ({:.0}%)",
+        n_workers,
+        total_rows,
+        copy_elapsed.as_secs_f64(),
+        parse_time_us as f64 / 1e6,
+        if copy_elapsed.as_secs_f64() > 0.0 {
+            (parse_time_us as f64 / 1e6) / copy_elapsed.as_secs_f64() * 100.0
+        } else {
+            0.0
+        }
+    );
+}
+
+/// Handle a trailing line at EOF (no terminator). Used by both parallel and sequential paths.
+#[allow(clippy::too_many_arguments)]
+fn handle_trailing_line(
+    raw_fields: &[&[u8]],
+    opts: &CopyTextOptions,
+    state: &BackfillState,
+    part_buffers: &mut [PartitionBuffer],
+    partitions: &[crate::catalog::PartitionInfo],
+    range_starts: &[i64],
+    range_ends: &[i64],
+    last_part_idx: &mut Option<usize>,
+    total_rows: &mut i64,
+    line_number: u64,
+) {
+    let time_raw = raw_fields[state.time_col_index];
+    if time_raw == opts.null_string.as_slice() {
+        pgrx::error!(
+            "pg_deltax: time column value is NULL at line {}",
+            line_number
+        );
+    }
+    let time_str = std::str::from_utf8(time_raw).unwrap_or_else(|_| {
+        pgrx::error!("pg_deltax: invalid UTF-8 in time column");
+    });
+    let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
+
+    let part_idx = match find_partition(range_starts, range_ends, time_usec) {
+        Some(idx) => idx,
+        None => {
+            pgrx::error!(
+                "pg_deltax: row at line {} with timestamp {} does not fit any partition",
+                line_number,
+                time_usec
+            );
+        }
+    };
+
+    if partitions[part_idx].is_compressed {
+        pgrx::error!(
+            "pg_deltax: partition '{}' is already compressed.",
+            partitions[part_idx].table_name
+        );
+    }
+
+    if let Some(prev_idx) = last_part_idx
+        .filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty())
+    {
+        flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
+    }
+
+    let pbuf = &mut part_buffers[part_idx];
+    for (i, (raw_field, kind)) in raw_fields.iter().zip(state.kinds.iter()).enumerate() {
+        if let Err(e) = parse_raw_field_and_append(
+            raw_field,
+            &opts.null_string,
+            *kind,
+            &mut pbuf.typed_cols[i],
+            i,
+            line_number,
+        ) {
+            pgrx::error!(
+                "pg_deltax: parse error at line {}, column {}: {}",
+                e.line, e.column, e.message
+            );
+        }
+    }
+    pbuf.row_count += 1;
+    *total_rows += 1;
+
+    if pbuf.row_count >= state.segment_size {
+        flush_segment(pbuf, state);
+    }
+}
+
+/// Merge worker results into partition buffers, flushing segments as they fill.
+fn merge_and_flush_results(
+    worker_results: Vec<Result<WorkerResult, crate::copyparse::ParseError>>,
+    part_buffers: &mut [PartitionBuffer],
+    state: &BackfillState,
+    _last_part_idx: &mut Option<usize>,
+    total_rows: &mut i64,
+) {
+    for result in worker_results {
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                pgrx::error!(
+                    "pg_deltax: parse error at line {}, column {}: {}",
+                    e.line,
+                    e.column,
+                    e.message
+                );
+            }
+        };
+
+        for (part_idx, worker_part) in result.partitions.into_iter().enumerate() {
+            if let Some(wp) = worker_part {
+                let pbuf = &mut part_buffers[part_idx];
+                for (i, worker_col) in wp.typed_cols.into_iter().enumerate() {
+                    pbuf.typed_cols[i].extend(worker_col);
+                }
+                pbuf.row_count += wp.row_count;
+                *total_rows += wp.row_count as i64;
+
+                if pbuf.row_count >= state.segment_size {
+                    flush_segment(pbuf, state);
+                }
+            }
+        }
+    }
+}
+
+/// Sequential file-path COPY (fallback for single-worker mode).
+fn handle_copy_from_file_sequential(
     filename: &str,
     opts: CopyTextOptions,
     state: &BackfillState,
@@ -570,7 +1049,6 @@ fn handle_copy_from_file(
     if matches!(opts.header, HeaderMode::Skip | HeaderMode::Match(_)) {
         match line_reader.next_line(&buf, 0) {
             LineResult::Row(_, e) => {
-                // Determine how many bytes to skip (line + EOL)
                 let eol_len = match line_reader.eol {
                     Some(crate::copyparse::Eol::CrLf) => 2,
                     _ => 1,
@@ -578,7 +1056,7 @@ fn handle_copy_from_file(
                 buf.drain(..e + eol_len);
             }
             LineResult::EndOfCopy => {
-                return; // empty file with just \.
+                return;
             }
             LineResult::Incomplete => {
                 pgrx::error!("pg_deltax: file has no complete header line");
@@ -588,8 +1066,6 @@ fn handle_copy_from_file(
 
     let num_columns = state.columns.len();
     let mut pos: usize = 0;
-    // Reuse field offset buffer across rows to avoid per-row Vec allocation.
-    // Stores (start, end) offsets relative to the line start.
     let mut field_offsets: Vec<(usize, usize)> = Vec::with_capacity(num_columns);
 
     loop {
@@ -611,7 +1087,6 @@ fn handle_copy_from_file(
                     );
                 }
 
-                // Extract time value from raw field (no allocation needed)
                 let (ts, te) = field_offsets[state.time_col_index];
                 let time_raw = &buf[line_start + ts..line_start + te];
                 if time_raw == opts.null_string.as_slice() {
@@ -629,7 +1104,6 @@ fn handle_copy_from_file(
                 };
                 let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
 
-                // Binary search for partition
                 let part_idx = match find_partition(range_starts, range_ends, time_usec) {
                     Some(idx) => idx,
                     None => {
@@ -648,14 +1122,11 @@ fn handle_copy_from_file(
                     );
                 }
 
-                // Flush previous partition's blobs on partition change
                 if let Some(prev_idx) = last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty()) {
                     flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
                 }
                 last_part_idx = Some(part_idx);
 
-                // Append each raw field directly into partition's typed columns
-                // — no intermediate Vec<Option<String>>, no per-row Vec allocation
                 let pbuf = &mut part_buffers[part_idx];
                 for (i, kind) in state.kinds.iter().enumerate() {
                     let (fs, fe) = field_offsets[i];
@@ -680,12 +1151,10 @@ fn handle_copy_from_file(
                 pbuf.row_count += 1;
                 total_rows += 1;
 
-                // Flush if segment full
                 if pbuf.row_count >= state.segment_size {
                     flush_segment(pbuf, state);
                 }
 
-                // Advance past the line + EOL
                 let eol_len = match line_reader.eol {
                     Some(crate::copyparse::Eol::CrLf) => 2,
                     _ => 1,
@@ -698,7 +1167,6 @@ fn handle_copy_from_file(
             LineResult::Incomplete => {
                 parse_time_us += t_parse.elapsed().as_micros() as u64;
 
-                // Remove consumed bytes and read more data
                 if pos > 0 {
                     buf.drain(..pos);
                     pos = 0;
@@ -708,69 +1176,16 @@ fn handle_copy_from_file(
                     pgrx::error!("pg_deltax: read error: {}", e);
                 });
                 if data.is_empty() {
-                    // EOF — process any trailing line without terminator
                     if !buf.is_empty() {
                         let line = &buf[..];
                         let raw_fields = split_fields(line, opts.delimiter);
                         if raw_fields.len() == num_columns {
                             line_reader.line_number += 1;
-
-                            let time_raw = raw_fields[state.time_col_index];
-                            if time_raw == opts.null_string.as_slice() {
-                                pgrx::error!(
-                                    "pg_deltax: time column value is NULL at line {}",
-                                    line_reader.line_number
-                                );
-                            }
-                            let time_str = std::str::from_utf8(time_raw).unwrap_or_else(|_| {
-                                pgrx::error!("pg_deltax: invalid UTF-8 in time column");
-                            });
-                            let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
-
-                            let part_idx = match find_partition(range_starts, range_ends, time_usec) {
-                                Some(idx) => idx,
-                                None => {
-                                    pgrx::error!(
-                                        "pg_deltax: row at line {} with timestamp {} does not fit any partition",
-                                        line_reader.line_number,
-                                        time_usec
-                                    );
-                                }
-                            };
-
-                            if partitions[part_idx].is_compressed {
-                                pgrx::error!(
-                                    "pg_deltax: partition '{}' is already compressed.",
-                                    partitions[part_idx].table_name
-                                );
-                            }
-
-                            if let Some(prev_idx) = last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty()) {
-                                flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
-                            }
-
-                            let pbuf = &mut part_buffers[part_idx];
-                            for (i, (raw_field, kind)) in raw_fields.iter().zip(state.kinds.iter()).enumerate() {
-                                if let Err(e) = parse_raw_field_and_append(
-                                    raw_field,
-                                    &opts.null_string,
-                                    *kind,
-                                    &mut pbuf.typed_cols[i],
-                                    i,
-                                    line_reader.line_number,
-                                ) {
-                                    pgrx::error!(
-                                        "pg_deltax: parse error at line {}, column {}: {}",
-                                        e.line, e.column, e.message
-                                    );
-                                }
-                            }
-                            pbuf.row_count += 1;
-                            total_rows += 1;
-
-                            if pbuf.row_count >= state.segment_size {
-                                flush_segment(pbuf, state);
-                            }
+                            handle_trailing_line(
+                                &raw_fields, &opts, state, part_buffers, partitions,
+                                range_starts, range_ends, &mut last_part_idx,
+                                &mut total_rows, line_reader.line_number,
+                            );
                         }
                     }
                     break;
@@ -1133,33 +1548,26 @@ fn flush_segment(
         blobs.push((cr.col_idx, cr.compressed));
     }
 
-    // Build INSERT statement
-    let mut insert_cols = Vec::new();
+    // Build VALUES clause for this segment's meta row
     let mut insert_vals = Vec::new();
 
-    insert_cols.push("_segment_id".to_string());
     insert_vals.push(seg_id.to_string());
 
     // Segment-by columns
     let mut seg_idx = 0;
     for col in &state.columns {
-        if col.is_segment_by {
-            insert_cols.push(format!("\"{}\"", col.name));
-            if seg_idx < seg_values.len() {
-                match &seg_values[seg_idx] {
-                    Some(v) => insert_vals.push(format!("'{}'", v.replace('\'', "''"))),
-                    None => insert_vals.push("NULL".to_string()),
-                }
-                seg_idx += 1;
+        if col.is_segment_by && seg_idx < seg_values.len() {
+            match &seg_values[seg_idx] {
+                Some(v) => insert_vals.push(format!("'{}'", v.replace('\'', "''"))),
+                None => insert_vals.push("NULL".to_string()),
             }
+            seg_idx += 1;
         }
     }
 
     // Min/max columns
     for (i, col) in state.columns.iter().enumerate() {
         if !col.is_segment_by && supports_minmax(&col.data_type) {
-            insert_cols.push(format!("\"_min_{}\"", col.name));
-            insert_cols.push(format!("\"_max_{}\"", col.name));
             match col_minmax.get(&i) {
                 Some((Some(min_val), Some(max_val))) => {
                     insert_vals.push(format_minmax_for_insert(min_val, &col.data_type));
@@ -1176,8 +1584,6 @@ fn flush_segment(
     // Sum and non-null count
     for (i, col) in state.columns.iter().enumerate() {
         if !col.is_segment_by && supports_sum(&col.data_type) {
-            insert_cols.push(format!("\"_sum_{}\"", col.name));
-            insert_cols.push(format!("\"_nonnull_count_{}\"", col.name));
             match col_sums.get(&i) {
                 Some((Some(sum_val), nonnull_count)) => {
                     insert_vals.push(sum_val.clone());
@@ -1195,7 +1601,6 @@ fn flush_segment(
     let mut nd_idx = 0;
     for col in &state.columns {
         if !col.is_segment_by {
-            insert_cols.push(format!("\"_ndistinct_{}\"", col.name));
             if nd_idx < ndistinct.len() {
                 insert_vals.push(ndistinct[nd_idx].to_string());
             } else {
@@ -1205,7 +1610,6 @@ fn flush_segment(
         }
     }
 
-    insert_cols.push("_row_count".to_string());
     insert_vals.push((buf.row_count as u32).to_string());
 
     // Bloom filters
@@ -1215,13 +1619,45 @@ fn flush_segment(
         Vec::new()
     };
 
-    let insert_sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        meta_fqn,
-        insert_cols.join(", "),
-        insert_vals.join(", ")
-    );
-    spi_exec(&insert_sql);
+    // Cache the meta table name and column list (same for every segment of this partition)
+    if buf.meta_fqn.is_none() {
+        buf.meta_fqn = Some(meta_fqn.clone());
+
+        let mut cols = Vec::new();
+        cols.push("_segment_id".to_string());
+        for col in &state.columns {
+            if col.is_segment_by {
+                cols.push(format!("\"{}\"", col.name));
+            }
+        }
+        for col in &state.columns {
+            if !col.is_segment_by && supports_minmax(&col.data_type) {
+                cols.push(format!("\"_min_{}\"", col.name));
+                cols.push(format!("\"_max_{}\"", col.name));
+            }
+        }
+        for col in &state.columns {
+            if !col.is_segment_by && supports_sum(&col.data_type) {
+                cols.push(format!("\"_sum_{}\"", col.name));
+                cols.push(format!("\"_nonnull_count_{}\"", col.name));
+            }
+        }
+        for col in &state.columns {
+            if !col.is_segment_by {
+                cols.push(format!("\"_ndistinct_{}\"", col.name));
+            }
+        }
+        cols.push("_row_count".to_string());
+        buf.meta_insert_cols = Some(cols.join(", "));
+    }
+
+    // Buffer the VALUES row
+    buf.meta_insert_rows.push(format!("({})", insert_vals.join(", ")));
+
+    // Flush meta batch if full
+    if buf.meta_insert_rows.len() >= META_BATCH_SIZE {
+        flush_meta_buffer(buf);
+    }
     let meta_ms = t_meta_start.elapsed().as_millis();
 
     buf.total_compressed_size += total_size;
@@ -1259,6 +1695,23 @@ fn flush_segment(
     buf.row_count = 0;
 }
 
+/// Flush buffered meta rows as a single multi-row INSERT.
+fn flush_meta_buffer(buf: &mut PartitionBuffer) {
+    if buf.meta_insert_rows.is_empty() {
+        return;
+    }
+    let meta_fqn = buf.meta_fqn.as_ref().expect("meta_fqn not set");
+    let cols = buf.meta_insert_cols.as_ref().expect("meta_insert_cols not set");
+    let insert_sql = format!(
+        "INSERT INTO {} ({}) VALUES {}",
+        meta_fqn,
+        cols,
+        buf.meta_insert_rows.join(", ")
+    );
+    spi_exec(&insert_sql);
+    buf.meta_insert_rows.clear();
+}
+
 /// Flush a partition's blob and bloom buffers to the companion tables.
 /// Called when the COPY loop moves to a different partition (for time-sorted data),
 /// or at end-of-COPY for remaining buffers. This keeps peak memory bounded to
@@ -1271,8 +1724,15 @@ fn flush_partition_blobs(
         return;
     }
 
-    let (_, blobs_fqn, blooms_fqn, _, _, _) =
-        build_companion_ddl(&buf.partition_table, columns);
+    // Cache companion table FQNs on first call
+    if buf.blobs_fqn_cached.is_none() {
+        let (_, blobs_fqn, blooms_fqn, _, _, _) =
+            build_companion_ddl(&buf.partition_table, columns);
+        buf.blobs_fqn_cached = Some(blobs_fqn);
+        buf.blooms_fqn_cached = Some(blooms_fqn);
+    }
+    let blobs_fqn = buf.blobs_fqn_cached.as_ref().unwrap();
+    let blooms_fqn = buf.blooms_fqn_cached.as_ref().unwrap();
 
     // Create tables without PK for fast heap_insert (PK added in finalize_partition)
     if !buf.blobs_table_created {
@@ -1296,7 +1756,7 @@ fn flush_partition_blobs(
     // This avoids per-INSERT executor overhead, plan caching, and catalog cache bloat.
     // BulkInsertState uses a ring buffer to avoid polluting shared_buffers.
     if !buf.blob_buffer.is_empty() {
-        let blobs_oid = resolve_relation_oid(&blobs_fqn);
+        let blobs_oid = *buf.blobs_oid_cached.get_or_insert_with(|| resolve_relation_oid(blobs_fqn));
         unsafe {
             // Create a temporary memory context for TOAST processing.
             // heap_insert internally calls toast_insert_or_update which palloc's
@@ -1349,7 +1809,7 @@ fn flush_partition_blobs(
 
     // Blooms: same approach with per-insert context reset
     if !buf.bloom_buffer.is_empty() {
-        let blooms_oid = resolve_relation_oid(&blooms_fqn);
+        let blooms_oid = *buf.blooms_oid_cached.get_or_insert_with(|| resolve_relation_oid(blooms_fqn));
         unsafe {
             let insert_ctx = pg_sys::AllocSetContextCreateInternal(
                 pg_sys::CurrentMemoryContext,

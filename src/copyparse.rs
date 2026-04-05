@@ -73,63 +73,71 @@ impl CopyLineReader {
         let len = data.len();
         let mut i = 0;
 
-        // Scan for line terminator, skipping escaped characters
+        // Scan for line terminator using SIMD-accelerated search,
+        // skipping escaped characters
         while i < len {
-            if data[i] == b'\\' {
-                // Skip the next byte (it's escaped)
-                i += 2;
-                continue;
-            }
-            if data[i] == b'\n' {
-                let eol = Eol::Lf;
-                if let Some(expected) = self.eol {
-                    if expected != eol {
-                        panic!(
-                            "pg_deltax: inconsistent line endings at line {} (expected {:?}, got {:?})",
-                            self.line_number + 1,
-                            expected,
-                            eol
-                        );
-                    }
-                } else {
-                    self.eol = Some(eol);
-                }
-                self.line_number += 1;
-                let line_end = start + i;
-                return self.check_end_of_copy(buf, start, line_end, line_end + 1);
-            }
-            if data[i] == b'\r' {
-                let eol = if i + 1 < len && data[i + 1] == b'\n' {
-                    Eol::CrLf
-                } else {
-                    Eol::Cr
-                };
-                if let Some(expected) = self.eol {
-                    if expected != eol {
-                        // For CrLf: if we see \r but no \n yet, might be incomplete
-                        if expected == Eol::CrLf && i + 1 >= len {
-                            return LineResult::Incomplete;
+            match memchr::memchr3(b'\n', b'\r', b'\\', &data[i..]) {
+                None => return LineResult::Incomplete,
+                Some(offset) => {
+                    i += offset;
+                    match data[i] {
+                        b'\\' => {
+                            // Skip escaped byte
+                            i += 2;
+                            continue;
                         }
-                        panic!(
-                            "pg_deltax: inconsistent line endings at line {} (expected {:?}, got {:?})",
-                            self.line_number + 1,
-                            expected,
-                            eol
-                        );
+                        b'\n' => {
+                            let eol = Eol::Lf;
+                            if let Some(expected) = self.eol {
+                                if expected != eol {
+                                    panic!(
+                                        "pg_deltax: inconsistent line endings at line {} (expected {:?}, got {:?})",
+                                        self.line_number + 1,
+                                        expected,
+                                        eol
+                                    );
+                                }
+                            } else {
+                                self.eol = Some(eol);
+                            }
+                            self.line_number += 1;
+                            let line_end = start + i;
+                            return self.check_end_of_copy(buf, start, line_end, line_end + 1);
+                        }
+                        b'\r' => {
+                            let eol = if i + 1 < len && data[i + 1] == b'\n' {
+                                Eol::CrLf
+                            } else {
+                                Eol::Cr
+                            };
+                            if let Some(expected) = self.eol {
+                                if expected != eol {
+                                    if expected == Eol::CrLf && i + 1 >= len {
+                                        return LineResult::Incomplete;
+                                    }
+                                    panic!(
+                                        "pg_deltax: inconsistent line endings at line {} (expected {:?}, got {:?})",
+                                        self.line_number + 1,
+                                        expected,
+                                        eol
+                                    );
+                                }
+                            } else {
+                                self.eol = Some(eol);
+                            }
+                            self.line_number += 1;
+                            let line_end = start + i;
+                            let next_start = if eol == Eol::CrLf {
+                                line_end + 2
+                            } else {
+                                line_end + 1
+                            };
+                            return self.check_end_of_copy(buf, start, line_end, next_start);
+                        }
+                        _ => unreachable!(),
                     }
-                } else {
-                    self.eol = Some(eol);
                 }
-                self.line_number += 1;
-                let line_end = start + i;
-                let next_start = if eol == Eol::CrLf {
-                    line_end + 2
-                } else {
-                    line_end + 1
-                };
-                return self.check_end_of_copy(buf, start, line_end, next_start);
             }
-            i += 1;
         }
         LineResult::Incomplete
     }
