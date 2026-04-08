@@ -1723,13 +1723,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             );
             let has_any_cd_agg = compact_storage.as_ref().unwrap().layout.slots.iter()
                 .any(|(_, k)| matches!(k, CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr));
-            // Skip speculative top-N when there are too many partial results (e.g. from
-            // pipeline batching). With hundreds of partial results, iterating all candidates
-            // across all results is very expensive and the correctness check (nth > floor_sum)
-            // is more likely to fail, wasting time before falling through to full merge.
-            let max_speculative_results = n_workers * 4;
-            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd
-                && partial_results.len() <= max_speculative_results {
+            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd {
                 let sort_slot = sort_slot_for_compact_spec;
                 let (_, sort_kind) = compact_storage.as_ref().unwrap().layout.slots[sort_slot];
                 let limit = topn_limit as usize;
@@ -1759,6 +1753,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         }
                     }
                 }
+
+                // Cost guard: Phase 2 iterates candidates × partial_results.
+                // For low-cardinality GROUP BY, candidate_set is small → fast.
+                // For high-cardinality with many pipeline batches, candidate_set
+                // can be huge → skip speculative and go straight to full merge.
+                let phase2_ops = candidate_set.len() as u64 * partial_results.len() as u64;
+                if phase2_ops > 10_000_000 {
+                    pgrx::log!(
+                        "pg_deltax speculative top-N skipped: phase2 too expensive \
+                         (candidates={} × results={} = {} ops)",
+                        candidate_set.len(), partial_results.len(), phase2_ops,
+                    );
+                } else {
 
                 // Phase 2: For each candidate, sum sort values across all workers
                 let mut merged: Vec<(i64, u128)> = Vec::with_capacity(candidate_set.len());
@@ -2109,6 +2116,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     (*node).custom_ps = state_ptr as *mut pg_sys::List;
                     return;
                 }
+            } // end else (phase2 cost guard)
             }
 
             // ----------------------------------------------------------
