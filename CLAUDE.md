@@ -77,6 +77,7 @@ Results are saved to `clickbench/results/pg_deltax.json` and archived by timesta
 If you need to reference pgrx source code, it is in ~/src/pgrx.
 If you need to reference the postgres source code, is in ~/src/postgres.
 Use the source there, it's much faster than looking into the docker images.
+Remember that ClickBench queries are counted starting with 0.
 
 ## Architecture
 

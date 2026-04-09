@@ -16,7 +16,8 @@ pub(crate) use count_minmax::{CountScanState, MinMaxScanState};
 pub(crate) use agg::AggScanState;
 
 // Re-exports for hook.rs
-pub(crate) use agg::{AggType, AggExpr, GroupByExpr, GroupByColSpec, HavingOp, HavingFilter};
+pub(crate) use agg::{AggType, AggExpr, GroupByExpr, GroupByColSpec, HavingOp, HavingFilter,
+    CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenValue};
 
 // Re-exports for path.rs (create_*_state callbacks referenced in CustomScanMethods)
 pub(crate) use decompress::{create_custom_scan_state, create_deltax_append_state};

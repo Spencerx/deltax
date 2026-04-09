@@ -162,6 +162,42 @@ pub(crate) enum GroupByExpr {
     Extract { unit: String, func_oid: u32 },
     /// col +/- const: GROUP BY col - 1  (offset is always stored as addition, so col-1 → offset=-1)
     AddConst { offset: i64, op_oid: u32 },
+    /// CASE WHEN ... THEN ... ELSE ... END
+    CaseWhen(CaseWhenSpec),
+}
+
+/// Comparison operator for CASE WHEN conditions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(i32)]
+pub(crate) enum CaseWhenOp { Eq = 0, NotEq = 1 }
+
+/// A single condition: col op const_val
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CaseWhenCondition {
+    pub(crate) col_idx: usize,
+    pub(crate) op: CaseWhenOp,
+    pub(crate) const_val: i64,
+}
+
+/// The value produced by a THEN or ELSE branch.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CaseWhenValue {
+    ColumnRef(usize),
+    StringConst(String),
+}
+
+/// A single WHEN clause: conditions (AND-combined) → result.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CaseWhenClause {
+    pub(crate) conditions: Vec<CaseWhenCondition>,
+    pub(crate) result: CaseWhenValue,
+}
+
+/// Full CASE WHEN spec: clauses evaluated in order, default is ELSE branch.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CaseWhenSpec {
+    pub(crate) clauses: Vec<CaseWhenClause>,
+    pub(crate) default: CaseWhenValue,
 }
 
 /// Convert a date_trunc unit string to microseconds.
@@ -343,6 +379,31 @@ struct ParsedAggPlan {
     bare_limit: i64,
 }
 
+/// Deserialize a CaseWhenValue from a custom_private integer list.
+unsafe fn deserialize_case_when_value_inline(
+    list: *mut pg_sys::List,
+    idx: &mut i32,
+) -> CaseWhenValue {
+    unsafe {
+    let tag = pg_sys::list_nth_int(list, *idx);
+    *idx += 1;
+    if tag == 0 {
+        let col_idx = pg_sys::list_nth_int(list, *idx) as usize;
+        *idx += 1;
+        CaseWhenValue::ColumnRef(col_idx)
+    } else {
+        let str_len = pg_sys::list_nth_int(list, *idx) as usize;
+        *idx += 1;
+        let mut bytes = Vec::with_capacity(str_len);
+        for _ in 0..str_len {
+            bytes.push(pg_sys::list_nth_int(list, *idx) as u8);
+            *idx += 1;
+        }
+        CaseWhenValue::StringConst(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    }
+}
+
 /// Deserialize a DeltaXAgg custom_private list into structured Rust types.
 ///
 /// The planner serializes the aggregate plan as a flat integer list with this layout:
@@ -476,6 +537,30 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 let op_oid = pg_sys::list_nth_int(custom_private, idx + 1) as u32;
                 idx += 2;
                 GroupByExpr::AddConst { offset, op_oid }
+            } else if expr_tag == 5 {
+                // CaseWhen
+                let num_clauses = pg_sys::list_nth_int(custom_private, idx) as usize;
+                idx += 1;
+                let mut clauses = Vec::with_capacity(num_clauses);
+                for _ in 0..num_clauses {
+                    let num_conditions = pg_sys::list_nth_int(custom_private, idx) as usize;
+                    idx += 1;
+                    let mut conditions = Vec::with_capacity(num_conditions);
+                    for _ in 0..num_conditions {
+                        let cond_col_idx = pg_sys::list_nth_int(custom_private, idx) as usize;
+                        let op_val = pg_sys::list_nth_int(custom_private, idx + 1);
+                        let const_hi = pg_sys::list_nth_int(custom_private, idx + 2) as i64;
+                        let const_lo = pg_sys::list_nth_int(custom_private, idx + 3) as u32 as i64;
+                        idx += 4;
+                        let op = if op_val == 0 { CaseWhenOp::Eq } else { CaseWhenOp::NotEq };
+                        let const_val = (const_hi << 32) | const_lo;
+                        conditions.push(CaseWhenCondition { col_idx: cond_col_idx, op, const_val });
+                    }
+                    let result = deserialize_case_when_value_inline(custom_private, &mut idx);
+                    clauses.push(CaseWhenClause { conditions, result });
+                }
+                let default = deserialize_case_when_value_inline(custom_private, &mut idx);
+                GroupByExpr::CaseWhen(CaseWhenSpec { clauses, default })
             } else {
                 GroupByExpr::Column
             };
@@ -1370,6 +1455,24 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             if gs.col_idx >= 0 && (gs.col_idx as usize) < num_cols {
                 needed_cols[gs.col_idx as usize] = true;
             }
+            // CaseWhen references additional columns in conditions and result values
+            if let GroupByExpr::CaseWhen(ref spec) = gs.expr {
+                for clause in &spec.clauses {
+                    for cond in &clause.conditions {
+                        if cond.col_idx < num_cols {
+                            needed_cols[cond.col_idx] = true;
+                        }
+                    }
+                    if let CaseWhenValue::ColumnRef(ci) = &clause.result
+                        && *ci < num_cols {
+                        needed_cols[*ci] = true;
+                    }
+                }
+                if let CaseWhenValue::ColumnRef(ci) = &spec.default
+                    && *ci < num_cols {
+                    needed_cols[*ci] = true;
+                }
+            }
         }
 
         // Build length_cols: columns where ALL referencing agg specs use LengthOf.
@@ -1571,6 +1674,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     || gs.type_oid == pg_sys::NAMEOID)
             {
                 text_group_cols[gs.col_idx as usize] = true;
+            }
+            // CaseWhen ColumnRef results reference text columns that need decompression
+            if let GroupByExpr::CaseWhen(ref spec) = gs.expr {
+                for clause in &spec.clauses {
+                    if let CaseWhenValue::ColumnRef(ci) = &clause.result
+                        && *ci < text_group_cols.len() {
+                        text_group_cols[*ci] = true;
+                    }
+                }
+                if let CaseWhenValue::ColumnRef(ci) = &spec.default
+                    && *ci < text_group_cols.len() {
+                    text_group_cols[*ci] = true;
+                }
             }
         }
 
@@ -2741,9 +2857,24 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             };
 
             // Build text_group_col_flags
-            let text_group_col_flags: Vec<bool> = (0..meta.col_names.len()).map(|i| {
+            let mut text_group_col_flags: Vec<bool> = (0..meta.col_names.len()).map(|i| {
                 group_specs.iter().any(|gs| gs.col_idx as usize == i && is_text_group_col(gs))
             }).collect();
+            // CaseWhen ColumnRef results reference text columns that need decompression
+            for gs in &group_specs {
+                if let GroupByExpr::CaseWhen(ref spec) = gs.expr {
+                    for clause in &spec.clauses {
+                        if let CaseWhenValue::ColumnRef(ci) = &clause.result
+                            && *ci < text_group_col_flags.len() {
+                            text_group_col_flags[*ci] = true;
+                        }
+                    }
+                    if let CaseWhenValue::ColumnRef(ci) = &spec.default
+                        && *ci < text_group_col_flags.len() {
+                        text_group_col_flags[*ci] = true;
+                    }
+                }
+            }
 
             // Build text qual infos for worker threads.
             // Order: positive LIKE first (most selective — match a pattern),
@@ -4650,7 +4781,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             // datums are never dereferenced).
             let selection = evaluate_batch_quals(&decompressed, row_count, &batch_quals, pre_selection);
 
-
+            // Pre-compute CaseWhen GROUP BY columns into SegTextColumn
+            let case_when_seg_cols: Vec<Option<SegTextColumn>> = group_specs.iter().map(|gs| {
+                if let GroupByExpr::CaseWhen(ref spec) = gs.expr {
+                    Some(apply_case_when_to_seg_col(spec, &decompressed, &seg_text_columns, row_count, &selection))
+                } else {
+                    None
+                }
+            }).collect();
 
 
             // Fast path: when no GROUP BY and all agg specs are SUM/AVG on the
@@ -4938,7 +5076,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                     // Build temporary borrowed key (reuse buffer, no heap alloc)
                     let mut regex_idx = 0;
-                    for gs in group_specs.iter() {
+                    for (gi, gs) in group_specs.iter().enumerate() {
+                        // CaseWhen has col_idx=-1, handle separately via pre-computed SegTextColumn
+                        if let GroupByExpr::CaseWhen(_) = &gs.expr {
+                            if let Some(Some(seg_col)) = case_when_seg_cols.get(gi) {
+                                match seg_col.get_str(row) {
+                                    Some(s) => key_ref.push(GroupKeyRef::from_str(s)),
+                                    None => key_ref.push(GroupKeyRef::Null),
+                                }
+                            } else {
+                                key_ref.push(GroupKeyRef::Null);
+                            }
+                            continue;
+                        }
                         let col = &decompressed[gs.col_idx as usize];
                         if col.is_empty() || col[row].1 {
                             key_ref.push(GroupKeyRef::Null);
@@ -4981,6 +5131,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         key_ref.push(GroupKeyRef::Int(datum.value() as i64));
                                     }
                                 }
+                                GroupByExpr::CaseWhen(_) => unreachable!(),
                             }
                         }
                     }
@@ -6461,6 +6612,7 @@ fn can_use_compact_keys(group_specs: &[GroupByColSpec]) -> bool {
             GroupByExpr::Extract { .. } => true,   // returns i64
             GroupByExpr::AddConst { .. } => true,  // returns i64
             GroupByExpr::RegexpReplace { .. } => false,
+            GroupByExpr::CaseWhen(_) => false,
         }
     })
 }
@@ -7170,12 +7322,12 @@ impl MixedKeyStorage {
 
 // strcoll_cmp is now in text_col.rs
 
-/// Check if a GROUP BY column is a text type (including RegexpReplace which produces text).
+/// Check if a GROUP BY column is a text type (including RegexpReplace/CaseWhen which produce text).
 fn is_text_group_col(gs: &GroupByColSpec) -> bool {
     let is_text_type = matches!(gs.type_oid,
         pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID);
     match &gs.expr {
-        GroupByExpr::Column | GroupByExpr::RegexpReplace { .. } => is_text_type,
+        GroupByExpr::Column | GroupByExpr::RegexpReplace { .. } | GroupByExpr::CaseWhen(_) => is_text_type,
         _ => false,
     }
 }
@@ -7276,6 +7428,86 @@ struct RustRegexInfo {
     col_idx: usize,
 }
 
+/// Evaluate a CASE WHEN expression on a segment, producing a SegTextColumn.
+///
+/// For each row, evaluates clauses in order; first match wins, else default.
+/// Condition columns come from `numeric_cols`, result ColumnRef values from `text_seg_cols`.
+fn apply_case_when_to_seg_col(
+    spec: &CaseWhenSpec,
+    numeric_cols: &[Vec<(pg_sys::Datum, bool)>],
+    text_seg_cols: &[Option<SegTextColumn>],
+    row_count: usize,
+    selection: &[bool],
+) -> SegTextColumn {
+    // Build dict-style: unique strings → entries, per-row index.
+    let mut unique_map: HashMap<String, u32> = HashMap::new();
+    let mut entries: Vec<String> = Vec::new();
+    let mut row_to_entry: Vec<u32> = Vec::with_capacity(row_count);
+
+    for row in 0..row_count {
+        if !selection.is_empty() && !selection[row] {
+            row_to_entry.push(u32::MAX); // filtered out, treat as null
+            continue;
+        }
+
+        // Evaluate clauses in order
+        let mut matched_value: Option<&CaseWhenValue> = None;
+        'clauses: for clause in &spec.clauses {
+            let mut all_conditions_true = true;
+            for cond in &clause.conditions {
+                let col = &numeric_cols[cond.col_idx];
+                if col.is_empty() || col[row].1 {
+                    // NULL column value — condition is false
+                    all_conditions_true = false;
+                    break;
+                }
+                let val = col[row].0.value() as i64;
+                let cond_met = match cond.op {
+                    CaseWhenOp::Eq => val == cond.const_val,
+                    CaseWhenOp::NotEq => val != cond.const_val,
+                };
+                if !cond_met {
+                    all_conditions_true = false;
+                    break;
+                }
+            }
+            if all_conditions_true {
+                matched_value = Some(&clause.result);
+                break 'clauses;
+            }
+        }
+        let value = matched_value.unwrap_or(&spec.default);
+
+        // Resolve the value to a string
+        let s: Option<String> = match value {
+            CaseWhenValue::StringConst(s) => Some(s.clone()),
+            CaseWhenValue::ColumnRef(col_idx) => {
+                if let Some(ref seg_col) = text_seg_cols[*col_idx] {
+                    seg_col.get_str(row).map(|s| s.to_owned())
+                } else {
+                    None // null
+                }
+            }
+        };
+
+        match s {
+            Some(string_val) => {
+                let idx = *unique_map.entry(string_val.clone()).or_insert_with(|| {
+                    let idx = entries.len() as u32;
+                    entries.push(string_val);
+                    idx
+                });
+                row_to_entry.push(idx);
+            }
+            None => {
+                row_to_entry.push(u32::MAX);
+            }
+        }
+    }
+
+    SegTextColumn::Dict { entries, row_to_entry }
+}
+
 /// Apply a Rust regex replacement to a SegTextColumn, producing a new transformed column.
 /// The original column is not modified (needed for aggregations on the same column).
 /// For Dict columns, only applies regex to unique dict entries (O(dict_size)).
@@ -7362,7 +7594,7 @@ fn can_parallel_mixed(
     batch_quals: &[BatchQual],
     agg_specs: &[AggExecSpec],
 ) -> bool {
-    if group_specs.is_empty() || group_specs.len() > 4 {
+    if group_specs.is_empty() || group_specs.len() > 6 {
         return false;
     }
 
@@ -7400,7 +7632,7 @@ fn can_parallel_mixed(
                 }
             }
             GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {}
-            GroupByExpr::RegexpReplace { .. } => return false, // non-text RegexpReplace not supported
+            GroupByExpr::RegexpReplace { .. } | GroupByExpr::CaseWhen(_) => return false, // non-text RegexpReplace/CaseWhen not supported
         }
     }
 
@@ -7420,6 +7652,15 @@ fn can_parallel_mixed(
         // Text column — must be a GROUP BY column, have a supported text qual,
         // or be used in a MIN/MAX aggregation
         let is_text_gb = group_specs.iter().any(|gs| gs.col_idx as usize == i && is_text_group_col(gs));
+        // Also check if this column is referenced by a CaseWhen result ColumnRef
+        let is_case_when_ref = group_specs.iter().any(|gs| {
+            if let GroupByExpr::CaseWhen(ref spec) = gs.expr {
+                spec.clauses.iter().any(|c| matches!(&c.result, CaseWhenValue::ColumnRef(ci) if *ci == i))
+                    || matches!(&spec.default, CaseWhenValue::ColumnRef(ci) if *ci == i)
+            } else {
+                false
+            }
+        });
         let has_text_qual = batch_quals.iter().any(|bq| {
             bq.col_idx == i && (
                 (matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne) && bq.text_const.is_some())
@@ -7441,7 +7682,7 @@ fn can_parallel_mixed(
                 && s.expr_kind == AggExpr::LengthOf
                 && (type_oid == pg_sys::TEXTOID || type_oid == pg_sys::VARCHAROID || type_oid == pg_sys::BPCHAROID)
         });
-        if !is_text_gb && !has_text_qual && !is_text_minmax_agg && !is_text_cd_agg && !is_text_length_agg {
+        if !is_text_gb && !is_case_when_ref && !has_text_qual && !is_text_minmax_agg && !is_text_cd_agg && !is_text_length_agg {
             return false; // unsupported column type
         }
     }
@@ -7615,6 +7856,15 @@ fn process_segments_mixed(
             continue;
         }
 
+        // Build CaseWhen-transformed text columns (indexed by group spec index)
+        let case_when_text_cols: Vec<Option<SegTextColumn>> = config.group_specs.iter().map(|gs| {
+            if let GroupByExpr::CaseWhen(ref spec) = gs.expr {
+                Some(apply_case_when_to_seg_col(spec, &numeric_cols, &text_seg_cols, row_count, &selection))
+            } else {
+                None
+            }
+        }).collect();
+
         // Aggregation loop
         let mut int_keys = vec![0i64; n_int_keys];
         let mut str_keys: Vec<Option<&str>> = vec![None; n_str_keys];
@@ -7629,8 +7879,18 @@ fn process_segments_mixed(
             let mut has_null = false;
             let mut int_idx = 0;
             let mut str_idx = 0;
-            for gs in config.group_specs.iter() {
+            for (gi, gs) in config.group_specs.iter().enumerate() {
                 if is_text_group_col(gs) {
+                    // CaseWhen: use pre-computed column indexed by group spec index
+                    if matches!(gs.expr, GroupByExpr::CaseWhen(_)) {
+                        if let Some(Some(seg_col)) = case_when_text_cols.get(gi) {
+                            str_keys[str_idx] = seg_col.get_str(row);
+                        } else {
+                            str_keys[str_idx] = None;
+                        }
+                        str_idx += 1;
+                        continue;
+                    }
                     let col_idx = gs.col_idx as usize;
                     // For RegexpReplace columns, use the pre-transformed column;
                     // for plain text columns, use the original

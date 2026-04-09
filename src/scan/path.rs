@@ -606,6 +606,56 @@ pub struct AggSpec {
     pub const_offset: i64,          // Only used when expr_kind == AddConst
 }
 
+/// Serialize a CaseWhenValue into the integer list.
+/// Format: tag(0=ColumnRef, 1=StringConst), then value.
+unsafe fn serialize_case_when_value(
+    value: &super::exec::CaseWhenValue,
+    private_list: &mut *mut pg_sys::List,
+) {
+    unsafe {
+    match value {
+        super::exec::CaseWhenValue::ColumnRef(col_idx) => {
+            *private_list = pg_sys::lappend_int(*private_list, 0); // tag=0
+            *private_list = pg_sys::lappend_int(*private_list, *col_idx as i32);
+        }
+        super::exec::CaseWhenValue::StringConst(s) => {
+            *private_list = pg_sys::lappend_int(*private_list, 1); // tag=1
+            *private_list = pg_sys::lappend_int(*private_list, s.len() as i32);
+            for &b in s.as_bytes() {
+                *private_list = pg_sys::lappend_int(*private_list, b as i32);
+            }
+        }
+    }
+    }
+}
+
+/// Deserialize a CaseWhenValue from the integer list.
+unsafe fn deserialize_case_when_value(
+    path_private: *mut pg_sys::List,
+    idx: &mut i32,
+) -> super::exec::CaseWhenValue {
+    unsafe {
+    let tag = pg_sys::list_nth_int(path_private, *idx);
+    *idx += 1;
+    if tag == 0 {
+        // ColumnRef
+        let col_idx = pg_sys::list_nth_int(path_private, *idx) as usize;
+        *idx += 1;
+        super::exec::CaseWhenValue::ColumnRef(col_idx)
+    } else {
+        // StringConst
+        let str_len = pg_sys::list_nth_int(path_private, *idx) as usize;
+        *idx += 1;
+        let mut bytes = Vec::with_capacity(str_len);
+        for _ in 0..str_len {
+            bytes.push(pg_sys::list_nth_int(path_private, *idx) as u8);
+            *idx += 1;
+        }
+        super::exec::CaseWhenValue::StringConst(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    }
+}
+
 /// Add a DeltaXAgg custom path to the grouped relation's pathlist.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_agg_path(
@@ -706,6 +756,22 @@ pub unsafe fn add_agg_path(
                     private_list = pg_sys::lappend_int(private_list, *offset as i32);
                     private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
                 }
+                super::exec::GroupByExpr::CaseWhen(spec) => {
+                    private_list = pg_sys::lappend_int(private_list, 5); // expr_tag=5
+                    private_list = pg_sys::lappend_int(private_list, spec.clauses.len() as i32);
+                    for clause in &spec.clauses {
+                        private_list = pg_sys::lappend_int(private_list, clause.conditions.len() as i32);
+                        for cond in &clause.conditions {
+                            private_list = pg_sys::lappend_int(private_list, cond.col_idx as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.op as i32);
+                            // Store i64 const_val as two i32s (high, low)
+                            private_list = pg_sys::lappend_int(private_list, (cond.const_val >> 32) as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.const_val as i32);
+                        }
+                        serialize_case_when_value(&clause.result, &mut private_list);
+                    }
+                    serialize_case_when_value(&spec.default, &mut private_list);
+                }
             }
         }
         // Store HAVING filters for thread-local passing to plan_agg_path
@@ -792,6 +858,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             DateTrunc { func_oid: u32, unit: String },
             Extract { func_oid: u32, unit: String },
             AddConst { offset: i32, op_oid: u32 },
+            CaseWhen(super::exec::CaseWhenSpec),
         }
         #[derive(Clone)]
         struct ParsedGroup {
@@ -893,6 +960,31 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     let op_oid = pg_sys::list_nth_int(path_private, idx + 1) as u32;
                     idx += 2;
                     ParsedGroupExpr::AddConst { offset, op_oid }
+                } else if expr_tag == 5 {
+                    // CaseWhen
+                    use super::exec::{CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp};
+                    let num_clauses = pg_sys::list_nth_int(path_private, idx) as usize;
+                    idx += 1;
+                    let mut clauses = Vec::with_capacity(num_clauses);
+                    for _ in 0..num_clauses {
+                        let num_conditions = pg_sys::list_nth_int(path_private, idx) as usize;
+                        idx += 1;
+                        let mut conditions = Vec::with_capacity(num_conditions);
+                        for _ in 0..num_conditions {
+                            let cond_col_idx = pg_sys::list_nth_int(path_private, idx) as usize;
+                            let op_val = pg_sys::list_nth_int(path_private, idx + 1);
+                            let const_hi = pg_sys::list_nth_int(path_private, idx + 2) as i64;
+                            let const_lo = pg_sys::list_nth_int(path_private, idx + 3) as u32 as i64;
+                            idx += 4;
+                            let op = if op_val == 0 { CaseWhenOp::Eq } else { CaseWhenOp::NotEq };
+                            let const_val = (const_hi << 32) | const_lo;
+                            conditions.push(CaseWhenCondition { col_idx: cond_col_idx, op, const_val });
+                        }
+                        let result = deserialize_case_when_value(path_private, &mut idx);
+                        clauses.push(CaseWhenClause { conditions, result });
+                    }
+                    let default = deserialize_case_when_value(path_private, &mut idx);
+                    ParsedGroupExpr::CaseWhen(CaseWhenSpec { clauses, default })
                 } else {
                     ParsedGroupExpr::Column
                 };
@@ -1116,6 +1208,13 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     } else {
                         output_map.push((1, 0));
                     }
+                } else if (*expr).type_ == pg_sys::NodeTag::T_CaseExpr {
+                    // CaseExpr in target list — find the first CaseWhen GROUP BY spec.
+                    // There can be multiple CaseWhen specs; match by position among CaseExpr tlist entries.
+                    let case_group_idx = parsed_groups.iter().position(|g| {
+                        matches!(g.expr, ParsedGroupExpr::CaseWhen(_))
+                    }).unwrap_or(0) as i32;
+                    output_map.push((1, case_group_idx));
                 } else if (*expr).type_ == pg_sys::NodeTag::T_Const {
                     // Constant in SELECT list (e.g. SELECT 1, ...) — serialize type + value
                     let c = expr as *const pg_sys::Const;
@@ -1202,6 +1301,21 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     private_list = pg_sys::lappend_int(private_list, 4);
                     private_list = pg_sys::lappend_int(private_list, *offset);
                     private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
+                }
+                ParsedGroupExpr::CaseWhen(spec) => {
+                    private_list = pg_sys::lappend_int(private_list, 5);
+                    private_list = pg_sys::lappend_int(private_list, spec.clauses.len() as i32);
+                    for clause in &spec.clauses {
+                        private_list = pg_sys::lappend_int(private_list, clause.conditions.len() as i32);
+                        for cond in &clause.conditions {
+                            private_list = pg_sys::lappend_int(private_list, cond.col_idx as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.op as i32);
+                            private_list = pg_sys::lappend_int(private_list, (cond.const_val >> 32) as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.const_val as i32);
+                        }
+                        serialize_case_when_value(&clause.result, &mut private_list);
+                    }
+                    serialize_case_when_value(&spec.default, &mut private_list);
                 }
             }
         }

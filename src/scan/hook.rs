@@ -498,6 +498,233 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
     }
 }
 
+/// Unwrap a RelabelType node to get the inner expression.
+unsafe fn unwrap_relabel_node(n: *const pg_sys::Node) -> *const pg_sys::Node {
+    unsafe {
+        if !n.is_null() && (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+            let rlt = n as *const pg_sys::RelabelType;
+            (*rlt).arg as *const pg_sys::Node
+        } else {
+            n
+        }
+    }
+}
+
+/// Parse a CASE WHEN expression from the PG node tree into a CaseWhenSpec.
+/// Only supports searched CASE (no simple CASE), integer equality/inequality conditions,
+/// AND-combined conditions, and text column refs or string constants as results.
+/// Returns None if any part is unsupported.
+unsafe fn parse_case_expr(
+    root: *mut pg_sys::PlannerInfo,
+    case_expr: *const pg_sys::CaseExpr,
+) -> Option<super::exec::CaseWhenSpec> {
+    unsafe {
+    use super::exec::{CaseWhenSpec, CaseWhenClause, CaseWhenValue};
+
+    // Must be searched CASE (arg is null), not simple CASE
+    if !(*case_expr).arg.is_null() {
+        return None;
+    }
+
+    let args_list = (*case_expr).args;
+    if args_list.is_null() || (*args_list).length == 0 {
+        return None;
+    }
+
+    let mut clauses: Vec<CaseWhenClause> = Vec::new();
+    let nargs = (*args_list).length;
+    for i in 0..nargs {
+        let when_node = (*(*args_list).elements.add(i as usize)).ptr_value as *const pg_sys::Node;
+        if when_node.is_null() || (*when_node).type_ != pg_sys::NodeTag::T_CaseWhen {
+            return None;
+        }
+        let case_when = when_node as *const pg_sys::CaseWhen;
+
+        // Parse conditions from the WHEN expr
+        let conditions = parse_case_when_conditions(root, (*case_when).expr as *const pg_sys::Node)?;
+        if conditions.is_empty() {
+            return None;
+        }
+
+        // Parse the THEN result
+        let result = parse_case_when_value(root, (*case_when).result as *const pg_sys::Node)?;
+
+        clauses.push(CaseWhenClause { conditions, result });
+    }
+
+    // Parse the ELSE (default) result
+    let default = if (*case_expr).defresult.is_null() {
+        CaseWhenValue::StringConst(String::new()) // implicit ELSE NULL → treat as empty string
+    } else {
+        parse_case_when_value(root, (*case_expr).defresult as *const pg_sys::Node)?
+    };
+
+    Some(CaseWhenSpec { clauses, default })
+    }
+}
+
+/// Parse conditions from a CASE WHEN clause's expr node.
+/// Supports: single OpExpr(col op const) or BoolExpr(AND, [OpExpr, ...])
+unsafe fn parse_case_when_conditions(
+    root: *mut pg_sys::PlannerInfo,
+    expr: *const pg_sys::Node,
+) -> Option<Vec<super::exec::CaseWhenCondition>> {
+    unsafe {
+    if expr.is_null() {
+        return None;
+    }
+
+    if (*expr).type_ == pg_sys::NodeTag::T_BoolExpr {
+        let bool_expr = expr as *const pg_sys::BoolExpr;
+        if (*bool_expr).boolop != pg_sys::BoolExprType::AND_EXPR {
+            return None; // Only AND is supported
+        }
+        let args = (*bool_expr).args;
+        if args.is_null() || (*args).length == 0 {
+            return None;
+        }
+        let mut conditions = Vec::new();
+        for i in 0..(*args).length {
+            let arg = (*(*args).elements.add(i as usize)).ptr_value as *const pg_sys::Node;
+            let cond = parse_single_condition(root, arg)?;
+            conditions.push(cond);
+        }
+        Some(conditions)
+    } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr {
+        let cond = parse_single_condition(root, expr)?;
+        Some(vec![cond])
+    } else {
+        None
+    }
+    }
+}
+
+/// Parse a single OpExpr condition: col = const or col <> const (integer).
+unsafe fn parse_single_condition(
+    _root: *mut pg_sys::PlannerInfo,
+    expr: *const pg_sys::Node,
+) -> Option<super::exec::CaseWhenCondition> {
+    unsafe {
+    use super::exec::{CaseWhenCondition, CaseWhenOp};
+
+    if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_OpExpr {
+        return None;
+    }
+    let opexpr = expr as *const pg_sys::OpExpr;
+    let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+    if opname_ptr.is_null() {
+        return None;
+    }
+    let opname = std::ffi::CStr::from_ptr(opname_ptr).to_str().unwrap_or("");
+    let op = match opname {
+        "=" => CaseWhenOp::Eq,
+        "<>" => CaseWhenOp::NotEq,
+        _ => return None,
+    };
+
+    let args = (*opexpr).args;
+    if args.is_null() || (*args).length != 2 {
+        return None;
+    }
+    let left = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+    let right = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+    if left.is_null() || right.is_null() {
+        return None;
+    }
+
+    // Extract (Var, Const)
+    let left = unwrap_relabel_node(left);
+    let right = unwrap_relabel_node(right);
+    let (var_ptr, const_ptr) = if (*left).type_ == pg_sys::NodeTag::T_Var
+        && (*right).type_ == pg_sys::NodeTag::T_Const
+    {
+        (left as *const pg_sys::Var, right as *const pg_sys::Const)
+    } else if (*left).type_ == pg_sys::NodeTag::T_Const
+        && (*right).type_ == pg_sys::NodeTag::T_Var
+    {
+        (right as *const pg_sys::Var, left as *const pg_sys::Const)
+    } else {
+        return None;
+    };
+
+    if (*const_ptr).constisnull {
+        return None;
+    }
+
+    // Extract integer constant value
+    let const_type = (*const_ptr).consttype;
+    let const_val: i64 = match const_type {
+        pg_sys::INT2OID => (*const_ptr).constvalue.value() as i16 as i64,
+        pg_sys::INT4OID => (*const_ptr).constvalue.value() as i32 as i64,
+        pg_sys::INT8OID => (*const_ptr).constvalue.value() as i64,
+        _ => return None, // Only integer constants supported
+    };
+
+    let col_idx = (*var_ptr).varattno as i32 - 1;
+    if col_idx < 0 {
+        return None;
+    }
+
+    Some(CaseWhenCondition { col_idx: col_idx as usize, op, const_val })
+    }
+}
+
+/// Parse a CASE WHEN result value: T_Var (column ref) or T_Const (string constant).
+unsafe fn parse_case_when_value(
+    root: *mut pg_sys::PlannerInfo,
+    expr: *const pg_sys::Node,
+) -> Option<super::exec::CaseWhenValue> {
+    unsafe {
+    use super::exec::CaseWhenValue;
+
+    if expr.is_null() {
+        return Some(CaseWhenValue::StringConst(String::new()));
+    }
+
+    let expr = unwrap_relabel_node(expr);
+
+    if (*expr).type_ == pg_sys::NodeTag::T_Var {
+        let var_node = expr as *const pg_sys::Var;
+        let col_idx = (*var_node).varattno as i32 - 1;
+        if col_idx < 0 {
+            return None;
+        }
+        // Verify the column is a text type
+        let varno = (*var_node).varno as usize;
+        if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
+            return None;
+        }
+        let rte = *(*root).simple_rte_array.add(varno);
+        if rte.is_null() {
+            return None;
+        }
+        let mut type_oid = pg_sys::InvalidOid;
+        let mut typmod: i32 = -1;
+        let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+        pg_sys::get_atttypetypmodcoll((*rte).relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
+        if type_oid != pg_sys::TEXTOID && type_oid != pg_sys::VARCHAROID && type_oid != pg_sys::BPCHAROID {
+            return None; // Only text column refs supported
+        }
+        Some(CaseWhenValue::ColumnRef(col_idx as usize))
+    } else if (*expr).type_ == pg_sys::NodeTag::T_Const {
+        let const_node = expr as *const pg_sys::Const;
+        if (*const_node).constisnull {
+            return Some(CaseWhenValue::StringConst(String::new()));
+        }
+        let const_type = (*const_node).consttype;
+        if const_type != pg_sys::TEXTOID && const_type != pg_sys::VARCHAROID && const_type != pg_sys::BPCHAROID {
+            return None; // Only string constants supported
+        }
+        let cstr = pg_sys::text_to_cstring((*const_node).constvalue.cast_mut_ptr());
+        let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+        pg_sys::pfree(cstr as *mut _);
+        Some(CaseWhenValue::StringConst(s))
+    } else {
+        None // Unsupported value type
+    }
+    }
+}
+
 /// The create_upper_paths hook. Detects aggregate patterns over deltax
 /// scans and injects optimized custom paths:
 /// - COUNT(*) alone → DeltaXCount (sum of segment row_counts, metadata-only)
@@ -576,6 +803,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         let mut non_agg_vars: Vec<*const pg_sys::Var> = Vec::new();
         let mut non_agg_func_exprs: Vec<(i32, *const pg_sys::FuncExpr)> = Vec::new(); // (tlist_index, FuncExpr)
         let mut non_agg_op_exprs: Vec<(i32, *const pg_sys::OpExpr)> = Vec::new(); // (tlist_index, OpExpr)
+        let mut non_agg_case_exprs: Vec<(i32, *const pg_sys::CaseExpr)> = Vec::new(); // (tlist_index, CaseExpr)
         let mut const_exprs: Vec<(i32, *const pg_sys::Const)> = Vec::new(); // (tlist_index, Const)
 
         for i in 0..nentries {
@@ -602,6 +830,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr && has_group_by {
                 // Non-aggregate OpExpr in target list (e.g. col - 1) — must match a GROUP BY expression
                 non_agg_op_exprs.push((i, expr as *const pg_sys::OpExpr));
+            } else if (*expr).type_ == pg_sys::NodeTag::T_CaseExpr && has_group_by {
+                // CASE WHEN in target list — must match a GROUP BY expression
+                non_agg_case_exprs.push((i, expr as *const pg_sys::CaseExpr));
             } else if (*expr).type_ == pg_sys::NodeTag::T_Const && has_group_by {
                 // Constant in target list (e.g. SELECT 1, ...) — pass through as-is
                 const_exprs.push((i, expr as *const pg_sys::Const));
@@ -1478,11 +1709,35 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         type_oid,
                         expr: GroupByExpr::AddConst { offset, op_oid },
                     });
+                } else if (*expr).type_ == pg_sys::NodeTag::T_CaseExpr {
+                    // CASE WHEN ... THEN ... ELSE ... END in GROUP BY
+                    match parse_case_expr(root, expr as *const pg_sys::CaseExpr) {
+                        Some(spec) => {
+                            group_specs.push(super::exec::GroupByColSpec {
+                                col_idx: -1, // CaseWhen references multiple columns
+                                type_oid: pg_sys::TEXTOID,
+                                expr: GroupByExpr::CaseWhen(spec),
+                            });
+                        }
+                        None => return, // Unsupported CASE WHEN pattern
+                    }
                 } else {
                     return; // Unsupported GROUP BY expression type
                 }
             }
 
+            // Validate that each non_agg_case_exprs entry matches a GROUP BY CaseWhen spec.
+            // CaseExpr in target list must match a GROUP BY CaseExpr exactly (by PG equal()).
+            // We find the matching group spec by checking that it's a CaseWhen variant.
+            for &(_tlist_idx, _case_expr) in &non_agg_case_exprs {
+                // The CaseExpr in the target list must correspond to a GROUP BY CaseWhen spec.
+                // PG guarantees this when groupClause references the target entry.
+                // If we have non_agg_case_exprs but no CaseWhen group specs, bail.
+                let matched = group_specs.iter().any(|gs| matches!(gs.expr, GroupByExpr::CaseWhen(_)));
+                if !matched {
+                    return;
+                }
+            }
 
             // Validate that each non_agg_func_exprs entry matches a GROUP BY spec.
             // Var position varies: regexp_replace(Var, ...) vs date_trunc(Const, Var).
@@ -1823,7 +2078,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                                     };
                                     product *= card;
                                 }
-                                GroupByExpr::DateTrunc { .. } | GroupByExpr::RegexpReplace { .. } => {
+                                GroupByExpr::DateTrunc { .. } | GroupByExpr::RegexpReplace { .. } | GroupByExpr::CaseWhen(_) => {
                                     // Can't easily estimate, skip ndistinct estimate
                                     all_found = false;
                                     break;
