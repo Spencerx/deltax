@@ -55,7 +55,15 @@ pub(crate) unsafe extern "C-unwind" fn create_count_scan_state(
     }
 }
 
-/// BeginCustomScan callback for DeltaXCount: load segment metadata and sum row counts.
+/// BeginCustomScan callback for DeltaXCount: sum total row count across partitions.
+///
+/// Fast path: read per-partition `row_count` from `deltax_partition` catalog
+/// (cached thread-locally in `cost::get_row_count`). Since compressed partitions
+/// are read-only, the catalog value is exact. Segment count for EXPLAIN is
+/// approximated via `pg_class.reltuples` on the meta relation (one row per segment).
+///
+/// Fallback: if any companion is missing from the catalog (invariant violation
+/// or racing partition creation), fall back to the full meta-scan path.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -84,61 +92,92 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             pgrx::error!("pg_deltax: DeltaXCount has no companion tables");
         }
 
-        // Get first companion table name for metadata
-        let first_name = {
-            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
-            if name_ptr.is_null() {
-                pgrx::error!(
-                    "pg_deltax: companion table not found for OID {}",
-                    u32::from(companion_oids[0])
-                );
-            }
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        // Load metadata via SPI from first companion table
+        // Fast path: read row counts from deltax_partition catalog.
         let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(client, &first_name));
-        let metadata_us = t0.elapsed().as_micros() as u64;
-
-        // Build needed_cols as all-false (no columns needed for COUNT(*))
-        let num_cols = meta.col_names.len();
-        let needed_cols = vec![false; num_cols];
-
-        // Load segments from all companion tables and sum row counts
-        let t1 = Instant::now();
-        let mut total_count: i64 = 0;
-        let mut total_segments: u64 = 0;
+        let mut catalog_total: i64 = 0;
+        let mut catalog_hit = true;
         for &oid in &companion_oids {
-            let (segs, _, _, _, _) = load_segments_heap(
-                oid,
-                &meta.col_names,
-                &meta.segment_by,
-                &needed_cols,
-                &meta.time_column,
-                false,
-                &[],
-                None,
-                None,
-                None,
-                &[],
-                false,
-            );
-            for seg in &segs {
-                total_count += seg.row_count as i64;
+            match super::super::cost::get_row_count(oid) {
+                Some(rc) => catalog_total += rc,
+                None => {
+                    catalog_hit = false;
+                    break;
+                }
             }
-            total_segments += segs.len() as u64;
         }
-        let heap_scan_us = t1.elapsed().as_micros() as u64;
 
-        let state = CountScanState {
-            total_count,
-            returned: false,
-            metadata_us,
-            heap_scan_us,
-            total_segments,
+        let state = if catalog_hit {
+            // Approximate segment count from pg_class.reltuples (one row per segment).
+            let mut total_segments: u64 = 0;
+            for &oid in &companion_oids {
+                let rt = super::super::cost::get_reltuples(oid);
+                if rt > 0.0 {
+                    total_segments += rt as u64;
+                }
+            }
+            let metadata_us = t0.elapsed().as_micros() as u64;
+
+            CountScanState {
+                total_count: catalog_total,
+                returned: false,
+                metadata_us,
+                heap_scan_us: 0,
+                total_segments,
+            }
+        } else {
+            // Fallback path: scan meta tables to sum per-segment row counts.
+            let first_name = {
+                let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+                if name_ptr.is_null() {
+                    pgrx::error!(
+                        "pg_deltax: companion table not found for OID {}",
+                        u32::from(companion_oids[0])
+                    );
+                }
+                std::ffi::CStr::from_ptr(name_ptr)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            let t_meta = Instant::now();
+            let meta = Spi::connect(|client| load_metadata(client, &first_name));
+            let metadata_us = t_meta.elapsed().as_micros() as u64;
+
+            let num_cols = meta.col_names.len();
+            let needed_cols = vec![false; num_cols];
+
+            let t1 = Instant::now();
+            let mut total_count: i64 = 0;
+            let mut total_segments: u64 = 0;
+            for &oid in &companion_oids {
+                let (segs, _, _, _, _) = load_segments_heap(
+                    oid,
+                    &meta.col_names,
+                    &meta.segment_by,
+                    &needed_cols,
+                    &meta.time_column,
+                    false,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                );
+                for seg in &segs {
+                    total_count += seg.row_count as i64;
+                }
+                total_segments += segs.len() as u64;
+            }
+            let heap_scan_us = t1.elapsed().as_micros() as u64;
+
+            CountScanState {
+                total_count,
+                returned: false,
+                metadata_us,
+                heap_scan_us,
+                total_segments,
+            }
         };
 
         let state_box = Box::new(state);
