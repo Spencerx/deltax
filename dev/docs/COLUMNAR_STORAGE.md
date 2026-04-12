@@ -2,11 +2,12 @@
 
 ## Overview
 
-DeltaX splits each compressed partition into three tables:
+DeltaX splits each compressed partition into four tables:
 
-1. **Meta table** — scalar per-segment metadata (no BYTEA, no TOAST)
-2. **Blob table** — compressed column data, inserted in column-major order for sequential I/O
-3. **Blooms table** — per-segment packed bloom filters for equality predicate pushdown
+1. **Meta table** — thin per-segment metadata: segment-by values, time bounds, row count (no BYTEA, no TOAST)
+2. **Colstats table** — normalized per-column statistics (min/max/sum/counts), one row per (column, segment)
+3. **Blob table** — compressed column data, inserted in column-major order for sequential I/O
+4. **Blooms table** — per-segment packed bloom filters for equality predicate pushdown
 
 This layout replaces the original single companion table design where all
 compressed column blobs were stored as BYTEA columns in one row per segment.
@@ -44,41 +45,80 @@ via `segment_size` parameter).
 
 ### 1. Segment Metadata Table (`<partition>_meta`)
 
-Stores all scalar per-segment metadata. No BYTEA columns, so scanning it
-involves zero TOAST I/O.
+Thin per-segment metadata. Contains only segment-by values, time column bounds,
+and row count. No BYTEA columns, no per-column statistics — so scanning it is
+extremely fast regardless of how many columns the table has.
 
 ```sql
 CREATE TABLE "_deltax_compressed"."<partition>_meta" (
-    _segment_id   SERIAL PRIMARY KEY,
+    _segment_id        SERIAL PRIMARY KEY,
 
     -- Segment-by columns (original types)
-    "<seg_by_col>" <type>,
+    "<seg_by_col>"     <type>,
+
+    -- Time column bounds
+    _min_<time_col>    TIMESTAMPTZ,
+    _max_<time_col>    TIMESTAMPTZ,
 
     -- Per-segment row count
-    _row_count    INT,
-
-    -- Time bounds
-    _min_<time_col> TIMESTAMPTZ,
-    _max_<time_col> TIMESTAMPTZ,
-
-    -- Per-column min/max (orderable types only)
-    _min_<col>    <type>,
-    _max_<col>    <type>,
-
-    -- Per-column sum + nonnull count (numeric types only)
-    _sum_<col>    DOUBLE PRECISION,
-    _nonnull_count_<col> INT,
-
-    -- Per-column cardinality estimate
-    _ndistinct_<col> INT
+    _row_count         INT
 );
 ```
 
-For ClickBench (105 columns): each row is ~2 KB (all small scalars). With
-~667 segments per partition, the entire metadata table fits in ~1.3 MB. A full
-sequential scan takes <1 ms even on cold storage.
+For ClickBench (105 columns, ~667 segments per partition): the meta table has
+only 4 columns per row, fits in ~31 pages total across 10 partitions, and
+scans in <1 ms.
 
-### 2. Column Blob Table (`<partition>_blobs`)
+### 2. Column Statistics Table (`<partition>_colstats`)
+
+Normalized per-column statistics with a fixed 8-column schema. One row per
+(column, segment) pair — the same layout as the blob table. This replaces
+the original wide meta table design where all per-column stats were stored
+as columns in the meta table (see Appendix for the motivation).
+
+```sql
+CREATE TABLE "_deltax_compressed"."<partition>_colstats" (
+    _col_idx           SMALLINT NOT NULL,
+    _segment_id        INT NOT NULL,
+    _min               INT8,          -- order-preserving encoded min
+    _max               INT8,          -- order-preserving encoded max
+    _sum               NUMERIC,       -- exact sum (avoids i128 overflow)
+    _nonnull_count     INT,
+    _nonzero_count     INT,
+    _ndistinct         INT,
+    PRIMARY KEY (_col_idx, _segment_id)
+);
+```
+
+**Key design decisions:**
+
+- **Fixed narrow schema**: 8 columns regardless of how many columns the
+  original table has. `heap_deform_tuple` cost is negligible.
+- **INT8 min/max with order-preserving encoding**: All orderable types
+  (integers, floats, timestamps, dates) are encoded to i64 values that
+  preserve comparison order. This allows segment pruning to compare encoded
+  values directly without type dispatch. Float encoding uses the standard
+  sign-bit flip technique; timestamps/dates convert from PG-epoch to
+  Unix-epoch microseconds.
+- **NUMERIC sum**: Avoids precision loss for large integer sums (i128 range)
+  while keeping the row narrow.
+- **Column-major insertion order**: Rows are inserted sorted by
+  `(_col_idx, _segment_id)` — the same pattern as the blob table. This
+  ensures rows for a single column are physically contiguous on the heap,
+  enabling fast PK index scans that read sequential pages.
+- **PK `(_col_idx, _segment_id)`**: Enables efficient lookups for a single
+  column's stats across all segments.
+
+**Adaptive scan strategy**: The read path chooses between PK index scan
+(for queries touching few columns) and sequential scan (for queries touching
+many columns). The threshold is: use index scan if `needed_cols < total_cols / 2`
+or `needed_cols <= 4`.
+
+For ClickBench: each `_col_idx` occupies ~6-8 contiguous heap pages per
+partition. A single-column PK index scan reads ~8 pages instead of scanning
+all ~630 pages.
+
+### 3. Column Blob Table (`<partition>_blobs`)
 
 Stores compressed column data. One row per (column, segment) pair.
 
@@ -97,12 +137,20 @@ chunks in insertion order, this naturally produces a columnar physical layout
 with no post-processing:
 
 ```
-Metadata table (no TOAST, ~1.3 MB):
+Meta table (no TOAST, ~31 pages for 10 partitions):
 ┌──────────────────────────────────────────────────────┐
-│ seg 1: seg_by | _row_count | _min/max_time | min/max │
+│ seg 1: seg_by | _min/max_time | _row_count           │
 │ seg 2: ...                                           │
 │ ...                                                  │
 │ seg 667: ...                                         │
+└──────────────────────────────────────────────────────┘
+
+Colstats table (column-major insertion → contiguous per col_idx):
+┌──────────────────────────────────────────────────────┐
+│ (col=0, seg=1) | (col=0, seg=2) | ... | (col=0,667) │  ← col 0 stats
+│ (col=1, seg=1) | (col=1, seg=2) | ... | (col=1,667) │    contiguous
+│ ...                                                  │
+│ (col=104, seg=1) | ... | (col=104, seg=667)          │
 └──────────────────────────────────────────────────────┘
 
 Blob table (column-major insertion → columnar TOAST):
@@ -128,7 +176,7 @@ Reading one column = sequential I/O on a contiguous ~1/105th slice of the
 TOAST table. The kernel's readahead (128 KB default on Linux) prefetches
 upcoming chunks automatically.
 
-### 3. Bloom Filter Table (`<partition>_blooms`)
+### 4. Bloom Filter Table (`<partition>_blooms`)
 
 Stores per-segment packed bloom filters for equality predicate pushdown.
 Kept in a separate table (rather than inline in meta) to avoid adding TOAST
@@ -163,19 +211,37 @@ blooms table doesn't exist, the bloom phase is skipped.
 
 ## Read Path
 
-The read path is a three-phase process in `load_segments_heap`:
+The read path is a four-phase process in `load_segments_heap`:
 
-### Phase 1: Metadata Scan (zero TOAST I/O)
+### Phase 1: Meta Scan (zero TOAST I/O)
 
-Scan the meta table with `heap_getnext()`. Apply pruning:
+Scan the thin meta table with `heap_getnext()`. Apply pruning:
 
 1. **Segment-by filters**: skip segments with non-matching segment_by values
-2. **Time range filters**: skip segments outside query time range
-3. **MinMax filters**: skip segments where min/max metadata proves no rows
-   can match
+2. **Time range filters**: skip segments outside query time range using
+   `_min_<time>` / `_max_<time>`
 
-Collect surviving `_segment_id` values into an array. This phase involves
-zero TOAST I/O — the metadata table has no BYTEA columns.
+Collect surviving segments into an array. This phase involves zero TOAST I/O
+and reads only ~31 pages across 10 partitions.
+
+### Phase 1b: Colstats Scan (targeted column stats)
+
+Only runs when the query needs per-column statistics not available in the meta
+table (minmax for non-time columns, sum/count data, nonzero counts for WHERE
+filters). Callers specify exactly which columns they need via
+`needed_minmax_cols` and `needed_stats_cols` parameters.
+
+1. **PK index scan** (few columns needed): one index scan per needed `_col_idx`,
+   reading only the contiguous pages for that column
+2. **Sequential scan** (many columns needed): single pass over all colstats rows,
+   filtering by `_col_idx`
+
+For each surviving segment, populate `col_minmax` (for minmax pruning and
+MIN/MAX pushdown) and `col_sums` (for SUM/AVG/COUNT pushdown and WHERE filter
+evaluation via nonzero_count).
+
+Additional minmax pruning is applied here: segments where min/max values
+prove no rows can match the batch quals are pruned.
 
 ### Bloom Phase: Equality Predicate Pushdown
 
@@ -229,36 +295,43 @@ blob table, compressed blobs are buffered in memory and flushed after all
 segments are processed.
 
 ```
-Phase 1: Compress all segments, buffer blobs and blooms
+Phase 1: Compress all segments, buffer blobs, colstats, and blooms
 
 for each batch of 30,000 rows:
     compress all columns → 105 blobs
+    compute per-column stats (encoded min/max, sum, counts, ndistinct)
     compute bloom filters for numeric/date/timestamp columns
-    INSERT metadata into meta table immediately (returns _segment_id)
+    INSERT meta row immediately (segment_by, time bounds, row_count)
+    buffer colstats rows in memory (keyed by col_idx, segment_id)
     buffer compressed blobs in memory (keyed by col_idx, segment_id)
     buffer packed bloom data in memory (keyed by segment_id)
 
-Phase 2: Flush blobs in column-major order
+Phase 2: Flush colstats in column-major order
+
+sort colstats_buffer by (col_idx, segment_id)
+batch INSERT INTO colstats (100 rows per INSERT)
+
+Phase 3: Flush blobs in column-major order
 
 sort blob_buffer by (col_idx, segment_id)
 for each (col_idx, segment_id, blob) in blob_buffer:
     INSERT INTO blobs (_col_idx, _segment_id, _data)
 
-Phase 3: Flush bloom filters
+Phase 4: Flush bloom filters
 
 for each (segment_id, bloom_data) in bloom_buffer:
     INSERT INTO blooms (_segment_id, _data)
 
-ANALYZE meta, blobs, blooms
+ANALYZE meta, colstats, blobs, blooms
 ```
 
 ### Memory Impact
 
-Buffering requires holding all compressed blobs for one partition in memory.
-For ClickBench (105 columns, ~667 segments per partition), the total
-compressed data is ~2.8 GB per partition. This is the worst case — a typical
-time-series table with 10-20 narrower columns and smaller partitions would
-buffer tens of MB.
+Buffering requires holding all compressed blobs and colstats rows for one
+partition in memory. For ClickBench (105 columns, ~667 segments per partition),
+the compressed blobs total ~2.8 GB per partition. Colstats rows add negligible
+overhead (~50 bytes × 105 × 667 ≈ 3.5 MB). A typical time-series table with
+10-20 narrower columns and smaller partitions would buffer tens of MB.
 
 This is acceptable because:
 - Compression is a batch operation (not latency-sensitive)
@@ -270,11 +343,21 @@ This is acceptable because:
 
 ### During Decompression
 
-`deltax_decompress_partition` reads from all three tables (meta for segment
-metadata, blobs for column data) and drops all three tables after restoring
-data to the original partition.
+`deltax_decompress_partition` reads from the meta and blob tables (meta for
+segment metadata, blobs for column data) and drops all four companion tables
+after restoring data to the original partition.
 
 ## Alternatives Considered
+
+### Wide meta table (all stats in one row per segment)
+The original design stored all per-column statistics (min, max, sum,
+nonnull_count, nonzero_count, ndistinct) as columns in the meta table — roughly
+5 columns per data column. For ClickBench with 105 columns, this meant ~500+
+columns per meta row. `heap_deform_tuple` on these wide rows cost 50-70ms
+across 3338 segments, even when only one column's stats were needed. The
+normalized colstats table has a fixed 8-column schema, eliminating this cost.
+The column-major insertion order ensures that queries needing only a few
+columns' stats read contiguous pages via PK index scan.
 
 ### CLUSTER after segment-major insertion
 Instead of buffering blobs for column-major insertion, insert in segment
