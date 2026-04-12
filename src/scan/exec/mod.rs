@@ -1,6 +1,6 @@
 mod batch_qual;
 pub(in crate::scan) mod datum_utils;
-mod segments;
+pub(in crate::scan) mod segments;
 mod count_minmax;
 mod agg;
 mod decompress;

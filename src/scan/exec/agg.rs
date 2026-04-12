@@ -1145,24 +1145,34 @@ fn accumulate_segment_metadata(
                     };
                     match &mut accumulators[i] {
                         AggAccumulator::SumInt { sum, count } => {
-                            let s = unsafe {
-                                let cstr = pg_sys::OidOutputFunctionCall(
-                                    pg_sys::Oid::from(1702u32), // numeric_out
-                                    cs.sum_datum,
-                                );
-                                let s = std::ffi::CStr::from_ptr(cstr)
-                                    .to_string_lossy()
-                                    .into_owned();
-                                pg_sys::pfree(cstr as *mut _);
-                                s
+                            let v = if let Some(v) = cs.sum_i128 {
+                                v
+                            } else {
+                                let s = unsafe {
+                                    let cstr = pg_sys::OidOutputFunctionCall(
+                                        pg_sys::Oid::from(1702u32), // numeric_out
+                                        cs.sum_datum,
+                                    );
+                                    let s = std::ffi::CStr::from_ptr(cstr)
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    pg_sys::pfree(cstr as *mut _);
+                                    s
+                                };
+                                match s.parse::<i128>() {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                }
                             };
-                            if let Ok(v) = s.parse::<i128>() {
-                                *sum += v + add_const as i128 * cs.nonnull_count as i128;
-                                *count += cs.nonnull_count;
-                            }
+                            *sum += v + add_const as i128 * cs.nonnull_count as i128;
+                            *count += cs.nonnull_count;
                         }
                         AggAccumulator::SumFloat { sum, count } => {
-                            let f = if cs.type_oid == pg_sys::NUMERICOID {
+                            let f = if let Some(v) = cs.sum_i128 {
+                                v as f64
+                            } else if let Some(v) = cs.sum_f64 {
+                                v
+                            } else if cs.type_oid == pg_sys::NUMERICOID {
                                 // Normalized colstats stores all sums as NUMERIC
                                 let s = unsafe {
                                     let cstr = pg_sys::OidOutputFunctionCall(
@@ -8954,6 +8964,8 @@ mod tests {
         seg1.col_sums.insert("value".to_string(), ColSum {
             sum_datum: pg_sys::Datum::from(0usize),
             sum_null: true,
+            sum_i128: None,
+            sum_f64: None,
             nonnull_count: 900,
             nonzero_count: -1,
             type_oid: pg_sys::Oid::from(1700u32),
@@ -8962,6 +8974,8 @@ mod tests {
         seg2.col_sums.insert("value".to_string(), ColSum {
             sum_datum: pg_sys::Datum::from(0usize),
             sum_null: true,
+            sum_i128: None,
+            sum_f64: None,
             nonnull_count: 450,
             nonzero_count: -1,
             type_oid: pg_sys::Oid::from(1700u32),
@@ -8983,6 +8997,8 @@ mod tests {
         seg.col_sums.insert("value".to_string(), ColSum {
             sum_datum: pg_sys::Datum::from(sum_val.to_bits() as usize),
             sum_null: false,
+            sum_i128: None,
+            sum_f64: None,
             nonnull_count: 100,
             nonzero_count: -1,
             type_oid: pg_sys::Oid::from(701u32),
@@ -9017,6 +9033,8 @@ mod tests {
         seg.col_sums.insert("value".to_string(), ColSum {
             sum_datum: numeric_datum,
             sum_null: false,
+            sum_i128: None,
+            sum_f64: None,
             nonnull_count: 100,
             nonzero_count: -1,
             type_oid: pg_sys::Oid::from(1700u32),
@@ -9046,6 +9064,8 @@ mod tests {
         seg.col_sums.insert("value".to_string(), ColSum {
             sum_datum: pg_sys::Datum::from(base_sum.to_bits() as usize),
             sum_null: false,
+            sum_i128: None,
+            sum_f64: None,
             nonnull_count: 50,
             nonzero_count: -1,
             type_oid: pg_sys::Oid::from(701u32),

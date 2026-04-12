@@ -1,11 +1,41 @@
 use pgrx::pg_sys;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::compression;
 use crate::compress::{encode_f64_to_i64, encode_f32_to_i64};
 use super::batch_qual::{BatchQual, BatchCompareOp, LikeStrategy, sql_like_match};
 use super::datum_utils::{pg_type_oid, tupdesc_get_attr};
+
+/// Cached colstats row for a single segment: min/max/sum/counts.
+struct CachedColStatsRow {
+    min_encoded: i64,
+    max_encoded: i64,
+    min_null: bool,
+    max_null: bool,
+    sum_i128: Option<i128>,  // Integer sums (e.g. "42000" parses to i128)
+    sum_f64: Option<f64>,    // Float sums (e.g. "123.5" parses to f64 but not i128)
+    sum_null: bool,
+    nonnull_count: i64,
+    nonzero_count: i64,
+}
+
+/// Cached colstats for a (colstats_oid, col_idx) pair: segment_id → row data.
+struct CachedColStats {
+    rows: HashMap<i32, CachedColStatsRow>,
+}
+
+thread_local! {
+    /// Cache: (colstats_oid, col_idx) → CachedColStats.
+    /// Invalidated via invalidate_colstats_cache() on compress/decompress.
+    static COLSTATS_CACHE: RefCell<HashMap<(pg_sys::Oid, i16), CachedColStats>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(in crate::scan) fn invalidate_colstats_cache() {
+    COLSTATS_CACHE.with(|c| c.borrow_mut().clear());
+}
 
 
 /// Which dict check to perform in `segment_skippable_by_dict`.
@@ -231,6 +261,8 @@ pub(super) struct ColMinMax {
 pub(super) struct ColSum {
     pub(super) sum_datum: pg_sys::Datum,
     pub(super) sum_null: bool,
+    pub(super) sum_i128: Option<i128>,  // Cached/pre-converted integer sum
+    pub(super) sum_f64: Option<f64>,    // Cached/pre-converted float sum (when i128 parse fails)
     pub(super) nonnull_count: i64,
     pub(super) nonzero_count: i64,  // -1 = unavailable (column missing in older meta tables)
     pub(super) type_oid: pg_sys::Oid,  // NUMERICOID or FLOAT8OID
@@ -885,6 +917,8 @@ pub(super) unsafe fn load_segments_heap(
                 col_sums.insert(col_name.clone(), ColSum {
                     sum_datum,
                     sum_null,
+                    sum_i128: None,
+                    sum_f64: None,
                     nonnull_count,
                     nonzero_count,
                     type_oid: *type_oid,
@@ -1042,6 +1076,99 @@ pub(super) unsafe fn load_segments_heap(
                     }
                 }
 
+                let mut cs_pruned_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+                // Check colstats cache — populate segments from cached data and
+                // remove fully-cached col_idxs so we skip scanning them.
+                COLSTATS_CACHE.with(|cache| {
+                    let cache = cache.borrow();
+                    let mut cached_idxs: Vec<i16> = Vec::new();
+                    for &ci in &needed_col_idxs {
+                        if let Some(cached) = cache.get(&(colstats_oid, ci)) {
+                            let (ref col_name, orig_type_oid) = idx_to_col[ci as usize];
+                            let mut all_found = true;
+                            for (&sid, &seg_idx) in &seg_id_to_idx {
+                                if let Some(row) = cached.rows.get(&sid) {
+                                    // Apply minmax filters from cache
+                                    if !cs_minmax_filters.is_empty() && !cs_pruned_ids.contains(&sid) {
+                                        let mut skip = false;
+                                        for f in &cs_minmax_filters {
+                                            if f.col_idx == ci && !row.min_null && !row.max_null
+                                                && !segment_passes_minmax_filter(f, row.min_encoded, row.max_encoded)
+                                            {
+                                                skip = true;
+                                                break;
+                                            }
+                                        }
+                                        if skip {
+                                            cs_pruned_ids.insert(sid);
+                                            segments_minmax_skipped += 1;
+                                            continue;
+                                        }
+                                    }
+                                    if load_minmax {
+                                        segments[seg_idx].col_minmax.insert(col_name.clone(), ColMinMax {
+                                            min_encoded: row.min_encoded,
+                                            max_encoded: row.max_encoded,
+                                            min_null: row.min_null,
+                                            max_null: row.max_null,
+                                            type_oid: orig_type_oid,
+                                        });
+                                    }
+                                    if load_sums {
+                                        segments[seg_idx].col_sums.insert(col_name.clone(), ColSum {
+                                            sum_datum: pg_sys::Datum::from(0usize),
+                                            sum_null: row.sum_null,
+                                            sum_i128: row.sum_i128,
+                                            sum_f64: row.sum_f64,
+                                            nonnull_count: row.nonnull_count,
+                                            nonzero_count: row.nonzero_count,
+                                            type_oid: pg_sys::NUMERICOID,
+                                        });
+                                    }
+                                } else {
+                                    all_found = false;
+                                }
+                            }
+                            if all_found {
+                                cached_idxs.push(ci);
+                            }
+                        }
+                    }
+                    for ci in cached_idxs {
+                        needed_col_idxs.remove(&ci);
+                    }
+                });
+
+                // If all needed col_idxs were served from cache, skip opening colstats table
+                COLSTATS_CACHE.with(|cache| {
+                    let cache = cache.borrow();
+                    let cache_size = cache.len();
+                    let has_oid = cache.keys().any(|&(oid, _)| oid == colstats_oid);
+                    pgrx::log!(
+                        "colstats_cache: oid={:?} remaining_uncached={} cache_entries={} has_oid={}",
+                        colstats_oid,
+                        needed_col_idxs.len(),
+                        cache_size,
+                        has_oid,
+                    );
+                });
+                if needed_col_idxs.is_empty() {
+                    // Remove colstats-pruned segments
+                    if !cs_pruned_ids.is_empty() {
+                        let mut i = 0;
+                        while i < segments.len() {
+                            if cs_pruned_ids.contains(&surviving_segment_ids[i]) {
+                                segments.swap_remove(i);
+                                surviving_segment_ids.swap_remove(i);
+                                segments_skipped += 1;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                } else {
+
                 // Open normalized colstats table and locate fixed columns
                 let cs_rel = pg_sys::table_open(colstats_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
                 let cs_tupdesc = (*cs_rel).rd_att;
@@ -1071,8 +1198,6 @@ pub(super) unsafe fn load_segments_heap(
                         _ => {}
                     }
                 }
-
-                let mut cs_pruned_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
                 // Decide: index scan (few columns) vs seq scan (many columns).
                 // Index scan reads only needed col_idx rows via PK (_col_idx, _segment_id).
@@ -1106,6 +1231,10 @@ pub(super) unsafe fn load_segments_heap(
                     pg_sys::InvalidOid
                 };
 
+                // Accumulate raw colstats rows into a per-(col_idx, segment_id) map
+                // for cache population, independent of pruning decisions.
+                let mut cs_raw_rows: HashMap<(i16, i32), CachedColStatsRow> = HashMap::new();
+
                 // Helper closure: process one colstats row from slot values/nulls
                 macro_rules! process_colstats_row {
                     ($vals:expr, $nls:expr, $ci_att:expr, $sid_att:expr,
@@ -1115,7 +1244,6 @@ pub(super) unsafe fn load_segments_heap(
                             Some(&idx) => idx,
                             None => continue,
                         };
-                        if cs_pruned_ids.contains(&seg_id) { continue; }
 
                         let col_idx_val = if !$nls[$ci_att] { $vals[$ci_att].value() as i16 } else { continue; };
                         if col_idx_val < 0 || col_idx_val as usize >= idx_to_col.len() { continue; }
@@ -1125,6 +1253,44 @@ pub(super) unsafe fn load_segments_heap(
                         let max_null = $nls[$max_att];
                         let min_enc = if min_null { 0i64 } else { $vals[$min_att].value() as i64 };
                         let max_enc = if max_null { 0i64 } else { $vals[$max_att].value() as i64 };
+
+                        // Extract sum data for both segment population and cache
+                        let sum_null = $nls[$sum_att];
+                        let sum_datum = if sum_null { pg_sys::Datum::from(0usize) } else { $vals[$sum_att] };
+                        let nonnull_count = if $nls[$nn_att] { 0i64 } else { $vals[$nn_att].value() as i64 };
+                        let nonzero_count = if $nls[$nz_att] { -1i64 } else { $vals[$nz_att].value() as i64 };
+
+                        // Convert NUMERIC sum to i128/f64 at scan time for caching
+                        let (sum_i128, sum_f64): (Option<i128>, Option<f64>) = if sum_null {
+                            (None, None)
+                        } else {
+                            let cstr = pg_sys::OidOutputFunctionCall(
+                                pg_sys::Oid::from(1702u32), // numeric_out
+                                sum_datum,
+                            );
+                            let s = std::ffi::CStr::from_ptr(cstr)
+                                .to_string_lossy();
+                            let i = s.parse::<i128>().ok();
+                            let f = if i.is_none() { s.parse::<f64>().ok() } else { None };
+                            pg_sys::pfree(cstr as *mut _);
+                            (i, f)
+                        };
+
+                        // Store raw row for cache population (before pruning)
+                        cs_raw_rows.insert((col_idx_val, seg_id), CachedColStatsRow {
+                            min_encoded: min_enc,
+                            max_encoded: max_enc,
+                            min_null,
+                            max_null,
+                            sum_i128,
+                            sum_f64,
+                            sum_null,
+                            nonnull_count,
+                            nonzero_count,
+                        });
+
+                        // Apply pruning
+                        if cs_pruned_ids.contains(&seg_id) { continue; }
 
                         if !cs_minmax_filters.is_empty() {
                             let mut skip = false;
@@ -1154,10 +1320,6 @@ pub(super) unsafe fn load_segments_heap(
                         }
 
                         if load_sums {
-                            let sum_null = $nls[$sum_att];
-                            let sum_datum = if sum_null { pg_sys::Datum::from(0usize) } else { $vals[$sum_att] };
-                            let nonnull_count = if $nls[$nn_att] { 0i64 } else { $vals[$nn_att].value() as i64 };
-                            let nonzero_count = if $nls[$nz_att] { -1i64 } else { $vals[$nz_att].value() as i64 };
                             let sum_type_oid = if !sum_null {
                                 let sum_attr = &*tupdesc_get_attr(cs_tupdesc, $sum_att);
                                 sum_attr.atttypid
@@ -1167,6 +1329,8 @@ pub(super) unsafe fn load_segments_heap(
                             segments[seg_idx].col_sums.insert(col_name.clone(), ColSum {
                                 sum_datum,
                                 sum_null,
+                                sum_i128,
+                                sum_f64,
                                 nonnull_count,
                                 nonzero_count,
                                 type_oid: sum_type_oid,
@@ -1261,6 +1425,18 @@ pub(super) unsafe fn load_segments_heap(
 
                 pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
+                // Populate colstats cache from the raw rows collected during scan.
+                // Uses cs_raw_rows which includes all segments (even pruned ones).
+                COLSTATS_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    for ((ci, sid), row) in cs_raw_rows.drain() {
+                        let entry = cache.entry((colstats_oid, ci)).or_insert_with(|| CachedColStats {
+                            rows: HashMap::new(),
+                        });
+                        entry.rows.insert(sid, row);
+                    }
+                });
+
                 // Remove colstats-pruned segments
                 if !cs_pruned_ids.is_empty() {
                     let mut i = 0;
@@ -1274,6 +1450,8 @@ pub(super) unsafe fn load_segments_heap(
                         }
                     }
                 }
+
+                } // end else (uncached col_idxs scan)
             }
         }
 

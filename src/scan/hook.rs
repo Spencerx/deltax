@@ -33,6 +33,7 @@ pub fn invalidate_compressed_cache() {
     TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().clear());
     SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().clear());
     cost::invalidate_caches();
+    super::exec::segments::invalidate_colstats_cache();
 }
 
 /// Set or clear the DML bypass flag for internal operations.
