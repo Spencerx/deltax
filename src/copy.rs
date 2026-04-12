@@ -1932,7 +1932,10 @@ fn flush_segment(
     buf.row_count = 0;
 }
 
-/// Flush buffered meta and colstats rows as multi-row INSERTs.
+/// Flush buffered meta rows as multi-row INSERTs.
+/// Note: colstats rows are NOT flushed here — they are accumulated until
+/// finalize time and flushed sorted by (_col_idx, _segment_id) for
+/// column-major heap layout.
 fn flush_meta_buffer(buf: &mut PartitionBuffer) {
     if !buf.meta_insert_rows.is_empty() {
         let meta_fqn = buf.meta_fqn.as_ref().expect("meta_fqn not set");
@@ -1946,16 +1949,40 @@ fn flush_meta_buffer(buf: &mut PartitionBuffer) {
         spi_exec(&insert_sql);
         buf.meta_insert_rows.clear();
     }
-    if !buf.colstats_insert_rows.is_empty() {
-        let colstats_fqn = buf.colstats_fqn.as_ref().expect("colstats_fqn not set");
+}
+
+/// Flush all buffered colstats rows sorted by (_col_idx, _segment_id) so that
+/// the heap is naturally clustered for index scans by _col_idx.
+fn flush_colstats_buffer(buf: &mut PartitionBuffer) {
+    if buf.colstats_insert_rows.is_empty() {
+        return;
+    }
+    let colstats_fqn = buf.colstats_fqn.as_ref().expect("colstats_fqn not set");
+
+    // Each row string is "(col_idx, segment_id, ...)". Sort by parsing the leading integers.
+    buf.colstats_insert_rows.sort_by(|a, b| {
+        fn parse_key(s: &str) -> (i16, i32) {
+            // Strip leading '(' and parse first two comma-separated integers
+            let inner = s.trim_start_matches('(');
+            let mut parts = inner.splitn(3, ',');
+            let col_idx: i16 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let seg_id: i32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            (col_idx, seg_id)
+        }
+        parse_key(a).cmp(&parse_key(b))
+    });
+
+    // Flush in batches
+    let batch_size = 100;
+    for chunk in buf.colstats_insert_rows.chunks(batch_size) {
         let insert_sql = format!(
             "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
             colstats_fqn,
-            buf.colstats_insert_rows.join(", ")
+            chunk.join(", ")
         );
         spi_exec(&insert_sql);
-        buf.colstats_insert_rows.clear();
     }
+    buf.colstats_insert_rows.clear();
 }
 
 /// Flush a partition's blob and bloom buffers to the companion tables.
@@ -2221,6 +2248,9 @@ fn finalize_partition(
             ddl.blooms_fqn
         ));
     }
+
+    // Flush colstats sorted by (_col_idx, _segment_id) for column-major heap layout
+    flush_colstats_buffer(buf);
 
     spi_exec(&format!("ANALYZE {}", ddl.meta_fqn));
     spi_exec(&format!("ANALYZE {}", ddl.colstats_fqn));

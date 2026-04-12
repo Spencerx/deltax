@@ -167,8 +167,9 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                     None,
                     None,
                     &[],
-                    false,
+                    &[],
                     &meta.col_types,
+                    &[],
                 );
                 for seg in &segs {
                     total_count += seg.row_count as i64;
@@ -397,8 +398,9 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 None,
                 None,
                 &[],
-                false,
+                &[],
                 &meta.col_types,
+                &agg_col_names,
             );
             for seg in &segs {
                 for (agg_idx, result) in results.iter_mut().enumerate() {

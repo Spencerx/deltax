@@ -1453,11 +1453,23 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             };
 
             let mut load_minmax = needs_minmax;
-            let mut load_sums = needs_sums || needs_counts;
             if !fast_batch_quals.is_empty() {
                 load_minmax = true;
-                load_sums = true;
             }
+
+            // Build list of columns needing stats (sum/nonnull/nonzero) from colstats
+            let mut needed_stats_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+            if needs_sums || needs_counts {
+                for s in &plan.agg_specs {
+                    if s.col_idx >= 0 && matches!(s.agg_type, AggType::Sum | AggType::Avg | AggType::Count) {
+                        needed_stats_set.insert(meta.col_names[s.col_idx as usize].clone());
+                    }
+                }
+            }
+            for bq in &fast_batch_quals {
+                needed_stats_set.insert(meta.col_names[bq.col_idx].clone());
+            }
+            let needed_stats_cols: Vec<String> = needed_stats_set.into_iter().collect();
 
             // Extract segment-by/time filters for pruning
             let (seg_filters, time_min, time_max) = if !plan.where_quals.is_null() {
@@ -1468,6 +1480,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 (vec![], None, None)
             };
 
+            // Build list of columns needing minmax from colstats
+            let needed_minmax_cols: Vec<String> = plan.agg_specs.iter()
+                .filter(|s| matches!(s.agg_type, AggType::Min | AggType::Max))
+                .map(|s| meta.col_names[s.col_idx as usize].clone())
+                .collect();
+
             // Fast path: load metadata only (no blobs) — Phase 2 is skipped
             let no_blobs = vec![false; num_cols];
             let t1 = Instant::now();
@@ -1476,8 +1494,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 let (segs, _, _, _, _) = load_segments_heap(
                     oid, &meta.col_names, &meta.segment_by, &no_blobs,
                     &meta.time_column, load_minmax, &seg_filters, time_min, time_max, None,
-                    &fast_batch_quals, load_sums,
+                    &fast_batch_quals, &needed_stats_cols,
                     &meta.col_types,
+                    &needed_minmax_cols,
                 );
                 all_segments.extend(segs);
             }
@@ -1607,8 +1626,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, time_min, time_max,
                 if use_lazy { Some(&lazy_cols) } else { None },
-                &batch_quals, false,
+                &batch_quals, &[],
                 &meta.col_types,
+                &[],
             );
             all_segments.extend(segs);
             total_detoast_us += dt_us;

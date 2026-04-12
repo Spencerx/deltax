@@ -676,18 +676,18 @@ pub(crate) struct ColstatsRow {
     pub(crate) ndistinct: i64,
 }
 
-/// Return type for flush_segment_metadata: (compressed_size, column blobs, per-column bloom entries).
+/// Return type for flush_segment_metadata: (compressed_size, column blobs, per-column bloom entries, colstats rows).
 /// Each bloom entry is (col_idx, num_hashes, bloom_bytes).
-pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<(u16, u8, Vec<u8>)>);
+pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<(u16, u8, Vec<u8>)>, Vec<ColstatsRow>);
 
-/// Compress accumulated typed column data and INSERT metadata into the meta + colstats tables.
-/// Returns (compressed_size, vec of (col_idx, compressed_blob)) — blobs are NOT inserted,
-/// they are returned for column-major buffering by the caller.
+/// Compress accumulated typed column data and INSERT metadata into the meta table.
+/// Returns (compressed_size, column blobs, bloom entries, colstats rows) — blobs and colstats
+/// are NOT inserted, they are returned for column-major buffering by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_segment_metadata(
     client: &mut SpiClient,
     meta_fqn: &str,
-    colstats_fqn: &str,
+    _colstats_fqn: &str,
     columns: &[ColumnMeta],
     typed_cols: &[TypedColumn],
     segment_by_values: &[Option<String>],
@@ -777,7 +777,8 @@ pub(crate) fn flush_segment_metadata(
         .expect("failed to insert segment metadata");
 
     // Build normalized colstats rows: one per non-segment-by column
-    let mut cs_rows: Vec<String> = Vec::new();
+    // Rows are returned to the caller for column-major buffering (sorted by col_idx, segment_id).
+    let mut cs_rows: Vec<ColstatsRow> = Vec::new();
     let mut col_idx_counter: i16 = 0;
     let mut nd_idx = 0;
     for (i, col) in columns.iter().enumerate() {
@@ -785,16 +786,14 @@ pub(crate) fn flush_segment_metadata(
             continue;
         }
         let (min_enc, max_enc) = compute_minmax_encoded_i64(&typed_cols[i], &col.data_type);
-        let min_str = min_enc.map_or("NULL".to_string(), |v| v.to_string());
-        let max_str = max_enc.map_or("NULL".to_string(), |v| v.to_string());
 
-        let (sum_str, nonnull, nonzero) = if supports_sum(&col.data_type) {
+        let (sum_val, nonnull, nonzero) = if supports_sum(&col.data_type) {
             let (s, nn, nz) = col_sums.get(&col.name)
                 .cloned()
                 .unwrap_or((None, 0, 0));
-            (s.unwrap_or_else(|| "NULL".to_string()), nn, nz)
+            (s, nn as i32, nz as i32)
         } else {
-            ("NULL".to_string(), 0, 0)
+            (None, 0, 0)
         };
 
         let nd = if nd_idx < ndistinct_values.len() {
@@ -804,22 +803,17 @@ pub(crate) fn flush_segment_metadata(
         };
         nd_idx += 1;
 
-        cs_rows.push(format!(
-            "({}, {}, {}, {}, {}, {}, {}, {})",
-            col_idx_counter, segment_id, min_str, max_str, sum_str, nonnull, nonzero, nd
-        ));
+        cs_rows.push(ColstatsRow {
+            col_idx: col_idx_counter,
+            segment_id,
+            min_val: min_enc,
+            max_val: max_enc,
+            sum_val,
+            nonnull_count: nonnull,
+            nonzero_count: nonzero,
+            ndistinct: nd,
+        });
         col_idx_counter += 1;
-    }
-
-    if !cs_rows.is_empty() {
-        let cs_sql = format!(
-            "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
-            colstats_fqn,
-            cs_rows.join(", ")
-        );
-        client
-            .update(&cs_sql, None, &[])
-            .expect("failed to insert segment colstats");
     }
 
     // Compute per-column bloom filters (if enabled via GUC) — stored separately
@@ -829,7 +823,7 @@ pub(crate) fn flush_segment_metadata(
         Vec::new()
     };
 
-    (total_size, blobs, bloom_entries)
+    (total_size, blobs, bloom_entries, cs_rows)
 }
 
 /// Slice a TypedColumn to a sub-range [start..end).
@@ -972,6 +966,7 @@ pub(crate) fn flush_with_splitting(
     next_segment_id: &mut i32,
     blob_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
     bloom_buffer: &mut Vec<(u16, i32, u8, Vec<u8>)>,
+    colstats_buffer: &mut Vec<ColstatsRow>,
 ) -> i64 {
     let mut total_size = 0i64;
     let mut offset = 0;
@@ -982,7 +977,7 @@ pub(crate) fn flush_with_splitting(
         *next_segment_id += 1;
         if offset == 0 && chunk_end == total_rows {
             let ndistinct = compute_segment_ndistinct(typed_cols, columns);
-            let (size, blobs, bloom_entries) =
+            let (size, blobs, bloom_entries, cs_rows) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -991,13 +986,14 @@ pub(crate) fn flush_with_splitting(
             for (col_idx, num_hashes, bytes) in bloom_entries {
                 bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
             }
+            colstats_buffer.extend(cs_rows);
         } else {
             let chunk_cols: Vec<TypedColumn> = typed_cols
                 .iter()
                 .map(|tc| slice_typed_column(tc, offset, chunk_end))
                 .collect();
             let ndistinct = compute_segment_ndistinct(&chunk_cols, columns);
-            let (size, blobs, bloom_entries) =
+            let (size, blobs, bloom_entries, cs_rows) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -1006,6 +1002,7 @@ pub(crate) fn flush_with_splitting(
             for (col_idx, num_hashes, bytes) in bloom_entries {
                 bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
             }
+            colstats_buffer.extend(cs_rows);
         }
         offset = chunk_end;
     }
@@ -1190,6 +1187,7 @@ fn compress_partition_streaming(
     let mut next_segment_id: i32 = 1;
     let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, blob)
     let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, num_hashes, bloom_bytes)
+    let mut colstats_buffer: Vec<ColstatsRow> = Vec::new();
 
     loop {
         let result = client
@@ -1239,6 +1237,7 @@ fn compress_partition_streaming(
                             &mut next_segment_id,
                             &mut blob_buffer,
                             &mut bloom_buffer,
+                            &mut colstats_buffer,
                         );
                         typed_cols = init_typed_columns(columns, &kinds);
                         rows_in_segment = 0;
@@ -1265,7 +1264,7 @@ fn compress_partition_streaming(
                 let seg_id = next_segment_id;
                 next_segment_id += 1;
                 let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
-                let (size, blobs, bloom_entries) = flush_segment_metadata(
+                let (size, blobs, bloom_entries, cs_rows) = flush_segment_metadata(
                     client,
                     &ddl.meta_fqn,
                     &ddl.colstats_fqn,
@@ -1283,6 +1282,7 @@ fn compress_partition_streaming(
                 for (col_idx, num_hashes, bytes) in bloom_entries {
                     bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
                 }
+                colstats_buffer.extend(cs_rows);
                 typed_cols = init_typed_columns(columns, &kinds);
                 rows_in_segment = 0;
             }
@@ -1320,12 +1320,40 @@ fn compress_partition_streaming(
             &mut next_segment_id,
             &mut blob_buffer,
             &mut bloom_buffer,
+            &mut colstats_buffer,
         );
     }
 
     client
         .update("CLOSE comp_cursor", None, &[])
         .expect("failed to close cursor");
+
+    // Flush colstats column-major: sort by (col_idx, segment_id) so heap pages
+    // are naturally clustered for index scans by _col_idx.
+    if !colstats_buffer.is_empty() {
+        colstats_buffer.sort_by_key(|r| (r.col_idx, r.segment_id));
+
+        // Batch insert for efficiency
+        let batch_size = 100;
+        for chunk in colstats_buffer.chunks(batch_size) {
+            let values: Vec<String> = chunk.iter().map(|r| {
+                let min_str = r.min_val.map_or("NULL".to_string(), |v| v.to_string());
+                let max_str = r.max_val.map_or("NULL".to_string(), |v| v.to_string());
+                let sum_str = r.sum_val.as_deref().unwrap_or("NULL");
+                format!(
+                    "({}, {}, {}, {}, {}, {}, {}, {})",
+                    r.col_idx, r.segment_id, min_str, max_str, sum_str,
+                    r.nonnull_count, r.nonzero_count, r.ndistinct
+                )
+            }).collect();
+            let sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
+                ddl.colstats_fqn,
+                values.join(", ")
+            );
+            client.update(&sql, None, &[]).expect("failed to insert colstats batch");
+        }
+    }
 
     // Flush blobs column-major into the blobs table
     if !blob_buffer.is_empty() {
@@ -2104,12 +2132,6 @@ pub(crate) fn supports_sum(data_type: &str) -> bool {
         || dt == "smallint" || dt == "int2"
         || dt == "double precision" || dt == "float8"
         || dt == "real" || dt == "float4"
-}
-
-/// Check if a data type is a floating-point type.
-pub(crate) fn is_float_type(data_type: &str) -> bool {
-    let dt = data_type.to_lowercase();
-    dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4"
 }
 
 /// Compute sum, non-null count, and nonzero count for a typed column.

@@ -558,8 +558,9 @@ pub(super) unsafe fn load_segments_heap(
     time_max: Option<i64>,
     lazy_cols: Option<&[bool]>,
     batch_quals: &[BatchQual],
-    load_sums: bool,
+    needed_stats_cols: &[String],
     col_types: &[pg_sys::Oid],
+    needed_minmax_cols: &[String],
 ) -> (Vec<SegmentData>, u64, u64, u64, u64) {  // skipped, minmax_skipped, bloom_skipped, detoast_us
     // Buffer stats are accumulated into a thread-local via `accumulate_scan_buf_stats`;
     // callers read them with `take_scan_buf_stats()` after all companion OIDs are processed.
@@ -629,6 +630,7 @@ pub(super) unsafe fn load_segments_heap(
         }
 
         // Discover per-column sum/nonnull_count/nonzero_count columns
+        let load_sums = !needed_stats_cols.is_empty();
         let mut sum_col_attnos: Vec<(String, usize, usize, Option<usize>, pg_sys::Oid)> = Vec::new();
         if load_sums {
             for col_name in col_names {
@@ -835,6 +837,41 @@ pub(super) unsafe fn load_segments_heap(
                 });
             }
 
+            // Also populate time column minmax when requested by caller
+            // (e.g. DeltaXMinMax on the time column) — avoids colstats scan.
+            // Must encode PG-epoch datum → Unix-epoch i64 to match colstats encoding.
+            if needed_minmax_cols.iter().any(|n| n == time_column) && !col_minmax.contains_key(time_column)
+                && let (Some(min_att), Some(max_att)) = (min_time_attno, max_time_attno)
+            {
+                let min_null = nulls[min_att];
+                let max_null = nulls[max_att];
+                let time_type_oid = att_type_oids.get(format!("_min_{}", time_column).as_str())
+                    .copied()
+                    .unwrap_or(pg_sys::TIMESTAMPTZOID);
+                let encode_time = |raw: i64| -> i64 {
+                    match time_type_oid {
+                        pg_sys::DATEOID => {
+                            // raw is PG-epoch days → Unix-epoch microseconds
+                            (raw + crate::compress::PG_EPOCH_OFFSET_DAYS) * 86_400_000_000
+                        }
+                        pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+                            // raw is PG-epoch usec → Unix-epoch usec
+                            raw + crate::compress::PG_EPOCH_OFFSET_USEC
+                        }
+                        _ => raw,
+                    }
+                };
+                let min_enc = if min_null { 0i64 } else { encode_time(values[min_att].value() as i64) };
+                let max_enc = if max_null { 0i64 } else { encode_time(values[max_att].value() as i64) };
+                col_minmax.insert(time_column.to_string(), ColMinMax {
+                    min_encoded: min_enc,
+                    max_encoded: max_enc,
+                    min_null,
+                    max_null,
+                    type_oid: time_type_oid,
+                });
+            }
+
             // Extract per-column sum/nonnull_count/nonzero_count
             let mut col_sums = HashMap::new();
             for (col_name, sum_att, nn_att, nz_att, type_oid) in &sum_col_attnos {
@@ -883,12 +920,24 @@ pub(super) unsafe fn load_segments_heap(
         // Phase 1b: Scan normalized colstats table for per-column stats
         // Only opened when we need non-time column stats and have surviving segments.
         // ================================================================
+        // Build set of column names that already have minmax in the meta table.
+        // Always include the time column — its min/max is loaded from meta
+        // regardless of `load_minmax`.
+        let mut meta_minmax_names: std::collections::HashSet<&str> = minmax_col_attnos
+            .iter()
+            .map(|(name, ..)| name.as_str())
+            .collect();
+        if min_time_attno.is_some() && max_time_attno.is_some() {
+            meta_minmax_names.insert(time_column);
+        }
+
         let need_colstats = !segments.is_empty() && (
-            // Need minmax for non-time columns?
-            (load_minmax && minmax_col_attnos.len() < col_names.iter().filter(|n| !segment_by.contains(n)).count())
-            // Need sum data?
-            || (load_sums && sum_col_attnos.is_empty())
-            // Have batch quals on non-time columns that weren't matched in meta?
+            // Need sum data that's not in meta?
+            (load_sums && sum_col_attnos.is_empty())
+            // Caller needs minmax for specific columns not already in meta?
+            || (!needed_minmax_cols.is_empty()
+                && needed_minmax_cols.iter().any(|n| !meta_minmax_names.contains(n.as_str())))
+            // Have batch quals on non-time orderable columns not covered by meta?
             || batch_quals.iter().any(|bq| {
                 !matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
                 && matches!(bq.type_oid,
@@ -918,9 +967,12 @@ pub(super) unsafe fn load_segments_heap(
                 // Build col_idx -> (column_name, original_type_oid) mapping
                 // (non-segment-by columns, 0-based, same order as blob table)
                 let mut idx_to_col: Vec<(String, pg_sys::Oid)> = Vec::new();
+                let mut col_to_idx: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
                 for (i, name) in col_names.iter().enumerate() {
                     if !segment_by.contains(name) {
+                        let ci = idx_to_col.len();
                         idx_to_col.push((name.clone(), col_types[i]));
+                        col_to_idx.insert(name.as_str(), ci);
                     }
                 }
 
@@ -973,13 +1025,19 @@ pub(super) unsafe fn load_segments_heap(
 
                 // Collect the set of _col_idx values we actually need:
                 // - minmax filter columns (from batch quals)
-                // - all non-segment-by columns if load_minmax or load_sums
+                // - columns caller needs minmax for (needed_minmax_cols)
+                // - columns caller needs stats for (needed_stats_cols)
                 let mut needed_col_idxs: std::collections::HashSet<i16> = std::collections::HashSet::new();
                 for f in &cs_minmax_filters {
                     needed_col_idxs.insert(f.col_idx);
                 }
-                if load_minmax || load_sums {
-                    for ci in 0..idx_to_col.len() {
+                for name in needed_minmax_cols {
+                    if let Some(&ci) = col_to_idx.get(name.as_str()) {
+                        needed_col_idxs.insert(ci as i16);
+                    }
+                }
+                for name in needed_stats_cols {
+                    if let Some(&ci) = col_to_idx.get(name.as_str()) {
                         needed_col_idxs.insert(ci as i16);
                     }
                 }
@@ -1379,8 +1437,8 @@ pub(super) unsafe fn load_segments_heap(
         }
 
         let (t2_hit, t2_read) = shared_buf_snapshot();
-        buf_stats.bloom_hit = t2_hit - t1_hit;
-        buf_stats.bloom_read = t2_read - t1_read;
+        buf_stats.bloom_hit = t2_hit - t1b_hit;
+        buf_stats.bloom_read = t2_read - t1b_read;
 
         pgrx::log!(
             "load_segments_heap phase1: segments={} skipped={} (minmax={} bloom={}) heap_getnext={:.1}ms deform={:.1}ms",
