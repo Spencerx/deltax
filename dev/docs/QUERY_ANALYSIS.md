@@ -77,14 +77,24 @@ been addressed. Cold-run numbers from EXPLAIN ANALYZE:
 | Q35 | 502 | 30% | 1,691 |
 | Q12 | 393 | 37% | 1,073 |
 
-This is **#39 Pipelined detoast + parallel aggregation** in
-PERF_IMPROVEMENTS.md — still the single biggest win.
+**#39 Pipelined detoast** is implemented (compact, mixed, and
+CountDistinct paths) but has **limited impact** — workers finish 6×
+faster than detoast per batch, so the pipeline can't hide the serial
+TOAST I/O.
 
-**Additional angle:** Some queries detoast columns they don't need.
-For instance Q32 (WatchID + ClientIP) detoasts for 6 s despite
-WatchID being bitpacked int8 (decompress=18 ms). The detoast is
-loading IsRefresh, ResolutionWidth, and other agg columns. Verify
-`needed_cols` is tight.
+**Investigated and ruled out:**
+- `needed_cols` is correct — only referenced columns are detoasted.
+  Q32 detoasts 4 small int columns; the 6 s cost is inherent to
+  ~13 K `pg_detoast_datum()` calls doing chunk-by-chunk TOAST I/O.
+- **Inline storage (`STORAGE MAIN` + self-chunking):** Would eliminate
+  TOAST indirection, but PG's LZ4 TOAST compression achieves ~31%
+  compression on top of our already-compressed blobs (4.1 GB raw →
+  2.8 GB on disk). Going inline would increase I/O by ~45% — net loss.
+- **`STORAGE EXTERNAL`:** Tried, but the LZ4 double-compression saves
+  enough I/O to be a net win. Reverted.
+
+Detoast remains the dominant cost with no clear fix beyond a
+**session-level blob cache** (detoast once, reuse across queries).
 
 ### F4. Merge phase dominates high-cardinality GROUP BY / COUNT DISTINCT
 
@@ -749,7 +759,7 @@ Sorted by estimated combined wallclock benefit across the benchmark:
 
 | # | Improvement | Queries helped | Est. benefit | Complexity | In PERF_IMPROVEMENTS.md? |
 |---|-------------|----------------|-------------|------------|--------------------------|
-| **1** | **#39 Pipelined detoast** | Q7–Q18, Q20–Q22, Q27, Q30–Q35 | ~15–20 s | Medium | Yes |
+| ~~1~~ | ~~#39 Pipelined detoast~~ | ~~Q7–Q18, Q20–Q22, Q27, Q30–Q35~~ | — | — | **Done — limited impact** |
 | ~~2~~ | ~~#33 Trigram bloom filters~~ | ~~Q20, Q21, Q22~~ | — | — | **Tried — doesn't work** |
 | **3** | **#36 Two-level hash aggregation** | Q8, Q13, Q15, Q32, Q35, Q39 | ~12 s | Med-High | Yes |
 | **4** | **Per-segment SUM(length(text_col)) metadata** | Q27 | ~1.7 s | Low | **No — new idea** |
@@ -772,8 +782,9 @@ Sorted by estimated combined wallclock benefit across the benchmark:
 3. **#6 dict-only COUNT(DISTINCT).** Q5 drops from 3.2× to ~0.5× CH.
    Union dict entries across segments instead of hashing 100 M values.
 
-4. **#1 #39 pipelined detoast.** Biggest absolute win. Overlaps TOAST
-   I/O with decompression and aggregation. Affects 20+ queries.
+4. ~~#39 pipelined detoast~~ — **done, limited impact.** Pipeline is
+   active but detoast is 6× slower than parallel work per batch, so
+   workers stall. The bottleneck is serial `pg_detoast_datum` I/O.
 
 5. ~~#33 trigram bloom filters~~ — **tried, doesn't work.** Common
    trigrams saturate the bloom; no pruning on realistic patterns.

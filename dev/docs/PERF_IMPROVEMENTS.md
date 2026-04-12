@@ -776,48 +776,52 @@ preserved for future reference if parallel-safe paths are revisited.
 **Files:** `src/scan/exec/segments.rs` (`load_metadata` direct-heap
 implementation), `src/scan/hook.rs` (consolidated `load_deltatable_info`)
 
-### 39. Pipelined detoast + parallel aggregation
+### 39. Pipelined detoast + parallel aggregation [DONE — LIMITED IMPACT]
 
 **Target: Q22 9.6s -> ~5s (ClickBench hot run)**
-**Complexity: Medium**
+**Actual: modest improvement on CountDistinct (Q4/Q5); negligible on most queries**
 
-In the DeltaXAgg parallel path, all segments are eagerly detoasted on the
-main thread before any parallel work begins. For Q22 this is 2.9s of
-single-core TOAST decompression (pglz) blocking 4 parallel workers.
+Implemented pipelined detoasting for the compact, mixed, and CountDistinct
+parallel paths. The main thread detoasts batch N+1 while workers process
+batch N, using `std::thread::scope` with `split_at_mut` for safe disjoint
+borrows.
 
-`pg_detoast_datum` is a PG API call that must run on the backend thread —
-it cannot be moved into worker threads. The solution is to **pipeline**
-detoasting with parallel processing so they overlap in time.
+**What was done:**
+- Compact and mixed GROUP BY paths already had pipelining (n_batches =
+  n_workers * 2 for compact, 2 for mixed).
+- Extended pipelining to the CountDistinct path (Q4, Q5) by enabling
+  lazy loading for all parallel paths (not just GROUP BY).
+- Verified `needed_cols` is correct — only referenced columns are detoasted.
 
-**Approach:**
+**Why impact is limited:** The pipeline only hides detoast latency when
+worker processing per batch takes at least as long as detoasting the next
+batch. In practice, for queries like Q32:
+- Per-batch detoast: ~378 ms (serial, PG backend thread)
+- Per-batch worker time: ~60 ms (parallel across 8 threads)
+- Workers finish 6× faster → sit idle ~300 ms per batch waiting
 
-1. Load all segments lazily (TOAST pointers only, ~100ms).
-2. Split segments into B batches (e.g. B = n_workers or 2 * n_workers).
-3. For batch 0: main thread detoasts all blobs, then spawns `thread::scope`
-   for workers to process batch 0.
-4. While workers process batch i, the main thread detoasts batch i+1.
-5. When workers finish batch i, they immediately start batch i+1 (already
-   detoasted). Main thread detoasts batch i+2, and so on.
+The fundamental constraint is `pg_detoast_datum` — serial, I/O-bound,
+must run on the PG backend thread. The pipeline can't overcome a 6:1
+detoast-to-work ratio.
 
-This requires a producer-consumer pattern: main thread pushes detoasted
-batches into a shared queue, workers pull from it. With `std::thread::scope`
-this can be done with a `Mutex<VecDeque<Range<usize>>>` work queue plus
-a `Condvar` for notification.
+**Alternatives investigated:**
 
-**Expected overlap:** With 2.9s detoast and 3.7s parallel work across 4
-threads, the detoast is fully hidden behind parallel processing for all
-but the first batch. Net saving: ~2.5s (detoast of first batch ~0.3s
-remains serial).
+- **Inline storage (`STORAGE MAIN` + self-chunking):** Chunk blobs into
+  ~1.5 KB pieces to stay below the TOAST threshold, eliminating TOAST
+  indirection entirely. **Not viable:** PG's LZ4 TOAST compression
+  achieves ~31% compression on top of our already-compressed blobs
+  (4129 MB raw → 2848 MB on disk for one partition). Inline storage
+  would increase I/O by ~45%, likely a net loss.
+- **`STORAGE EXTERNAL` (uncompressed TOAST):** Tried earlier. The extra
+  LZ4 compression from TOAST still provides meaningful size reduction,
+  and the lower I/O from smaller on-disk size is a net win vs the CPU
+  cost of double-decompression. Reverted.
+- **Session-level blob cache:** Detoast once per session, reuse across
+  queries. Would eliminate detoast cost for all but the first query.
+  Not yet explored in depth.
 
-**Constraints:**
-- `pg_detoast_datum` must stay on the main thread (PG backend requirement).
-- Workers must not touch `SegmentData.toast_pointers` — only read
-  `compressed_blobs` after the main thread has detoasted them.
-- Each batch's segments must be fully detoasted before workers access them.
-
-**Files:** `src/scan/exec/agg.rs` (pipelined batch loop in compact and
-mixed parallel paths), `src/scan/exec/segments.rs` (lazy loading for
-agg path)
+**Files:** `src/scan/exec/agg.rs` (pipelined batch loop in compact, mixed,
+and CountDistinct paths), `src/scan/exec/segments.rs` (lazy loading)
 
 ### 40. Dict-accelerated LIKE filtering + two-phase column decompression
 

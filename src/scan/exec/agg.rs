@@ -1627,7 +1627,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         );
         // Load segments from all companion tables (with lazy pruning)
         let n_workers = crate::get_parallel_workers();
-        let use_lazy = n_workers > 1 && !group_specs.is_empty();
+        let use_lazy = n_workers > 1;
         let lazy_cols: Vec<bool> = needed_cols.to_vec();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
@@ -4250,13 +4250,73 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 ParallelCdResult { int_sets, str_sets, segments_processed }
             }
 
-            let chunk_size = all_segments.len().div_ceil(n_workers);
-            let partial_results: Vec<ParallelCdResult> = std::thread::scope(|s| {
-                let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
-                    s.spawn(|| process_cd_segments(chunk, &config))
-                }).collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+            // Pipeline detoast with parallel processing
+            let use_cd_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+            if use_lazy {
+                let t_detoast = Instant::now();
+                if use_cd_pipeline {
+                    let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                    let batch_size = all_segments.len().div_ceil(n_batches);
+                    let first_end = batch_size.min(all_segments.len());
+                    for seg in &mut all_segments[..first_end] {
+                        detoast_lazy_blobs(seg);
+                    }
+                } else {
+                    for seg in &mut all_segments {
+                        detoast_lazy_blobs(seg);
+                    }
+                }
+                total_detoast_us += t_detoast.elapsed().as_micros() as u64;
+            }
+
+            let mut pipeline_detoast_us: u64 = 0;
+            let partial_results: Vec<ParallelCdResult> = if use_cd_pipeline {
+                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                let batch_size = all_segments.len().div_ceil(n_batches);
+                let mut results: Vec<ParallelCdResult> = Vec::new();
+                let mut batch_start = 0;
+                let total_segs = all_segments.len();
+
+                while batch_start < total_segs {
+                    let batch_end = (batch_start + batch_size).min(total_segs);
+                    let next_end = (batch_end + batch_size).min(total_segs);
+
+                    let (done, pending) = all_segments.split_at_mut(batch_end);
+                    let current_batch = &done[batch_start..];
+
+                    std::thread::scope(|s| {
+                        let chunk_size = current_batch.len().div_ceil(n_workers);
+                        let handles: Vec<_> = current_batch.chunks(chunk_size).map(|chunk| {
+                            let cfg = &config;
+                            s.spawn(move || process_cd_segments(chunk, cfg))
+                        }).collect();
+
+                        // Main thread detoasts next batch while workers run
+                        if batch_end < total_segs {
+                            let t_pd = Instant::now();
+                            for seg in &mut pending[..next_end - batch_end] {
+                                detoast_lazy_blobs(seg);
+                            }
+                            pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
+                        }
+
+                        for h in handles {
+                            results.push(h.join().unwrap());
+                        }
+                    });
+
+                    batch_start = batch_end;
+                }
+                results
+            } else {
+                let chunk_size = all_segments.len().div_ceil(n_workers);
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
+                        s.spawn(|| process_cd_segments(chunk, &config))
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            };
 
             let agg_us = t2.elapsed().as_micros() as u64;
 
@@ -4306,7 +4366,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 _num_result_cols: num_result_cols,
                 metadata_us,
                 heap_scan_us,
-                detoast_us: 0,
+                detoast_us: total_detoast_us + pipeline_detoast_us,
                 decompress_us: 0,
                 agg_us,
                 total_segments,
