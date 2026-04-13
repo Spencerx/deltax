@@ -71,7 +71,7 @@ Tracking DeltaX compressed vs uncompressed performance on ClickBench.
 | Q10    | MobilePhoneModel users    |         0.718 |         4.64x |
 | Q11    | MobilePhone+Model users   |         0.871 |         5.76x |
 | Q12    | Top SearchPhrase          |         1.935 |         3.19x |
-| Q13    | SearchPhrase users        |         8.027 |         9.87x |
+| Q13    | SearchPhrase users        |         2.127 |         2.61x |
 | Q14    | SearchEngine+Phrase       |         2.195 |         3.63x |
 | Q15    | Top UserID                |         1.764 |         4.50x |
 | Q16    | UserID+SearchPhrase top   |         3.361 |         1.96x |
@@ -822,6 +822,40 @@ detoast-to-work ratio.
 
 **Files:** `src/scan/exec/agg.rs` (pipelined batch loop in compact, mixed,
 and CountDistinct paths), `src/scan/exec/segments.rs` (lazy loading)
+
+### 41. Partitioned parallel merge for mixed (text GROUP BY) path [DONE]
+
+**Impact: Q13 4971ms → 2127ms (2.3x improvement, hot run)**
+
+The mixed path (text GROUP BY) had a serial merge bottleneck: all worker
+partial results were merged into one hash table on the main thread, then
+top-N selection ran as a separate pass. For Q13 (`GROUP BY SearchPhrase
+ORDER BY COUNT(DISTINCT UserID) DESC LIMIT 10`) with 3.9M groups, this
+serial merge took ~2.9s + 289ms top-N selection.
+
+**What was done:** Added a partitioned parallel merge path for the mixed
+path, analogous to the existing one in the compact (int-key) path.
+When `topn_limit > 0 && having_filters.is_empty()`:
+
+1. Partition the key space into N slices by hash (N = n_workers)
+2. Each thread merges its slice from all workers (including CD sidecar
+   unions and MixedKeyStorage copying), writes CD counts, and runs local
+   top-N via a bounded heap
+3. Copy winners to mini CompactAccStorage + mini MixedKeyStorage
+4. Main thread merges N×limit local winners into global top-N
+
+Also removed the `!compact_sort_is_cd` guard from the compact path's
+partitioned merge gate — the guard was unnecessary because CD counts are
+written to storage via `write_counts_to_storage` before top-N selection.
+
+**Scope:** Primarily benefits Q13. Other mixed-path queries with ORDER BY
++ LIMIT have their speculative top-N succeed (merge=0), so they skip the
+full merge entirely. Q28 has HAVING which gates out the partitioned merge.
+Q32's 5.8s merge is on the compact path with ~10M groups — the parallel
+merge is already active there, the cost is inherent to the cardinality.
+
+**Files:** `src/scan/exec/agg.rs` (partitioned parallel merge in mixed
+path, `!compact_sort_is_cd` guard removal in compact path)
 
 ### 40. Dict-accelerated LIKE filtering + two-phase column decompression
 
