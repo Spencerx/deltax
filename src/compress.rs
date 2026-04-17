@@ -317,6 +317,9 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         client
             .update(&format!("DROP TABLE IF EXISTS {}", ddl.blooms_fqn), None, &[])
             .expect("failed to drop empty blooms table");
+        client
+            .update(&format!("DROP TABLE IF EXISTS {}", ddl.text_lengths_fqn), None, &[])
+            .expect("failed to drop empty text_lengths table");
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
@@ -676,9 +679,17 @@ pub(crate) struct ColstatsRow {
     pub(crate) ndistinct: i64,
 }
 
-/// Return type for flush_segment_metadata: (compressed_size, column blobs, per-column bloom entries, colstats rows).
+/// Return type for flush_segment_metadata: (compressed_size, column blobs,
+/// per-column bloom entries, colstats rows, per-text-column length sidecars).
 /// Each bloom entry is (col_idx, num_hashes, bloom_bytes).
-pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<(u16, u8, Vec<u8>)>, Vec<ColstatsRow>);
+/// Each text-length entry is (col_idx, length_blob).
+pub(crate) type FlushResult = (
+    i64,
+    Vec<(u16, Vec<u8>)>,
+    Vec<(u16, u8, Vec<u8>)>,
+    Vec<ColstatsRow>,
+    Vec<(u16, Vec<u8>)>,
+);
 
 /// Compress accumulated typed column data and INSERT metadata into the meta table.
 /// Returns (compressed_size, column blobs, bloom entries, colstats rows) — blobs and colstats
@@ -705,6 +716,9 @@ pub(crate) fn flush_segment_metadata(
     let mut col_sums: std::collections::HashMap<String, (Option<String>, i64, i64)> =
         std::collections::HashMap::new();
 
+    // Per-text-column length sidecars (col_idx, length_blob).
+    let mut text_length_blobs: Vec<(u16, Vec<u8>)> = Vec::new();
+
     let mut col_idx: u16 = 0;
     for (i, col) in columns.iter().enumerate() {
         if col.is_segment_by {
@@ -717,6 +731,14 @@ pub(crate) fn flush_segment_metadata(
         }
         if supports_sum(&col.data_type) {
             col_sums.insert(col.name.clone(), compute_typed_sum(&typed_cols[i]));
+        }
+        // Build length sidecar for text columns. The main blob already contains
+        // the string bodies; the sidecar lets queries that only need
+        // length(col)/col='' skip detoasting the main blob.
+        if is_text_data_type(&col.data_type.to_lowercase())
+            && let TypedColumn::Text(vals) = &typed_cols[i]
+        {
+            text_length_blobs.push((col_idx, compress_text_lengths(vals)));
         }
         total_size += compressed.len() as i64;
         blobs.push((col_idx, compressed));
@@ -823,7 +845,7 @@ pub(crate) fn flush_segment_metadata(
         Vec::new()
     };
 
-    (total_size, blobs, bloom_entries, cs_rows)
+    (total_size, blobs, bloom_entries, cs_rows, text_length_blobs)
 }
 
 /// Slice a TypedColumn to a sub-range [start..end).
@@ -967,6 +989,7 @@ pub(crate) fn flush_with_splitting(
     blob_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
     bloom_buffer: &mut Vec<(u16, i32, u8, Vec<u8>)>,
     colstats_buffer: &mut Vec<ColstatsRow>,
+    text_length_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
 ) -> i64 {
     let mut total_size = 0i64;
     let mut offset = 0;
@@ -977,7 +1000,7 @@ pub(crate) fn flush_with_splitting(
         *next_segment_id += 1;
         if offset == 0 && chunk_end == total_rows {
             let ndistinct = compute_segment_ndistinct(typed_cols, columns);
-            let (size, blobs, bloom_entries, cs_rows) =
+            let (size, blobs, bloom_entries, cs_rows, length_blobs) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -986,6 +1009,9 @@ pub(crate) fn flush_with_splitting(
             for (col_idx, num_hashes, bytes) in bloom_entries {
                 bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
             }
+            for (col_idx, blob) in length_blobs {
+                text_length_buffer.push((col_idx, seg_id, blob));
+            }
             colstats_buffer.extend(cs_rows);
         } else {
             let chunk_cols: Vec<TypedColumn> = typed_cols
@@ -993,7 +1019,7 @@ pub(crate) fn flush_with_splitting(
                 .map(|tc| slice_typed_column(tc, offset, chunk_end))
                 .collect();
             let ndistinct = compute_segment_ndistinct(&chunk_cols, columns);
-            let (size, blobs, bloom_entries, cs_rows) =
+            let (size, blobs, bloom_entries, cs_rows, length_blobs) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -1001,6 +1027,9 @@ pub(crate) fn flush_with_splitting(
             }
             for (col_idx, num_hashes, bytes) in bloom_entries {
                 bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
+            }
+            for (col_idx, blob) in length_blobs {
+                text_length_buffer.push((col_idx, seg_id, blob));
             }
             colstats_buffer.extend(cs_rows);
         }
@@ -1016,10 +1045,12 @@ pub(crate) struct CompanionDdl {
     pub(crate) colstats_fqn: String,
     pub(crate) blobs_fqn: String,
     pub(crate) blooms_fqn: String,
+    pub(crate) text_lengths_fqn: String,
     pub(crate) meta_ddl: String,
     pub(crate) colstats_ddl: String,
     pub(crate) blobs_ddl: String,
     pub(crate) blooms_ddl: String,
+    pub(crate) text_lengths_ddl: String,
 }
 
 /// Build DDL for companion tables (meta, colstats, blobs, blooms) for a partition.
@@ -1036,6 +1067,7 @@ pub(crate) fn build_companion_ddl(
     let colstats_fqn = format!("\"{}\".\"{}_colstats\"", companion_schema, part_table);
     let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
+    let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
 
     // Thin meta table: segment_id, segment_by cols, time column min/max, row_count
     let mut meta_cols = Vec::new();
@@ -1085,15 +1117,25 @@ pub(crate) fn build_companion_ddl(
         blooms_fqn
     );
 
+    // Per-text-column per-segment length sidecar: compact u32 array, LZ4-compressed.
+    // Used when a query only needs length(col)/col=''/col<>'' — lets the scan skip
+    // detoasting the (typically large) main text blob.
+    let text_lengths_ddl = format!(
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
+        text_lengths_fqn
+    );
+
     CompanionDdl {
         meta_fqn,
         colstats_fqn,
         blobs_fqn,
         blooms_fqn,
+        text_lengths_fqn,
         meta_ddl,
         colstats_ddl,
         blobs_ddl,
         blooms_ddl,
+        text_lengths_ddl,
     }
 }
 
@@ -1188,6 +1230,7 @@ fn compress_partition_streaming(
     let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, blob)
     let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, num_hashes, bloom_bytes)
     let mut colstats_buffer: Vec<ColstatsRow> = Vec::new();
+    let mut text_length_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, length_blob)
 
     loop {
         let result = client
@@ -1238,6 +1281,7 @@ fn compress_partition_streaming(
                             &mut blob_buffer,
                             &mut bloom_buffer,
                             &mut colstats_buffer,
+                            &mut text_length_buffer,
                         );
                         typed_cols = init_typed_columns(columns, &kinds);
                         rows_in_segment = 0;
@@ -1264,7 +1308,7 @@ fn compress_partition_streaming(
                 let seg_id = next_segment_id;
                 next_segment_id += 1;
                 let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
-                let (size, blobs, bloom_entries, cs_rows) = flush_segment_metadata(
+                let (size, blobs, bloom_entries, cs_rows, length_blobs) = flush_segment_metadata(
                     client,
                     &ddl.meta_fqn,
                     &ddl.colstats_fqn,
@@ -1281,6 +1325,9 @@ fn compress_partition_streaming(
                 }
                 for (col_idx, num_hashes, bytes) in bloom_entries {
                     bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
+                }
+                for (col_idx, blob) in length_blobs {
+                    text_length_buffer.push((col_idx, seg_id, blob));
                 }
                 colstats_buffer.extend(cs_rows);
                 typed_cols = init_typed_columns(columns, &kinds);
@@ -1321,6 +1368,7 @@ fn compress_partition_streaming(
             &mut blob_buffer,
             &mut bloom_buffer,
             &mut colstats_buffer,
+            &mut text_length_buffer,
         );
     }
 
@@ -1404,6 +1452,33 @@ fn compress_partition_streaming(
             client
                 .update(&format!("ANALYZE {}", ddl.blooms_fqn), None, &[])
                 .expect("failed to analyze blooms table");
+        }
+
+        // Flush text-length sidecars into the text_lengths table
+        if !text_length_buffer.is_empty() {
+            client.update(&ddl.text_lengths_ddl, None, &[]).expect("failed to create text_lengths table");
+
+            // Sort by (col_idx, segment_id) for column-major insertion order
+            text_length_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+
+            for (col_idx, seg_id, blob) in text_length_buffer {
+                use pgrx::datum::DatumWithOid;
+                let insert_sql = format!(
+                    "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
+                    &ddl.text_lengths_fqn
+                );
+                let args: Vec<DatumWithOid> = vec![
+                    (col_idx as i16).into(),
+                    seg_id.into(),
+                    DatumWithOid::from(blob),
+                ];
+                client
+                    .update(&insert_sql, None, &args)
+                    .expect("failed to insert text length sidecar");
+            }
+            client
+                .update(&format!("ANALYZE {}", ddl.text_lengths_fqn), None, &[])
+                .expect("failed to analyze text_lengths table");
         }
 
         // ANALYZE meta, colstats, and blobs tables for planner statistics
@@ -1787,6 +1862,7 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let colstats_fqn = format!("\"{}\".\"{}_colstats\"", companion_schema, part_table);
     let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
+    let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
 
     // 3. Read compressed segments from meta + blobs tables
@@ -1940,13 +2016,16 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         total_rows_restored += segment_row_count as i64;
     }
 
-    // 4. Drop meta + colstats + blobs + blooms tables
+    // 4. Drop meta + colstats + blobs + blooms + text_lengths tables
     client
         .update(&format!("DROP TABLE IF EXISTS {}", blobs_fqn), None, &[])
         .expect("failed to drop blobs table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", blooms_fqn), None, &[])
         .expect("failed to drop blooms table");
+    client
+        .update(&format!("DROP TABLE IF EXISTS {}", text_lengths_fqn), None, &[])
+        .expect("failed to drop text_lengths table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", colstats_fqn), None, &[])
         .expect("failed to drop colstats table");
@@ -2124,7 +2203,10 @@ pub(crate) fn supports_minmax(data_type: &str) -> bool {
         || dt == "real" || dt == "float4"
 }
 
-/// Check if a column type supports sum metadata (numeric types only, not timestamps/dates).
+/// Check if a column type supports sum metadata. Numeric types get SUM(col);
+/// text types get SUM(length(col)) + nonempty_count (both go through the same
+/// `_sum`/`_nonnull_count`/`_nonzero_count` colstats slots — the interpretation
+/// at read time is driven by column type).
 pub(crate) fn supports_sum(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt == "integer" || dt == "int4"
@@ -2132,6 +2214,21 @@ pub(crate) fn supports_sum(data_type: &str) -> bool {
         || dt == "smallint" || dt == "int2"
         || dt == "double precision" || dt == "float8"
         || dt == "real" || dt == "float4"
+        || is_text_data_type(&dt)
+}
+
+/// True for PostgreSQL text-family types.
+pub(crate) fn is_text_data_type(dt: &str) -> bool {
+    dt == "text"
+        || dt == "varchar"
+        || dt.starts_with("varchar(")
+        || dt == "character varying"
+        || dt.starts_with("character varying(")
+        || dt == "char"
+        || dt.starts_with("char(")
+        || dt == "character"
+        || dt.starts_with("character(")
+        || dt == "bpchar"
 }
 
 /// Compute sum, non-null count, and nonzero count for a typed column.
@@ -2193,9 +2290,64 @@ pub(crate) fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64, i64
             }
             if count > 0 { (Some(format!("{:.17e}", sum)), count, nonzero) } else { (None, 0, 0) }
         }
-        TypedColumn::Text(_) | TypedColumn::Bool(_) => (None, 0, 0),
+        TypedColumn::Bool(_) => (None, 0, 0),
+        TypedColumn::Text(v) => {
+            // For text columns we store in _sum the sum of length(value) over
+            // non-null rows (character count — same semantics as PostgreSQL's
+            // `length(text)`); _nonnull_count counts non-null rows;
+            // _nonzero_count counts rows with a non-empty string. These power
+            // the length-sidecar metadata fast path without affecting numeric
+            // SUM() resolution (the numeric fast path gates on type_oid).
+            let mut sum: i128 = 0;
+            let mut nonnull: i64 = 0;
+            let mut nonempty: i64 = 0;
+            for val in v.iter().flatten() {
+                nonnull += 1;
+                let chars = val.chars().count() as i128;
+                sum += chars;
+                if chars > 0 {
+                    nonempty += 1;
+                }
+            }
+            if nonnull > 0 {
+                (Some(sum.to_string()), nonnull, nonempty)
+            } else {
+                (None, 0, 0)
+            }
+        }
     }
 }
+
+/// Compress a text column's per-row length array into a sidecar blob.
+///
+/// Wire format mirrors CompressedColumn: [type_tag=Lz4][row_count][has_nulls]
+/// [null_bitmap?][lz4_flex::compress_prepend_size(u32 array of non-null lengths)].
+///
+/// Lengths are stored as *character* counts (same semantics as PostgreSQL's
+/// `length(text)`), not byte counts, so the sidecar can directly serve
+/// `length(col)` expressions.
+///
+/// This blob is a fraction of the main text blob (URL avg ~50 bytes per value,
+/// length fits in 2 bytes; LZ4 shrinks further because neighbouring URLs on the
+/// same site have similar lengths). Used by queries that only need length(col)
+/// or col <> ''.
+pub(crate) fn compress_text_lengths(values: &[Option<String>]) -> Vec<u8> {
+    let (non_null, null_bitmap) = compression::extract_nulls(values);
+    let mut u32_bytes = Vec::with_capacity(non_null.len() * 4);
+    for s in &non_null {
+        let chars = s.chars().count() as u32;
+        u32_bytes.extend_from_slice(&chars.to_le_bytes());
+    }
+    let compressed = lz4_flex::compress_prepend_size(&u32_bytes);
+    CompressedColumn {
+        type_tag: CompressionType::Lz4,
+        row_count: values.len() as u32,
+        null_bitmap,
+        data: compressed,
+    }
+    .to_bytes()
+}
+
 
 /// Compute the min and max of a column's string values using type-aware comparison.
 fn compute_column_minmax(

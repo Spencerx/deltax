@@ -15,11 +15,11 @@ use crate::catalog;
 use crate::compress::{
     ColumnKind, ColumnMeta, TypedColumn,
     PG_EPOCH_OFFSET_USEC,
-    build_companion_ddl, classify_column, compress_typed_column,
+    build_companion_ddl, classify_column, compress_text_lengths, compress_typed_column,
     compute_segment_blooms, compute_segment_ndistinct,
     compute_typed_minmax, compute_typed_sum, compute_minmax_encoded_i64,
-    format_minmax_for_insert, init_typed_columns, new_typed_column, get_column_metadata,
-    sort_typed_columns, supports_minmax, supports_sum,
+    format_minmax_for_insert, init_typed_columns, is_text_data_type, new_typed_column,
+    get_column_metadata, sort_typed_columns, supports_minmax, supports_sum,
 };
 use crate::copyparse::{
     CopyLineReader, CopyTextOptions, HeaderMode, LineResult,
@@ -287,6 +287,8 @@ struct PartitionBuffer {
     blob_buffer: Vec<(u16, i32, Vec<u8>)>,
     blob_buffer_size: usize,
     bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)>,
+    /// Accumulated text-length sidecar blobs (col_idx, segment_id, length_blob).
+    text_length_buffer: Vec<(u16, i32, Vec<u8>)>,
     total_compressed_size: i64,
     total_rows: i64,
     meta_table_created: bool,
@@ -306,6 +308,10 @@ struct PartitionBuffer {
     blooms_fqn_cached: Option<String>,
     blobs_oid_cached: Option<pg_sys::Oid>,
     blooms_oid_cached: Option<pg_sys::Oid>,
+    /// Cached text_lengths FQN/OID, created lazily on first flush.
+    text_lengths_fqn_cached: Option<String>,
+    text_lengths_oid_cached: Option<pg_sys::Oid>,
+    text_lengths_table_created: bool,
 }
 
 /// State for the entire backfill operation.
@@ -477,6 +483,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
             blob_buffer: Vec::new(),
             blob_buffer_size: 0,
             bloom_buffer: Vec::new(),
+            text_length_buffer: Vec::new(),
             total_compressed_size: 0,
             total_rows: 0,
             meta_table_created: false,
@@ -491,6 +498,9 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
             blooms_fqn_cached: None,
             blobs_oid_cached: None,
             blooms_oid_cached: None,
+            text_lengths_fqn_cached: None,
+            text_lengths_oid_cached: None,
+            text_lengths_table_created: false,
         });
     }
 
@@ -1419,6 +1429,17 @@ fn handle_copy_from_legacy(
     unsafe { pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
 }
 
+/// Build a per-row length sidecar blob for a text column; None for non-text types.
+fn build_text_length_blob(col: &TypedColumn, data_type: &str) -> Option<Vec<u8>> {
+    if !is_text_data_type(&data_type.to_lowercase()) {
+        return None;
+    }
+    match col {
+        TypedColumn::Text(values) => Some(compress_text_lengths(values)),
+        _ => None,
+    }
+}
+
 /// Per-column compression result produced by worker threads.
 struct ColResult {
     col_idx: u16,
@@ -1429,6 +1450,8 @@ struct ColResult {
     sum_val: Option<String>,
     nonnull_count: i64,
     nonzero_count: i64,
+    /// Per-row length sidecar, only populated for text-family columns.
+    text_length_blob: Option<Vec<u8>>,
 }
 
 /// A fully compressed segment ready for heap_insert on the main thread.
@@ -1439,6 +1462,8 @@ struct CompressedSegment {
     row_count: usize,
     blobs: Vec<(u16, Vec<u8>)>,      // (col_idx, compressed_data)
     bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
+    /// Per-text-column length sidecars (col_idx, length_blob).
+    text_length_blobs: Vec<(u16, Vec<u8>)>,
     meta_values_csv: String,          // pre-formatted VALUES clause for thin meta
     colstats_rows_csv: Vec<String>,   // pre-formatted VALUES tuples, one per non-segment-by column
     total_compressed_size: i64,
@@ -1510,7 +1535,8 @@ fn compress_segment(
                             } else {
                                 (None, 0, 0)
                             };
-                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
+                            let text_length_blob = build_text_length_blob(&typed_cols_ref[col_i], &col.data_type);
+                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
                         }).collect::<Vec<_>>()
                     })
                 })
@@ -1533,13 +1559,15 @@ fn compress_segment(
             } else {
                 (None, 0, 0)
             };
-            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
+            let text_length_blob = build_text_length_blob(&typed_cols[col_i], &col.data_type);
+            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
         }).collect()
     };
 
     // Build blobs and meta
     let mut total_size: i64 = 0;
     let mut blobs: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut text_length_blobs: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut col_minmax: std::collections::HashMap<usize, (Option<String>, Option<String>)> =
         std::collections::HashMap::new();
     let mut col_sums: std::collections::HashMap<usize, (Option<String>, i64, i64)> =
@@ -1555,6 +1583,9 @@ fn compress_segment(
         }
     }
     for cr in col_results {
+        if let Some(length_blob) = cr.text_length_blob {
+            text_length_blobs.push((cr.col_idx, length_blob));
+        }
         blobs.push((cr.col_idx, cr.compressed));
     }
 
@@ -1634,6 +1665,7 @@ fn compress_segment(
         row_count,
         blobs,
         bloom_entries,
+        text_length_blobs,
         meta_values_csv: meta_vals.join(", "),
         colstats_rows_csv,
         total_compressed_size: total_size,
@@ -1736,7 +1768,8 @@ fn flush_segment(
                             } else {
                                 (None, 0, 0)
                             };
-                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
+                            let text_length_blob = build_text_length_blob(&typed_cols_ref[col_i], &col.data_type);
+                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
                         }).collect::<Vec<_>>()
                     })
                 })
@@ -1760,7 +1793,8 @@ fn flush_segment(
             } else {
                 (None, 0, 0)
             };
-            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count }
+            let text_length_blob = build_text_length_blob(&typed_cols_ref[col_i], &col.data_type);
+            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
         }).collect()
     };
 
@@ -1770,6 +1804,7 @@ fn flush_segment(
     let t_meta_start = std::time::Instant::now();
     let mut total_size: i64 = 0;
     let mut blobs: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut length_blobs: Vec<(u16, Vec<u8>)> = Vec::new();
 
     // Index col_results by col_i for lookup
     let mut col_minmax: std::collections::HashMap<usize, (Option<String>, Option<String>)> =
@@ -1787,6 +1822,9 @@ fn flush_segment(
         }
     }
     for cr in col_results {
+        if let Some(length_blob) = cr.text_length_blob {
+            length_blobs.push((cr.col_idx, length_blob));
+        }
         blobs.push((cr.col_idx, cr.compressed));
     }
 
@@ -1908,6 +1946,9 @@ fn flush_segment(
     for (col_idx, num_hashes, bytes) in bloom_entries {
         buf.bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
     }
+    for (col_idx, length_blob) in length_blobs {
+        buf.text_length_buffer.push((col_idx, seg_id, length_blob));
+    }
 
     // Flush blobs immediately if buffer exceeds threshold to bound memory usage.
     let t_blob_flush_start = std::time::Instant::now();
@@ -1993,7 +2034,7 @@ fn flush_partition_blobs(
     buf: &mut PartitionBuffer,
     columns: &[ColumnMeta],
 ) {
-    if buf.blob_buffer.is_empty() && buf.bloom_buffer.is_empty() {
+    if buf.blob_buffer.is_empty() && buf.bloom_buffer.is_empty() && buf.text_length_buffer.is_empty() {
         return;
     }
 
@@ -2002,9 +2043,11 @@ fn flush_partition_blobs(
         let ddl = build_companion_ddl(&buf.partition_table, columns);
         buf.blobs_fqn_cached = Some(ddl.blobs_fqn);
         buf.blooms_fqn_cached = Some(ddl.blooms_fqn);
+        buf.text_lengths_fqn_cached = Some(ddl.text_lengths_fqn);
     }
     let blobs_fqn = buf.blobs_fqn_cached.as_ref().unwrap();
     let blooms_fqn = buf.blooms_fqn_cached.as_ref().unwrap();
+    let text_lengths_fqn = buf.text_lengths_fqn_cached.as_ref().unwrap();
 
     // Create tables without PK for fast heap_insert (PK added in finalize_partition)
     if !buf.blobs_table_created {
@@ -2019,6 +2062,13 @@ fn flush_partition_blobs(
             ));
         }
         buf.blobs_table_created = true;
+    }
+    if !buf.text_lengths_table_created && !buf.text_length_buffer.is_empty() {
+        spi_exec(&format!(
+            "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
+            text_lengths_fqn
+        ));
+        buf.text_lengths_table_created = true;
     }
 
     // Sort blobs column-major (col_idx, segment_id) for sequential TOAST I/O on read
@@ -2131,6 +2181,56 @@ fn flush_partition_blobs(
         }
     }
 
+    // Text-length sidecars: same direct heap_insert pattern as blobs.
+    if !buf.text_length_buffer.is_empty() {
+        buf.text_length_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+
+        let text_lengths_oid = *buf.text_lengths_oid_cached.get_or_insert_with(|| resolve_relation_oid(text_lengths_fqn));
+        unsafe {
+            let insert_ctx = pg_sys::AllocSetContextCreateInternal(
+                pg_sys::CurrentMemoryContext,
+                c"direct_backfill_text_lengths_insert".as_ptr(),
+                pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+                pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+                pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+            );
+
+            let rel = pg_sys::table_open(text_lengths_oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+            let tupdesc = (*rel).rd_att;
+            let bistate = pg_sys::GetBulkInsertState();
+            let cid = pg_sys::GetCurrentCommandId(true);
+
+            for (col_idx, seg_id, length_blob) in buf.text_length_buffer.drain(..) {
+                let old_ctx = pg_sys::MemoryContextSwitchTo(insert_ctx);
+
+                let (bytea_datum, _) = bytea_to_datum(&length_blob);
+                drop(length_blob);
+
+                let mut values: [pg_sys::Datum; 3] = [
+                    pg_sys::Datum::from(col_idx as i16),
+                    pg_sys::Datum::from(seg_id),
+                    bytea_datum,
+                ];
+                let mut nulls: [bool; 3] = [false, false, false];
+
+                let tuple = pg_sys::heap_form_tuple(
+                    tupdesc,
+                    values.as_mut_ptr(),
+                    nulls.as_mut_ptr(),
+                );
+                pg_sys::heap_insert(rel, tuple, cid, 0, bistate);
+                pg_sys::heap_freetuple(tuple);
+
+                pg_sys::MemoryContextSwitchTo(old_ctx);
+                pg_sys::MemoryContextReset(insert_ctx);
+            }
+
+            pg_sys::FreeBulkInsertState(bistate);
+            pg_sys::table_close(rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+            pg_sys::MemoryContextDelete(insert_ctx);
+        }
+    }
+
     pgrx::notice!(
         "pg_deltax: flushed {} MB of blobs for partition '{}' ({} rows total)",
         buf.blob_buffer_size / (1024 * 1024),
@@ -2218,6 +2318,9 @@ fn write_compressed_segment(
     for (col_idx, num_hashes, bytes) in cs.bloom_entries {
         buf.bloom_buffer.push((col_idx, cs.seg_id, num_hashes, bytes));
     }
+    for (col_idx, length_blob) in cs.text_length_blobs {
+        buf.text_length_buffer.push((col_idx, cs.seg_id, length_blob));
+    }
 
     // Flush blobs when threshold reached
     if buf.blob_buffer_size >= BLOB_BUFFER_THRESHOLD {
@@ -2248,6 +2351,12 @@ fn finalize_partition(
             ddl.blooms_fqn
         ));
     }
+    if buf.text_lengths_table_created {
+        spi_exec(&format!(
+            "ALTER TABLE {} ADD PRIMARY KEY (_col_idx, _segment_id)",
+            ddl.text_lengths_fqn
+        ));
+    }
 
     // Flush colstats sorted by (_col_idx, _segment_id) for column-major heap layout
     flush_colstats_buffer(buf);
@@ -2258,6 +2367,9 @@ fn finalize_partition(
 
     if buf.blobs_table_created && crate::BLOOM_FILTERS.get() {
         spi_exec(&format!("ANALYZE {}", ddl.blooms_fqn));
+    }
+    if buf.text_lengths_table_created {
+        spi_exec(&format!("ANALYZE {}", ddl.text_lengths_fqn));
     }
 
     // Use a short-lived SPI connection for catalog update

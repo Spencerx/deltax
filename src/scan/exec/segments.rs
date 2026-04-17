@@ -364,8 +364,15 @@ pub(super) fn segment_skippable_by_dict(
 }
 
 pub(super) struct SegmentData {
+    /// Companion-table segment id (used to fetch sidecar/bloom data after
+    /// the main load).
+    pub(super) segment_id: i32,
     pub(super) segment_values: Vec<Option<String>>,
     pub(super) compressed_blobs: Vec<Vec<u8>>,
+    /// Per-text-column length sidecar blobs (parallel to compressed_blobs).
+    /// Non-empty when the planner has marked a text column as sidecar-only;
+    /// holds the compressed u32-per-row length array instead of the main blob.
+    pub(super) text_length_blobs: Vec<Vec<u8>>,
     pub(super) row_count: i32,
     pub(super) min_time: Option<i64>,
     pub(super) max_time: Option<i64>,
@@ -927,12 +934,15 @@ pub(super) unsafe fn load_segments_heap(
 
             // Pre-allocate empty blob slots — will be filled in Phase 2
             let compressed_blobs: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
+            let text_length_blobs: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
             let toast_pointers: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
 
             surviving_segment_ids.push(segment_id);
             segments.push(SegmentData {
+                segment_id,
                 segment_values,
                 compressed_blobs,
+                text_length_blobs,
                 row_count,
                 min_time: seg_min_time,
                 max_time: seg_max_time,
@@ -1880,6 +1890,166 @@ pub(super) unsafe fn load_segments_heap(
         );
 
         (segments, segments_skipped, segments_minmax_skipped, segments_bloom_skipped, detoast_us)
+    }
+}
+
+/// Load text-length sidecar blobs for the columns marked sidecar-only, writing
+/// them into each segment's `text_length_blobs[blob_slot]`. Returns the elapsed
+/// detoast time in microseconds.
+///
+/// Uses an index scan on the `<partition>_text_lengths` PK (same pattern as the
+/// main blob loader). Silently no-ops when the table doesn't exist (old data
+/// compressed before the sidecar was introduced).
+pub(super) unsafe fn load_text_length_sidecars(
+    meta_oid: pg_sys::Oid,
+    col_names: &[String],
+    segment_by: &[String],
+    sidecar_cols: &[bool],
+    segments: &mut [SegmentData],
+) -> u64 {
+    if segments.is_empty() || !sidecar_cols.iter().any(|&s| s) {
+        return 0;
+    }
+
+    unsafe {
+        // Derive text_lengths table OID from meta table name
+        let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+        let meta_name = std::ffi::CStr::from_ptr(meta_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+        let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+        let partition_name = meta_name.strip_suffix("_meta").unwrap_or(&meta_name);
+        let tl_name = format!("{}_text_lengths", partition_name);
+        let tl_cname = std::ffi::CString::new(tl_name).unwrap();
+        let tl_oid = pg_sys::get_relname_relid(tl_cname.as_ptr(), meta_ns_oid);
+
+        if tl_oid == pg_sys::InvalidOid {
+            // Data compressed before the sidecar feature — no sidecar to load.
+            return 0;
+        }
+
+        // Build col_idx -> blob_slot mapping (same rule as load_segments_heap)
+        let mut col_idx_map: Vec<Option<u16>> = Vec::new();
+        let mut ci: u16 = 0;
+        for name in col_names {
+            if segment_by.contains(name) {
+                col_idx_map.push(None);
+            } else {
+                col_idx_map.push(Some(ci));
+                ci += 1;
+            }
+        }
+
+        // Determine which col_idx values we need sidecars for
+        let mut needed_col_idxs: Vec<u16> = Vec::new();
+        for (i, &is_sidecar) in sidecar_cols.iter().enumerate() {
+            if is_sidecar
+                && let Some(ci) = col_idx_map[i]
+            {
+                needed_col_idxs.push(ci);
+            }
+        }
+        if needed_col_idxs.is_empty() {
+            return 0;
+        }
+
+        // Build segment_id -> index-in-segments map
+        let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
+        for (idx, seg) in segments.iter().enumerate() {
+            seg_id_to_idx.insert(seg.segment_id, idx);
+        }
+
+        let t_start = std::time::Instant::now();
+
+        let rel = pg_sys::table_open(tl_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        // Find PK index
+        let pk_index_oid = {
+            let mut pk_oid = pg_sys::InvalidOid;
+            let index_list = pg_sys::RelationGetIndexList(rel);
+            if !index_list.is_null() {
+                let n = (*index_list).length;
+                for i in 0..n {
+                    let idx_oid =
+                        (*(*index_list).elements.add(i as usize)).oid_value;
+                    let idx_rel = pg_sys::index_open(idx_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    let is_primary = if !(*idx_rel).rd_index.is_null() {
+                        (*(*idx_rel).rd_index).indisprimary
+                    } else { false };
+                    pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    if is_primary {
+                        pk_oid = idx_oid;
+                        break;
+                    }
+                }
+                pg_sys::list_free(index_list);
+            }
+            pk_oid
+        };
+
+        let snapshot = pg_sys::GetActiveSnapshot();
+
+        if pk_index_oid != pg_sys::InvalidOid {
+            let idx_rel = pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+            for &col_idx in &needed_col_idxs {
+                let mut skey = [pg_sys::ScanKeyData::default()];
+                pg_sys::ScanKeyInit(
+                    &mut skey[0],
+                    1, // _col_idx
+                    pg_sys::BTEqualStrategyNumber as u16,
+                    pg_sys::F_INT2EQ.into(),
+                    pg_sys::Datum::from(col_idx as i16),
+                );
+
+                #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+                let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, 1, 0);
+                #[cfg(feature = "pg18")]
+                let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, std::ptr::null_mut(), 1, 0);
+                pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
+
+                let slot = pg_sys::table_slot_create(rel, std::ptr::null_mut());
+
+                loop {
+                    if !pg_sys::index_getnext_slot(scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+                        break;
+                    }
+                    pg_sys::slot_getallattrs(slot);
+                    let tts_values = (*slot).tts_values;
+                    let tts_isnull = (*slot).tts_isnull;
+
+                    // attnum 2 = _segment_id, attnum 3 = _data
+                    if *tts_isnull.add(1) || *tts_isnull.add(2) {
+                        continue;
+                    }
+                    let seg_id = (*tts_values.add(1)).value() as i32;
+                    let seg_idx = match seg_id_to_idx.get(&seg_id) {
+                        Some(&i) => i,
+                        None => continue, // pruned
+                    };
+
+                    let varlena_ptr: *mut pg_sys::varlena = (*tts_values.add(2)).cast_mut_ptr();
+                    let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                    let len = pgrx::varsize_any_exhdr(detoasted);
+                    let data = pgrx::vardata_any(detoasted);
+                    #[allow(clippy::unnecessary_cast)]
+                    let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+                    if detoasted != varlena_ptr {
+                        pg_sys::pfree(detoasted as *mut _);
+                    }
+                    segments[seg_idx].text_length_blobs[col_idx as usize] = bytes;
+                }
+
+                pg_sys::ExecDropSingleTupleTableSlot(slot);
+                pg_sys::index_endscan(scan);
+            }
+
+            pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        }
+
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        t_start.elapsed().as_micros() as u64
     }
 }
 

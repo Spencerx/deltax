@@ -24,10 +24,22 @@ pub(super) enum SegTextColumn {
     },
     /// Segment-by column: same value for all rows.
     SegBy(Option<String>),
+    /// Length-sidecar only: per-row character count; no string body available.
+    /// `null_bitmap[row / 8] & (1 << (row % 8))` == 1 means null; empty bitmap = all non-null.
+    /// Callers using `get_str` on this variant will get `None`, which matches the
+    /// semantics of a null row — so any code path that actually needs string bytes
+    /// must check the variant beforehand. The query planner only routes a column
+    /// to this variant when every usage is `length(col)`, `col = ''`, `col <> ''`,
+    /// or IS [NOT] NULL.
+    Lengths {
+        lengths: Vec<u32>,
+        null_bitmap: Vec<u8>,
+    },
 }
 
 impl SegTextColumn {
-    /// Get the string for a given row, or None if null.
+    /// Get the string for a given row, or None if null. Returns None for the
+    /// Lengths variant since string bytes are not available there.
     pub(super) fn get_str(&self, row: usize) -> Option<&str> {
         match self {
             SegTextColumn::Dict { entries, row_to_entry } => {
@@ -43,8 +55,41 @@ impl SegTextColumn {
                 }
             }
             SegTextColumn::SegBy(opt) => opt.as_deref(),
+            SegTextColumn::Lengths { .. } => None,
         }
     }
+
+    /// Get the character length of the value at a given row, or None if null.
+    /// All variants support this — Dict/Lz4/SegBy compute from the string body,
+    /// Lengths reads directly from the stored array.
+    pub(super) fn get_len(&self, row: usize) -> Option<usize> {
+        match self {
+            SegTextColumn::Dict { entries, row_to_entry } => {
+                let idx = row_to_entry[row];
+                if idx == u32::MAX { None } else { Some(entries[idx as usize].chars().count()) }
+            }
+            SegTextColumn::Lz4 { buf, row_to_range } => {
+                let (off, len) = row_to_range[row];
+                if off == u32::MAX {
+                    None
+                } else {
+                    let slice = &buf[off as usize..off as usize + len as usize];
+                    Some(std::str::from_utf8(slice).unwrap_or("").chars().count())
+                }
+            }
+            SegTextColumn::SegBy(opt) => opt.as_deref().map(|s| s.chars().count()),
+            SegTextColumn::Lengths { lengths, null_bitmap } => {
+                if !null_bitmap.is_empty()
+                    && (null_bitmap[row / 8] >> (row % 8)) & 1 == 1
+                {
+                    None
+                } else {
+                    Some(lengths[row] as usize)
+                }
+            }
+        }
+    }
+
 }
 
 /// Pre-extracted text qual info for worker threads.
@@ -52,6 +97,40 @@ impl SegTextColumn {
 pub(super) enum TextQualInfo {
     EqNe { col_idx: usize, const_str: String, is_ne: bool },
     Like { col_idx: usize, strategy: LikeStrategy, negate: bool },
+}
+
+/// Decode a per-row length sidecar blob into a SegTextColumn::Lengths (pure Rust).
+pub(super) fn decompress_length_sidecar(blob: &[u8]) -> Option<SegTextColumn> {
+    if blob.is_empty() {
+        return None;
+    }
+    let cc = compression::CompressedColumnRef::from_bytes(blob);
+    // Only Lz4 raw-u32 encoding is produced today; reject anything else.
+    if cc.type_tag != compression::CompressionType::Lz4 {
+        return None;
+    }
+    let raw = lz4_flex::decompress_size_prepended(cc.data).ok()?;
+    let row_count = cc.row_count as usize;
+    let mut lengths = vec![0u32; row_count];
+    if cc.null_bitmap.is_empty() {
+        if raw.len() != row_count * 4 {
+            return None;
+        }
+        for (i, slot) in lengths.iter_mut().enumerate() {
+            *slot = u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().ok()?);
+        }
+        Some(SegTextColumn::Lengths { lengths, null_bitmap: Vec::new() })
+    } else {
+        let mut vi = 0;
+        for (i, slot) in lengths.iter_mut().enumerate() {
+            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if !is_null {
+                *slot = u32::from_le_bytes(raw[vi * 4..vi * 4 + 4].try_into().ok()?);
+                vi += 1;
+            }
+        }
+        Some(SegTextColumn::Lengths { lengths, null_bitmap: cc.null_bitmap.to_vec() })
+    }
 }
 
 /// Decompress a text column blob into a SegTextColumn (pure Rust, thread-safe).
@@ -130,6 +209,44 @@ pub(super) fn decompress_text_to_seg_col(blob: &[u8]) -> Option<SegTextColumn> {
 /// If `sel` is empty, it is initialized (all rows evaluated).
 /// If `sel` is non-empty, rows already false are skipped (short-circuit).
 pub(super) fn apply_text_eq_filter(seg_col: &SegTextColumn, const_str: &str, is_ne: bool, row_count: usize, sel: &mut Vec<bool>) {
+    // Length-sidecar fast path: only "" comparisons are resolvable (length == 0 / > 0).
+    // Non-empty const_str on a Lengths column means we can't evaluate — the planner
+    // is supposed to prevent this, but fail safe by zeroing the selection.
+    if let SegTextColumn::Lengths { lengths, null_bitmap } = seg_col {
+        if const_str.is_empty() {
+            let is_null = |row: usize| -> bool {
+                !null_bitmap.is_empty() && (null_bitmap[row / 8] >> (row % 8)) & 1 == 1
+            };
+            let pass_fn = |row: usize| -> bool {
+                if is_null(row) {
+                    return false;
+                }
+                let is_empty = lengths[row] == 0;
+                if is_ne { !is_empty } else { is_empty }
+            };
+            if sel.is_empty() {
+                sel.reserve(row_count);
+                for row in 0..row_count {
+                    sel.push(pass_fn(row));
+                }
+            } else {
+                for (row, s) in sel.iter_mut().enumerate() {
+                    if !*s { continue; }
+                    *s = pass_fn(row);
+                }
+            }
+        } else {
+            // Can't evaluate a non-empty equality on lengths alone — drop all rows.
+            if sel.is_empty() {
+                sel.clear();
+                sel.resize(row_count, false);
+            } else {
+                for s in sel.iter_mut() { *s = false; }
+            }
+        }
+        return;
+    }
+
     match seg_col {
         SegTextColumn::Dict { entries, row_to_entry } => {
             // Dict fast path: match against unique dict entries only

@@ -556,12 +556,16 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
             let blooms_table = format!("\"_deltax_compressed\".\"{}_blooms\"", name);
             let colstats_table = format!("\"_deltax_compressed\".\"{}_colstats\"", name);
             let meta_table = format!("\"_deltax_compressed\".\"{}_meta\"", name);
+            let text_lengths_table = format!("\"_deltax_compressed\".\"{}_text_lengths\"", name);
             client
                 .update(&format!("DROP TABLE IF EXISTS {}", blobs_table), None, &[])
                 .expect("failed to drop compressed blobs table");
             client
                 .update(&format!("DROP TABLE IF EXISTS {}", blooms_table), None, &[])
                 .expect("failed to drop compressed blooms table");
+            client
+                .update(&format!("DROP TABLE IF EXISTS {}", text_lengths_table), None, &[])
+                .expect("failed to drop compressed text_lengths table");
             client
                 .update(&format!("DROP TABLE IF EXISTS {}", colstats_table), None, &[])
                 .expect("failed to drop compressed colstats table");

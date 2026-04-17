@@ -28,7 +28,7 @@ use super::segments::{
     classify_segment_quals, SegmentQualResult, is_zero_const,
     detoast_lazy_blobs,
 };
-use super::text_col::{SegTextColumn, TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
+use super::text_col::{SegTextColumn, TextQualInfo, decompress_length_sidecar, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
 
 /// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
 /// Uses two AHasher instances (AES-NI accelerated) with different fixed keys
@@ -1625,21 +1625,87 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.segment_by,
             &meta.time_column,
         );
+
+        // Build sidecar_only_cols: text columns where every aggregate on the
+        // column is LengthOf AND every batch qual is `= ''` / `<> ''`, and the
+        // column is not in GROUP BY. For such columns we can skip detoasting
+        // the main text blob and use the compact per-row length sidecar.
+        //
+        // Only the parallel mixed path knows how to read from the sidecar; if
+        // that path won't run for this query, we must load the main blob as
+        // usual. So the sidecar flags are cleared when the query isn't a
+        // parallel-mixed candidate.
+        let sidecar_candidate: Vec<bool> = (0..num_cols).map(|col_idx| {
+            let t = meta.col_types[col_idx];
+            let is_text = t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID;
+            if !is_text { return false; }
+            if !needed_cols[col_idx] { return false; }
+
+            // Must not appear in GROUP BY
+            if group_specs.iter().any(|gs| gs.col_idx >= 0 && gs.col_idx as usize == col_idx) {
+                return false;
+            }
+            // Every agg on this column must be LengthOf
+            let agg_refs: Vec<&AggExecSpec> = agg_specs.iter()
+                .filter(|s| s.col_idx >= 0 && s.col_idx as usize == col_idx)
+                .collect();
+            if !agg_refs.iter().all(|s| s.expr_kind == AggExpr::LengthOf) {
+                return false;
+            }
+            // Every batch qual on this column must be EQ/NE with empty string
+            let qual_refs: Vec<&BatchQual> = batch_quals.iter()
+                .filter(|bq| bq.col_idx == col_idx)
+                .collect();
+            let all_quals_ok = qual_refs.iter().all(|bq| {
+                matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
+                    && matches!(bq.text_const.as_deref(), Some(""))
+            });
+            if !all_quals_ok { return false; }
+            // Must have at least one usage (otherwise the column wouldn't be needed)
+            !agg_refs.is_empty() || !qual_refs.is_empty()
+        }).collect();
+
+        // Gate sidecar activation on the parallel-mixed path being usable.
+        let sidecar_only_cols: Vec<bool> = if sidecar_candidate.iter().any(|&s| s)
+            && crate::get_parallel_workers() > 1
+            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &batch_quals, &agg_specs)
+        {
+            sidecar_candidate
+        } else {
+            vec![false; num_cols]
+        };
+
+        // For load_segments_heap, suppress main-blob loading for sidecar-only
+        // columns. We load their length sidecars separately below.
+        let mut needed_cols_main: Vec<bool> = needed_cols.clone();
+        for (i, &s) in sidecar_only_cols.iter().enumerate() {
+            if s {
+                needed_cols_main[i] = false;
+            }
+        }
+
         // Load segments from all companion tables (with lazy pruning)
         let n_workers = crate::get_parallel_workers();
         let use_lazy = n_workers > 1;
-        let lazy_cols: Vec<bool> = needed_cols.to_vec();
+        let lazy_cols: Vec<bool> = needed_cols_main.clone();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, _, _, _, dt_us) = load_segments_heap(
-                oid, &meta.col_names, &meta.segment_by, &needed_cols,
+            let (mut segs, _, _, _, dt_us) = load_segments_heap(
+                oid, &meta.col_names, &meta.segment_by, &needed_cols_main,
                 &meta.time_column, false, &seg_filters, time_min, time_max,
                 if use_lazy { Some(&lazy_cols) } else { None },
                 &batch_quals, &[],
                 &meta.col_types,
                 &[],
             );
+            // Load text-length sidecars for the columns in sidecar-only mode.
+            if sidecar_only_cols.iter().any(|&s| s) {
+                let sidecar_detoast_us = super::segments::load_text_length_sidecars(
+                    oid, &meta.col_names, &meta.segment_by, &sidecar_only_cols, &mut segs,
+                );
+                total_detoast_us += sidecar_detoast_us;
+            }
             all_segments.extend(segs);
             total_detoast_us += dt_us;
         }
@@ -3089,6 +3155,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 text_group_col_flags: &text_group_col_flags,
                 text_qual_infos: &text_qual_infos,
                 rust_regex_infos: &rust_regex_infos,
+                sidecar_only_cols: &sidecar_only_cols,
             };
 
             // Pipeline detoast with parallel processing when enough segments.
@@ -8124,6 +8191,15 @@ fn apply_regex_to_seg_col(seg_col: &SegTextColumn, regex: &Regex, replacement: &
             let new_opt = opt.as_deref().map(|s| regex.replace(s, replacement).into_owned());
             SegTextColumn::SegBy(new_opt)
         }
+        SegTextColumn::Lengths { lengths, null_bitmap } => {
+            // Regex on a length-only column is meaningless (the planner should
+            // never route a RegexpReplace column into sidecar mode). Preserve
+            // the shape so callers don't panic if this ever fires.
+            SegTextColumn::Lengths {
+                lengths: lengths.clone(),
+                null_bitmap: null_bitmap.clone(),
+            }
+        }
     }
 }
 
@@ -8146,6 +8222,9 @@ struct ParallelMixedConfig<'a> {
     text_qual_infos: &'a [TextQualInfo],
     /// Compiled Rust regex info for RegexpReplace GROUP BY columns
     rust_regex_infos: &'a [RustRegexInfo],
+    /// Per-column flag: true when the text column is loaded in sidecar-only
+    /// mode (length blob instead of main blob). Parallel to col_names.
+    sidecar_only_cols: &'a [bool],
 }
 
 // TextQualInfo is now in text_col.rs
@@ -8376,6 +8455,13 @@ fn process_segments_mixed(
                     text_seg_cols.push(None);
                 }
                 seg_val_idx += 1;
+            } else if config.sidecar_only_cols.get(col_idx).copied().unwrap_or(false) {
+                // Text column in sidecar-only mode: main blob wasn't loaded;
+                // decode the length sidecar instead.
+                let sidecar_blob = &seg.text_length_blobs[blob_idx];
+                text_seg_cols.push(decompress_length_sidecar(sidecar_blob));
+                numeric_cols.push(Vec::new());
+                blob_idx += 1;
             } else {
                 let blob = &seg.compressed_blobs[blob_idx];
                 if config.text_group_col_flags[col_idx] {
@@ -8581,9 +8667,9 @@ fn process_segments_mixed(
                             *count += 1;
                         } else if spec.expr_kind == AggExpr::LengthOf
                             && let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
-                            && let Some(s) = seg_col.get_str(row) {
+                            && let Some(len) = seg_col.get_len(row) {
                             let (sum, count) = unsafe { compact_storage.sum_int_mut(group_idx, spec_idx) };
-                            *sum += s.chars().count() as i128;
+                            *sum += len as i128;
                             *count += 1;
                         }
                     }
@@ -8600,9 +8686,9 @@ fn process_segments_mixed(
                             *count += 1;
                         } else if spec.expr_kind == AggExpr::LengthOf
                             && let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
-                            && let Some(s) = seg_col.get_str(row) {
+                            && let Some(len) = seg_col.get_len(row) {
                             let (sum, count) = unsafe { compact_storage.sum_int_narrow_mut(group_idx, spec_idx) };
-                            *sum += s.chars().count() as i64;
+                            *sum += len as i64;
                             *count += 1;
                         }
                     }
@@ -8619,9 +8705,9 @@ fn process_segments_mixed(
                             *count += 1;
                         } else if spec.expr_kind == AggExpr::LengthOf
                             && let Some(ref seg_col) = text_seg_cols[spec.col_idx as usize]
-                            && let Some(s) = seg_col.get_str(row) {
+                            && let Some(len) = seg_col.get_len(row) {
                             let (sum, count) = unsafe { compact_storage.sum_float_mut(group_idx, spec_idx) };
-                            *sum += s.chars().count() as f64;
+                            *sum += len as f64;
                             *count += 1;
                         }
                     }
@@ -9153,8 +9239,10 @@ mod tests {
 
     fn make_empty_segment(row_count: i32) -> SegmentData {
         SegmentData {
+            segment_id: 0,
             segment_values: Vec::new(),
             compressed_blobs: Vec::new(),
+            text_length_blobs: Vec::new(),
             row_count,
             min_time: None,
             max_time: None,

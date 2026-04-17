@@ -908,3 +908,73 @@ trigram bloom filters (#33) are the appropriate optimization.
 **Files:** `src/scan/exec/text_col.rs` (dict-aware `apply_text_like_filter`
 and `apply_text_eq_filter`), `src/scan/exec/agg.rs` (`process_segments_mixed`
 two-phase column decompression)
+
+### 42. Text-length sidecar for `length()` / `col <> ''` [DONE]
+
+**Impact: Q27 1.80s → 0.55s hot (3.3x), 7.97s → 1.99s cold (4.0x). Bonus:
+Q30 1.57s → 1.05s (−33%), Q31 2.24s → 1.75s (−22%) and their cold runs
+21–28% faster, because their `WHERE SearchPhrase <> ''` filter is now
+served from the sidecar.**
+
+At compression time we emit a per-row character-length array for every text
+column and store it LZ4-compressed in a new `*_text_lengths` companion table.
+For a text column `col`, if every query-time reference is one of
+`length(col)`, `col = ''`, `col <> ''` (and the column is not in GROUP BY),
+the scan loads the small length blob instead of detoasting the full text
+blob. Lengths are character counts (not bytes), matching PG's `length(text)`
+semantics for UTF-8.
+
+Why this works on Q27 specifically: the URL column accounts for the entire
+~1 s of hot detoast time. The main URL blob is ~830 KB per segment; the
+length sidecar is ~10 KB (~80× smaller). `length(URL)` becomes a direct u32
+lookup; `URL <> ''` becomes `length > 0`. No varlena allocation, no string
+materialization, no LZ4 decode of the main blob.
+
+**Measured breakdown (Q27 hot, 3338 segments):**
+
+| Phase | Before | After |
+|-------|--------|-------|
+| detoast | 1037 ms | 245 ms |
+| decompress | 253 ms | 25 ms |
+| agg | 558 ms | 240 ms |
+| **total** | **1.79 s** | **0.54 s** |
+
+Per-segment metadata is also enriched: `_sum` / `_nonnull_count` /
+`_nonzero_count` in colstats now get populated for text columns as
+`SUM(length)` / non-null count / non-empty count (they were NULL
+previously). This also enables future metadata-only fast paths on
+`AVG(length(col))` without GROUP BY.
+
+**Gating.** The sidecar is activated only when the parallel mixed path
+will run (`n_workers > 1 && can_parallel_mixed(...)`) and the planner-level
+detection succeeds. Other paths (compact-only, non-parallel fallback,
+decompress path) don't know about sidecars and continue loading the main
+blob. This is strict to keep the change non-invasive — a column that's
+eligible on query shape but lands in a non-mixed path still works, it
+just doesn't get the speedup.
+
+**Disqualifications.** The detection rejects the column if any:
+- MIN/MAX agg on the column (Q22, Q28: MIN(URL), MIN(Referer))
+- LIKE / NOT LIKE qual (Q20, Q21, Q22)
+- GROUP BY on the column (Q33, Q34)
+- Any other agg shape that isn't `LengthOf`
+
+Each of these paths needs the full string body.
+
+**Storage cost.** +650 MB across 18 partitions (~65 MB/partition) for all
+text columns' sidecars. Compared to ~2.8 GB/partition of main text blobs,
+this is within rounding at the benchmark total (both 12.93 GiB).
+Load time +4% (310 s → 323 s) for the per-row character-count pass.
+
+**Wire format.** Length blobs reuse the existing `CompressedColumn`
+framing: `[tag=Lz4][row_count][has_nulls][null_bitmap?][lz4(u32 array)]`.
+Single new variant `SegTextColumn::Lengths` in the text column decoder.
+
+**Files:** `src/compress.rs` (`compress_text_lengths`, text-aware
+`compute_typed_sum`, DDL additions), `src/copy.rs` (direct backfill path:
+buffer + heap_insert), `src/scan/exec/text_col.rs` (`Lengths` variant,
+`get_len()`, empty-string fast path in `apply_text_eq_filter`,
+`decompress_length_sidecar`), `src/scan/exec/segments.rs`
+(`load_text_length_sidecars` PK index scan), `src/scan/exec/agg.rs`
+(sidecar detection in planner, `ParallelMixedConfig.sidecar_only_cols`,
+LengthOf accumulators routed through `get_len()`).

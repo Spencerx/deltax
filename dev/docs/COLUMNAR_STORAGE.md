@@ -2,12 +2,13 @@
 
 ## Overview
 
-DeltaX splits each compressed partition into four tables:
+DeltaX splits each compressed partition into five tables:
 
 1. **Meta table** — thin per-segment metadata: segment-by values, time bounds, row count (no BYTEA, no TOAST)
 2. **Colstats table** — normalized per-column statistics (min/max/sum/counts), one row per (column, segment)
 3. **Blob table** — compressed column data, inserted in column-major order for sequential I/O
 4. **Blooms table** — per-segment packed bloom filters for equality predicate pushdown
+5. **Text lengths table** — per-row character-count sidecars for text columns, consulted when a query only needs `length(col)` / `col <> ''`
 
 This layout replaces the original single companion table design where all
 compressed column blobs were stored as BYTEA columns in one row per segment.
@@ -209,9 +210,64 @@ columns. Building can be disabled via the `pg_deltax.bloom_filters` GUC
 (default: on). The read path gracefully handles missing bloom data — if the
 blooms table doesn't exist, the bloom phase is skipped.
 
+### 5. Text Lengths Table (`<partition>_text_lengths`)
+
+Stores a per-row character-length sidecar for every text column, one row per
+(text_column, segment) pair. The planner routes text columns to this table
+when every query-time reference is `length(col)`, `col = ''`, or `col <> ''`
+— i.e. the actual string bytes are never needed. The sidecar is ~50–80×
+smaller than the main text blob, so detoasting it is near-free.
+
+```sql
+CREATE TABLE "_deltax_compressed"."<partition>_text_lengths" (
+    _col_idx     SMALLINT NOT NULL,
+    _segment_id  INT NOT NULL,
+    _data        BYTEA NOT NULL,
+    PRIMARY KEY (_col_idx, _segment_id)
+);
+```
+
+**Wire format** of `_data` (same `CompressedColumn` framing as the main
+blob table, just with a u32-array payload):
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ tag: u8 (= Lz4) | row_count: u32_le | has_nulls: u8             │
+│ [null_bitmap: ceil(row_count/8) bytes if has_nulls]             │
+│ lz4_compressed_u32_array_of_non_null_character_counts           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Each stored value is `s.chars().count() as u32` — PostgreSQL's `length(text)`
+semantics, not byte length. Null rows are encoded via the null bitmap and
+appear as `0` in the decoded array; callers distinguishing "null" from
+"empty" consult the bitmap.
+
+**Why a separate table, not a column in `blobs`:** sidecar loading is
+selective (only for columns the planner has marked sidecar-only) and the
+main blob load is suppressed for those columns, so mixing them in one table
+would require a second index scan anyway. Keeping them separate also lets
+the sidecar table be missing (old compressed data) and the reader silently
+falls back to the main blob.
+
+**Which text columns get a sidecar:** all text columns (text / varchar /
+bpchar) at compress time. Storage cost is low — typical character-length
+arrays compress to a few KB per segment via LZ4 because neighbouring rows
+have similar lengths. For ClickBench: ~650 MB across all 18 partitions for
+all ~28 text columns combined, vs multi-GB for the main text blobs.
+
+**Relation to colstats.** The colstats `_sum`, `_nonnull_count`, and
+`_nonzero_count` columns are also populated for text columns: `_sum` holds
+`SUM(length)`, `_nonzero_count` holds the number of non-empty rows. These
+powered future metadata-only fast paths when the grouping is constant per
+segment.
+
+See PERF_IMPROVEMENTS #42 for the performance impact.
+
 ## Read Path
 
-The read path is a four-phase process in `load_segments_heap`:
+The read path is a four-phase process in `load_segments_heap`, followed by
+an optional sidecar load for text-length queries:
 
 ### Phase 1: Meta Scan (zero TOAST I/O)
 
@@ -275,10 +331,31 @@ For each needed col_idx:
 Because blobs were inserted in column-major order, the TOAST chunks for one
 column are contiguous on disk.
 
+### Phase 2b: Text-Length Sidecar (optional)
+
+Runs when the planner marks any text column as sidecar-only — i.e. every
+reference is `length(col)` / `col = ''` / `col <> ''` and the column is not
+in GROUP BY. The caller suppresses the main-blob entry for that column's
+`col_idx` before invoking Phase 2, then calls `load_text_length_sidecars`
+to read from the `*_text_lengths` table.
+
+The loader mirrors Phase 2: PK index scan by `_col_idx`, detoast each
+matching segment's `_data`, store into `SegmentData.text_length_blobs`.
+Because the sidecar is ~1–2% the size of the main text blob, detoast cost
+is near-negligible. Works per-column: some cols on a query can be
+sidecar-only while others keep the main blob.
+
+When the sidecar table is absent (data compressed before the sidecar
+feature), the loader silently no-ops and callers fall back to the main
+blob path.
+
+Currently wired into the parallel mixed aggregation path only
+(`ParallelMixedConfig.sidecar_only_cols`). Other paths ignore the flag.
+
 ### Parallel Workers
 
 The current parallel dispatch pattern is preserved:
-1. Main thread: Phase 1 + Bloom + Phase 2 → `Vec<SegmentData>`
+1. Main thread: Phase 1 + Bloom + Phase 2 (+ Phase 2b) → `Vec<SegmentData>`
 2. Dispatch segments to parallel workers for decompression + aggregation
 
 Phase 2 runs on the main thread because `pg_detoast_datum` requires a valid
@@ -295,16 +372,19 @@ blob table, compressed blobs are buffered in memory and flushed after all
 segments are processed.
 
 ```
-Phase 1: Compress all segments, buffer blobs, colstats, and blooms
+Phase 1: Compress all segments, buffer blobs, colstats, blooms, and text lengths
 
 for each batch of 30,000 rows:
     compress all columns → 105 blobs
+    for each text column: build per-row character-length array, LZ4-compress → text length blob
     compute per-column stats (encoded min/max, sum, counts, ndistinct)
+        — for text columns, _sum = SUM(length), _nonzero_count = non-empty rows
     compute bloom filters for numeric/date/timestamp columns
     INSERT meta row immediately (segment_by, time bounds, row_count)
     buffer colstats rows in memory (keyed by col_idx, segment_id)
     buffer compressed blobs in memory (keyed by col_idx, segment_id)
     buffer packed bloom data in memory (keyed by segment_id)
+    buffer text length blobs in memory (keyed by col_idx, segment_id)
 
 Phase 2: Flush colstats in column-major order
 
@@ -322,7 +402,13 @@ Phase 4: Flush bloom filters
 for each (segment_id, bloom_data) in bloom_buffer:
     INSERT INTO blooms (_segment_id, _data)
 
-ANALYZE meta, colstats, blobs, blooms
+Phase 5: Flush text-length sidecars in column-major order
+
+sort text_length_buffer by (col_idx, segment_id)
+for each (col_idx, segment_id, length_blob) in text_length_buffer:
+    INSERT INTO text_lengths (_col_idx, _segment_id, _data)
+
+ANALYZE meta, colstats, blobs, blooms, text_lengths
 ```
 
 ### Memory Impact
@@ -330,8 +416,10 @@ ANALYZE meta, colstats, blobs, blooms
 Buffering requires holding all compressed blobs and colstats rows for one
 partition in memory. For ClickBench (105 columns, ~667 segments per partition),
 the compressed blobs total ~2.8 GB per partition. Colstats rows add negligible
-overhead (~50 bytes × 105 × 667 ≈ 3.5 MB). A typical time-series table with
-10-20 narrower columns and smaller partitions would buffer tens of MB.
+overhead (~50 bytes × 105 × 667 ≈ 3.5 MB). Text-length sidecars add ~35 MB
+per partition (~28 text columns × 667 segments × a few KB each after LZ4).
+A typical time-series table with 10-20 narrower columns and smaller
+partitions would buffer tens of MB.
 
 This is acceptable because:
 - Compression is a batch operation (not latency-sensitive)
@@ -344,8 +432,10 @@ This is acceptable because:
 ### During Decompression
 
 `deltax_decompress_partition` reads from the meta and blob tables (meta for
-segment metadata, blobs for column data) and drops all four companion tables
-after restoring data to the original partition.
+segment metadata, blobs for column data) and drops all five companion tables
+after restoring data to the original partition. The text-length sidecars are
+derived data and are simply dropped — they don't need to be read back
+because the original row values are restored from the main blobs.
 
 ## Alternatives Considered
 
