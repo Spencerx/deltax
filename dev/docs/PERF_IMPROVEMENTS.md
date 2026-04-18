@@ -1077,19 +1077,33 @@ bypassed entirely since this path is gated on all-CountDistinct
 (every spec's result is a count). Merge is now visible in EXPLAIN as
 `merge=...`.
 
-Measured result (on top of fix (a)):
+**Fix (c) — parallelize CD count in speculative top-N Phase 5 [DONE].**
+The same pattern applies to the Phase 5 "for each winner, merge CD
+accumulators across workers" path that runs when speculative top-N
+succeeds on queries with GROUP BY + CountDistinct. Instrumentation
+showed 98 % of Q9's 321 ms finalize was `HashSet::extend` (top 10
+RegionIDs have ~7 M cumulative distinct UserIDs; destination set
+grew past L3 at ~60 ns per insert). Replaced with a parallel
+partitioned count across winners — same partitioning trick, but
+indexed over winners × cd_slots. Non-CD accumulators (Count, SumInt,
+…) still merged serially since they were only ~2 ms of the 321 ms.
 
-| Query | After (a) only | After (a)+(b) | Δ |
-|-------|---------------:|--------------:|--:|
-| Q4 wall | 2017 ms | **703 ms** | −1314 ms (−65 %) |
-| Q4 `merge=` | 1590 ms | **271 ms** | 5.9× faster |
-| Q5 wall | 1214 ms | **753 ms** | −461 ms (−40 %) |
-| Q5 `merge=` | 534 ms | **94 ms** | 5.7× faster |
-| **Bench total (hot)** | 63.40 s | **61.44 s** | **−1.96 s** |
+Measured results (on top of fix (a)):
 
-**Cumulative pre-HLL wins (a)+(b):** Q4 3.02 → 0.70 s (−77 %),
-Q5 1.85 → 0.75 s (−59 %), bench total 64.96 → 61.44 s (−3.52 s,
-−5.4 %) — all with exact semantics.
+| Query | After (a) only | After (a)+(b) | After (a)+(b)+(c) | Δ total |
+|-------|---------------:|--------------:|------------------:|--------:|
+| Q4 wall | 2017 ms | **703 ms** | 707 ms | −65 % |
+| Q4 `merge=` | 1590 ms | **271 ms** | 271 ms | 5.9× |
+| Q5 wall | 1214 ms | **753 ms** | 750 ms | −40 % |
+| Q5 `merge=` | 534 ms | **94 ms** | 94 ms | 5.7× |
+| Q9 wall | 1503 ms | 1487 ms | **1245 ms** | −17 % |
+| Q9 `finalize=` | 317 ms | 320 ms | **65 ms** | −80 % |
+| **Bench total (hot)** | 63.40 s | 61.44 s | **61.09 s** | **−3.87 s (−6.0 %)** |
+
+**Cumulative pre-HLL wins (a)+(b)+(c):** Q4 3.02 → 0.71 s (−77 %),
+Q5 1.85 → 0.75 s (−59 %), Q9 1.50 → 1.25 s (−17 %), bench total
+64.96 → 61.09 s (−3.87 s, −6.0 %) — all with exact semantics, ~300
+LoC total.
 
 Partitioning uses SplitMix64 for int keys (cheap, well-distributed)
 and top bits of u128 for text keys (they're already SipHash-128
