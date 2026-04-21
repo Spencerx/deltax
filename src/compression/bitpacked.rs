@@ -61,6 +61,29 @@ fn unpack_bits_u32(data: &[u8], count: usize, bits: u8) -> Vec<u32> {
     if bits == 0 || count == 0 {
         return vec![0u32; count];
     }
+
+    // Byte-aligned fast paths; see `unpack_bits_u64` for rationale.
+    match bits {
+        8 => {
+            return data[..count].iter().map(|&b| b as u32).collect();
+        }
+        16 => {
+            let mut result = Vec::with_capacity(count);
+            for chunk in data[..count * 2].chunks_exact(2) {
+                result.push(u16::from_le_bytes(chunk.try_into().unwrap()) as u32);
+            }
+            return result;
+        }
+        32 => {
+            let mut result = Vec::with_capacity(count);
+            for chunk in data[..count * 4].chunks_exact(4) {
+                result.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            return result;
+        }
+        _ => {}
+    }
+
     let mut result = Vec::with_capacity(count);
     let mut bit_pos: u64 = 0;
     for _ in 0..count {
@@ -120,6 +143,41 @@ fn unpack_bits_u64(data: &[u8], count: usize, bits: u8) -> Vec<u64> {
     if bits == 0 || count == 0 {
         return vec![0u64; count];
     }
+
+    // Fast paths for byte-aligned widths. The general bit-loop below reads
+    // one byte per inner iteration even when `bits % 8 == 0`, which burns
+    // ~8 inner iterations × ~10 arith ops per value — material on queries
+    // that decompress high-cardinality i64 columns stored at bits=64
+    // (hash columns like URLHash/RefererHash/UserID). See
+    // `QUERY_ANALYSIS.md` #48 investigation.
+    match bits {
+        8 => {
+            return data[..count].iter().map(|&b| b as u64).collect();
+        }
+        16 => {
+            let mut result = Vec::with_capacity(count);
+            for chunk in data[..count * 2].chunks_exact(2) {
+                result.push(u16::from_le_bytes(chunk.try_into().unwrap()) as u64);
+            }
+            return result;
+        }
+        32 => {
+            let mut result = Vec::with_capacity(count);
+            for chunk in data[..count * 4].chunks_exact(4) {
+                result.push(u32::from_le_bytes(chunk.try_into().unwrap()) as u64);
+            }
+            return result;
+        }
+        64 => {
+            let mut result = Vec::with_capacity(count);
+            for chunk in data[..count * 8].chunks_exact(8) {
+                result.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            return result;
+        }
+        _ => {}
+    }
+
     let mut result = Vec::with_capacity(count);
     let mut bit_pos: u64 = 0;
     for _ in 0..count {

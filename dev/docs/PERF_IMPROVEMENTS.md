@@ -880,57 +880,66 @@ merge is already active there, the cost is inherent to the cardinality.
 **Files:** `src/scan/exec/agg.rs` (partitioned parallel merge in mixed
 path, `!compact_sort_is_cd` guard removal in compact path)
 
-### 40. Dict-accelerated LIKE filtering + two-phase column decompression
+### 40. Dict-accelerated LIKE filtering + two-phase column decompression [LARGELY DONE]
 
-**Target: Q22 9.6s -> ~2s, Q20 7.7s -> ~2s, Q21 4.6s -> ~1s (ClickBench hot run)**
-**Complexity: Medium**
+**Status (2026-04-21, re-audited):** the two main pieces of this
+spec are already in the tree. The third piece ("skip other columns
+within a segment that has some matches") is architecturally
+incompatible with PG's TOAST model and won't be pursued. Filing
+this honestly rather than leaving it on the priority list as
+"planned, not impl".
 
-For dictionary-compressed text columns, LIKE/NOT LIKE filters are currently
-evaluated row-by-row: `get_str(row)` looks up the dict entry, then
-`string.contains(pattern)` is called for each of ~30K rows per segment.
-But every row's value is one of ~500 dict entries — checking the same
-strings thousands of times.
+**What's already landed:**
 
-**Dict-accelerated filtering:** Check the LIKE pattern against each unique
-dict entry once, build a bitset of matching entry IDs, then produce the
-row-level selection bitmap via integer lookups into `row_to_entry`:
+1. **Per-dict-entry LIKE match.**
+   `src/scan/exec/text_col.rs::apply_text_like_filter` handles
+   dict-encoded columns via a fast path (line ~318): builds
+   `dict_matches: Vec<bool>` once per segment by evaluating the
+   pattern against each unique dict entry, then per-row does
+   `dict_matches[row_to_entry[row]]` — one integer lookup instead
+   of a string scan. ~60× fewer string ops, as the original spec
+   predicted. Same pattern applies to `apply_text_eq_filter`.
 
-```
-Current:  2787 segments × 30K rows × string.contains() = 83M string ops
-Proposed: 2787 segments × 500 entries × string.contains() = 1.4M string ops
-          + 83M integer lookups (matching_entries[row_to_entry[row]])
-```
+2. **Segment-level pruning on zero dict matches.**
+   `src/scan/exec/segments.rs::segment_skippable_by_dict` is
+   called in all three worker loops
+   (`try_metadata_fast_path`, `process_segments_compact`,
+   `process_segments_mixed`) immediately after time/segment-by
+   pruning. For a segment whose dict has no matching entry, the
+   whole segment is skipped — no decompression of filter or
+   non-filter columns.
 
-~60x fewer string operations. Exact (not approximate) — every non-null
-row value IS one of the dict entries.
+**What's NOT landed and won't be (re-audited 2026-04-21):**
 
-**Two-phase column decompression:** Combined with dict-accelerated
-filtering, enables skipping decompression of non-filter columns for
-segments with zero matches:
+3. **Sub-segment column deferral.** The original spec proposed a
+   two-phase column-load for segments with SOME matches: decompress
+   only the filter column first, check which rows survive, then
+   detoast other columns only if row count > 0. This doesn't work
+   with TOAST: `pg_detoast_datum` is all-or-nothing per column
+   blob. We can't "detoast only the rows where Title matched"
+   because a column's blob is a single atomic varlena. The per-row
+   save only kicks in if an entire blob goes untouched — which is
+   exactly the segment-level skip already implemented by #2.
 
-- Phase 1: Parse only the filter column's dict header → check LIKE against
-  dict entries → if 0 match, skip segment entirely (no URL/SearchPhrase/
-  UserID decompression)
-- Phase 2 (matching segments only): Decompress remaining columns, apply
-  remaining filters, aggregate
+**Measured effect of the already-landed pieces (Q22 today):**
+`segments=2915` surviving out of 3338 (13 % dict-pruned already).
+Remaining detoast cost (2.37 s) is for the 2915 survivors, each
+having at least one Title entry matching `%Google%` but mostly few
+rows actually matching. That waste is real but bounded by the
+TOAST granularity — no per-row detoast avoidance is possible.
 
-For Q22 (`Title LIKE '%Google%'`), 37K rows match out of 100M (0.037%).
-Dict pruning (#19) already skips segments where no dict entry matches,
-but with matches scattered across most segments, few are skipped. The
-win here is avoiding full text decompression + row-by-row matching for
-the non-filter columns in every segment.
+**What could further help Q22/Q20/Q21 (if we ever revisit):**
+- Smaller segments (e.g. 5 K rows instead of 30 K) would let
+  per-segment dict-skipping prune finer. Big architectural change.
+- Bloom filters on LZ4 (non-dict) text (#25, low-card / #33
+  trigram, high-card) — both evaluated and not viable today.
+- Inverted trigram postings (per-trigram → rowset). Storage-prohibitive.
 
-**Applies to:** `apply_text_like_filter` and `apply_text_eq_filter` in
-`text_col.rs` for the dict fast path. `process_segments_mixed` in
-`agg.rs` for two-phase column loading.
-
-**LZ4 fallback:** High-cardinality LZ4-compressed columns don't have a
-dictionary and fall back to the current row-by-row path. For those,
-trigram bloom filters (#33) are the appropriate optimization.
-
-**Files:** `src/scan/exec/text_col.rs` (dict-aware `apply_text_like_filter`
-and `apply_text_eq_filter`), `src/scan/exec/agg.rs` (`process_segments_mixed`
-two-phase column decompression)
+**Files (reference):** `src/scan/exec/text_col.rs`
+(dict fast paths in `apply_text_like_filter`,
+`apply_text_eq_filter`), `src/scan/exec/segments.rs`
+(`segment_skippable_by_dict`), `src/scan/exec/agg.rs`
+(call sites).
 
 ### 42. Text-length sidecar for `length()` / `col <> ''` [DONE]
 
@@ -1275,7 +1284,14 @@ not depend on or conflict with any map-layout change (e.g. #36).
   (analogous to `load_text_length_sidecars`).
 - `src/lib.rs` — `pg_deltax.exact_count_distinct` GUC.
 
-### 44. Two-pass filter for `GROUP BY … LIMIT N` without `ORDER BY`
+### 44. Two-pass filter for `GROUP BY … LIMIT N` without `ORDER BY` [DONE]
+
+**Measured on EC2 c6a.4xlarge, 100 M bench, hot best-of-3 (2026-04-21):**
+Q17 **1.686 s → 0.921 s (−765 ms, −45 %)**. DeltaXAgg `agg` phase
+**805 ms → 215 ms (−74 %)**. `f8_preselected=10` visible in
+`DeltaX Stats`. No regressions on other queries (all within ±50 ms
+noise). Correctness verified: Q17 result rows have exact global
+counts (spot-checked four rows against `SELECT COUNT(*) WHERE …`).
 
 **Target: Q17 1.48 s → ~0.8 s (−45 %, agg 805 ms → ~130 ms)**
 **Complexity: Medium (~200 LOC)**
@@ -1380,63 +1396,132 @@ correctness constraint. Savings recomputed: ~0.7 s on Q17 (not
 ~1.5 s), but the shape is common in interactive querying so the
 UX value extends beyond bench.
 
-### 45. Dict sidecar blob for dict-encoded text columns
+### 45. Dict sidecar blob for dict-encoded text columns [NOT PURSUED — PREMISE WRONG]
 
-**Target: Q5 0.76 s → ~0.2 s, Q25 1.91 s → ~0.15 s (ClickBench hot run). Cumulative ~3 s.**
-**Complexity: Medium**
+**Status (2026-04-21): investigated, dropped without implementing.**
+
+The original proposal assumed the dict is a small prefix of a
+dict-encoded blob (~5 KB vs ~200 KB), so a dict-only sidecar would
+let `COUNT(DISTINCT)` / `ORDER BY LIMIT` paths skip ~95 % of
+detoast. Direct inspection of the on-disk blobs invalidated that
+assumption.
+
+**Measured dict fraction on ClickBench (`_deltax_compressed.hits_p20130702_blobs`):**
+
+| Column | blob size | LZ4 dict bytes | dict % of blob |
+|--------|----------:|---------------:|---------------:|
+| Title (col 2) | 270 KB | 211 KB | **78 %** |
+| URL (col 13) | 217 KB | 157 KB | **72 %** |
+| Referer (col 14) | 660 KB | 600 KB | **91 %** |
+| SearchPhrase (col 39) | 161 KB | 101 KB | **63 %** |
+| MobilePhoneModel (col 34) | 30 KB | <1 KB | 0.5 % (only 15 distinct values) |
+
+Dense-cardinality dict columns (which are the ones
+`COUNT(DISTINCT)` targets) have dicts that are **63–91 %** of the
+blob, not 2–5 %. A dict sidecar duplicates most of the storage
+for marginal detoast savings.
+
+**Revised savings estimate (ClickBench):**
+- Q5 COUNT DISTINCT SearchPhrase: detoast 580 ms × (1 − 0.63)
+  ≈ 215 ms saved → 708 ms → ~490 ms.
+- Q25 ORDER BY SearchPhrase LIMIT: ~150–250 ms saved (not 1.75 s).
+- Q22 partial: Title dict is 78 % of blob — same story.
+- Cumulative: ~300–500 ms (not 3 s).
+
+**Storage cost:** +2–3 GB across the bench (was estimated 50 MB).
+For a ~14 GB on-disk dataset that's a 15–20 % footprint increase
+for sub-1 s bench saving. Not a favourable trade.
+
+**Why the original estimate was wrong.** I assumed "dict" meant
+~500 entries × ~10 bytes ≈ 5 KB. Reality: ClickBench text columns
+have 1,500–8,000 distinct entries per segment with long average
+entry lengths (URLs, titles, referer URLs), plus the dict is
+LZ4-compressed inline, so the on-disk dict section is large.
+
+**Adjacent finding — #40 is largely already implemented.** While
+confirming what the dict-only fast path does today,
+`apply_text_like_filter` in `src/scan/exec/text_col.rs:303` already
+computes per-dict-entry LIKE matches once per segment
+(`dict_matches: Vec<bool>`) and indexes into it per-row.
+`segment_skippable_by_dict` in `src/scan/exec/segments.rs` already
+prunes segments where no dict entry matches. The remaining item
+from the original #40 spec — "skip other columns' decompression
+when a segment has some matches" — is incompatible with PG's TOAST
+model (detoast is all-or-nothing per blob). So most of what #40
+proposed is already in the tree.
+
+**Revival criterion.** If we ever compress a workload where dicts
+really are a small prefix (e.g. very low cardinality with short
+strings — MobilePhoneModel shape), this optimization becomes
+attractive. The design notes below are left intact for that case.
+
+---
+
+**Original design (for reference):**
 
 Several queries only need the dictionary portion of a dict-encoded
 blob, not the per-row index array:
 
 - `COUNT(DISTINCT SearchPhrase)` (Q5) — current dict-only fast path
-  hashes only ~500 dict entries per segment, but still detoasts the
-  full ~200 KB main blob to reach the dict header.
+  hashes only the dict entries per segment, but still detoasts the
+  full main blob to reach the dict header.
 - `ORDER BY text_col LIMIT N` (Q25) — only needs the lex-smallest
   dict entry per segment to produce top-N candidates.
-- Dict-accelerated LIKE pre-check (#40 pre-phase) — tests the
-  pattern against ~500 dict entries without touching the index
-  array.
+- Dict-accelerated LIKE pre-check — tests the pattern against dict
+  entries without touching the index array.
 
 **Approach.** At compress time, emit the dict as its own LZ4 blob
 in a new `*_text_dicts` companion table (analogous to
 `*_text_lengths` in #42). Wire format can be identical to the
 leading bytes of the existing main blob's dict header — just split
-out. Storage cost: per segment, roughly the same size as the dict
-section of the main blob (~2–10 KB), minus some framing overhead.
+out.
 
 Query-time: segments.rs gains a `load_text_dict_sidecars` PK scan,
 activated when all query-time references to the column are
-dict-resolvable (COUNT DISTINCT / MIN/MAX by lex / dict-LIKE
-pre-check). The main blob detoast is then skipped for those
+dict-resolvable. The main blob detoast is then skipped for those
 segments.
 
-**Gating & disqualifications.** Same pattern as #42:
-- Any per-row reference (equality with non-dict constant, GROUP BY,
-  emit in projection) disqualifies and forces main-blob detoast.
-- Only activated when the aggregate dispatcher knows the fast path
-  applies (`count_distinct_only_str`, `topn_dict_only_text`,
-  dict-LIKE pre-check in Phase 1).
-
-**Interaction with #40.** When #40 lands, the dict-accelerated
-LIKE pre-phase reads only the dict. Pairing with this sidecar lets
-the pre-phase skip the main blob entirely for non-matching
-segments, compounding the gain.
-
-**Storage cost estimate.** 3338 segments × ~5 KB avg per text dict
-column × 3 dict columns (SearchPhrase, Title, one more) ≈ 50 MB —
-negligible against the existing ~14 GB on-disk footprint.
-
-**Files:** `src/compress.rs` (`compress_text_dict` or emit during
-`compress_text_column`, companion DDL), `src/copy.rs` (direct
-backfill: buffer + `heap_insert`), `src/scan/exec/segments.rs`
-(`load_text_dict_sidecars`), `src/scan/exec/text_col.rs`
+**Files (if ever revived):** `src/compress.rs`, `src/copy.rs`,
+`src/scan/exec/segments.rs`, `src/scan/exec/text_col.rs`
 (`SegTextColumn::DictOnly` variant), `src/scan/exec/agg.rs`
 (dict-only dispatchers detect sidecar availability).
 
-### 46. Text-empty segment pruning via `nonzero_count`
+### 46. Text-empty segment pruning via `nonzero_count` [TRIED — REVERTED]
+
+**Status: implemented and reverted on 2026-04-21.** The pruning
+mechanically works (verified via `DeltaX Stats`: `segments=3332`
+on Q12–Q14 vs 3336 baseline; `rows_processed` drops by ~120 K on
+SearchPhrase queries) but on the ClickBench dataset only 4–6 of
+3338 segments are fully empty for SearchPhrase and 0 for
+MobilePhoneModel. Bench total moved ±50 ms across repeat runs —
+indistinguishable from noise.
+
+**Why reverted.** The "might help real-world clumpy data"
+justification was speculative and carried measurable complexity
+cost:
+- ~100 LOC across `segments.rs` + `agg.rs`
+- Three new helpers (`is_empty_text_const`, `classify_text_empty_qual`,
+  `segment_skippable_by_text_empty`)
+- A subtle tweak to `classify_segment_quals` that skips the
+  post-loop NULL-safety check for text-empty quals (correct but
+  non-obvious)
+- New `needed_stats_cols` construction in the mixed path that
+  only existed to feed F7
+
+The optimization's ceiling on ClickBench (~0.15 % of segments
+prunable) is low enough that even with perfect clumpiness on some
+hypothetical dataset, the gain would be small vs the permanent
+reading cost imposed on everyone maintaining the pruning code.
+
+**If the workload calls for it later:** the helpers and the
+planner plumbing were straightforward to write the first time
+(this section is effectively the spec). The nonzero_count stats
+are still collected at compress time (#42), so the foundation is
+in place.
 
 **Target: Q30 1.03 s → ~0.9 s, Q31 1.79 s → ~1.5 s; smaller margins on Q10, Q11, Q12, Q21, Q22.**
-**Cumulative: ~0.3–0.6 s.** **Complexity: Low (~20 LOC).**
+**Cumulative: ~0.3–0.6 s** on a dataset with real temporal clumpiness.
+**Complexity: Low (~20 LOC core logic, ~100 LOC with plumbing).**
 
 The compressor already tracks `_nonzero_count_<col>` for text
 columns (number of non-empty rows per segment — see
@@ -1505,31 +1590,64 @@ during `deltax_create_table` and on partition compaction),
 `src/scan/exec/segments.rs` (partition-level bloom load + test
 before per-segment bloom).
 
-### 48. Q40 column-pruning audit
+### 48. Q40 decompress anomaly — byte-aligned bitpack fast path [DONE]
 
-**Target: Q40 138 ms → ~80 ms**
-**Complexity: Investigation**
+**Landed 2026-04-21. Measured on EC2, warm best-of-3:**
 
-Q40 (`CounterID=62 URLHash range query`) shows `decompress=71 ms`
-for only 89,914 rows out of 100 M — roughly 0.8 µs/row, which is
-an order of magnitude higher than other range queries on similar
-row counts (Q36 `decompress=12 ms` for 671 K rows). The 6 batch
-quals narrow to a tiny working set, but the scan appears to be
-decompressing more columns than strictly needed.
+| Query | Before | After | Δ | Cause |
+|-------|------:|-----:|--:|-------|
+| Q40 | 138 ms | **107 ms** | **−31 ms (−22.5 %)** | direct target |
+| Q22 | 3748 ms | 3653 ms | −95 ms | URL/Title/SearchPhrase decompress |
+| Q20 | 6735 ms | 6654 ms | −81 ms | URL column decompress |
+| Q31 | 1785 ms | 1712 ms | −73 ms | WatchID+ClientIP i64 decompress |
+| Q16 | 2087 ms | 2043 ms | −44 ms | UserID+SearchPhrase i64 decompress |
+| **Bench total** | **60.51 s** | **60.26 s** | **−252 ms** | |
 
-**Investigation.** Add per-column decompress timing to the
-`decompress` phase of DeltaXAgg (via a feature-flagged or
-debug-only dump), run Q40 under it, and identify which columns are
-being materialized beyond the ones referenced in SELECT, GROUP BY,
-and WHERE. Likely suspects: a fallback in `needed_cols`
-construction that adds a column for qual evaluation even when the
-qual was batch-handled, or Phase 2 kicking in for columns that
-Phase 1 quals already eliminated.
+No regressions above noise. All 364 unit tests pass.
 
-**Expected outcome.** Either a targeted fix (tighten `needed_cols`
-at the specific call site), or confirmation that Q40's decompress
-cost is fundamental and the query is well-optimized. ~60 ms saving
-on Q40 is the plausible ceiling.
+**Root cause.** The original hypothesis (column over-decompression
+— `needed_cols` too broad) was wrong. The real bottleneck was
+`unpack_bits_u64` in `src/compression/bitpacked.rs`: a bit-by-bit
+inner loop that processed EACH value with ~8 inner iterations,
+reading one byte and doing shift/mask/OR per iteration — **even
+when `bits == 64`** (the common case for high-cardinality hash
+columns like URLHash, RefererHash, UserID, WatchID, ClientIP,
+where bit-packing offers no savings and the data is stored at
+full 64-bit width).
 
-**Files:** probably `src/scan/exec/agg.rs` (`needed_cols`
-computation) and `src/scan/exec/decompress.rs` (phase boundary).
+For a segment of 30 K values at bits=64:
+- Old: 30 K × 8 inner iterations × ~10 arith ops ≈ 2.4 M ops per
+  segment ≈ 1.4 ms per i64 column per segment.
+- New: 30 K `u64::from_le_bytes` calls ≈ 30 µs — essentially
+  memcpy speed.
+
+**What was isolated, verified, then fixed:**
+1. Filter-ablation experiments on Q40 showed that removing
+   `RefererHash = const` cut `decompress` from 73 ms to 37 ms →
+   one i64 column costs ~36 ms / 26 segments ≈ 1.4 ms/segment.
+2. An isolated `SELECT COUNT(*) WHERE RefererHash = const` query
+   confirmed the 37 ms / 1.4 ms-per-segment cost.
+3. Blob-layout inspection showed RefererHash is stored as
+   `ForBitpacked` with `bits=64` (no actual bitpacking — raw
+   u64-per-row).
+4. Walking `unpack_bits_u64` revealed the byte-by-byte inner
+   loop had no fast path for byte-aligned widths.
+
+**Fix.** Added byte-aligned fast paths for `bits ∈ {8, 16, 32, 64}`
+in `unpack_bits_u64` and `unpack_bits_u32`. Each path uses
+`chunks_exact` + `from_le_bytes` — trivial to read, vectorizable
+by LLVM, and ~45× faster than the bit-loop for the common
+`bits=64` case.
+
+Also folded a small refactor of `decompress_numeric_blob` that
+was explored first (splitting no-null fast path from
+null-containing path). That refactor alone was immaterial (as
+measured — the allocator churn wasn't the real problem), but it
+cleaned up the structure and saved one intermediate `Vec<Datum>`
+allocation per column per segment, so it's kept.
+
+**Files touched:**
+- `src/compression/bitpacked.rs` — `unpack_bits_u64` /
+  `unpack_bits_u32` fast paths for byte-aligned widths.
+- `src/scan/exec/agg.rs` — `decompress_numeric_blob` split into
+  no-null fast path + null-containing path helpers.

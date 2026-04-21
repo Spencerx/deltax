@@ -118,50 +118,32 @@ cost + approximate-semantics GUC tradeoff given how much ground
 (a)+(b)+(c) already recovered. #43 marked deprioritized in
 `PERF_IMPROVEMENTS.md`.
 
-### F7. Text `<> ''` segments not pruned (new)
+### F7. Text `<> ''` segments not pruned — tried, reverted
 
-Several queries filter on `WHERE <text_col> <> ''`:
+Several queries filter on `WHERE <text_col> <> ''`. The compressor
+already tracks `_nonzero_count_<col>` for text columns, and a Low-LOC
+extension to the segment-pruning gate can use it to skip segments
+that are fully empty / fully non-empty for the filter column.
+Implementation landed and was reverted on 2026-04-21 after measurement
+showed ClickBench data has almost no fully-empty segments for text
+columns (4–6 of 3338 for SearchPhrase, 0 for MobilePhoneModel). See
+`PERF_IMPROVEMENTS.md` #46 for the full write-up and the spec to
+revive if a more clumpy dataset motivates it.
 
-| Query | filter column | rows_processed | of 99,997,497 |
-|-------|--------------|---------------:|---------------:|
-| Q12/Q13/Q14 | SearchPhrase | 55,556,318 | 55 % |
-| Q10/Q11 | MobilePhoneModel | 49,918,514 | 50 % |
-| Q21/Q22 | SearchPhrase (AND URL LIKE) | 46–47 M | ~47 % |
-| Q30/Q31 | SearchPhrase | 13,172,392 | 13 % |
-
-The compressor already tracks `_nonzero_count_<col>` for text columns
-(non-empty row count — see `compress.rs`), and segment-pruning code in
-`segments.rs::check_all_pass` *uses* `nonzero_count` for `Ne 0` / `Eq 0`
-on integers — but **only when the qual constant is numeric zero**
-(`is_zero_const`). Text `<> ''` is lowered to `BatchCompareOp::Ne`
-with a text constant and misses the gate.
-
-Extending the gate to recognize text-empty constants would enable
-segment pruning for any segment whose column is entirely empty
-(`nonzero_count == 0`) or entirely non-empty (`nonzero_count == row_count`).
-In the ClickBench dataset, these columns are temporally clumpy, so a
-fraction of 3338 segments should be in either extreme.
-
-**Expected wins:** hard to predict without measuring, but a realistic
-lower bound is skipping 10–30 % of segments on the worst offenders.
-Even 10 % off Q30/Q31's detoast saves 80–120 ms each.
-
-### F8. `GROUP BY … LIMIT N` without `ORDER BY` (new, narrow)
+### F8. `GROUP BY … LIMIT N` without `ORDER BY` — landed
 
 Q17: `SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID,
-SearchPhrase LIMIT 10`. No ORDER BY. PostgreSQL's execution semantics
-for LIMIT without ORDER BY allow returning *any* 10 rows.
+SearchPhrase LIMIT 10`. PG semantics require the returned rows to
+carry **correct global counts** for their keys; a naive
+"stop early after N local groups" shortcut produces partial counts
+and is a correctness bug.
 
-Today we still materialize every group (pre_topn_groups ≈ 17 M), then
-emit 10. EXPLAIN shows `agg=813 ms` + `merge=0` + full hash-build for
-all 17 M groups.
-
-A targeted fast path: once aggregation has seen ≥ N distinct groups,
-stop reading new segments. Current measured cost on Q17 is 1.49 s;
-with early termination it would drop to roughly one segment's worth
-of work (~10–20 ms). **Potential saving: ~1.5 s on Q17.** Only one
-ClickBench query hits this exact shape, but the optimization is
-tiny and tests easily.
+Landed 2026-04-21 via a two-pass filter: Phase 0 extracts `bare_limit`
+distinct group-key hashes from one segment on the main thread,
+Phase 1 workers then filter per-row via that set (≤ N-entry probe,
+L1-resident). Measured: Q17 **1.69 s → 0.92 s (−45 %)**, agg
+**805 ms → 215 ms (−74 %)**. No regressions on other queries. See
+`PERF_IMPROVEMENTS.md` #44.
 
 ---
 
@@ -598,14 +580,14 @@ SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE ... THEN Referer ELSE '
 | 2 | 0.021 | 0.027 | 1.3× | metadata I/O | — |
 | 3 | 0.027 | 0.026 | **0.96×** | — | — |
 | 4 | 0.353 | 0.693 | 2.0× | detoast + agg | — (HLL deprioritized) |
-| 5 | 0.623 | 0.758 | 1.2× | detoast + agg | **dict sidecar** |
+| 5 | 0.623 | 0.758 | 1.2× | detoast + agg | — (sidecar ruled out) |
 | 6 | 0.010 | 0.014 | 1.4× | metadata I/O | — |
 | 7 | 0.009 | 0.091 | 10.1× | detoast | — |
 | 8 | 0.452 | 1.017 | 2.3× | detoast + merge | — |
 | 9 | 0.522 | 1.221 | 2.3× | detoast | — |
-| 10 | 0.147 | 0.461 | 3.1× | detoast | F7 pruning |
-| 11 | 0.143 | 0.481 | 3.4× | detoast | F7 pruning |
-| 12 | 0.599 | 1.111 | 1.9× | agg + detoast | F7 (partial) |
+| 10 | 0.147 | 0.461 | 3.1× | detoast | — |
+| 11 | 0.143 | 0.481 | 3.4× | detoast | — |
+| 12 | 0.599 | 1.111 | 1.9× | agg + detoast | — |
 | 13 | 0.804 | 2.135 | 2.7× | detoast + agg + merge | — |
 | 14 | 0.597 | 1.214 | 2.0× | detoast + agg | — |
 | 15 | 0.384 | 1.976 | 5.1× | merge | — (#36 reverted) |
@@ -615,16 +597,16 @@ SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE ... THEN Referer ELSE '
 | 19 | 0.003 | 0.043 | 14.3× | bloom scan | partition bloom |
 | 20 | 0.312 | 6.728 | **21.6×** | detoast URL (LZ4) | open problem |
 | 21 | 0.098 | 1.948 | 19.9× | detoast URL | — |
-| 22 | 0.717 | 3.760 | 5.2× | detoast URL+Title | #40 for Title |
+| 22 | 0.717 | 3.760 | 5.2× | detoast URL+Title | — (#40 already landed) |
 | 23 | 0.393 | 0.473 | 1.2× | decompress | — |
 | 24 | 0.147 | 0.107 | **0.73×** | — | — |
-| 25 | 0.192 | 1.912 | 10.0× | decompress text | **dict sidecar** |
+| 25 | 0.192 | 1.912 | 10.0× | decompress text | — (sidecar ruled out) |
 | 26 | 0.149 | 0.108 | **0.72×** | — | — |
 | 27 | 0.083 | 0.550 | 6.6× | detoast (sidecar) | — |
 | 28 | 9.582 | 6.727 | **0.70×** | regex | — |
 | 29 | 0.029 | 0.045 | 1.6× | metadata I/O | — |
-| 30 | 0.342 | 1.032 | 3.0× | detoast + agg | F7 pruning |
-| 31 | 0.562 | 1.785 | 3.2× | detoast + agg | **F7 pruning** |
+| 30 | 0.342 | 1.032 | 3.0× | detoast + agg | — |
+| 31 | 0.562 | 1.785 | 3.2× | detoast + agg | — |
 | 32 | 3.793 | 9.417 | 2.5× | **merge** | — (#36 reverted) |
 | 33 | 2.782 | 2.661 | **0.96×** | agg | — |
 | 34 | 2.851 | 2.677 | **0.94×** | agg | — |
@@ -633,7 +615,7 @@ SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE ... THEN Referer ELSE '
 | 37 | 0.021 | 0.041 | 2.0× | agg | — |
 | 38 | 0.017 | 0.078 | 4.6× | heap_scan + agg | — |
 | 39 | 0.077 | 0.217 | 2.8× | agg + merge | — |
-| 40 | 0.013 | 0.138 | 10.6× | decompress | column-pruning audit |
+| 40 | 0.013 | 0.107 | 8.2× | decompress | — (#48 landed) |
 | 41 | 0.009 | 0.052 | 5.8× | agg + detoast | — |
 | 42 | 0.008 | 0.041 | 5.1× | framework | — |
 
@@ -650,54 +632,67 @@ Bench total (hot best-of-3): **~59 s** (from ~65 s).
 ## Prioritized improvement list
 
 **Scope rule:** only genuinely untried items are ranked here. Ideas
-that were implemented and reverted (#36 two-level hash), or spec'd
-but deprioritized after recent measurements (#43 HLL), are listed
+that were implemented and reverted (#36 two-level hash, #46 F7
+text-empty pruning), spec'd but deprioritized after recent
+measurements (#43 HLL), or investigated and found not worth
+pursuing (#45 dict sidecar, #40 dict-accel LIKE), are listed
 separately below so the top of the list reflects real forward work.
 
 | # | Improvement | Queries helped | Est. benefit | Complexity | In PERF? |
 |---|-------------|----------------|--------------|------------|---------|
-| **1** | **F8 GROUP BY LIMIT (no ORDER BY) early-term** | Q17 | ~1.5 s | **Low** | **No — new** |
-| **2** | **Dict sidecar blob** | Q5, Q25 (+Q22 partial) | ~3 s | Medium | **No — new** |
-| **3** | **F7 text-empty segment pruning** | Q10, Q11, Q12, Q30, Q31 (+margins on Q21, Q22) | ~0.3–0.6 s | **Low** | **No — new** |
-| **4** | **#40 dict-accelerated LIKE** | Q22 (Title) | ~1.5 s | Medium | Yes — planned, not impl |
-| **5** | **Partition-level bloom for point lookups** | Q19 | ~30 ms | Low-Med | No |
-| **6** | **Q40 column-pruning audit** | Q40 | ~60 ms | Investigation | — |
+| **1** | **Partition-level bloom for point lookups** | Q19 | ~30 ms | Low-Med | #47 |
+
+The list is thin — most large optimization targets have either
+landed or been ruled out after measurement. Further bench gains
+likely need structural changes (smaller segments, parallel-safe
+custom scans so PG workers can compose with Rust threads, or a
+different storage layout for TOAST) rather than algorithmic
+tweaks to the current plan.
+
+Already landed:
+- **F8 (#44)** — Q17 1.69 s → 0.92 s (−45 %).
+- **#48 byte-aligned bitpack fast path** — Q40 138 → 107 ms (−22.5 %),
+  bench total −252 ms across Q40/Q22/Q20/Q31/Q16.
 
 ### Recommended order of attack
 
-1. **F8 (GROUP BY LIMIT early-term).** Smallest change, fastest to
-   validate (single Q17 target, ~1.5 s saving). ~50 LOC in `agg.rs`:
-   add a `limit_no_order` flag in the planner hook; in phase-1 worker
-   loop, after each segment check `local_groups.len() >= limit` and
-   break out of the segment iteration. Tests: Q17 result cardinality
-   is `LIMIT 10` — already correct under PG semantics.
-
-2. **F7 (text-empty segment pruning).** Also small (~20 LOC). In
-   `segments.rs::check_all_pass`, extend `is_zero_const` to recognize
-   the empty-text constant; then `nonzero_count` already gates.
-   Possibly expose a new `BatchCompareOp::NeEmpty` if type-safety gets
-   awkward. Risk: low — existing path is well-tested. Benefit
-   proportional to clumpiness of empty values in real datasets.
-
-3. **Dict sidecar blob (new).** Biggest per-query gains on Q5 (0.76 s
-   → ~0.2 s) and Q25 (1.9 s → ~0.15 s); reuses the length-sidecar
-   plumbing from #42 (compress.rs + segments.rs). Compress-time cost:
-   a second LZ4 blob per dict column carrying just the dict bytes.
-
-4. **#40 dict-accelerated LIKE** for Title in Q22 — spec'd in
-   PERF_IMPROVEMENTS.md but never implemented. Title is
-   dict-encoded so it's the natural candidate.
-
-5. **Partition-level bloom filter for Q19** — coarse bloom on 18
-   partitions before per-segment blooms. Collapses most of the 5926
-   bloom buffer pages currently read on warm runs.
-
-6. **Q40 column-pruning audit** — investigate why decompress=71 ms
-   for 90 K rows. Likely too many columns detoasted for the 6 batch
-   quals on CounterID=62 range queries.
+1. **Partition-level bloom filter for Q19 (#47).** Coarse bloom on
+   18 partitions before per-segment blooms. Collapses most of the
+   5926 bloom buffer pages currently read on warm runs. Modest
+   saving but clean implementation.
 
 ### Already-explored items (not in the priority list above)
 
+- **F8 GROUP BY LIMIT early-term (#44).** **Landed 2026-04-21.**
+  Q17 1.69 s → 0.92 s (−45 %). Correctness verified. No
+  regressions on other queries.
+- **Byte-aligned bitpack fast path (#48).** **Landed 2026-04-21.**
+  Originally scoped as a column-pruning audit on Q40 — the real
+  bottleneck turned out to be `unpack_bits_u64` doing a
+  byte-by-byte loop even when `bits=64`. Added fast paths for
+  byte-aligned widths. Q40 138 → 107 ms (−22.5 %), bench total
+  −252 ms across Q40/Q22/Q20/Q31/Q16 (all queries that decompress
+  high-cardinality i64 columns).
+- **F7 text-empty segment pruning (#46).** **Tried and reverted
+  2026-04-21.** The pruning logic works correctly (4–6 segments
+  prunable on Q30/Q31) but ClickBench data is too well-mixed —
+  bench impact indistinguishable from noise. Reverted to avoid
+  carrying ~100 LOC for a speculative "might help real-world
+  clumpy data" benefit.
+- **Dict sidecar blob (#45).** **Investigated and dropped
+  2026-04-21.** Original ~3 s projection rested on a wrong premise
+  (dict = ~5 KB of a 200 KB blob). On-disk inspection showed dicts
+  are **63–91 %** of dense-text blobs (Title 78 %, URL 72 %,
+  Referer 91 %, SearchPhrase 63 %). Revised savings:
+  ~300–500 ms total bench, against a +2–3 GB storage cost. Not
+  worth the trade.
+- **#40 dict-accelerated LIKE.** **Re-audited 2026-04-21,
+  largely already implemented.** `apply_text_like_filter`
+  computes `dict_matches` once per segment; `segment_skippable_by_dict`
+  skips segments with zero matching dict entries. The remaining
+  spec item ("skip other columns within a segment that has some
+  matches") is architecturally incompatible with PG's TOAST
+  (detoast is all-or-nothing per blob). No further work planned.
 - **#36 two-level hash aggregation.** Implemented on branch
   `two_phases_hash`, measured −1.2 s at bench level (within run-to-run
   noise), **reverted 2026-04-18**. Follow-up (partition

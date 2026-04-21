@@ -7545,6 +7545,12 @@ use super::{PG_EPOCH_OFFSET_USEC, PG_EPOCH_OFFSET_DAYS};
 /// SAFETY: This function does NOT call any PG functions and is safe to call
 /// from worker threads. Only handles integer, float, timestamp, date, and bool
 /// types (pass-by-value types where Datum is just the raw value).
+///
+/// No-null fast path: writes `(Datum, false)` tuples directly from the decoder
+/// output in a single pass, skipping the intermediate `Vec<Datum>`. Cuts
+/// allocations per column-per-segment from 3–4 down to 2 — material on
+/// queries like Q40 that filter on multiple i64 hash columns across many
+/// segments (see `QUERY_ANALYSIS.md` #48 investigation).
 fn decompress_numeric_blob(
     blob: &[u8],
     type_oid: pg_sys::Oid,
@@ -7557,7 +7563,153 @@ fn decompress_numeric_blob(
     let total_count = cc.row_count as usize;
     let non_null_count = count_non_null(cc.null_bitmap, total_count);
 
-    let nn_datums: Vec<pg_sys::Datum> = match cc.type_tag {
+    // Build `Vec<(Datum, bool)>` in two branches: no-null fast path (single
+    // allocation for the output) vs null-containing path (decode into
+    // `Vec<Datum>` then weave nulls).
+    if cc.null_bitmap.is_empty() {
+        return decompress_numeric_no_nulls(&cc, type_oid, total_count);
+    }
+
+    let nn_datums = decompress_numeric_nn_datums(&cc, type_oid, non_null_count);
+    let mut result = Vec::with_capacity(total_count);
+    let mut val_idx = 0;
+    for i in 0..total_count {
+        let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+        if is_null {
+            result.push((pg_sys::Datum::from(0usize), true));
+        } else {
+            result.push((nn_datums[val_idx], false));
+            val_idx += 1;
+        }
+    }
+    result
+}
+
+/// No-null fast path for `decompress_numeric_blob`: write `(Datum, false)`
+/// tuples directly from decoder output. Saves one `Vec<Datum>` allocation
+/// + one copy pass vs the null-containing path.
+#[inline]
+fn decompress_numeric_no_nulls(
+    cc: &compression::CompressedColumnRef<'_>,
+    type_oid: pg_sys::Oid,
+    total_count: usize,
+) -> Vec<(pg_sys::Datum, bool)> {
+    let mut out = Vec::with_capacity(total_count);
+    match cc.type_tag {
+        compression::CompressionType::Gorilla => {
+            if type_oid == pg_sys::TIMESTAMPOID || type_oid == pg_sys::TIMESTAMPTZOID {
+                let timestamps = compression::gorilla::decode_timestamps(cc.data, total_count);
+                for usec in timestamps {
+                    let pg_usec = usec - PG_EPOCH_OFFSET_USEC;
+                    out.push((pg_sys::Datum::from(pg_usec as usize), false));
+                }
+            } else if type_oid == pg_sys::DATEOID {
+                let timestamps = compression::gorilla::decode_timestamps(cc.data, total_count);
+                for usec in timestamps {
+                    let unix_days = (usec / 86_400_000_000) as i32;
+                    let pg_days = unix_days - PG_EPOCH_OFFSET_DAYS;
+                    out.push((pg_sys::Datum::from(pg_days as usize), false));
+                }
+            } else if type_oid == pg_sys::FLOAT4OID {
+                let floats = compression::gorilla::decode_floats_f32(cc.data, total_count);
+                for v in floats {
+                    out.push((pg_sys::Datum::from(v.to_bits() as usize), false));
+                }
+            } else {
+                // FLOAT8OID
+                let floats = compression::gorilla::decode_floats(cc.data, total_count);
+                for v in floats {
+                    out.push((pg_sys::Datum::from(v.to_bits() as usize), false));
+                }
+            }
+        }
+        compression::CompressionType::DeltaVarint => {
+            if type_oid == pg_sys::INT2OID {
+                let ints = compression::integer::decode_i32(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as i16 as usize), false));
+                }
+            } else if type_oid == pg_sys::INT4OID || type_oid == pg_sys::DATEOID {
+                let ints = compression::integer::decode_i32(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as usize), false));
+                }
+            } else {
+                // INT8OID, TIMESTAMPOID, TIMESTAMPTZOID
+                let ints = compression::integer::decode_i64(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as usize), false));
+                }
+            }
+        }
+        compression::CompressionType::Constant => {
+            if type_oid == pg_sys::INT2OID {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as i16 as usize), false));
+                }
+            } else if type_oid == pg_sys::INT4OID || type_oid == pg_sys::DATEOID {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as usize), false));
+                }
+            } else if type_oid == pg_sys::FLOAT4OID {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(f32::from_bits(v as u32).to_bits() as usize), false));
+                }
+            } else if type_oid == pg_sys::FLOAT8OID {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(f64::from_bits(v as u64).to_bits() as usize), false));
+                }
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as usize), false));
+                }
+            }
+        }
+        compression::CompressionType::ForBitpacked => {
+            if type_oid == pg_sys::INT2OID {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as i16 as usize), false));
+                }
+            } else if type_oid == pg_sys::INT4OID || type_oid == pg_sys::DATEOID {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as usize), false));
+                }
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(cc.data, total_count);
+                for v in ints {
+                    out.push((pg_sys::Datum::from(v as usize), false));
+                }
+            }
+        }
+        compression::CompressionType::BooleanBitmap => {
+            let bools = compression::boolean::decode(cc.data, total_count);
+            for b in bools {
+                out.push((pg_sys::Datum::from(b as usize), false));
+            }
+        }
+        _ => {
+            // Text/dictionary/lz4 types — should not happen in compact path
+        }
+    }
+    out
+}
+
+/// Null-containing path: decode only the non-null values into `Vec<Datum>`.
+/// Caller weaves nulls back into the final output.
+#[inline]
+fn decompress_numeric_nn_datums(
+    cc: &compression::CompressedColumnRef<'_>,
+    type_oid: pg_sys::Oid,
+    non_null_count: usize,
+) -> Vec<pg_sys::Datum> {
+    match cc.type_tag {
         compression::CompressionType::Gorilla => {
             if type_oid == pg_sys::TIMESTAMPOID || type_oid == pg_sys::TIMESTAMPTZOID {
                 let timestamps = compression::gorilla::decode_timestamps(cc.data, non_null_count);
@@ -7582,7 +7734,6 @@ fn decompress_numeric_blob(
                     .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
                     .collect()
             } else {
-                // FLOAT8OID
                 let floats = compression::gorilla::decode_floats(cc.data, non_null_count);
                 floats.iter()
                     .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
@@ -7597,7 +7748,6 @@ fn decompress_numeric_blob(
                 let ints = compression::integer::decode_i32(cc.data, non_null_count);
                 ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
             } else {
-                // INT8OID, TIMESTAMPOID, TIMESTAMPTZOID
                 let ints = compression::integer::decode_i64(cc.data, non_null_count);
                 ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
             }
@@ -7636,28 +7786,7 @@ fn decompress_numeric_blob(
             let bools = compression::boolean::decode(cc.data, non_null_count);
             bools.iter().map(|&b| pg_sys::Datum::from(b as usize)).collect()
         }
-        _ => {
-            // Text/dictionary/lz4 types — should not happen in compact path
-            Vec::new()
-        }
-    };
-
-    // Reinsert nulls
-    if cc.null_bitmap.is_empty() {
-        nn_datums.iter().map(|&d| (d, false)).collect()
-    } else {
-        let mut result = Vec::with_capacity(total_count);
-        let mut val_idx = 0;
-        for i in 0..total_count {
-            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
-            if is_null {
-                result.push((pg_sys::Datum::from(0usize), true));
-            } else {
-                result.push((nn_datums[val_idx], false));
-                val_idx += 1;
-            }
-        }
-        result
+        _ => Vec::new(),
     }
 }
 
