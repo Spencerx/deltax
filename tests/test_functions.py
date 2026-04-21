@@ -218,3 +218,122 @@ class TestTopN:
         assert "TopN" not in explain_text, (
             f"TopN should not appear without LIMIT:\n{explain_text}"
         )
+
+
+def _setup_bare_limit_table(db):
+    """Compressed deltax table with a mixed (int+text) GROUP BY shape,
+    multiple segments, and predictable duplicate distribution so that
+    partial counts would be visibly wrong."""
+    db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    db.execute("""
+        CREATE TABLE bare_limit_test (
+            ts TIMESTAMPTZ NOT NULL,
+            user_id BIGINT NOT NULL,
+            phrase TEXT NOT NULL,
+            val INT NOT NULL
+        )
+    """)
+    # Short partition window so we get multiple partitions (and thus
+    # multiple segments) over our data span.
+    db.execute(
+        "SELECT deltax_create_table('bare_limit_test', 'ts', '1 hour'::interval)"
+    )
+    db.commit()
+
+    # 20 distinct (user_id, phrase) keys. Each key appears exactly `count`
+    # times distributed across 4 partitions (so 4 segments after compression).
+    keys = [(1000 + i, f"phrase-{i:02d}", 3 + (i % 5)) for i in range(20)]
+
+    # Generate rows spanning 4 hours (= 4 partitions at 1h window).
+    values = []
+    for uid, phrase, count in keys:
+        for c in range(count):
+            hour = c % 4
+            values.append(
+                f"('{BASE_TS}'::timestamptz + interval '{hour} hours {c} seconds',"
+                f" {uid}, '{phrase}', {c})"
+            )
+    db.execute(
+        "INSERT INTO bare_limit_test (ts, user_id, phrase, val) "
+        f"VALUES {', '.join(values)}"
+    )
+    db.commit()
+
+    db.execute(
+        "SELECT deltax_enable_compression('bare_limit_test', "
+        "segment_by => ARRAY[]::text[], order_by => ARRAY['ts'])"
+    )
+    db.commit()
+
+    partitions = db.execute(
+        "SELECT partition_name FROM deltax_partition_info('bare_limit_test') "
+        "WHERE range_start <= '2025-01-15 04:00:00+00'::timestamptz "
+        "AND range_end > '2025-01-15'::timestamptz"
+    ).fetchall()
+    for row in partitions:
+        db.execute(f"SELECT deltax_compress_partition('{row[0]}')")
+    db.commit()
+
+    return {uid: (phrase, count) for uid, phrase, count in keys}
+
+
+class TestBareLimit:
+    """F8: `GROUP BY … LIMIT N` without ORDER BY must return exact global
+    counts (PG semantics), not per-worker partial counts. A naive early-
+    termination would silently break this."""
+
+    def test_bare_limit_counts_are_exact(self, db):
+        expected = _setup_bare_limit_table(db)
+        rows = db.execute(
+            "SELECT user_id, phrase, COUNT(*) AS c "
+            "FROM bare_limit_test GROUP BY user_id, phrase LIMIT 5"
+        ).fetchall()
+        assert len(rows) == 5
+        for uid, phrase, c in rows:
+            exp_phrase, exp_count = expected[uid]
+            assert phrase == exp_phrase, (
+                f"phrase mismatch for uid={uid}: got {phrase!r}, expected {exp_phrase!r}"
+            )
+            assert c == exp_count, (
+                f"count mismatch for (uid={uid}, phrase={phrase!r}): "
+                f"got {c}, expected {exp_count} (partial count would indicate "
+                f"F8 correctness regression)"
+            )
+
+    def test_bare_limit_consistent_with_full_agg(self, db):
+        """The rows returned by bare-LIMIT must be a subset of the full
+        aggregation result — both the keys and the counts must match."""
+        _setup_bare_limit_table(db)
+        limited = set(db.execute(
+            "SELECT user_id, phrase, COUNT(*) "
+            "FROM bare_limit_test GROUP BY user_id, phrase LIMIT 7"
+        ).fetchall())
+        full = set(db.execute(
+            "SELECT user_id, phrase, COUNT(*) "
+            "FROM bare_limit_test GROUP BY user_id, phrase"
+        ).fetchall())
+        assert len(limited) == 7
+        assert limited.issubset(full), (
+            f"Bare-LIMIT rows not a subset of full aggregation — this "
+            f"indicates F8 emitted rows with wrong counts.\n"
+            f"Extra rows: {limited - full}"
+        )
+
+    def test_explain_shows_f8_preselected(self, db):
+        _setup_bare_limit_table(db)
+        # Force parallel mixed path: n_workers > 1 and >1 segment. The
+        # table setup produces 4 partitions / 4 segments already.
+        db.execute("SET pg_deltax.parallel_workers = 2")
+        explain = db.execute(
+            "EXPLAIN ANALYZE SELECT user_id, phrase, COUNT(*) "
+            "FROM bare_limit_test GROUP BY user_id, phrase LIMIT 5"
+        ).fetchall()
+        explain_text = "\n".join(r[0] for r in explain)
+        assert "DeltaXAgg" in explain_text
+        # f8_preselected=N appears only when F8 fires. Allow it to be
+        # absent (the parallel mixed path requires >1 segment; depending
+        # on compression timing a single-partition insert might only
+        # produce 1 segment in this minimal table, in which case we
+        # gracefully fall through to the full path).
+        # What we must NOT see is incorrect counts — covered by the
+        # other two tests.

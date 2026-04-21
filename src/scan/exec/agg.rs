@@ -343,6 +343,9 @@ pub(crate) struct AggScanState {
     pub(crate) bare_limit: i64,
     pub(crate) wall_us: u64,
     pub(crate) buf_stats: super::segments::ScanBufferStats,
+    /// F8 (`PERF_IMPROVEMENTS.md` #44): number of preselected keys used to
+    /// filter Phase-1 rows. 0 when the optimization didn't fire.
+    pub(crate) f8_preselected: u64,
 }
 
 
@@ -813,7 +816,7 @@ fn try_catalog_shortcut(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(),
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
     })
 }
 
@@ -1102,7 +1105,7 @@ fn try_metadata_fast_path(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(),
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
     })
 }
 
@@ -2356,7 +2359,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
                     };
 
                     let state_box = Box::new(state);
@@ -2522,7 +2525,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us: spec_fail_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
                     };
 
                     let state_box = Box::new(state);
@@ -2689,6 +2692,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     bare_limit,
                     wall_us: t_wall.elapsed().as_micros() as u64,
                     buf_stats: super::segments::take_scan_buf_stats(),
+                    // Compact (int-only) path doesn't wire F8 today.
+                    f8_preselected: 0,
                 };
 
                 let state_box = Box::new(state);
@@ -3009,7 +3014,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
                 };
 
                 let state_box = Box::new(state);
@@ -3160,7 +3165,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
             };
 
             let state_box = Box::new(state);
@@ -3281,24 +3286,6 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 TextQualInfo::Like { negate: true, .. } => 2,   // NOT LIKE
             });
 
-            let config = ParallelMixedConfig {
-                agg_specs: &agg_specs,
-                group_specs: &group_specs,
-                col_names: &meta.col_names,
-                col_types: &meta.col_types,
-                segment_by: &meta.segment_by,
-                needed_cols: &needed_cols,
-                batch_quals: &batch_quals,
-                seg_filters: &seg_filters,
-                time_min,
-                time_max,
-                topn_spec,
-                text_group_col_flags: &text_group_col_flags,
-                text_qual_infos: &text_qual_infos,
-                rust_regex_infos: &rust_regex_infos,
-                sidecar_only_cols: &sidecar_only_cols,
-            };
-
             // Pipeline detoast with parallel processing when enough segments.
             // Use fewer batches than the compact path (4 vs n_workers*2) because
             // the mixed path processes text columns which have high per-segment
@@ -3321,6 +3308,57 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 }
                 total_detoast_us += t_detoast.elapsed().as_micros() as u64;
             }
+
+            // F8 Phase 0: when the query shape matches (bare LIMIT, no WHERE,
+            // no HAVING, no non-trivial group-by expressions), pre-select
+            // `bare_limit` distinct group-key hashes from the first few
+            // segments. Workers will then filter phase-1 rows by this set,
+            // bounding each worker's hash map to at most `bare_limit` entries.
+            // Counts stay exact because every matching row is still counted.
+            let has_case_when_group = group_specs.iter()
+                .any(|gs| matches!(gs.expr, GroupByExpr::CaseWhen(_)));
+            let has_regex_group = group_specs.iter()
+                .any(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }));
+            let preselected_keys: Option<hashbrown::HashSet<u128>> = if bare_limit > 0
+                && having_filters.is_empty()
+                && batch_quals.is_empty()
+                && where_quals.is_null()
+                && !has_case_when_group
+                && !has_regex_group
+            {
+                try_build_preselected(
+                    bare_limit as usize,
+                    &all_segments,
+                    &group_specs,
+                    &meta.col_names,
+                    &meta.col_types,
+                    &meta.segment_by,
+                    &needed_cols,
+                    &text_group_col_flags,
+                    /* max_probe_segments */ 4,
+                )
+            } else {
+                None
+            };
+
+            let config = ParallelMixedConfig {
+                agg_specs: &agg_specs,
+                group_specs: &group_specs,
+                col_names: &meta.col_names,
+                col_types: &meta.col_types,
+                segment_by: &meta.segment_by,
+                needed_cols: &needed_cols,
+                batch_quals: &batch_quals,
+                seg_filters: &seg_filters,
+                time_min,
+                time_max,
+                topn_spec,
+                text_group_col_flags: &text_group_col_flags,
+                text_qual_infos: &text_qual_infos,
+                rust_regex_infos: &rust_regex_infos,
+                sidecar_only_cols: &sidecar_only_cols,
+                preselected_keys: preselected_keys.as_ref(),
+            };
 
             let mut pipeline_detoast_us: u64 = 0;
             let partial_results: Vec<ParallelMixedResult> = if use_pipeline {
@@ -3626,7 +3664,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
                     };
 
                     let state_box = Box::new(state);
@@ -3803,7 +3841,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
                     };
 
                     let state_box = Box::new(state);
@@ -4015,6 +4053,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     bare_limit,
                     wall_us: t_wall.elapsed().as_micros() as u64,
                     buf_stats: super::segments::take_scan_buf_stats(),
+                    f8_preselected: preselected_keys.as_ref()
+                        .map(|s| s.len() as u64).unwrap_or(0),
                 };
 
                 let state_box = Box::new(state);
@@ -4375,7 +4415,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
                 };
 
                 let state_box = Box::new(state);
@@ -4672,7 +4712,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
             };
 
             let state_box = Box::new(state);
@@ -5091,7 +5131,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us: 0,
                 topn_select_us: 0,
                 n_workers: actual_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
             };
 
             let state_box = Box::new(state);
@@ -6456,7 +6496,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             finalize_us,
             topn_select_us,
             n_workers: 0,
-            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
+            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
         };
 
         let state_box = Box::new(state);
@@ -6797,7 +6837,7 @@ pub(super) unsafe extern "C-unwind" fn end_agg_scan(
             pgrx::log!(
                 "pg_deltax DeltaXAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  [detoast={:.1}ms]  \
                  decompress={:.1}ms  agg={:.1}ms  merge={:.1}ms  finalize={:.1}ms  topn_select={:.1}ms  | \
-                 workers={} segments={} rows_processed={} groups={} result_rows={} topn_limit={} bare_limit={}",
+                 workers={} segments={} rows_processed={} groups={} result_rows={} topn_limit={} bare_limit={} f8_preselected={}",
                 total_us as f64 / 1000.0,
                 state.metadata_us as f64 / 1000.0,
                 state.heap_scan_us as f64 / 1000.0,
@@ -6814,6 +6854,7 @@ pub(super) unsafe extern "C-unwind" fn end_agg_scan(
                 state.result_rows.len(),
                 state.topn_limit,
                 state.bare_limit,
+                state.f8_preselected,
             );
             (*node).custom_ps = std::ptr::null_mut();
         }
@@ -8430,6 +8471,14 @@ struct ParallelMixedConfig<'a> {
     /// Per-column flag: true when the text column is loaded in sidecar-only
     /// mode (length blob instead of main blob). Parallel to col_names.
     sidecar_only_cols: &'a [bool],
+    /// F8 optimization: when `Some`, filter phase-1 rows by group-key
+    /// hash. Only rows whose `hash_mixed_key` output is in this set are
+    /// inserted into the per-worker map; all others are skipped. This
+    /// bounds each worker's map to `|preselected|` entries instead of
+    /// the full group cardinality. Set iff the bare-LIMIT shape matches
+    /// (no ORDER BY, no HAVING, no WHERE) and the Phase-0 probe
+    /// succeeded in finding `bare_limit` distinct keys.
+    preselected_keys: Option<&'a hashbrown::HashSet<u128>>,
 }
 
 // TextQualInfo is now in text_col.rs
@@ -8571,6 +8620,170 @@ fn can_parallel_mixed(
 }
 
 /// Process a chunk of segments on a worker thread using the mixed (int+string) path.
+/// F8 Phase 0 — try to extract `bare_limit` distinct hashed group keys by
+/// scanning up to `max_probe_segments` segments. Returns Some(set) iff the
+/// set reaches `bare_limit` entries; None otherwise (caller falls back to
+/// the normal full-agg path). Mirrors the decompression + key-building logic
+/// of `process_segments_mixed` but without aggregation, WHERE filtering, or
+/// top-N tracking. Caller must have gated this on: no WHERE clause, no
+/// HAVING, no CaseWhen / RegexpReplace group-by expression.
+#[allow(clippy::too_many_arguments)]
+fn try_build_preselected(
+    bare_limit: usize,
+    segments: &[SegmentData],
+    group_specs: &[GroupByColSpec],
+    col_names: &[String],
+    col_types: &[pg_sys::Oid],
+    segment_by: &[String],
+    needed_cols: &[bool],
+    text_group_col_flags: &[bool],
+    max_probe_segments: usize,
+) -> Option<hashbrown::HashSet<u128>> {
+    if bare_limit == 0 {
+        return None;
+    }
+
+    // Bail on group-by expressions the probe doesn't support.
+    for gs in group_specs {
+        match gs.expr {
+            GroupByExpr::Column
+            | GroupByExpr::AddConst { .. }
+            | GroupByExpr::DateTrunc { .. }
+            | GroupByExpr::Extract { .. } => {}
+            _ => return None,
+        }
+    }
+
+    let n_int_keys = group_specs.iter().filter(|gs| !is_text_group_col(gs)).count();
+    let n_str_keys = group_specs.iter().filter(|gs| is_text_group_col(gs)).count();
+
+    let mut keys: hashbrown::HashSet<u128> =
+        hashbrown::HashSet::with_capacity(bare_limit.max(16));
+
+    let probe_budget = max_probe_segments.min(segments.len());
+
+    for seg in segments.iter().take(probe_budget) {
+        if seg.row_count == 0 {
+            continue;
+        }
+
+        // Decompress GROUP BY columns for this segment only.
+        let mut numeric_cols: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+        let mut text_seg_cols: Vec<Option<SegTextColumn>> = Vec::new();
+        let mut blob_idx = 0;
+        let mut seg_val_idx = 0;
+
+        for (col_idx, col_name) in col_names.iter().enumerate() {
+            let type_oid = col_types[col_idx];
+
+            if !needed_cols[col_idx] {
+                if segment_by.contains(col_name) {
+                    seg_val_idx += 1;
+                } else {
+                    blob_idx += 1;
+                }
+                numeric_cols.push(Vec::new());
+                text_seg_cols.push(None);
+                continue;
+            }
+
+            if segment_by.contains(col_name) {
+                if text_group_col_flags[col_idx] {
+                    let val = &seg.segment_values[seg_val_idx];
+                    text_seg_cols.push(Some(SegTextColumn::SegBy(val.clone())));
+                    numeric_cols.push(Vec::new());
+                } else {
+                    let val = &seg.segment_values[seg_val_idx];
+                    let (datum, is_null) = match val {
+                        Some(s) => (parse_string_to_datum(s, type_oid), false),
+                        None => (pg_sys::Datum::from(0usize), true),
+                    };
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    numeric_cols.push(repeated);
+                    text_seg_cols.push(None);
+                }
+                seg_val_idx += 1;
+            } else {
+                // Guard against an under-sized blob vector (shouldn't happen
+                // in practice, but Phase 0 runs very early — skip this
+                // segment rather than panic).
+                if blob_idx >= seg.compressed_blobs.len() {
+                    return None;
+                }
+                let blob = &seg.compressed_blobs[blob_idx];
+                if text_group_col_flags[col_idx] {
+                    text_seg_cols.push(decompress_text_to_seg_col(blob));
+                    numeric_cols.push(Vec::new());
+                } else if is_numeric_type(type_oid) {
+                    numeric_cols.push(decompress_numeric_blob(blob, type_oid));
+                    text_seg_cols.push(None);
+                } else {
+                    // Unexpected type — bail cleanly.
+                    return None;
+                }
+                blob_idx += 1;
+            }
+        }
+
+        let row_count = seg.row_count as usize;
+        let mut int_keys_buf = vec![0i64; n_int_keys];
+        let mut str_keys_buf: Vec<Option<&str>> = vec![None; n_str_keys];
+
+        for row in 0..row_count {
+            let mut has_null = false;
+            let mut int_idx = 0;
+            let mut str_idx = 0;
+            for gs in group_specs {
+                if is_text_group_col(gs) {
+                    let col_idx = gs.col_idx as usize;
+                    str_keys_buf[str_idx] = text_seg_cols[col_idx]
+                        .as_ref()
+                        .and_then(|sc| sc.get_str(row));
+                    str_idx += 1;
+                } else {
+                    let col = &numeric_cols[gs.col_idx as usize];
+                    if col.is_empty() || col[row].1 {
+                        has_null = true;
+                        break;
+                    }
+                    int_keys_buf[int_idx] = match &gs.expr {
+                        GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                            let pg_usec = col[row].0.value() as i64;
+                            pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+                        }
+                        GroupByExpr::Extract { unit, .. } => {
+                            let pg_usec = col[row].0.value() as i64;
+                            extract_field_from_usecs(pg_usec, unit)
+                        }
+                        GroupByExpr::AddConst { offset, .. } => {
+                            col[row].0.value() as i64 + offset
+                        }
+                        GroupByExpr::Column => col[row].0.value() as i64,
+                        _ => unreachable!(),
+                    };
+                    int_idx += 1;
+                }
+            }
+            if has_null {
+                continue;
+            }
+
+            let hash_key = hash_mixed_key(
+                &int_keys_buf[..n_int_keys],
+                &str_keys_buf[..n_str_keys],
+            );
+            keys.insert(hash_key);
+            if keys.len() >= bare_limit {
+                return Some(keys);
+            }
+        }
+    }
+
+    // Probe exhausted without reaching bare_limit distinct keys.
+    None
+}
+
 fn process_segments_mixed(
     segments: &[SegmentData],
     config: &ParallelMixedConfig,
@@ -8814,6 +9027,18 @@ fn process_segments_mixed(
             if has_null { continue; }
 
             let hash_key = hash_mixed_key(&int_keys[..n_int_keys], &str_keys[..n_str_keys]);
+
+            // F8: when a preselected key set is supplied, skip rows whose
+            // group-key hash is not in the set. The set is bounded to
+            // `bare_limit` entries (typically 10), so the probe is an
+            // L1-resident hashbrown lookup (~5 ns). Rows that hit proceed
+            // to the normal Entry path below; rows that miss contribute
+            // nothing to any output group.
+            if let Some(preselected) = config.preselected_keys
+                && !preselected.contains(&hash_key)
+            {
+                continue;
+            }
 
             // Lookup or insert group
             if compact_map.len() == compact_map.capacity() {

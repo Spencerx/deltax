@@ -221,8 +221,13 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                 } else {
                     String::new()
                 };
+                let f8_str = if state.f8_preselected > 0 {
+                    format!(" f8_preselected={}", state.f8_preselected)
+                } else {
+                    String::new()
+                };
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} rows_processed={} result_rows={} batch_quals={} where_quals_null={}{}{}",
+                    "segments={} rows_processed={} result_rows={} batch_quals={} where_quals_null={}{}{}{}",
                     state.total_segments,
                     state.total_rows_processed,
                     state.result_rows.len(),
@@ -230,6 +235,7 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                     state.where_quals_null,
                     filtered_str,
                     regex_str,
+                    f8_str,
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(

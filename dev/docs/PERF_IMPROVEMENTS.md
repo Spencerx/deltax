@@ -1275,50 +1275,110 @@ not depend on or conflict with any map-layout change (e.g. #36).
   (analogous to `load_text_length_sidecars`).
 - `src/lib.rs` — `pg_deltax.exact_count_distinct` GUC.
 
-### 44. Early termination for `GROUP BY … LIMIT N` without `ORDER BY`
+### 44. Two-pass filter for `GROUP BY … LIMIT N` without `ORDER BY`
 
-**Target: Q17 1.69 s → ~0.02 s (ClickBench hot run)**
-**Complexity: Low (~50 LOC)**
+**Target: Q17 1.48 s → ~0.8 s (−45 %, agg 805 ms → ~130 ms)**
+**Complexity: Medium (~200 LOC)**
 
 Q17 is `SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY
 UserID, SearchPhrase LIMIT 10` — no ORDER BY. Today we still
 materialize every group (`pre_topn_groups ≈ 17 M`), then PG's Limit
-node picks 10. EXPLAIN shows `agg=813 ms` on top of `detoast=523 ms`
-to build a hash table that's 99.9999 % thrown away.
+node picks 10. EXPLAIN shows `agg=805 ms` on top of `detoast=517 ms`
+building a 17 M-entry hashbrown that's 99.99999 % thrown away.
 
-Under PostgreSQL's semantics, `LIMIT N` without `ORDER BY` is
-allowed to return any N rows in any order. Once aggregation has
-accumulated ≥ N distinct groups, the remaining segments cannot
-change the result.
+**Correctness constraint (key to the design).** Under PostgreSQL
+semantics, `LIMIT N` without ORDER BY may return any N aggregated
+rows in any order, but each returned row must carry the
+**correct global aggregate value** for its group. A naive "stop
+worker loops after accumulating N local groups" approach would
+emit partial counts — verified: Q17's `(1148718334461794889, '', 9)`
+has true global count 9, a worker that stopped after one segment
+would report count 1. That's a correctness bug, not a valid
+optimization.
 
-**Approach.** In the planner hook (`plan_agg_path`), detect the
-shape `GROUP BY … LIMIT N` with no sort key, and flag
-`GroupByLimit::EarlyTerm { limit: N }` in `custom_private`. In the
-phase-1 mixed/compact worker loop in `agg.rs`, after processing
-each segment check `local_map.len() >= limit` and, if so, set an
-`early_done` atomic flag observed by other workers to stop their
-segment loops. Phase-2 merge proceeds normally on the (small)
-accumulated state; each worker's map has ≥ `limit` groups but
-probably far more (workers don't coordinate on which groups they
-already covered), so the global map is still typically larger than
-`limit`. That's fine — the LIMIT at the top of the plan truncates.
+**Approach — two-pass filter.**
+
+1. **Phase 0 (main thread, before spawning workers).** Decompress
+   the group-by columns of one (or up to a small M) segment from
+   the leader's list. Iterate rows, build a `HashSet<u128>` of the
+   first N distinct packed keys using the same `hash_mixed_key`
+   routine workers use. Cost: ~30 ms for one segment. Fall back to
+   `None` (current path) if we can't fill N keys within M segments.
+
+2. **Phase 1 (workers).** Each worker receives
+   `preselected_keys: Option<&HashSet<u128>>` via
+   `ParallelMixedConfig`. In the row loop, immediately after
+   `hash_mixed_key` produces the u128, probe the preselected set
+   (≤ N entries → L1-resident → ~5 ns). On miss, `continue`. On
+   hit, fall through to the existing accumulator path. Each
+   worker's `compact_map` is now bounded to ≤ N entries.
+
+3. **Merge & emit.** Unchanged — the existing `bare_limit`
+   post-worker merge (agg.rs:3820) already handles the "pick N
+   keys, merge only those" shape.
+
+**Why this is correct.** Every row whose key is in the preselected
+set is counted exactly once across all workers (existing merge sums
+workers' contributions). Every row not in the set is skipped —
+those groups are never emitted. Output: exactly N rows, each with
+correct global count for its key. PG's LIMIT N requires any valid
+N rows from the aggregate; these are valid. ✓
+
+**Why this is fast.** The 17 M-entry hashbrown per worker is
+DRAM-bound (~100 ns per probe). A 10-entry hashbrown is L1-resident
+(~5 ns per probe). Per-row cost in Phase 1 is ~20 ns (hash + probe)
+vs ~100 ns today — matches the observed 805 → 130 ms gap. Detoast
+(517 ms) and decompress (176 ms) are unchanged; they dominate the
+remaining ~800 ms.
 
 **Gating.** Only trigger when:
-- `parse->hasLimit && parse->limitCount` is a positive const
-- `parse->sortClause.is_null()` (no ORDER BY)
-- `parse->groupClause.is_not_null()` (actually has GROUP BY —
-  otherwise the existing TopN path or plain aggregate applies)
-- No HAVING clause
+- `parse->hasLimit && parse->limitCount` is a positive const ≤ 10 K
+- `parse->sortClause` is empty (no ORDER BY)
+- `parse->groupClause` is non-empty
+- `parse->havingQual` is null (HAVING could eliminate preselected
+  keys, leaving < N rows in the output)
+- Query has no non-trivial WHERE (Phase 0 would pre-select keys
+  that might get filtered out of Phase 1 — narrowing scope keeps
+  the implementation tractable; can be relaxed later by having
+  Phase 0 apply the same batch quals)
 
-**Scope.** Only one ClickBench query hits this exact shape (Q17),
-so the bench-level win is ~1.5 s; but the change is small, safe,
-and the same shape shows up in interactive exploration queries
-(people frequently prototype with `GROUP BY … LIMIT 10` before
-adding an ORDER BY).
+**Scope.** Only Q17 in ClickBench hits this exact shape. Wires in
+the mixed path only; compact path (int-only GROUP BY) gets no
+additional ClickBench benefit but could be added the same way if a
+future query needs it.
 
-**Files:** `src/scan/hook.rs` (shape detection + `custom_private`
-encoding), `src/scan/exec/agg.rs` (atomic `early_done` flag, segment
-loop check in both compact and mixed paths).
+**Fallbacks.**
+- Phase 0 yields < N distinct keys across M segments → `None`,
+  current full-build path runs unchanged. Q17's first segment has
+  ~30 K distinct pairs, so N = 10 is trivial; the fallback exists
+  for degenerate synthetic workloads.
+- NULL-containing keys: the existing `has_null → continue` skip
+  (agg.rs:8814) is preserved, matching current NULL semantics.
+
+**Files:**
+- `src/scan/hook.rs` — extend the existing `bare_limit` gate
+  (around line 2304) with `havingQual.is_null` + no-WHERE check;
+  signal F8-eligibility via `custom_private`.
+- `src/scan/exec/agg.rs` —
+  - `ParallelMixedConfig` (line 8412): new `preselected_keys`
+    field.
+  - New `try_build_preselected` helper (~80 LOC) — reuses
+    `decompress_numeric_blob` (agg.rs:7507), `decompress_text_to_seg_col`
+    (text_col.rs:137), and `hash_mixed_key` (agg.rs:8816).
+  - Row-loop filter (~5 LOC) at agg.rs:8816 — one probe after
+    `hash_mixed_key`.
+  - EXPLAIN counter for observability (e.g. `f8_preselected=10/10`
+    line in DeltaX Stats).
+- Unit test (`#[pg_test]` in agg.rs) + integration test
+  (`tests/test_functions.py`) asserting exact-count semantics on a
+  synthetic table with known (X, Y) duplicate distribution.
+
+**Complexity.** Originally estimated at ~50 LOC / low complexity
+based on a (semantically incorrect) "stop early" approach. Revised
+to ~200 LOC / medium complexity after working through the
+correctness constraint. Savings recomputed: ~0.7 s on Q17 (not
+~1.5 s), but the shape is common in interactive querying so the
+UX value extends beyond bench.
 
 ### 45. Dict sidecar blob for dict-encoded text columns
 
