@@ -121,6 +121,7 @@ pub(super) fn pg_type_oid(type_name: &str) -> pg_sys::Oid {
         "bool" => pg_sys::BOOLOID,
         "text" => pg_sys::TEXTOID,
         "varchar" => pg_sys::VARCHAROID,
+        "jsonb" => pg_sys::JSONBOID,
         _ => pg_sys::TEXTOID,
     }
 }
@@ -143,6 +144,8 @@ pub(super) fn pg_type_name(type_oid: pg_sys::Oid) -> String {
         "date".to_string()
     } else if type_oid == pg_sys::BOOLOID {
         "boolean".to_string()
+    } else if type_oid == pg_sys::JSONBOID {
+        "jsonb".to_string()
     } else {
         "text".to_string()
     }
@@ -1152,8 +1155,10 @@ pub(super) unsafe fn collation_strcmp(a: &str, b: &str) -> i32 {
 
 pub(super) unsafe fn str_to_text_datum(s: &str, type_oid: pg_sys::Oid, typmod: i32) -> pg_sys::Datum {
     unsafe {
-        if type_oid == pg_sys::BPCHAROID {
-            // bpchar needs the type input function with the correct typmod for padding
+        // bpchar needs the type input function for padding; jsonb stores
+        // as canonical text and needs the input function to produce a real
+        // jsonb binary Datum (otherwise jsonb operators segfault).
+        if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
             let cstr = std::ffi::CString::new(s).unwrap();
             let mut typinput: pg_sys::Oid = pg_sys::InvalidOid;
             let mut typioparam: pg_sys::Oid = pg_sys::InvalidOid;
@@ -1183,8 +1188,10 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
         return Vec::new();
     }
 
-    // bpchar needs the type input function for padding — can't arena-allocate
-    if type_oid == pg_sys::BPCHAROID {
+    // bpchar needs the input function for padding; jsonb needs it to
+    // produce a real jsonb binary Datum from the stored text (otherwise
+    // jsonb operators like ->> segfault on raw text bytes).
+    if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
         return unsafe {
             slices
                 .iter()

@@ -177,8 +177,14 @@ unsafe fn has_segment_by(parent_oid: pg_sys::Oid) -> bool {
     }
 }
 
-/// Check if the first query pathkey matches the time column (ASC or DESC).
+/// Check if the first query pathkey matches the time column in ASC order.
 /// Returns `(pathkey_list, is_ascending)` — pathkey_list is null if no match.
+///
+/// DESC is intentionally NOT advertised here: the decompress scan emits rows
+/// in ASC storage order within each segment, so advertising a DESC pathkey
+/// would let the planner skip the sort step and return rows out of order
+/// (observed on PG17). For DESC queries we fall through to no advertisement,
+/// which lets the planner add a Sort above our scan.
 unsafe fn check_time_pathkey(
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
@@ -195,18 +201,12 @@ unsafe fn check_time_pathkey(
             return (std::ptr::null_mut(), true);
         }
 
-        // Accept both ASC and DESC
         #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
         let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
         #[cfg(feature = "pg18")]
         let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
 
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
-        let is_desc = (*first_pk).pk_strategy == pg_sys::BTGreaterStrategyNumber as i32;
-        #[cfg(feature = "pg18")]
-        let is_desc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_GT;
-
-        if !is_asc && !is_desc {
+        if !is_asc {
             return (std::ptr::null_mut(), true);
         }
 
