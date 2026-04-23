@@ -298,6 +298,32 @@ pub fn mark_partition_compressed(
     Ok(())
 }
 
+/// Write a pre-computed per-column ndistinct map (typically from
+/// HLL sketches merged across segments during compression) to the
+/// `deltax_partition.column_ndistinct` JSONB column.
+pub fn update_partition_column_ndistinct_from_map(
+    client: &mut SpiClient,
+    partition_id: i32,
+    col_ndistinct: &std::collections::HashMap<String, i64>,
+) -> spi::SpiResult<()> {
+    let mut parts: Vec<String> = Vec::with_capacity(col_ndistinct.len());
+    let mut names: Vec<&String> = col_ndistinct.keys().collect();
+    names.sort();
+    for name in names {
+        let nd_val = col_ndistinct[name];
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        parts.push(format!("\"{}\":{}", escaped, nd_val));
+    }
+    let json = format!("{{{}}}", parts.join(","));
+
+    client.update(
+        "UPDATE deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
 /// Compute per-column max ndistinct from the meta table and store the
 /// result as a JSONB map on `deltax_partition.column_ndistinct`. Called
 /// once at the end of compression so that planner-time cost estimation

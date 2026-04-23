@@ -44,6 +44,82 @@ pub unsafe fn register_process_utility_hook() {
 
 /// Chain to the previous ProcessUtility hook, or call standard_ProcessUtility.
 #[allow(clippy::too_many_arguments)]
+/// Walk a VacuumStmt's `rels` list and remove any entries whose
+/// relation is a compressed pg_deltax partition. If the list becomes
+/// empty we leave it empty — PG's vacuum executor treats that as "no
+/// target", which is the desired outcome.
+///
+/// This runs at ProcessUtility time for user-initiated
+/// `ANALYZE <rel>` / `VACUUM ANALYZE <rel>`. Autovacuum bypasses
+/// ProcessUtility entirely, so the `autovacuum_enabled = off` storage
+/// option set at compress time is the other half of the belt-and-
+/// suspenders protection.
+unsafe fn filter_compressed_rels_from_vacuum_stmt(vstmt: *mut pg_sys::VacuumStmt) {
+    unsafe {
+        if vstmt.is_null() || (*vstmt).rels.is_null() {
+            return; // NIL means "all tables"; don't touch that case
+        }
+
+        let rels = (*vstmt).rels;
+        let len = (*rels).length;
+        let mut kept: Vec<*mut std::ffi::c_void> = Vec::with_capacity(len as usize);
+        let mut dropped: Vec<String> = Vec::new();
+
+        for i in 0..len {
+            let node = pg_sys::list_nth(rels, i) as *mut pg_sys::VacuumRelation;
+            if node.is_null() {
+                continue;
+            }
+            let rv = (*node).relation;
+            if rv.is_null() {
+                kept.push(node as *mut std::ffi::c_void);
+                continue;
+            }
+            // Resolve the RangeVar to an OID without taking a lock; we
+            // only need the ID to check the deltax catalog.
+            let rel_oid = pg_sys::RangeVarGetRelidExtended(
+                rv,
+                pg_sys::NoLock as i32,
+                pg_sys::RVROption::RVR_MISSING_OK,
+                None,
+                std::ptr::null_mut(),
+            );
+            if rel_oid == pg_sys::InvalidOid {
+                kept.push(node as *mut std::ffi::c_void);
+                continue;
+            }
+            let companion = crate::scan::check_compressed_partition(rel_oid);
+            if companion != pg_sys::InvalidOid {
+                let name = std::ffi::CStr::from_ptr((*rv).relname)
+                    .to_string_lossy()
+                    .into_owned();
+                dropped.push(name);
+            } else {
+                kept.push(node as *mut std::ffi::c_void);
+            }
+        }
+
+        if dropped.is_empty() {
+            return;
+        }
+        // Rebuild the list with only the kept entries. `list_delete_nth_cell`
+        // exists but needs a cell; easier to build a new List here.
+        let mut new_list: *mut pg_sys::List = std::ptr::null_mut();
+        for n in kept {
+            new_list = pg_sys::lappend(new_list, n);
+        }
+        (*vstmt).rels = new_list;
+
+        pgrx::log!(
+            "pg_deltax: skipping ANALYZE on compressed partition(s): {} \
+             (stats maintained by deltax_compress_partition; run \
+             deltax_analyze_partition() to refresh manually)",
+            dropped.join(", "),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn chain_to_prev(
     pstmt: *mut pg_sys::PlannedStmt,
     query_string: *const c_char,
@@ -98,6 +174,19 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     qc: *mut pg_sys::QueryCompletion,
 ) {
     let utility_stmt = unsafe { (*pstmt).utilityStmt };
+
+    // Intercept `ANALYZE <compressed_partition>` (and `VACUUM ANALYZE`)
+    // before the standard executor samples our empty heap and overwrites
+    // the `pg_statistic` rows we maintain ourselves. Compressed
+    // partitions are also marked `autovacuum_enabled = off` at compress
+    // time; this hook catches user-initiated ANALYZE.
+    if !utility_stmt.is_null() && unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_VacuumStmt) } {
+        unsafe {
+            filter_compressed_rels_from_vacuum_stmt(utility_stmt as *mut pg_sys::VacuumStmt);
+        }
+        // Fall through to chain so PG executes the (now-filtered) stmt.
+    }
+
     if utility_stmt.is_null() || !unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_CopyStmt) } {
         unsafe {
             chain_to_prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
@@ -1546,7 +1635,7 @@ fn compress_segment(
     sort_typed_columns(&mut typed_cols, order_col_indices, row_count);
 
     // Ndistinct
-    let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
+    let (ndistinct, _hll_sketches) = compute_segment_ndistinct(&typed_cols, columns);
 
     // Segment_by values
     let seg_values: Vec<Option<String>> = columns
@@ -1769,7 +1858,7 @@ fn flush_segment(
     let companion_ddl = build_companion_ddl(&buf.partition_table, &state.columns);
 
     // Compute ndistinct
-    let ndistinct = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
+    let (ndistinct, _hll_sketches) = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
 
     // Segment_by values from the buffered data (extract from first row if present)
     let seg_values: Vec<Option<String>> = state.columns

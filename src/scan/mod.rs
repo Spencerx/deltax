@@ -20,6 +20,9 @@ static PREV_UPPER_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 /// Previous hook to chain (ExecutorStart_hook).
 static PREV_EXECUTOR_START_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Previous hook to chain (get_relation_info_hook).
+static PREV_GET_RELATION_INFO_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Custom scan method name (NUL-terminated, static lifetime).
 const CUSTOM_NAME: &std::ffi::CStr = c"DeltaXDecompress";
 
@@ -50,6 +53,15 @@ pub(crate) fn set_dml_bypass(bypass: bool) {
     hook::set_dml_bypass(bypass);
 }
 
+/// Look up the companion OID for a compressed partition's relation OID,
+/// or `InvalidOid` if it's not a pg_deltax-managed compressed table.
+///
+/// # Safety
+/// Must be called from a backend with a valid transaction (uses SearchSysCache).
+pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
+    unsafe { hook::check_compressed_partition(rel_oid) }
+}
+
 /// Register the planner hook at extension load time.
 ///
 /// # Safety
@@ -68,6 +80,20 @@ pub unsafe fn register_hook() {
             PREV_UPPER_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
         pg_sys::create_upper_paths_hook = Some(hook::deltax_create_upper_paths);
+
+        // Register get_relation_info_hook so we can patch `rel->tuples`
+        // and `rel->pages` for compressed partitions. PG's default
+        // `estimate_rel_size` multiplies reltuples by curpages/relpages,
+        // and curpages on a compressed partition is 0 (the heap is
+        // truncated), so reltuples=50K collapses to tuples=0 and every
+        // restrictinfo selectivity multiplies out to 0/1. Setting
+        // rel->tuples here (before set_baserel_size_estimates runs)
+        // feeds the correct baseline into the planner.
+        let prev_gri = pg_sys::get_relation_info_hook;
+        if let Some(prev_fn) = prev_gri {
+            PREV_GET_RELATION_INFO_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
+        }
+        pg_sys::get_relation_info_hook = Some(hook::deltax_get_relation_info);
 
         // Register CustomScanMethods by name so parallel workers can
         // deserialize custom scan nodes from DSM.

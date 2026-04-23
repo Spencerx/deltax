@@ -13,6 +13,7 @@ mod copyparse;
 mod functions;
 mod partition;
 mod scan;
+mod stats;
 mod timeparse;
 mod worker;
 

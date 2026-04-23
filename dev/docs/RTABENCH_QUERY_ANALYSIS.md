@@ -312,9 +312,10 @@ issue — TimescaleDB shows similar cold/warm ratios.
 | Priority | Fix | Status | Est. suite impact |
 |---|---|---|---|
 | P0 | Make `DeltaXAppend` parallel-safe (partial-path + DSM cursor) | **✓ done** (2026-04) | **−49 s** realized on Q17/Q23/Q25/Q30 |
-| P0 | Filter-selectivity in DeltaXAppend cost estimator | open — attempted hook-level gate reverted (see §5.3) | **−15 s** remaining + fixes small-query regressions in §5.3 |
+| P0 | Filter-selectivity in cost estimator (via `pg_statistic` + `get_relation_info_hook`) | **✓ done** (2026-04) | closes §5.3 small-query regressions + aligns cost-model for Cat A |
 | P0 | `DeltaXAgg` parallel-safe | open | unknown — likely helps Cat H queries |
 | P1 | Metadata-only fast path for global min/max/sum/count (DeltaXAgg) | open | **−700 ms** (Q02, also Q06 pattern) |
+| P2 | Share segment metadata via DSM in parallel scan | open — §5.6 (fixes Q15's 9× metadata duplication) | improves parallel-scan efficiency on selective queries |
 | P2 | Trim column-blob decompress set to referenced columns only | open | helps Q15 (EXISTS) and any narrow-projection query |
 | P2 | Partition-level `order_id` min/max pruning hook | open | 5–7× on Q07, Q09–Q13 |
 | P3 | EXISTS short-circuit in `DeltaXAppend` executor | open | Q15 specifically |
@@ -386,19 +387,99 @@ real P0 #2 work (below) rather than more hook-level heuristics.
 | Q13 satisfaction_with_without_backup | 13 ms | 81 ms | +68 ms | idem |
 | Q15 EXISTS (customer_id=124) | 435 ms | 1.36 s | +925 ms | 9× metadata duplication (1 of 55K segments survives) |
 
-### 5.4 · P0 #2 — Filter-selectivity in cost estimator (open)
+### 5.4 · P0 #2 — Filter-selectivity in cost estimator (done)
 
-The broader cost-estimator bug — DeltaXAppend reports `rows=14.8M`
-when actual is `602K` because the `event_type='Delivered'` filter
-isn't in the estimator — still stands and would also close the
-regressions in 5.3. Properly wiring segment-level bloom + min/max
-selectivity into `src/scan/cost.rs::estimate_cost` would let the
-planner see tiny row counts for point lookups (so it picks serial
-on cost, no gate needed) **and** accurate row counts for Category A
-queries (so it picks the correct join-side hash). ANALYZE-side fix:
-populate `pg_statistic` for compressed children from our per-segment
-colstats so PG's default-selectivity fallback doesn't kick in.
+Shipped. Rather than teaching `cost::estimate_cost` about bloom/
+min-max selectivity directly, we populate PG's own stats catalog so
+its built-in selectivity functions become accurate on compressed
+partitions. Three pieces:
 
-Together with partition-level `order_id` min/max pruning (P2) this
-should close the point-lookup regressions entirely.
+1. **`src/stats.rs`** (new). At compress time, write
+   `pg_class.reltuples = row_count`,
+   `pg_class.relpages = row_count/density`, and one `pg_statistic`
+   row per non-segment-by column with
+   `(stadistinct, stanullfrac, stawidth)` derived from the existing
+   `_colstats` table plus a partition-level HLL merged across
+   segments during compression. Sign convention for `stadistinct`
+   matches PG's own ANALYZE (positive absolute below 10% of row
+   count; negative fraction above).
+
+2. **`get_relation_info_hook`** in `src/scan/hook.rs`. After
+   compression the partition's heap is truncated to 0 blocks, so
+   PG's `estimate_rel_size` computes `tuples = density * curpages = 0`
+   no matter what we put in `pg_class.reltuples`. The hook runs just
+   after `estimate_rel_size` and just before
+   `set_baserel_size_estimates` — we inject
+   `rel->tuples = cost::get_row_count(companion_oid)` so
+   restrictinfo selectivity has a correct baseline to multiply.
+
+3. **`deltax_analyze_partition(text)`** and
+   **`deltax_analyze_table(text)`** SQL functions, so operators can
+   refresh stats on already-compressed partitions (e.g. after
+   upgrading to this version). Uses a SUM-capped fallback since the
+   HLL sketches don't persist.
+
+4. **Autovacuum interception**. Each compressed partition gets
+   `ALTER TABLE ... SET (autovacuum_enabled = off)` at compress time
+   (blocks the launcher). A `ProcessUtility_hook` extension
+   (`src/copy.rs::filter_compressed_rels_from_vacuum_stmt`) also
+   strips compressed partitions from user-run `ANALYZE <rel>` so
+   they don't reset our `pg_statistic` rows by sampling an empty
+   heap.
+
+### 5.5 · EC2 benchmark after P0 #2 (warm, c6a.4xlarge, 181M events)
+
+| Query | Baseline | + parallel-safe | + pg_statistic | vs baseline |
+|---|---:|---:|---:|---:|
+| Q17 `top_selling_month_product` | 25.41 s | 8.59 s | **2.59 s** | **9.8×** |
+| Q23 `top_sales_volume_product_from_terminal` | 23.71 s | 8.74 s | **4.50 s** | **5.3×** |
+| Q25 `product_category_performance` | 13.13 s | 1.64 s | **1.11 s** | **11.8×** |
+| Q30 `customers_with_most_orders_delivered` | 10.77 s | 4.61 s | **4.24 s** | 2.5× |
+| **Category A subtotal** | **73.0 s** | 23.6 s | **12.4 s** | **5.9×** |
+| **Suite total (31 queries)** | **128.6 s** | ~46 s | **~34 s** | **3.8×** |
+
+After the pg_statistic fix, pg_deltax beats TimescaleDB on Q17
+(2.6×), Q23 (1.8×), is roughly on par for Q25, and remains slower
+on Q30 (4.24 s vs 1.52 s). Most other queries where pg_deltax
+already wins held or improved slightly.
+
+Residual small-query regressions from §5.3 partially closed but
+not fully — these remain slower than the pre-parallel baseline:
+
+| Query | Baseline | Parallel-safe | + pg_statistic |
+|---|---:|---:|---:|
+| Q07 point lookup | 12 ms | 80 ms | **85 ms** |
+| Q11 events_for_an_order | 5 ms | 14 ms | **14 ms** |
+| Q12 max_satisfaction | 15 ms | 72 ms | **86 ms** |
+| Q13 satisfaction_with_without_backup | 13 ms | 81 ms | **86 ms** |
+| Q15 EXISTS (customer_id=124) | 435 ms | 1.36 s | **1.36 s** |
+
+The absolute costs are small (~0.1 s aggregate across the five),
+so they don't offset the Category A gains. Diagnosis for follow-up:
+Q15's residual cost is the 9× metadata duplication in the parallel
+scan path (even when the planner now picks it, pg_statistic is fed
+via `rel->tuples`, but the parallel path's per-worker heap-scan
+cost isn't modeled yet) — the fix for this is item §5.6 below.
+
+
+
+### 5.6 · DSM metadata sharing for selective parallel scans (open)
+
+Residual cost on selective parallel scans: each of the 8 workers
+re-runs `load_metadata` + `load_segments_heap` for every companion
+partition before the shared-cursor code hands a segment to one
+worker. For Q15 this meant ~2 s × 9 processes = ~18 s of
+aggregated `heap_scan` time for 1 segment of actual work. The P0
+#2 fix above keeps Q15 off the parallel path (via correct row
+estimate → serial wins on cost), so the wasted-metadata case is
+no longer on the default plan, but the underlying inefficiency
+stays. If a future query lands on the parallel path with very
+selective segment pruning we'd hit it again.
+
+The planned fix is to ship just the serialized segment metadata
+(min/max, segment_values, bloom — *not* compressed blobs) through
+DSM at `InitializeDSMCustomScan` and have workers attach via
+`InitializeWorkerCustomScan` instead of running their own SPI +
+`load_segments_heap` pass. Tracked as item (c) in the
+Recommendations table above.
 

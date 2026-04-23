@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use super::PREV_HOOK;
 use super::PREV_UPPER_HOOK;
 use super::PREV_EXECUTOR_START_HOOK;
+use super::PREV_GET_RELATION_INFO_HOOK;
 use super::path;
 use super::cost;
 
@@ -387,6 +388,80 @@ unsafe fn extract_topn_info(
         }
 
         (effective_limit, is_asc, multi_col_sort)
+    }
+}
+
+/// `get_relation_info_hook` — invoked inside `get_relation_info` after
+/// PG has populated `rel->pages`/`rel->tuples` from `estimate_rel_size`
+/// but before `set_baserel_size_estimates` applies restrictinfo
+/// selectivity.
+///
+/// For a compressed pg_deltax child partition, the on-disk heap is
+/// truncated to 0 pages. PG's estimator uses `ceil((reltuples/relpages)
+/// * curpages)` where `curpages = 0`, so `rel->tuples` collapses to 0
+/// and every `clauselist_selectivity * tuples` result rounds up to the
+/// `rel->rows = 1` fallback. That's what makes the planner treat
+/// `WHERE order_id = N` as returning "maybe 1 row" even though
+/// pg_statistic.stadistinct is populated correctly.
+///
+/// Injecting the true row count here (from `deltax_partition.row_count`
+/// via `cost::get_row_count`) feeds the post-hook selectivity math
+/// properly: `rel->rows = row_count * eq_selectivity`.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn deltax_get_relation_info(
+    root: *mut pg_sys::PlannerInfo,
+    relation_object_id: pg_sys::Oid,
+    inh_parent: bool,
+    rel: *mut pg_sys::RelOptInfo,
+) {
+    unsafe {
+        let prev = PREV_GET_RELATION_INFO_HOOK.load(Ordering::SeqCst);
+        if !prev.is_null() {
+            let prev_fn: pg_sys::get_relation_info_hook_type = Some(
+                std::mem::transmute::<
+                    *mut (),
+                    unsafe extern "C-unwind" fn(
+                        *mut pg_sys::PlannerInfo,
+                        pg_sys::Oid,
+                        bool,
+                        *mut pg_sys::RelOptInfo,
+                    ),
+                >(prev),
+            );
+            if let Some(f) = prev_fn {
+                f(root, relation_object_id, inh_parent, rel);
+            }
+        }
+
+        // Only interested in base relations (partitioned children show
+        // up as RELOPT_OTHER_MEMBER_REL during partition expansion).
+        if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
+            && (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL
+        {
+            return;
+        }
+
+        // Is this a compressed pg_deltax partition?
+        let companion_oid = check_compressed_partition(relation_object_id);
+        if companion_oid == pg_sys::InvalidOid {
+            return;
+        }
+
+        let row_count = match cost::get_row_count(companion_oid) {
+            Some(rc) if rc > 0 => rc as f64,
+            _ => return,
+        };
+
+        // Override with the true row count from our catalog. Keep
+        // pages derived from tuple-width × row_count so PG doesn't
+        // later read relpages=0 and zero out tuples again.
+        (*rel).tuples = row_count;
+        if (*rel).pages == 0 {
+            // Rough heuristic: 100 rows per page is a reasonable
+            // density for typical OLTP-ish row widths. The exact
+            // value doesn't matter much — PG primarily uses tuples.
+            (*rel).pages = ((row_count / 100.0).ceil() as u32).max(1);
+        }
     }
 }
 
@@ -2399,17 +2474,32 @@ unsafe fn extract_companion_oids(
     path: *const pg_sys::Path,
 ) -> Option<Vec<pg_sys::Oid>> {
     unsafe {
-        // Unwrap ProjectionPath at the top level — PG wraps the input path
-        // in ProjectionPath when the GROUP BY target list contains expressions
-        // (e.g. regexp_replace) that need evaluation.
-        let path = if (*path).type_ == pg_sys::NodeTag::T_ProjectionPath {
-            let proj = path as *const pg_sys::ProjectionPath;
-            (*proj).subpath as *const pg_sys::Path
-        } else {
-            path
-        };
-        if path.is_null() {
-            return None;
+        // Unwrap wrapper paths the planner might place above our scan:
+        // - ProjectionPath: wraps input when the GROUP BY target list contains
+        //   expressions (e.g. regexp_replace) that need evaluation.
+        // - GatherPath / GatherMergePath: appears once DeltaXAppend is
+        //   parallel-safe and PG places a Gather above it. Without this
+        //   unwrap, the upper aggregate-pushdown hook would fail to
+        //   recognise the scan as compressed and skip DeltaXAgg, which
+        //   can cause 5–10× regressions on aggregation queries where
+        //   DeltaXAgg's pushdown is vastly cheaper than sort/hash-agg.
+        let mut path = path;
+        loop {
+            if path.is_null() {
+                return None;
+            }
+            match (*path).type_ {
+                pg_sys::NodeTag::T_ProjectionPath => {
+                    path = (*(path as *const pg_sys::ProjectionPath)).subpath as *const pg_sys::Path;
+                }
+                pg_sys::NodeTag::T_GatherPath => {
+                    path = (*(path as *const pg_sys::GatherPath)).subpath as *const pg_sys::Path;
+                }
+                pg_sys::NodeTag::T_GatherMergePath => {
+                    path = (*(path as *const pg_sys::GatherMergePath)).subpath as *const pg_sys::Path;
+                }
+                _ => break,
+            }
         }
         if (*path).type_ == pg_sys::NodeTag::T_CustomPath {
             extract_oids_from_custom_path(path as *const pg_sys::CustomPath)

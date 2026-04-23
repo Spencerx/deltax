@@ -124,7 +124,19 @@ pub unsafe fn add_decompress_path(
         (*cpath).path.pathtarget = (*rel).reltarget;
 
         let (startup_cost, total_cost, rows) = cost::estimate_cost(companion_oid, 0);
-        (*cpath).path.rows = rows;
+        // Prefer PG's filter-aware `rel->rows` estimate when it's
+        // meaningful — we now write accurate `pg_class.reltuples` and
+        // `pg_statistic` at compress time (see `src/stats.rs`), so the
+        // planner's restrictinfo-aware estimate is trustworthy. Fall
+        // back to the raw companion row count only if PG hasn't
+        // computed a real value yet (rel->rows = 1 is PG's default
+        // when reltuples is 0/-1 and no stats are populated).
+        let path_rows = if (*rel).rows > 1.0 {
+            (*rel).rows.min(rows)
+        } else {
+            rows
+        };
+        (*cpath).path.rows = path_rows;
         (*cpath).path.startup_cost = startup_cost;
         (*cpath).path.total_cost = total_cost;
         (*cpath).path.parallel_workers = 0;
@@ -1585,7 +1597,25 @@ unsafe fn build_deltax_append_path(
             total_cost += cost;
             total_rows += rows;
         }
-        (*cpath).path.rows = total_rows;
+        // Prefer the filter-aware estimate PG already computed for the
+        // partitioned parent rel (it sums children's post-filter rows).
+        // `rel->rows = 1.0` is PG's fallback when nothing populated
+        // `pg_class.reltuples`; if we see that, trust our companion sum
+        // instead. When parallel (workers > 0), divide the PG estimate
+        // by the parallel divisor so per-worker row counts stay
+        // consistent with the serial path.
+        let rel_rows = (*rel).rows;
+        let path_rows = if rel_rows > 1.0 {
+            if workers > 0 {
+                let div = cost::parallel_divisor(workers as usize);
+                rel_rows / div
+            } else {
+                rel_rows
+            }
+        } else {
+            total_rows
+        };
+        (*cpath).path.rows = path_rows;
         (*cpath).path.startup_cost = total_startup;
         (*cpath).path.total_cost = total_cost;
         (*cpath).path.parallel_workers = 0;

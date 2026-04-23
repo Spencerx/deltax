@@ -125,6 +125,24 @@ fn deltax_decompress_partition(partition: &str) -> String {
     })
 }
 
+/// Refresh `pg_class.reltuples` and `pg_statistic` for a compressed
+/// partition from the existing `_colstats` data. Used to (re-)populate
+/// planner stats on partitions that were compressed before the
+/// stats-population path shipped, or after an accidental `ANALYZE` on
+/// a compressed partition.
+#[pg_extern]
+fn deltax_analyze_partition(partition: &str) -> String {
+    Spi::connect_mut(|client| analyze_partition_impl(client, partition))
+}
+
+/// Refresh stats on every compressed partition of a deltax-managed
+/// table. Equivalent to calling `deltax_analyze_partition` on each
+/// partition returned by `deltax_partition_info(relation)`.
+#[pg_extern]
+fn deltax_analyze_table(relation: &str) -> String {
+    Spi::connect_mut(|client| analyze_table_impl(client, relation))
+}
+
 /// Show compression statistics for a deltatable.
 #[pg_extern]
 #[allow(clippy::type_complexity)]
@@ -293,7 +311,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
     let segment_size = ht.segment_size as usize;
 
-    let (total_compressed_size, row_count) = compress_partition_streaming(
+    let (total_compressed_size, row_count, partition_hll) = compress_partition_streaming(
         client,
         &part_fqn,
         &ddl,
@@ -338,15 +356,64 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     )
     .expect("failed to update catalog");
 
-    // Persist per-column max ndistinct so planner cost estimation can do
-    // a catalog lookup instead of a cold full scan of the colstats table.
-    let nd_col_names: Vec<String> = columns
+    // Persist per-column ndistinct from the partition-level HLL merge
+    // (strictly more accurate than the old MAX-over-segments approach,
+    // especially for time-clustered high-cardinality keys like order_id
+    // where per-segment HLL sees only a fraction of global distinct
+    // values). The resulting JSONB map feeds both `scan::cost` planner
+    // estimates and the `pg_statistic.stadistinct` write below.
+    let nd_col_names: Vec<&str> = columns
         .iter()
         .filter(|c| !c.is_segment_by)
-        .map(|c| c.name.clone())
+        .map(|c| c.name.as_str())
         .collect();
-    catalog::update_partition_column_ndistinct(client, part_info.id, &ddl.colstats_fqn, &nd_col_names)
+    let col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
+        .iter()
+        .zip(partition_hll.iter())
+        .map(|(name, hll)| ((*name).to_string(), hll.estimate() as i64))
+        .collect();
+    catalog::update_partition_column_ndistinct_from_map(client, part_info.id, &col_ndistinct)
         .expect("failed to update partition column_ndistinct");
+
+    // Populate pg_class.reltuples + pg_statistic for the compressed
+    // child partition so PG's built-in selectivity functions stop
+    // falling back to defaults (0.005 equality-sel, ~2.5e-5 text-eq).
+    // Failure here is WARNING, not fatal — the partition is still
+    // queryable with pessimistic estimates.
+    let part_rel_oid: pg_sys::Oid = client
+        .select(
+            &format!("SELECT '{}'::regclass::oid", part_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to resolve partition oid")
+        .first()
+        .get_one::<pg_sys::Oid>()
+        .ok()
+        .flatten()
+        .unwrap_or(pg_sys::InvalidOid);
+    if part_rel_oid != pg_sys::InvalidOid
+        && let Err(e) = crate::stats::write_partition_stats(
+            client, part_rel_oid, &col_ndistinct, row_count, &ddl.colstats_fqn, &columns,
+        )
+    {
+        pgrx::warning!(
+            "pg_deltax: failed to update pg_statistic for {}: {}. \
+             Run deltax_analyze_partition('{}') to retry.",
+            part_fqn, e, part_fqn,
+        );
+    }
+
+    // Disable autovacuum so user-triggered ANALYZE (including the
+    // autovacuum launcher) doesn't sample this empty-heap partition
+    // and wipe the pg_statistic rows we just wrote. The ProcessUtility
+    // hook (src/copy.rs) also filters explicit `ANALYZE <part>` calls
+    // as a belt-and-suspenders safeguard.
+    let _ = client.update(
+        &format!("ALTER TABLE {} SET (autovacuum_enabled = off)", part_fqn),
+        None,
+        &[],
+    );
 
     crate::scan::invalidate_compressed_cache();
 
@@ -972,12 +1039,15 @@ fn hash_for_hll<T: Hash>(val: &T) -> u64 {
 }
 
 /// Compute per-segment ndistinct using HyperLogLog estimators.
-/// Returns one estimate per non-segment-by column.
+/// Returns (per-non-segment-by-column estimates, per-non-segment-by-column HLL sketches).
+/// The sketches can be merged across segments to compute a partition-level
+/// cardinality estimate (used by `src/stats.rs` to populate `pg_statistic`).
 pub(crate) fn compute_segment_ndistinct(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
-) -> Vec<i64> {
-    let mut result = Vec::new();
+) -> (Vec<i64>, Vec<CardinalityEstimator<u64>>) {
+    let mut estimates = Vec::new();
+    let mut sketches = Vec::new();
     for (i, col) in columns.iter().enumerate() {
         if col.is_segment_by {
             continue;
@@ -993,9 +1063,10 @@ pub(crate) fn compute_segment_ndistinct(
             TypedColumn::Text(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
             TypedColumn::Bytes(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
         }
-        result.push(hll.estimate() as i64);
+        estimates.push(hll.estimate() as i64);
+        sketches.push(hll);
     }
-    result
+    (estimates, sketches)
 }
 
 /// Compute per-column bloom filters for a segment.
@@ -1086,6 +1157,7 @@ pub(crate) fn flush_with_splitting(
     bloom_buffer: &mut Vec<(u16, i32, u8, Vec<u8>)>,
     colstats_buffer: &mut Vec<ColstatsRow>,
     text_length_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
+    partition_hll: &mut [CardinalityEstimator<u64>],
 ) -> i64 {
     let mut total_size = 0i64;
     let mut offset = 0;
@@ -1095,7 +1167,10 @@ pub(crate) fn flush_with_splitting(
         let seg_id = *next_segment_id;
         *next_segment_id += 1;
         if offset == 0 && chunk_end == total_rows {
-            let ndistinct = compute_segment_ndistinct(typed_cols, columns);
+            let (ndistinct, sketches) = compute_segment_ndistinct(typed_cols, columns);
+            for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
+                dst.merge(src);
+            }
             let (size, blobs, bloom_entries, cs_rows, length_blobs) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
@@ -1114,7 +1189,10 @@ pub(crate) fn flush_with_splitting(
                 .iter()
                 .map(|tc| slice_typed_column(tc, offset, chunk_end))
                 .collect();
-            let ndistinct = compute_segment_ndistinct(&chunk_cols, columns);
+            let (ndistinct, sketches) = compute_segment_ndistinct(&chunk_cols, columns);
+            for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
+                dst.merge(src);
+            }
             let (size, blobs, bloom_entries, cs_rows, length_blobs) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
@@ -1250,7 +1328,7 @@ fn compress_partition_streaming(
     order_by: &[String],
     segment_by: &[String],
     segment_size: usize,
-) -> (i64, i64) {
+) -> (i64, i64, Vec<CardinalityEstimator<u64>>) {
     let batch_size = segment_size;
 
     // Classify columns for native datum extraction
@@ -1328,6 +1406,14 @@ fn compress_partition_streaming(
     let mut colstats_buffer: Vec<ColstatsRow> = Vec::new();
     let mut text_length_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, length_blob)
 
+    // Partition-level HLL sketches, one per non-segment-by column (matches
+    // the order `compute_segment_ndistinct` returns). Each per-segment HLL
+    // gets merged in below; the final merged estimates feed the
+    // `pg_statistic.stadistinct` write.
+    let num_nonseg_cols = columns.iter().filter(|c| !c.is_segment_by).count();
+    let mut partition_hll: Vec<CardinalityEstimator<u64>> =
+        (0..num_nonseg_cols).map(|_| CardinalityEstimator::<u64>::new()).collect();
+
     loop {
         let result = client
             .select(&fetch_sql, None, &[])
@@ -1378,6 +1464,7 @@ fn compress_partition_streaming(
                             &mut bloom_buffer,
                             &mut colstats_buffer,
                             &mut text_length_buffer,
+                            &mut partition_hll,
                         );
                         typed_cols = init_typed_columns(columns, &kinds);
                         rows_in_segment = 0;
@@ -1403,7 +1490,10 @@ fn compress_partition_streaming(
                 }
                 let seg_id = next_segment_id;
                 next_segment_id += 1;
-                let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
+                let (ndistinct, sketches) = compute_segment_ndistinct(&typed_cols, columns);
+                for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
+                    dst.merge(src);
+                }
                 let (size, blobs, bloom_entries, cs_rows, length_blobs) = flush_segment_metadata(
                     client,
                     &ddl.meta_fqn,
@@ -1465,6 +1555,7 @@ fn compress_partition_streaming(
             &mut bloom_buffer,
             &mut colstats_buffer,
             &mut text_length_buffer,
+            &mut partition_hll,
         );
     }
 
@@ -1589,7 +1680,7 @@ fn compress_partition_streaming(
             .expect("failed to analyze blobs table");
     }
 
-    (total_compressed_size, total_rows)
+    (total_compressed_size, total_rows, partition_hll)
 }
 
 /// Compress a typed column directly, bypassing string parsing.
@@ -2583,6 +2674,129 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
     }
 
     compressed
+}
+
+/// Re-populate pg_class.reltuples + pg_statistic for an already-compressed
+/// partition from the `_colstats` catalog data. HLL sketches aren't
+/// available here (they only exist during compression), so
+/// `stats::analyze_partition_from_catalog` falls back to a SUM-capped
+/// per-segment ndistinct — less accurate but still strictly better than
+/// PG's defaults.
+fn analyze_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+    let (schema, part_table) = crate::partition::resolve_relation(client, partition);
+    let part_info = match catalog::get_partition_by_name(client, &schema, &part_table) {
+        Ok(Some(p)) => p,
+        Ok(None) => return format!("Partition {}.{} not found in catalog", schema, part_table),
+        Err(e) => return format!("Failed to query partition: {}", e),
+    };
+
+    if !part_info.is_compressed {
+        return format!(
+            "Partition {}.{} is not compressed; nothing to analyze",
+            schema, part_table
+        );
+    }
+
+    let ht = match catalog::get_deltatable_by_id(client, part_info.deltatable_id) {
+        Ok(Some(h)) => h,
+        _ => {
+            return format!(
+                "Failed to look up deltatable for {}.{}",
+                schema, part_table
+            );
+        }
+    };
+
+    let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by, &ht.time_column);
+    let part_fqn = crate::partition::fqn(&schema, &part_table);
+    let ddl = build_companion_ddl(&part_table, &columns);
+
+    let part_rel_oid: pg_sys::Oid = client
+        .select(
+            &format!("SELECT '{}'::regclass::oid", part_fqn),
+            None,
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
+        .unwrap_or(pg_sys::InvalidOid);
+
+    let row_count: i64 = client
+        .select(
+            "SELECT row_count FROM deltax_partition WHERE id = $1",
+            None,
+            &[part_info.id.into()],
+        )
+        .ok()
+        .and_then(|r| r.first().get_one::<i64>().ok().flatten())
+        .unwrap_or(0);
+    if part_rel_oid == pg_sys::InvalidOid || row_count <= 0 {
+        return format!(
+            "Partition {}.{} has no usable stats (row_count={})",
+            schema, part_table, row_count,
+        );
+    }
+
+    if let Err(e) = crate::stats::analyze_partition_from_catalog(
+        client, part_rel_oid, &ddl.colstats_fqn, &columns, row_count,
+    ) {
+        return format!("Failed to update pg_statistic for {}: {}", part_fqn, e);
+    }
+
+    // Keep autovacuum disabled so a future ANALYZE doesn't clobber what
+    // we just wrote. Safe to re-set even if already off.
+    let _ = client.update(
+        &format!("ALTER TABLE {} SET (autovacuum_enabled = off)", part_fqn),
+        None,
+        &[],
+    );
+
+    crate::scan::invalidate_compressed_cache();
+
+    format!("Refreshed stats for {} ({} rows)", part_fqn, row_count)
+}
+
+fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
+    let (schema, table) = crate::partition::resolve_relation(client, relation);
+    let query = "SELECT schema_name, table_name FROM deltax_partition \
+                 WHERE schema_name = $1 AND is_compressed = true AND deltatable_id = (\
+                     SELECT id FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2\
+                 ) \
+                 ORDER BY range_start";
+    let rows = match client.select(query, None, &[schema.clone().into(), table.clone().into()]) {
+        Ok(r) => r,
+        Err(e) => return format!("Failed to list partitions: {}", e),
+    };
+
+    let mut partitions: Vec<(String, String)> = Vec::new();
+    for row in rows {
+        let s: Option<String> = row.get_datum_by_ordinal(1).ok().and_then(|d| d.value().ok().flatten());
+        let t: Option<String> = row.get_datum_by_ordinal(2).ok().and_then(|d| d.value().ok().flatten());
+        if let (Some(s), Some(t)) = (s, t) {
+            partitions.push((s, t));
+        }
+    }
+
+    if partitions.is_empty() {
+        return format!("No compressed partitions found for {}.{}", schema, table);
+    }
+
+    let mut n_ok = 0;
+    let mut n_err = 0;
+    for (s, t) in &partitions {
+        let fqn = crate::partition::fqn(s, t);
+        let result = analyze_partition_impl(client, &fqn);
+        if result.starts_with("Failed") || result.starts_with("Partition") {
+            n_err += 1;
+            pgrx::warning!("deltax_analyze_table: {}", result);
+        } else {
+            n_ok += 1;
+        }
+    }
+    format!(
+        "deltax_analyze_table({}.{}): refreshed {} partition(s), {} failed",
+        schema, table, n_ok, n_err,
+    )
 }
 
 #[cfg(test)]
