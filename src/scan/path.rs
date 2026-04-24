@@ -804,8 +804,18 @@ pub unsafe fn add_agg_path(
             100.0
         };
         (*cpath).path.rows = estimated_rows;
-        (*cpath).path.startup_cost = 10.0;
-        (*cpath).path.total_cost = 20.0;
+        // §5.8-b: real formula replaces the historic `(10.0, 20.0)` hack so
+        // future parallel-partial paths can be costed meaningfully against
+        // `parallel_setup_cost`. See `cost::estimate_agg_cost` for
+        // calibration notes and per-constant rationale.
+        let (startup, total) = cost::estimate_agg_cost(
+            companion_oids,
+            agg_specs.len(),
+            estimated_rows,
+            having_filters.len(),
+        );
+        (*cpath).path.startup_cost = startup;
+        (*cpath).path.total_cost = total;
         (*cpath).path.parallel_workers = 0;
         (*cpath).path.parallel_aware = false;
         (*cpath).path.parallel_safe = false;

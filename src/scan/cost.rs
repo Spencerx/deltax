@@ -129,6 +129,65 @@ pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
     if row_count > 0 { Some(row_count) } else { None }
 }
 
+/// Realistic cost estimate for `DeltaXAgg` (see §5.8-b in
+/// `dev/docs/RTABENCH_QUERY_ANALYSIS.md`).
+///
+/// Returns `(startup_cost, total_cost)` with standard PG semantics:
+/// `startup_cost` is the cost to produce the first output row (= scan + per-row
+/// aggregate evaluation, because GROUP BY can't emit until every row is
+/// consumed), and `total_cost` adds the per-group output-emit cost.
+///
+/// Replaces the historic `(10.0, 20.0)` hack. The constants are calibrated
+/// so that on every RTABench query shape, DeltaXAgg remains cheaper than the
+/// alternative of `DeltaXAppend → Aggregate` — i.e. the planner still picks
+/// the fused path — while the absolute numbers scale meaningfully with row
+/// count so future parallel-partial paths can sit above/below serial based on
+/// `parallel_setup_cost`.
+///
+/// Per-row/per-agg-expr coefficients are deliberately far below PG's
+/// `cpu_tuple_cost (0.01)` / `cpu_operator_cost (0.0025)` because the
+/// `DeltaXAgg` executor:
+///   1. Parallelises scan + aggregate across Rust threads within the leader
+///      process (`get_parallel_workers()` threads).
+///   2. Avoids per-row PG heap-tuple materialisation — aggregates consume
+///      decompressed columnar batches directly.
+///   3. Has metadata / catalog fast paths (`DeltaXMinMax`, `DeltaXCount`)
+///      for simple shapes; the formula here applies only when those don't
+///      fire.
+pub(super) fn estimate_agg_cost(
+    companion_oids: &[pg_sys::Oid],
+    num_agg_exprs: usize,
+    estimated_groups: f64,
+    num_having_filters: usize,
+) -> (f64, f64) {
+    // Calibrated against RTABench suite (Apr 2026). Adjusting any of these
+    // risks regressing planner selection on a subset of queries; re-run
+    // `make bench-rtabench` + the EC2 suite after tuning.
+    const PER_PARTITION: f64 = 50.0;      // metadata SPI + heap-scan startup
+    const PER_ROW: f64 = 0.0005;          // 20× below pg cpu_tuple_cost
+    const PER_AGG_EXPR: f64 = 0.00005;    // 50× below pg cpu_operator_cost
+    const PER_GROUP: f64 = 0.01;          // matches cpu_tuple_cost for output
+    const PER_HAVING: f64 = 0.00005;      // per-group HAVING eval
+
+    let total_rows: f64 = companion_oids.iter()
+        .map(|&oid| get_row_count(oid).unwrap_or(0) as f64)
+        .sum();
+
+    let num_partitions = companion_oids.len() as f64;
+    let num_aggs = num_agg_exprs.max(1) as f64;
+    let groups = estimated_groups.max(1.0);
+
+    let scan_work = num_partitions * PER_PARTITION + total_rows * PER_ROW;
+    let agg_work = total_rows * num_aggs * PER_AGG_EXPR;
+    let having_work = groups * num_having_filters as f64 * PER_HAVING;
+    let group_emit = groups * PER_GROUP;
+
+    let startup = 10.0 + scan_work + agg_work + having_work;
+    let total = startup + group_emit;
+
+    (startup, total)
+}
+
 /// Get the estimated segment count for a companion OID (0 if unknown).
 pub(super) fn get_segment_count(companion_oid: pg_sys::Oid) -> i64 {
     let (_, segments) = get_partition_stats(companion_oid);
