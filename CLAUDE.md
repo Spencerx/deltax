@@ -56,7 +56,9 @@ The benchmark prints a `psql postgres://...` connection string at the end. Use i
 
 #### Full Benchmark (EC2)
 
-Runs from `clickbench/Makefile` against a remote EC2 instance with the complete ClickBench dataset (~100M rows). Ask the user for the EC2 IP rather than launching a new instance.
+Runs from `clickbench/Makefile` against a remote EC2 instance with the complete
+ClickBench dataset (~100M rows). The EC2 IP is saved in the `.env` file in the
+clickbench folder.
 
 ```bash
 # First-time setup (installs PG18, Rust, pgrx, builds extension, loads data, compresses)
@@ -99,7 +101,9 @@ Results go to `tests/.bench_results/rtabench_pg_deltax.json` (latest) + `.bench_
 
 #### Full RTABench (EC2)
 
-Runs from `rtabench/Makefile` against a remote EC2 instance with the complete dataset (~181M events). Ask the user for the EC2 IP rather than launching a new instance.
+Runs from `rtabench/Makefile` against a remote EC2 instance with the complete
+dataset (~181M events). The EC2 ip address is found in the .env file in the
+rtabench folder. Try that one before launching a new one.
 
 ```bash
 # First-time setup (installs PG18, Rust, pgrx, builds extension, loads + compresses data)
