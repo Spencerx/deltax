@@ -13,4 +13,6 @@ tests/.data/
 tests/.bench_results/
 clickbench/results/
 clickbench/data.generated.js.new
+clickbench/.env
 rtabench/results/
+rtabench/.env

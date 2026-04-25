@@ -2682,8 +2682,24 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
 /// `stats::analyze_partition_from_catalog` falls back to a SUM-capped
 /// per-segment ndistinct — less accurate but still strictly better than
 /// PG's defaults.
-fn analyze_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+pub(crate) fn analyze_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let (schema, part_table) = crate::partition::resolve_relation(client, partition);
+    analyze_partition_impl_split(client, &schema, &part_table)
+}
+
+/// Same as `analyze_partition_impl` but takes (schema, table) separately.
+/// Callers inside an already-open SPI connection should use this variant —
+/// `resolve_relation` opens a nested `Spi::get_one_with_args` which has
+/// been observed to confuse the outer connection's tuptable cursor
+/// (pgrx SPI iterator returns `InvalidPosition` after the nested call
+/// pops its frame).
+pub(crate) fn analyze_partition_impl_split(
+    client: &mut SpiClient,
+    schema: &str,
+    part_table: &str,
+) -> String {
+    let schema = schema.to_string();
+    let part_table = part_table.to_string();
     let part_info = match catalog::get_partition_by_name(client, &schema, &part_table) {
         Ok(Some(p)) => p,
         Ok(None) => return format!("Partition {}.{} not found in catalog", schema, part_table),
@@ -2784,8 +2800,10 @@ fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
     let mut n_ok = 0;
     let mut n_err = 0;
     for (s, t) in &partitions {
-        let fqn = crate::partition::fqn(s, t);
-        let result = analyze_partition_impl(client, &fqn);
+        // Use the split variant — invoking `analyze_partition_impl` inside
+        // this loop would call `resolve_relation` → nested
+        // `Spi::get_one_with_args`, which confuses the outer cursor.
+        let result = analyze_partition_impl_split(client, s, t);
         if result.starts_with("Failed") || result.starts_with("Partition") {
             n_err += 1;
             pgrx::warning!("deltax_analyze_table: {}", result);

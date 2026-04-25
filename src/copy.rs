@@ -119,6 +119,59 @@ unsafe fn filter_compressed_rels_from_vacuum_stmt(vstmt: *mut pg_sys::VacuumStmt
     }
 }
 
+/// Re-populate `pg_class.reltuples` and `pg_statistic` on every
+/// compressed pg_deltax partition after a whole-database
+/// `VACUUM ANALYZE` / `ANALYZE` (NIL rels). PG's executor samples the
+/// empty heap and overwrites our maintained stats with zeros; invoking
+/// `deltax_analyze_partition` recomputes them from the `_colstats`
+/// catalog. Idempotent — if PG didn't clobber anything (e.g. `VACUUM`
+/// without `ANALYZE`) this just rewrites the same values.
+fn restore_compressed_partition_stats() {
+    let result: Result<usize, String> = Spi::connect_mut(|client| {
+        let rows = client
+            .select(
+                "SELECT schema_name, table_name FROM deltax_partition \
+                 WHERE is_compressed = true",
+                None,
+                &[],
+            )
+            .map_err(|e| format!("failed to list compressed partitions: {}", e))?;
+
+        let partitions: Vec<(String, String)> = rows
+            .filter_map(|row| {
+                let s: Option<String> = row
+                    .get_datum_by_ordinal(1).ok()
+                    .and_then(|d| d.value().ok().flatten());
+                let t: Option<String> = row
+                    .get_datum_by_ordinal(2).ok()
+                    .and_then(|d| d.value().ok().flatten());
+                match (s, t) {
+                    (Some(s), Some(t)) => Some((s, t)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let mut n = 0usize;
+        for (s, t) in &partitions {
+            // Use the (schema, table) variant to avoid `resolve_relation`'s
+            // nested `Spi::get_one_with_args`, which confuses the outer
+            // SPI cursor post-VACUUM and surfaces as `InvalidPosition`.
+            let _ = crate::compress::analyze_partition_impl_split(client, s, t);
+            n += 1;
+        }
+        Ok::<_, String>(n)
+    });
+    match result {
+        Ok(n) if n > 0 => pgrx::log!(
+            "pg_deltax: restored stats on {} compressed partition(s) after VACUUM/ANALYZE",
+            n,
+        ),
+        Ok(_) => {} // no compressed partitions — nothing to do
+        Err(e) => pgrx::warning!("pg_deltax: {}", e),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn chain_to_prev(
     pstmt: *mut pg_sys::PlannedStmt,
@@ -180,9 +233,21 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     // the `pg_statistic` rows we maintain ourselves. Compressed
     // partitions are also marked `autovacuum_enabled = off` at compress
     // time; this hook catches user-initiated ANALYZE.
+    //
+    // When the statement has an explicit `rels` list we filter compressed
+    // partitions out directly. When `rels` is NIL (whole-db
+    // `VACUUM ANALYZE` / `ANALYZE`) we can't filter — PG expands NIL to
+    // every table in its own machinery. Instead we flag the case and
+    // restore our stats after the standard executor returns.
+    let mut restore_stats_after_vacuum = false;
     if !utility_stmt.is_null() && unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_VacuumStmt) } {
         unsafe {
-            filter_compressed_rels_from_vacuum_stmt(utility_stmt as *mut pg_sys::VacuumStmt);
+            let vstmt = utility_stmt as *mut pg_sys::VacuumStmt;
+            if (*vstmt).rels.is_null() {
+                restore_stats_after_vacuum = true;
+            } else {
+                filter_compressed_rels_from_vacuum_stmt(vstmt);
+            }
         }
         // Fall through to chain so PG executes the (now-filtered) stmt.
     }
@@ -190,6 +255,9 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     if utility_stmt.is_null() || !unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_CopyStmt) } {
         unsafe {
             chain_to_prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+        }
+        if restore_stats_after_vacuum {
+            restore_compressed_partition_stats();
         }
         return;
     }
