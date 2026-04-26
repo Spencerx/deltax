@@ -164,6 +164,10 @@ pub(crate) struct ScanTiming {
     pub(crate) segments_minmax_skipped: u64,
     /// Total segments skipped specifically by bloom filter checks.
     pub(crate) segments_bloom_skipped: u64,
+    /// Total segments skipped specifically by per-segment value-presence
+    /// bitmap checks (text Eq on low-cardinality columns; see
+    /// `compress::compute_segment_valbitmap_values`).
+    pub(crate) segments_valbitmap_skipped: u64,
     /// Per-phase shared-buffer deltas captured during `load_segments_heap`.
     pub(crate) buf_stats: super::segments::ScanBufferStats,
     /// Total segments where Phase 2 was skipped (no selected rows).
@@ -202,6 +206,7 @@ pub(crate) struct ScanTimingShmem {
     pub(crate) segments_skipped: u64,
     pub(crate) segments_minmax_skipped: u64,
     pub(crate) segments_bloom_skipped: u64,
+    pub(crate) segments_valbitmap_skipped: u64,
     pub(crate) phase2_skipped: u64,
 }
 
@@ -274,6 +279,7 @@ unsafe fn flush_timing_to_shmem(state: &DecompressState) {
         slot.segments_skipped = t.segments_skipped;
         slot.segments_minmax_skipped = t.segments_minmax_skipped;
         slot.segments_bloom_skipped = t.segments_bloom_skipped;
+        slot.segments_valbitmap_skipped = t.segments_valbitmap_skipped;
         slot.phase2_skipped = t.phase2_skipped;
         // populated must be written last so the leader can treat slots
         // missing this flag (e.g. a worker that crashed) as absent.
@@ -469,6 +475,7 @@ fn make_worker_stub_state() -> DecompressState {
             segments_skipped: 0,
             segments_minmax_skipped: 0,
             segments_bloom_skipped: 0,
+            segments_valbitmap_skipped: 0,
             buf_stats: super::segments::ScanBufferStats::default(),
             phase2_skipped: 0,
             topn_limit: 0,
@@ -653,17 +660,19 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let mut total_skipped: u64 = 0;
         let mut total_minmax_skipped: u64 = 0;
         let mut total_bloom_skipped: u64 = 0;
+        let mut total_valbitmap_skipped: u64 = 0;
         for &oid in &companion_oids {
             // Segments carry their source companion OID so `fetch_segment_blobs`
             // can re-open the right `_blobs` table per claimed segment.
-            let (mut segs, skipped, mm_skipped, bloom_skipped, _dt_us) = load_segments_heap(
-                oid, &meta.col_names, &meta.segment_by, &needed_cols,
-                &meta.time_column, false, &seg_filters, t_min, t_max,
-                lazy_cols.as_deref(), &batch_quals, &[],
-                &meta.col_types,
-                &[],
-                skip_blob_load,
-            );
+            let (mut segs, skipped, mm_skipped, bloom_skipped, vb_skipped, _dt_us) =
+                load_segments_heap(
+                    oid, &meta.col_names, &meta.segment_by, &needed_cols,
+                    &meta.time_column, false, &seg_filters, t_min, t_max,
+                    lazy_cols.as_deref(), &batch_quals, &[],
+                    &meta.col_types,
+                    &[],
+                    skip_blob_load,
+                );
             for s in &mut segs {
                 s.companion_oid = oid;
             }
@@ -671,6 +680,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             total_skipped += skipped;
             total_minmax_skipped += mm_skipped;
             total_bloom_skipped += bloom_skipped;
+            total_valbitmap_skipped += vb_skipped;
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
         let total_buf_stats = super::segments::take_scan_buf_stats();
@@ -731,6 +741,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 segments_skipped: total_skipped,
                 segments_minmax_skipped: total_minmax_skipped,
                 segments_bloom_skipped: total_bloom_skipped,
+                segments_valbitmap_skipped: total_valbitmap_skipped,
                 buf_stats: total_buf_stats,
                 phase2_skipped: 0,
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
@@ -847,7 +858,7 @@ fn load_decompress_state(
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
     super::segments::reset_scan_buf_stats();
     let t1 = Instant::now();
-    let (segments_data, segments_skipped, minmax_skipped, bloom_skipped, _detoast_us) = unsafe {
+    let (segments_data, segments_skipped, minmax_skipped, bloom_skipped, valbitmap_skipped, _detoast_us) = unsafe {
         load_segments_heap(
             companion_oid, &meta.col_names, &meta.segment_by, &needed_cols,
             &meta.time_column, false, &seg_filters, t_min, t_max,
@@ -901,6 +912,7 @@ fn load_decompress_state(
             segments_skipped,
             segments_minmax_skipped: minmax_skipped,
             segments_bloom_skipped: bloom_skipped,
+            segments_valbitmap_skipped: valbitmap_skipped,
             buf_stats,
             phase2_skipped: 0,
             topn_limit: 0,

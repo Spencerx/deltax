@@ -15,12 +15,19 @@ thread_local! {
     /// `_ndistinct_*` columns).
     static NDISTINCT_CACHE: RefCell<HashMap<pg_sys::Oid, HashMap<String, i64>>> =
         RefCell::new(HashMap::new());
+
+    /// Cache of companion_oid → per-column value→bit_idx maps for the segment
+    /// value-presence bitmap. Empty map = no eligible columns for this
+    /// partition (no low-card text columns).
+    static VALMAP_CACHE: RefCell<HashMap<pg_sys::Oid, HashMap<String, Vec<String>>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Clear all cost-related caches. Called from `hook::invalidate_compressed_cache`.
 pub(super) fn invalidate_caches() {
     PARTITION_STATS_CACHE.with(|cache| cache.borrow_mut().clear());
     NDISTINCT_CACHE.with(|cache| cache.borrow_mut().clear());
+    VALMAP_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Estimate the cost and row count for scanning a compressed partition.
@@ -237,6 +244,114 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
     NDISTINCT_CACHE
         .with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
     result_map
+}
+
+/// Get per-column value-list for the segment value-presence bitmap from
+/// `deltax_partition.column_valmap` (populated at compression time). Returns
+/// a map of column-name → sorted distinct values; the array index is the bit
+/// position in each segment's bitmap. Empty map ⇒ no eligible columns.
+pub(crate) fn get_column_valmap(
+    companion_oid: pg_sys::Oid,
+) -> std::collections::HashMap<String, Vec<String>> {
+    if let Some(cached) =
+        VALMAP_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
+    {
+        return cached;
+    }
+
+    let companion_name = unsafe {
+        let name_ptr = pg_sys::get_rel_name(companion_oid);
+        if name_ptr.is_null() {
+            return std::collections::HashMap::new();
+        }
+        std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
+    };
+    let partition_name = companion_name.strip_suffix("_meta").unwrap_or(&companion_name);
+
+    let mut result_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    let json_text = Spi::get_one_with_args::<String>(
+        "SELECT column_valmap::text FROM deltax_partition
+         WHERE table_name = $1 AND is_compressed = true",
+        &[partition_name.into()],
+    );
+
+    if let Ok(Some(text)) = json_text {
+        parse_valmap_json(&text, &mut result_map);
+    }
+
+    VALMAP_CACHE
+        .with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
+    result_map
+}
+
+/// Parse a `{"col": ["v0","v1",...], ...}` JSON object (as emitted by
+/// `catalog::update_partition_column_valmap`). Trivial hand-rolled parser —
+/// values are quoted strings, keys are column names with `\\` and `\"`
+/// escapes. Lenient: malformed input → leave `out` partially populated.
+fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec<String>>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    if i >= bytes.len() || bytes[i] != b'{' { return; }
+    i += 1;
+
+    loop {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'}' { return; }
+        if bytes[i] != b'"' { return; }
+        i += 1;
+
+        // Key.
+        let mut key = String::new();
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                key.push(bytes[i + 1] as char);
+                i += 2;
+            } else {
+                key.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        if i >= bytes.len() { return; }
+        i += 1;
+
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'[' { return; }
+        i += 1;
+
+        let mut vals: Vec<String> = Vec::new();
+        loop {
+            while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] == b']' {
+                break;
+            }
+            if bytes[i] != b'"' { return; }
+            i += 1;
+            let mut v = String::new();
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    v.push(bytes[i + 1] as char);
+                    i += 2;
+                } else {
+                    v.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() { return; }
+            i += 1;
+            vals.push(v);
+        }
+        if i < bytes.len() && bytes[i] == b']' { i += 1; }
+        out.insert(key, vals);
+    }
 }
 
 /// Parse a `{"col": int, ...}` JSON object (as emitted by

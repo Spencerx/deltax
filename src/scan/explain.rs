@@ -317,6 +317,7 @@ unsafe fn explain_timing(
                 let mut segments_skipped = t.segments_skipped;
                 let mut segments_minmax_skipped = t.segments_minmax_skipped;
                 let mut segments_bloom_skipped = t.segments_bloom_skipped;
+                let mut segments_valbitmap_skipped = t.segments_valbitmap_skipped;
                 let mut phase2_skipped = t.phase2_skipped;
                 let mut rows_emitted = t.rows_emitted;
                 let mut rows_filtered = t.rows_filtered;
@@ -335,6 +336,7 @@ unsafe fn explain_timing(
                     segments_skipped += s.segments_skipped;
                     segments_minmax_skipped += s.segments_minmax_skipped;
                     segments_bloom_skipped += s.segments_bloom_skipped;
+                    segments_valbitmap_skipped += s.segments_valbitmap_skipped;
                     phase2_skipped += s.phase2_skipped;
                     rows_emitted += s.rows_emitted;
                     rows_filtered += s.rows_filtered;
@@ -367,11 +369,12 @@ unsafe fn explain_timing(
                     String::new()
                 };
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} segments_skipped={} segments_minmax_skipped={} segments_bloom_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}{}",
+                    "segments={} segments_skipped={} segments_minmax_skipped={} segments_bloom_skipped={} segments_valbitmap_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}{}",
                     segments_decompressed,
                     segments_skipped,
                     segments_minmax_skipped,
                     segments_bloom_skipped,
+                    segments_valbitmap_skipped,
                     phase2_skipped,
                     rows_emitted,
                     rows_filtered,

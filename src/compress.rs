@@ -311,15 +311,16 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
     let segment_size = ht.segment_size as usize;
 
-    let (total_compressed_size, row_count, partition_hll) = compress_partition_streaming(
-        client,
-        &part_fqn,
-        &ddl,
-        &columns,
-        &ht.order_by,
-        &ht.segment_by,
-        segment_size,
-    );
+    let (total_compressed_size, row_count, partition_hll, column_valmap) =
+        compress_partition_streaming(
+            client,
+            &part_fqn,
+            &ddl,
+            &columns,
+            &ht.order_by,
+            &ht.segment_by,
+            segment_size,
+        );
 
     // Empty partition — clean up tables and return
     if row_count == 0 {
@@ -338,6 +339,9 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         client
             .update(&format!("DROP TABLE IF EXISTS {}", ddl.text_lengths_fqn), None, &[])
             .expect("failed to drop empty text_lengths table");
+        client
+            .update(&format!("DROP TABLE IF EXISTS {}", ddl.valbitmap_fqn), None, &[])
+            .expect("failed to drop empty valbitmap table");
         return format!("Partition {}.{} has no rows to compress", schema, part_table);
     }
 
@@ -374,6 +378,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         .collect();
     catalog::update_partition_column_ndistinct_from_map(client, part_info.id, &col_ndistinct)
         .expect("failed to update partition column_ndistinct");
+
+    // Persist the partition-level value→bit_idx maps for low-card text
+    // columns. Empty map is fine — the read path treats a missing entry
+    // for a column as "no bitmap available, fall back to bloom/batch
+    // filtering".
+    catalog::update_partition_column_valmap(client, part_info.id, &column_valmap)
+        .expect("failed to update partition column_valmap");
 
     // Populate pg_class.reltuples + pg_statistic for the compressed
     // child partition so PG's built-in selectivity functions stop
@@ -840,16 +851,26 @@ pub(crate) struct ColstatsRow {
 }
 
 /// Return type for flush_segment_metadata: (compressed_size, column blobs,
-/// per-column bloom entries, colstats rows, per-text-column length sidecars).
+/// per-column bloom entries, colstats rows, per-text-column length sidecars,
+/// per-text-column value sets for valbitmap).
 /// Each bloom entry is (col_idx, num_hashes, bloom_bytes).
 /// Each text-length entry is (col_idx, length_blob).
+/// Each valbitmap entry is (col_idx, sorted_distinct_values) — only for text
+/// columns with ≤ `VALBITMAP_MAX_DISTINCT` distinct values in this segment.
 pub(crate) type FlushResult = (
     i64,
     Vec<(u16, Vec<u8>)>,
     Vec<(u16, u8, Vec<u8>)>,
     Vec<ColstatsRow>,
     Vec<(u16, Vec<u8>)>,
+    Vec<(u16, Vec<String>)>,
 );
+
+/// Cap on distinct values for the per-segment value-presence bitmap. Each
+/// segment's bitmap is one bit per distinct partition-level value, so 32
+/// values fit in 4 bytes. Columns whose partition-level distinct count
+/// exceeds this cap are dropped from valbitmap entirely (no entry written).
+pub(crate) const VALBITMAP_MAX_DISTINCT: usize = 32;
 
 /// Compress accumulated typed column data and INSERT metadata into the meta table.
 /// Returns (compressed_size, column blobs, bloom entries, colstats rows) — blobs and colstats
@@ -1005,7 +1026,49 @@ pub(crate) fn flush_segment_metadata(
         Vec::new()
     };
 
-    (total_size, blobs, bloom_entries, cs_rows, text_length_blobs)
+    // Per-segment distinct-value sets for low-cardinality text columns. The
+    // bitmap itself is encoded later (in `compress_partition_streaming`)
+    // once the partition-level value→bit_idx map is finalized.
+    let valbitmap_value_sets = compute_segment_valbitmap_values(typed_cols, columns);
+
+    (total_size, blobs, bloom_entries, cs_rows, text_length_blobs, valbitmap_value_sets)
+}
+
+/// Collect per-segment distinct text values for low-cardinality columns.
+/// Returns one `(col_idx, sorted_values)` entry per text column whose
+/// distinct count in this segment is ≤ `VALBITMAP_MAX_DISTINCT`. Columns
+/// that overflow the cap are simply omitted — the partition-level finalize
+/// pass treats a missing entry as "give up on bitmap for this column".
+pub(crate) fn compute_segment_valbitmap_values(
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+) -> Vec<(u16, Vec<String>)> {
+    let mut entries: Vec<(u16, Vec<String>)> = Vec::new();
+    let mut col_idx: u16 = 0;
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
+        }
+        if let TypedColumn::Text(vals) = &typed_cols[i] {
+            // Cap the set at VALBITMAP_MAX_DISTINCT + 1: as soon as we'd
+            // exceed the cap we know this column can't get a bitmap, so we
+            // bail and skip allocating the rest.
+            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut overflow = false;
+            for v in vals.iter().flatten() {
+                if set.len() >= VALBITMAP_MAX_DISTINCT && !set.contains(v) {
+                    overflow = true;
+                    break;
+                }
+                set.insert(v.clone());
+            }
+            if !overflow {
+                entries.push((col_idx, set.into_iter().collect()));
+            }
+        }
+        col_idx += 1;
+    }
+    entries
 }
 
 /// Slice a TypedColumn to a sub-range [start..end).
@@ -1157,6 +1220,7 @@ pub(crate) fn flush_with_splitting(
     bloom_buffer: &mut Vec<(u16, i32, u8, Vec<u8>)>,
     colstats_buffer: &mut Vec<ColstatsRow>,
     text_length_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
+    valbitmap_value_buffer: &mut Vec<(u16, i32, Vec<String>)>,
     partition_hll: &mut [CardinalityEstimator<u64>],
 ) -> i64 {
     let mut total_size = 0i64;
@@ -1171,7 +1235,7 @@ pub(crate) fn flush_with_splitting(
             for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
                 dst.merge(src);
             }
-            let (size, blobs, bloom_entries, cs_rows, length_blobs) =
+            let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -1183,6 +1247,9 @@ pub(crate) fn flush_with_splitting(
             for (col_idx, blob) in length_blobs {
                 text_length_buffer.push((col_idx, seg_id, blob));
             }
+            for (col_idx, vals) in vb_values {
+                valbitmap_value_buffer.push((col_idx, seg_id, vals));
+            }
             colstats_buffer.extend(cs_rows);
         } else {
             let chunk_cols: Vec<TypedColumn> = typed_cols
@@ -1193,7 +1260,7 @@ pub(crate) fn flush_with_splitting(
             for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
                 dst.merge(src);
             }
-            let (size, blobs, bloom_entries, cs_rows, length_blobs) =
+            let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
                 flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -1204,6 +1271,9 @@ pub(crate) fn flush_with_splitting(
             }
             for (col_idx, blob) in length_blobs {
                 text_length_buffer.push((col_idx, seg_id, blob));
+            }
+            for (col_idx, vals) in vb_values {
+                valbitmap_value_buffer.push((col_idx, seg_id, vals));
             }
             colstats_buffer.extend(cs_rows);
         }
@@ -1220,11 +1290,13 @@ pub(crate) struct CompanionDdl {
     pub(crate) blobs_fqn: String,
     pub(crate) blooms_fqn: String,
     pub(crate) text_lengths_fqn: String,
+    pub(crate) valbitmap_fqn: String,
     pub(crate) meta_ddl: String,
     pub(crate) colstats_ddl: String,
     pub(crate) blobs_ddl: String,
     pub(crate) blooms_ddl: String,
     pub(crate) text_lengths_ddl: String,
+    pub(crate) valbitmap_ddl: String,
 }
 
 /// Build DDL for companion tables (meta, colstats, blobs, blooms) for a partition.
@@ -1242,6 +1314,7 @@ pub(crate) fn build_companion_ddl(
     let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
     let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
+    let valbitmap_fqn = format!("\"{}\".\"{}_valbitmap\"", companion_schema, part_table);
 
     // Thin meta table: segment_id, segment_by cols, time column min/max, row_count
     let mut meta_cols = Vec::new();
@@ -1299,17 +1372,28 @@ pub(crate) fn build_companion_ddl(
         text_lengths_fqn
     );
 
+    // Per-segment value-presence bitmap for low-cardinality (≤32) text columns.
+    // One bit per distinct partition-level value (mapping persisted in
+    // `deltax_partition.column_valmap`). Lets `WHERE col = const` queries skip
+    // segments where the constant's bit is clear, with no false positives.
+    let valbitmap_ddl = format!(
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _bits BYTEA COMPRESSION lz4 NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
+        valbitmap_fqn
+    );
+
     CompanionDdl {
         meta_fqn,
         colstats_fqn,
         blobs_fqn,
         blooms_fqn,
         text_lengths_fqn,
+        valbitmap_fqn,
         meta_ddl,
         colstats_ddl,
         blobs_ddl,
         blooms_ddl,
         text_lengths_ddl,
+        valbitmap_ddl,
     }
 }
 
@@ -1320,6 +1404,12 @@ pub(crate) fn build_companion_ddl(
 /// Returns (compressed_size, row_count). ndistinct is tracked per-segment via HLL
 /// and stored in the meta table. Blobs are buffered and inserted column-major
 /// into the blobs table after all segments are processed.
+/// Returns (total_compressed_size, total_rows, partition_hll_per_nonseg_col,
+/// finalized_valbitmap_value_map). The valbitmap map shape is
+/// `{column_name: [val0, val1, ...]}` where the array index is the bit
+/// position in each segment's bitmap; absent columns means "no bitmap"
+/// (e.g. > 32 distinct values across the partition or non-text type).
+#[allow(clippy::type_complexity)]
 fn compress_partition_streaming(
     client: &mut SpiClient,
     part_fqn: &str,
@@ -1328,7 +1418,12 @@ fn compress_partition_streaming(
     order_by: &[String],
     segment_by: &[String],
     segment_size: usize,
-) -> (i64, i64, Vec<CardinalityEstimator<u64>>) {
+) -> (
+    i64,
+    i64,
+    Vec<CardinalityEstimator<u64>>,
+    std::collections::HashMap<String, Vec<String>>,
+) {
     let batch_size = segment_size;
 
     // Classify columns for native datum extraction
@@ -1405,6 +1500,10 @@ fn compress_partition_streaming(
     let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, num_hashes, bloom_bytes)
     let mut colstats_buffer: Vec<ColstatsRow> = Vec::new();
     let mut text_length_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, length_blob)
+    // (col_idx, segment_id, sorted distinct values). Encoded into per-segment
+    // bitmaps after the streaming loop, once partition-level value lists are
+    // finalized.
+    let mut valbitmap_value_buffer: Vec<(u16, i32, Vec<String>)> = Vec::new();
 
     // Partition-level HLL sketches, one per non-segment-by column (matches
     // the order `compute_segment_ndistinct` returns). Each per-segment HLL
@@ -1464,6 +1563,7 @@ fn compress_partition_streaming(
                             &mut bloom_buffer,
                             &mut colstats_buffer,
                             &mut text_length_buffer,
+                            &mut valbitmap_value_buffer,
                             &mut partition_hll,
                         );
                         typed_cols = init_typed_columns(columns, &kinds);
@@ -1494,7 +1594,7 @@ fn compress_partition_streaming(
                 for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
                     dst.merge(src);
                 }
-                let (size, blobs, bloom_entries, cs_rows, length_blobs) = flush_segment_metadata(
+                let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) = flush_segment_metadata(
                     client,
                     &ddl.meta_fqn,
                     &ddl.colstats_fqn,
@@ -1514,6 +1614,9 @@ fn compress_partition_streaming(
                 }
                 for (col_idx, blob) in length_blobs {
                     text_length_buffer.push((col_idx, seg_id, blob));
+                }
+                for (col_idx, vals) in vb_values {
+                    valbitmap_value_buffer.push((col_idx, seg_id, vals));
                 }
                 colstats_buffer.extend(cs_rows);
                 typed_cols = init_typed_columns(columns, &kinds);
@@ -1555,6 +1658,7 @@ fn compress_partition_streaming(
             &mut bloom_buffer,
             &mut colstats_buffer,
             &mut text_length_buffer,
+            &mut valbitmap_value_buffer,
             &mut partition_hll,
         );
     }
@@ -1680,7 +1784,141 @@ fn compress_partition_streaming(
             .expect("failed to analyze blobs table");
     }
 
-    (total_compressed_size, total_rows, partition_hll)
+    // Finalize per-segment value bitmaps. For each col_idx, take the union
+    // of per-segment value sets — if it's still ≤ VALBITMAP_MAX_DISTINCT we
+    // keep it; otherwise we drop the column from valbitmap entirely. Then
+    // encode each segment's bitmap against the finalized partition map and
+    // bulk-insert into the valbitmap table. The partition map itself is
+    // returned to the caller for catalog persistence.
+    let column_valmap = finalize_and_insert_valbitmaps(
+        client,
+        ddl,
+        columns,
+        valbitmap_value_buffer,
+    );
+
+    (total_compressed_size, total_rows, partition_hll, column_valmap)
+}
+
+/// Build partition-level value→bit_idx maps from per-segment value sets,
+/// encode each segment's bitmap, bulk-insert into the valbitmap table.
+/// Returns the partition-level value map keyed by user column name (for
+/// the catalog write).
+fn finalize_and_insert_valbitmaps(
+    client: &mut SpiClient,
+    ddl: &CompanionDdl,
+    columns: &[ColumnMeta],
+    value_buffer: Vec<(u16, i32, Vec<String>)>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    use std::collections::{BTreeSet, HashMap};
+
+    if value_buffer.is_empty() {
+        return HashMap::new();
+    }
+
+    // Aggregate per-col_idx union. Stop accumulating into a column's set as
+    // soon as it crosses VALBITMAP_MAX_DISTINCT (we'll drop the bitmap for
+    // that column anyway).
+    let mut union_by_col: HashMap<u16, BTreeSet<String>> = HashMap::new();
+    let mut overflow_cols: std::collections::HashSet<u16> =
+        std::collections::HashSet::new();
+    for (col_idx, _seg_id, vals) in &value_buffer {
+        if overflow_cols.contains(col_idx) {
+            continue;
+        }
+        let entry = union_by_col.entry(*col_idx).or_default();
+        for v in vals {
+            if entry.len() >= VALBITMAP_MAX_DISTINCT && !entry.contains(v) {
+                overflow_cols.insert(*col_idx);
+                union_by_col.remove(col_idx);
+                break;
+            }
+            entry.insert(v.clone());
+        }
+    }
+
+    if union_by_col.is_empty() {
+        return HashMap::new();
+    }
+
+    // Finalize per-column sorted value list + value→bit_idx index.
+    // Vec<(col_idx, sorted_values, value→bit_idx HashMap)>.
+    let mut finalized: HashMap<u16, (Vec<String>, HashMap<String, u8>)> = HashMap::new();
+    for (col_idx, set) in union_by_col {
+        let sorted: Vec<String> = set.into_iter().collect();
+        let mut idx: HashMap<String, u8> = HashMap::new();
+        for (i, v) in sorted.iter().enumerate() {
+            idx.insert(v.clone(), i as u8);
+        }
+        finalized.insert(col_idx, (sorted, idx));
+    }
+
+    // Map non-segment-by col_idx → user column name for the catalog payload.
+    let col_idx_to_name: HashMap<u16, String> = {
+        let mut m = HashMap::new();
+        let mut idx: u16 = 0;
+        for col in columns {
+            if col.is_segment_by {
+                continue;
+            }
+            m.insert(idx, col.name.clone());
+            idx += 1;
+        }
+        m
+    };
+
+    // Encode + bulk-insert per-segment bitmaps. n_bytes = ceil(ndistinct/8).
+    client
+        .update(&ddl.valbitmap_ddl, None, &[])
+        .expect("failed to create valbitmap table");
+
+    let mut entries: Vec<(u16, i32, Vec<u8>)> =
+        Vec::with_capacity(value_buffer.len());
+    for (col_idx, seg_id, vals) in value_buffer {
+        let Some((_, idx_map)) = finalized.get(&col_idx) else {
+            // Column overflowed at partition level — skip.
+            continue;
+        };
+        let n_bits = idx_map.len();
+        let n_bytes = n_bits.div_ceil(8);
+        let mut bits: Vec<u8> = vec![0; n_bytes];
+        for v in &vals {
+            if let Some(&bit_idx) = idx_map.get(v) {
+                bits[(bit_idx / 8) as usize] |= 1u8 << (bit_idx % 8);
+            }
+        }
+        entries.push((col_idx, seg_id, bits));
+    }
+
+    // Sort by (col_idx, seg_id) for column-major insertion order.
+    entries.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+    for (col_idx, seg_id, bits) in entries {
+        use pgrx::datum::DatumWithOid;
+        let insert_sql = format!(
+            "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
+            &ddl.valbitmap_fqn
+        );
+        let args: Vec<DatumWithOid> = vec![
+            (col_idx as i16).into(),
+            seg_id.into(),
+            DatumWithOid::from(bits),
+        ];
+        client
+            .update(&insert_sql, None, &args)
+            .expect("failed to insert valbitmap row");
+    }
+    client
+        .update(&format!("ANALYZE {}", ddl.valbitmap_fqn), None, &[])
+        .expect("failed to analyze valbitmap table");
+
+    // Build the catalog payload: column name → sorted value list.
+    let mut by_name: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (col_idx, (vals, _)) in finalized {
+        if let Some(name) = col_idx_to_name.get(&col_idx) {
+            by_name.insert(name.clone(), vals);
+        }
+    }
+    by_name
 }
 
 /// Compress a typed column directly, bypassing string parsing.
@@ -2077,6 +2315,7 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
     let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
+    let valbitmap_fqn = format!("\"{}\".\"{}_valbitmap\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
 
     // 3. Read compressed segments from meta + blobs tables
@@ -2230,7 +2469,7 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         total_rows_restored += segment_row_count as i64;
     }
 
-    // 4. Drop meta + colstats + blobs + blooms + text_lengths tables
+    // 4. Drop meta + colstats + blobs + blooms + text_lengths + valbitmap tables
     client
         .update(&format!("DROP TABLE IF EXISTS {}", blobs_fqn), None, &[])
         .expect("failed to drop blobs table");
@@ -2240,6 +2479,9 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     client
         .update(&format!("DROP TABLE IF EXISTS {}", text_lengths_fqn), None, &[])
         .expect("failed to drop text_lengths table");
+    client
+        .update(&format!("DROP TABLE IF EXISTS {}", valbitmap_fqn), None, &[])
+        .expect("failed to drop valbitmap table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", colstats_fqn), None, &[])
         .expect("failed to drop colstats table");

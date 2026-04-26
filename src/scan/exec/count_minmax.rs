@@ -183,7 +183,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             let mut total_count: i64 = 0;
             let mut total_segments: u64 = 0;
             for &oid in &companion_oids {
-                let (segs, _, _, _, _) = load_segments_heap(
+                let (segs, _, _, _, _, _) = load_segments_heap(
                     oid,
                     &meta.col_names,
                     &meta.segment_by,
@@ -479,7 +479,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
 
         let mut total_segments: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, _, _, _, _) = load_segments_heap(
+            let (segs, _, _, _, _, _) = load_segments_heap(
                 oid,
                 &meta.col_names,
                 &meta.segment_by,

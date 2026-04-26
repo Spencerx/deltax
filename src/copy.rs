@@ -491,6 +491,10 @@ struct PartitionBuffer {
     bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)>,
     /// Accumulated text-length sidecar blobs (col_idx, segment_id, length_blob).
     text_length_buffer: Vec<(u16, i32, Vec<u8>)>,
+    /// Per-segment distinct-value sets for low-cardinality text columns.
+    /// Encoded into bitmaps in `finalize_partition` once the partition-level
+    /// value→bit_idx map is known.
+    valbitmap_value_buffer: Vec<(u16, i32, Vec<String>)>,
     total_compressed_size: i64,
     total_rows: i64,
     meta_table_created: bool,
@@ -686,6 +690,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
             blob_buffer_size: 0,
             bloom_buffer: Vec::new(),
             text_length_buffer: Vec::new(),
+            valbitmap_value_buffer: Vec::new(),
             total_compressed_size: 0,
             total_rows: 0,
             meta_table_created: false,
@@ -1681,6 +1686,10 @@ struct CompressedSegment {
     bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
     /// Per-text-column length sidecars (col_idx, length_blob).
     text_length_blobs: Vec<(u16, Vec<u8>)>,
+    /// Per-text-column distinct-value sets for low-cardinality (≤32) columns.
+    /// Encoded into bitmaps in `finalize_partition` once the partition-level
+    /// value list is finalized.
+    valbitmap_value_sets: Vec<(u16, Vec<String>)>,
     meta_values_csv: String,          // pre-formatted VALUES clause for thin meta
     colstats_rows_csv: Vec<String>,   // pre-formatted VALUES tuples, one per non-segment-by column
     total_compressed_size: i64,
@@ -1876,6 +1885,10 @@ fn compress_segment(
         Vec::new()
     };
 
+    // Per-segment value sets for low-cardinality text columns.
+    let valbitmap_value_sets =
+        crate::compress::compute_segment_valbitmap_values(&typed_cols, columns);
+
     CompressedSegment {
         partition_idx,
         seg_id,
@@ -1883,6 +1896,7 @@ fn compress_segment(
         blobs,
         bloom_entries,
         text_length_blobs,
+        valbitmap_value_sets,
         meta_values_csv: meta_vals.join(", "),
         colstats_rows_csv,
         total_compressed_size: total_size,
@@ -2165,6 +2179,13 @@ fn flush_segment(
     }
     for (col_idx, length_blob) in length_blobs {
         buf.text_length_buffer.push((col_idx, seg_id, length_blob));
+    }
+    let vb_values = crate::compress::compute_segment_valbitmap_values(
+        &buf.typed_cols,
+        &state.columns,
+    );
+    for (col_idx, vals) in vb_values {
+        buf.valbitmap_value_buffer.push((col_idx, seg_id, vals));
     }
 
     // Flush blobs immediately if buffer exceeds threshold to bound memory usage.
@@ -2538,6 +2559,9 @@ fn write_compressed_segment(
     for (col_idx, length_blob) in cs.text_length_blobs {
         buf.text_length_buffer.push((col_idx, cs.seg_id, length_blob));
     }
+    for (col_idx, vals) in cs.valbitmap_value_sets {
+        buf.valbitmap_value_buffer.push((col_idx, cs.seg_id, vals));
+    }
 
     // Flush blobs when threshold reached
     if buf.blob_buffer_size >= BLOB_BUFFER_THRESHOLD {
@@ -2578,6 +2602,13 @@ fn finalize_partition(
     // Flush colstats sorted by (_col_idx, _segment_id) for column-major heap layout
     flush_colstats_buffer(buf);
 
+    // Encode + insert per-segment value-presence bitmaps. The buffer holds
+    // per-segment value sets; finalize the partition-level value→bit_idx
+    // map, drop columns that overflowed VALBITMAP_MAX_DISTINCT, encode each
+    // segment's bitmap, bulk-insert. Returns the column→values map for the
+    // catalog write below.
+    let column_valmap = finalize_and_insert_valbitmap(buf, columns, &ddl);
+
     spi_exec(&format!("ANALYZE {}", ddl.meta_fqn));
     spi_exec(&format!("ANALYZE {}", ddl.colstats_fqn));
     spi_exec(&format!("ANALYZE {}", ddl.blobs_fqn));
@@ -2614,7 +2645,136 @@ fn finalize_partition(
             &nd_col_names,
         )
         .expect("failed to update partition column_ndistinct");
+        catalog::update_partition_column_valmap(client, partition_id, &column_valmap)
+            .expect("failed to update partition column_valmap");
     });
+}
+
+/// Build partition-level value→bit_idx maps from per-segment value sets,
+/// encode each segment's bitmap, bulk-insert into the valbitmap table.
+/// Returns the partition-level value list keyed by user column name (for
+/// the catalog write).
+///
+/// Mirrors `compress::finalize_and_insert_valbitmaps` but uses `spi_exec`
+/// for inserts (the direct-backfill path doesn't have a long-lived
+/// `SpiClient` available).
+fn finalize_and_insert_valbitmap(
+    buf: &mut PartitionBuffer,
+    columns: &[ColumnMeta],
+    ddl: &crate::compress::CompanionDdl,
+) -> std::collections::HashMap<String, Vec<String>> {
+    use std::collections::{BTreeSet, HashMap};
+
+    let value_buffer = std::mem::take(&mut buf.valbitmap_value_buffer);
+    if value_buffer.is_empty() {
+        return HashMap::new();
+    }
+
+    // Aggregate per-col_idx union, dropping columns that overflow.
+    let mut union_by_col: HashMap<u16, BTreeSet<String>> = HashMap::new();
+    let mut overflow_cols: std::collections::HashSet<u16> =
+        std::collections::HashSet::new();
+    for (col_idx, _seg_id, vals) in &value_buffer {
+        if overflow_cols.contains(col_idx) {
+            continue;
+        }
+        let entry = union_by_col.entry(*col_idx).or_default();
+        for v in vals {
+            if entry.len() >= crate::compress::VALBITMAP_MAX_DISTINCT
+                && !entry.contains(v)
+            {
+                overflow_cols.insert(*col_idx);
+                union_by_col.remove(col_idx);
+                break;
+            }
+            entry.insert(v.clone());
+        }
+    }
+
+    if union_by_col.is_empty() {
+        return HashMap::new();
+    }
+
+    // Finalize per-column sorted value list + value→bit_idx index.
+    let mut finalized: HashMap<u16, (Vec<String>, HashMap<String, u8>)> = HashMap::new();
+    for (col_idx, set) in union_by_col {
+        let sorted: Vec<String> = set.into_iter().collect();
+        let mut idx: HashMap<String, u8> = HashMap::new();
+        for (i, v) in sorted.iter().enumerate() {
+            idx.insert(v.clone(), i as u8);
+        }
+        finalized.insert(col_idx, (sorted, idx));
+    }
+
+    // Map non-segment-by col_idx → user column name for the catalog payload.
+    let col_idx_to_name: HashMap<u16, String> = {
+        let mut m = HashMap::new();
+        let mut idx: u16 = 0;
+        for col in columns {
+            if col.is_segment_by {
+                continue;
+            }
+            m.insert(idx, col.name.clone());
+            idx += 1;
+        }
+        m
+    };
+
+    // Create the valbitmap table (without PK; we'll add it after bulk insert,
+    // mirroring the blobs/blooms pattern in this file for fast heap_insert).
+    spi_exec(&ddl.valbitmap_ddl);
+
+    // Encode + bulk-insert per-segment bitmaps.
+    let mut entries: Vec<(u16, i32, Vec<u8>)> = Vec::with_capacity(value_buffer.len());
+    for (col_idx, seg_id, vals) in value_buffer {
+        let Some((_, idx_map)) = finalized.get(&col_idx) else {
+            continue;
+        };
+        let n_bits = idx_map.len();
+        let n_bytes = n_bits.div_ceil(8);
+        let mut bits: Vec<u8> = vec![0; n_bytes];
+        for v in &vals {
+            if let Some(&bit_idx) = idx_map.get(v) {
+                bits[(bit_idx / 8) as usize] |= 1u8 << (bit_idx % 8);
+            }
+        }
+        entries.push((col_idx, seg_id, bits));
+    }
+
+    // Sort by (col_idx, seg_id) for column-major insertion order, then
+    // bulk-insert as multi-row VALUES (~100 rows/batch).
+    entries.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+    let batch_size = 100;
+    for chunk in entries.chunks(batch_size) {
+        let mut values: Vec<String> = Vec::with_capacity(chunk.len());
+        for (col_idx, seg_id, bits) in chunk {
+            // Hex-encode bytes as `'\x...'::bytea`.
+            let hex: String = bits.iter().map(|b| format!("{:02x}", b)).collect();
+            values.push(format!(
+                "({}, {}, '\\x{}'::bytea)",
+                col_idx, seg_id, hex
+            ));
+        }
+        let sql = format!(
+            "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES {}",
+            ddl.valbitmap_fqn,
+            values.join(", ")
+        );
+        spi_exec(&sql);
+    }
+    // Note: valbitmap_ddl already includes PRIMARY KEY inline (the table is
+    // tiny vs blobs/blooms, so the bulk-insert-then-add-PK optimization
+    // those use isn't worth it here).
+    spi_exec(&format!("ANALYZE {}", ddl.valbitmap_fqn));
+
+    // Build the catalog payload: column name → sorted value list.
+    let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+    for (col_idx, (vals, _)) in finalized {
+        if let Some(name) = col_idx_to_name.get(&col_idx) {
+            by_name.insert(name.clone(), vals);
+        }
+    }
+    by_name
 }
 
 /// Binary search for partition by time value.

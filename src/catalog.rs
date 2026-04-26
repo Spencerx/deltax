@@ -324,6 +324,66 @@ pub fn update_partition_column_ndistinct_from_map(
     Ok(())
 }
 
+/// Persist the per-column value lists used by the segment value-presence
+/// bitmap (see `compress::compute_segment_valbitmaps` and the read-side
+/// pruner in `scan::exec::segments`). Shape on disk is
+/// `{"col_name": ["val0", "val1", ...]}` where the array index is the bit
+/// position in each segment's bitmap. Only columns where partition-level
+/// ndistinct ≤ 32 (the bitmap budget) get an entry.
+pub fn update_partition_column_valmap(
+    client: &mut SpiClient,
+    partition_id: i32,
+    col_valmap: &std::collections::HashMap<String, Vec<String>>,
+) -> spi::SpiResult<()> {
+    let mut parts: Vec<String> = Vec::with_capacity(col_valmap.len());
+    let mut names: Vec<&String> = col_valmap.keys().collect();
+    names.sort();
+    for name in names {
+        let vals = &col_valmap[name];
+        let array_body: Vec<String> = vals
+            .iter()
+            .map(|v| format!("\"{}\"", json_escape(v)))
+            .collect();
+        parts.push(format!(
+            "\"{}\":[{}]",
+            json_escape(name),
+            array_body.join(",")
+        ));
+    }
+    let json = format!("{{{}}}", parts.join(","));
+
+    client.update(
+        "UPDATE deltax_partition SET column_valmap = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Escape a string for inclusion in a JSON string literal. Handles all
+/// JSON-mandatory escapes (`"`, `\\`, control chars 0x00–0x1F). Used by the
+/// hand-rolled JSON writers above; we don't pull in a full JSON crate just
+/// for the catalog payloads.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Compute per-column max ndistinct from the meta table and store the
 /// result as a JSONB map on `deltax_partition.column_ndistinct`. Called
 /// once at the end of compression so that planner-time cost estimation

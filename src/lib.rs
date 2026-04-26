@@ -95,8 +95,11 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
     row_count       BIGINT,
     compressed_at   TIMESTAMPTZ,
     column_ndistinct JSONB,
+    column_valmap   JSONB,
     UNIQUE(schema_name, table_name)
 );
+
+ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
 "#,
     name = "create_catalog_tables",
 );
