@@ -8,7 +8,7 @@
 # Iterating on code changes:
 #   make deploy EC2=<ip>         # rsync source, recompile, restart PG
 #   make bench EC2=<ip>          # run all 31 queries, download results
-#   make query EC2=<ip> Q=10     # EXPLAIN ANALYZE a single query (by 4-digit number)
+#   make query EC2=<ip> Q=10     # EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) a single query (by 4-digit number)
 #
 # Ad-hoc:
 #   make sql EC2=<ip> SQL="SHOW work_mem"
@@ -23,6 +23,12 @@ EC2_PG_CONFIG = /usr/lib/postgresql/18/bin/pg_config
 EC2_DB = test
 PG_DELTAX_SRC = $(CURDIR)/..
 
+# Side-by-side TimescaleDB cluster on the same EC2 box (PG16 on port 5433,
+# loaded with the same RTABench data). Used for plan-shape comparison via
+# `make query-ts` / `make query-both`.
+TS_PORT = 5433
+TS_PSQL = sudo -u postgres /usr/lib/postgresql/16/bin/psql -p $(TS_PORT)
+
 RESULTS_DIR = results
 HISTORY_DIR = $(RESULTS_DIR)/history
 
@@ -35,7 +41,8 @@ RTABENCH_DIR ?= $(CURDIR)/../../../rtabench/pg_deltax
 AWS_PROFILE ?= management
 AWS_NAME = rtabench-pg-deltax
 
-.PHONY: launch-ec2 destroy-ec2 ssh setup deploy bench report fetch-competitors query query-cold sql psql
+.PHONY: launch-ec2 destroy-ec2 ssh setup deploy bench report fetch-competitors query query-cold sql psql \
+        setup-ts query-ts query-both sql-ts psql-ts
 
 # Launch a new EC2 instance (terminates any existing one with the same name)
 launch-ec2:
@@ -139,17 +146,25 @@ fetch-competitors:
 	@test -d "$(RTABENCH_DIR)/.." || (echo "$(RTABENCH_DIR)/.. not found — clone https://github.com/timescale/rtabench first"; exit 1)
 	python3 $(CURDIR)/fetch-competitors.py --rtabench-root $(RTABENCH_DIR)/..
 
-# EXPLAIN ANALYZE a single query. Usage: make query EC2=<ip> Q=10 [SET="SET pg_deltax.parallel_workers=4"]
+# Run a single query against pg_deltax. First with `\timing on` (no
+# instrumentation — accurate wall clock), then `EXPLAIN (ANALYZE, BUFFERS,
+# TIMING OFF)` for plan shape and actual row counts. Plain EXPLAIN ANALYZE
+# is intentionally avoided: per-tuple `gettimeofday()` instrumentation
+# inflates wall time by 100×+ on plans that filter billions of rows
+# (Q0030's 4.6B `Rows Removed by Join Filter` measured 408s in EXPLAIN
+# ANALYZE vs ~3s real). TIMING OFF removes the timer but row counters
+# remain — still adds 20–60s on Q0030-shaped plans, hence the separate
+# wall-clock pass.
+# Usage: make query EC2=<ip> Q=10 [SET="SET pg_deltax.parallel_workers=4"]
 query:
 	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
 	@test -n "$(Q)"   || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
 	$(EC2_SSH) "QN=\$$(printf '%04d' $(Q)) && \
 		F=\$$(ls ~/rtabench/queries/\$${QN}_*.sql | head -1) && \
 		test -n \"\$$F\" || (echo \"No query file matching \$${QN}_*.sql\"; exit 1) && \
-		echo \"\$${F}\" && echo '---' && cat \"\$${F}\" && echo '---' && \
-		sudo -u postgres psql $(EC2_DB) -c '$(SET)' -c \"EXPLAIN ANALYZE \$$(cat \"\$${F}\")\""
+		SET='$(SET)' bash ~/rtabench/run-query.sh \"\$$F\" sudo -u postgres psql $(EC2_DB)"
 
-# Cold EXPLAIN ANALYZE: restart PG + drop OS caches first. Usage: make query-cold EC2=<ip> Q=10
+# Cold variant: restart PG + drop OS caches first. Usage: make query-cold EC2=<ip> Q=10
 query-cold:
 	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
 	@test -n "$(Q)"   || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
@@ -159,8 +174,8 @@ query-cold:
 		QN=\$$(printf '%04d' $(Q)) && \
 		F=\$$(ls ~/rtabench/queries/\$${QN}_*.sql | head -1) && \
 		test -n \"\$$F\" || (echo \"No query file matching \$${QN}_*.sql\"; exit 1) && \
-		echo \"\$${F} (cold)\" && echo '---' && cat \"\$${F}\" && echo '---' && \
-		sudo -u postgres psql $(EC2_DB) -c '$(SET)' -c \"EXPLAIN ANALYZE \$$(cat \"\$${F}\")\""
+		echo '(cold)' && \
+		SET='$(SET)' bash ~/rtabench/run-query.sh \"\$$F\" sudo -u postgres psql $(EC2_DB)"
 
 # Run arbitrary SQL. Usage: make sql EC2=<ip> SQL="SHOW work_mem"
 sql:
@@ -171,3 +186,47 @@ sql:
 psql:
 	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip>"; exit 1)
 	$(EC2_SSH) -t "sudo -u postgres psql $(EC2_DB)"
+
+# --- TimescaleDB side-by-side cluster -----------------------------------------
+# Install PG16 + TimescaleDB 2.18.1 on port 5433 alongside the existing PG18
+# cluster. Same RTABench data, separate cluster so plans can be compared on
+# identical hardware.
+setup-ts:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip>"; exit 1)
+	@echo "=== Syncing rtabench scripts ==="
+	rsync -az -e "ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no" \
+		$(CURDIR)/ $(EC2_USER)@$(EC2):~/rtabench/
+	@echo "=== Running timescale-setup.sh (this takes a while) ==="
+	$(EC2_SSH) 'cd ~/rtabench && bash timescale-setup.sh'
+
+# Run a single query against the TimescaleDB cluster: wall-clock first,
+# then plan with row counts (TIMING OFF, see notes on `query` above).
+# Usage: make query-ts EC2=<ip> Q=10 [SET="SET ..."]
+query-ts:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
+	@test -n "$(Q)"   || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
+	$(EC2_SSH) "QN=\$$(printf '%04d' $(Q)) && \
+		F=\$$(ls ~/rtabench/queries/\$${QN}_*.sql | head -1) && \
+		test -n \"\$$F\" || (echo \"No query file matching \$${QN}_*.sql\"; exit 1) && \
+		echo '(TimescaleDB)' && \
+		SET='$(SET)' bash ~/rtabench/run-query.sh \"\$$F\" $(TS_PSQL) $(EC2_DB)"
+
+# Run EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) on both clusters back-to-back. Usage: make query-both EC2=<ip> Q=10
+query-both:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
+	@test -n "$(Q)"   || (echo "Usage: make $@ EC2=<ip> Q=<NNNN>"; exit 1)
+	@echo "########## pg_deltax ##########"
+	@$(MAKE) -s query EC2=$(EC2) Q=$(Q) SET="$(SET)"
+	@echo
+	@echo "########## TimescaleDB ##########"
+	@$(MAKE) -s query-ts EC2=$(EC2) Q=$(Q) SET="$(SET)"
+
+# Run arbitrary SQL against the TimescaleDB cluster. Usage: make sql-ts EC2=<ip> SQL="..."
+sql-ts:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> SQL=\"...\""; exit 1)
+	$(EC2_SSH) "$(TS_PSQL) $(EC2_DB) -c \"$(SQL)\""
+
+# Open interactive psql session against the TimescaleDB cluster.
+psql-ts:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip>"; exit 1)
+	$(EC2_SSH) -t "$(TS_PSQL) $(EC2_DB)"
