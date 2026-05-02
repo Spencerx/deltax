@@ -677,16 +677,23 @@ pub(crate) type SubplanTlist = Vec<SubplanColumn>;
 
 /// Top-level entry called by `planner_hook`. Walks the plan tree and applies
 /// JSON-extract chain substitutions. Returns nothing — mutates plan nodes
-/// in place.
-pub(crate) unsafe fn rewrite_plan_tree(plan: *mut pg_sys::Plan) {
+/// in place. `rtable` is the PlannedStmt's range table, used to resolve
+/// `cscan->scan.scanrelid` to a relation OID for the SPI spec lookup.
+pub(crate) unsafe fn rewrite_plan_tree(
+    plan: *mut pg_sys::Plan,
+    rtable: *mut pg_sys::List,
+) {
     unsafe {
-        let _ = rewrite_plan_subtree(plan);
+        let _ = rewrite_plan_subtree(plan, rtable);
     }
 }
 
 /// Walk a plan subtree. Returns the `SubplanTlist` describing what each
 /// position of THIS plan's targetlist provides to the parent.
-unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan) -> SubplanTlist {
+unsafe fn rewrite_plan_subtree(
+    plan: *mut pg_sys::Plan,
+    rtable: *mut pg_sys::List,
+) -> SubplanTlist {
     unsafe {
         if plan.is_null() {
             return Vec::new();
@@ -695,11 +702,12 @@ unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan) -> SubplanTlist {
         // Leaf cases first.
         if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
             let cscan = plan as *mut pg_sys::CustomScan;
-            return subplan_tlist_from_deltax_decompress(cscan).unwrap_or_default();
+            return subplan_tlist_from_deltax_decompress(cscan, rtable)
+                .unwrap_or_default();
         }
 
         // Recursive case: collect children's SubplanTlists.
-        let child_stl = collect_child_subplan_tlist(plan);
+        let child_stl = collect_child_subplan_tlist(plan, rtable);
 
         // Substitute any matched chain Exprs in THIS plan's expressions.
         if !child_stl.is_empty() && has_any_synthetic(&child_stl) {
@@ -967,6 +975,7 @@ unsafe fn match_chain_against_child_stl(
 /// configured.
 unsafe fn subplan_tlist_from_deltax_decompress(
     cscan: *mut pg_sys::CustomScan,
+    rtable: *mut pg_sys::List,
 ) -> Option<SubplanTlist> {
     unsafe {
         if cscan.is_null() {
@@ -986,29 +995,29 @@ unsafe fn subplan_tlist_from_deltax_decompress(
             return None;
         }
 
-        // KNOWN BLOCKER: empirically, by the time `planner_hook` runs (after
-        // `standard_planner` → `set_plan_references` completes),
-        // `cscan->custom_scan_tlist` is NIL even though `plan_custom_path`
-        // set it to a 3-entry list a moment earlier. Verified via
-        // `nodeToString` dumps on both sides:
-        //   - At `plan_custom_path` return: list has [Var(ts), Var(data),
-        //     OpExpr(data->>'kind')] (well-formed).
-        //   - At walker entry: list is NIL; `cscan->scan.plan.targetlist`
-        //     still has its original `Var(varno=rti)` form (i.e.,
-        //     `set_customscan_references`'s rewrite branch wasn't taken,
-        //     which only happens when `custom_scan_tlist == NIL` on entry).
-        //   - All other CustomScan fields (custom_private, methods, scanrelid,
-        //     flags) survive intact.
-        // Only place PG core can null this field is setrefs.c line 1706's
-        // `cscan->custom_scan_tlist = fix_scan_list(...)`, which is itself
-        // guarded by `if (cscan->custom_scan_tlist != NIL)`. Something
-        // between `plan_custom_path` and `set_customscan_references` is
-        // clearing the field — needs a fresh debugging pass with a deeper
-        // bisection of the planner pipeline.
-        let cstlist = (*cscan).custom_scan_tlist;
+        // Rebuild `custom_scan_tlist` here. We can't trust whatever
+        // `plan_custom_path` set on it: empirically, that value is
+        // observed as NIL by the time `planner_hook` runs (post-
+        // `set_plan_references`) — even though `plan_custom_path` left it
+        // non-NIL a moment earlier. Static analysis of PG core says the only
+        // writer is setrefs.c:1706, itself guarded by the same NIL check, so
+        // the empirical observation contradicts the source. Rather than chase
+        // it with GDB, we just rebuild the tlist here. This rebuild happens
+        // AFTER `set_plan_references`, so nothing is going to mutate it again
+        // before `ExecInitCustomScan` reads it to size the scan tuple slot.
+        let cstlist = rebuild_custom_scan_tlist_from_catalog(cscan, rtable)?;
         if cstlist.is_null() {
             return None;
         }
+        (*cscan).custom_scan_tlist = cstlist;
+        // TODO(json-extract): also extend `scan.plan.targetlist` with
+        // synthetic forwarder TargetEntries — each `Var(INDEX_VAR, k)`
+        // referring to a synthetic position in `custom_scan_tlist`. Upper
+        // plans reference the subplan's output via OUTER_VAR refs that index
+        // into `scan.plan.targetlist`, not `custom_scan_tlist`. Without the
+        // extension, our walker's `Var(OUTER_VAR, k_synth)` substitutions
+        // would point at slot positions that don't exist in the projected
+        // tuple. This is the next iteration on top of this commit.
 
         // Build SubplanTlist by inspecting each TargetEntry. Physical entries
         // are Var nodes referencing the rel; synthetic entries are chain
@@ -1078,20 +1087,23 @@ unsafe fn classify_custom_scan_tlist_entry(expr: *mut pg_sys::Node) -> SubplanCo
 /// Recurse into children. For Append/MergeAppend take the intersection of
 /// child SubplanTlists at each position so a synthetic only propagates if
 /// every child can serve it. For everything else, take the lefttree's STL.
-unsafe fn collect_child_subplan_tlist(plan: *mut pg_sys::Plan) -> SubplanTlist {
+unsafe fn collect_child_subplan_tlist(
+    plan: *mut pg_sys::Plan,
+    rtable: *mut pg_sys::List,
+) -> SubplanTlist {
     unsafe {
         match (*plan).type_ {
             pg_sys::NodeTag::T_Append => {
                 let app = plan as *mut pg_sys::Append;
-                intersect_children_subplan_tlists((*app).appendplans)
+                intersect_children_subplan_tlists((*app).appendplans, rtable)
             }
             pg_sys::NodeTag::T_MergeAppend => {
                 let mapp = plan as *mut pg_sys::MergeAppend;
-                intersect_children_subplan_tlists((*mapp).mergeplans)
+                intersect_children_subplan_tlists((*mapp).mergeplans, rtable)
             }
             _ => {
                 if !(*plan).lefttree.is_null() {
-                    rewrite_plan_subtree((*plan).lefttree)
+                    rewrite_plan_subtree((*plan).lefttree, rtable)
                 } else {
                     Vec::new()
                 }
@@ -1100,17 +1112,20 @@ unsafe fn collect_child_subplan_tlist(plan: *mut pg_sys::Plan) -> SubplanTlist {
     }
 }
 
-unsafe fn intersect_children_subplan_tlists(plan_list: *mut pg_sys::List) -> SubplanTlist {
+unsafe fn intersect_children_subplan_tlists(
+    plan_list: *mut pg_sys::List,
+    rtable: *mut pg_sys::List,
+) -> SubplanTlist {
     unsafe {
         if plan_list.is_null() || (*plan_list).length == 0 {
             return Vec::new();
         }
         let n = (*plan_list).length;
         let first = pg_sys::list_nth(plan_list, 0) as *mut pg_sys::Plan;
-        let mut acc = rewrite_plan_subtree(first);
+        let mut acc = rewrite_plan_subtree(first, rtable);
         for i in 1..n {
             let child = pg_sys::list_nth(plan_list, i) as *mut pg_sys::Plan;
-            let stl = rewrite_plan_subtree(child);
+            let stl = rewrite_plan_subtree(child, rtable);
             // Intersect element-wise: positions disagreeing become Other.
             // If lengths differ, truncate to shorter — over-approximation that
             // never produces wrong substitutions.
@@ -1123,6 +1138,45 @@ unsafe fn intersect_children_subplan_tlists(plan_list: *mut pg_sys::List) -> Sub
             }
         }
         acc
+    }
+}
+
+/// Resolve `cscan->scan.scanrelid` to the underlying relation OID by
+/// indexing into the PlannedStmt range table, then SPI-look up the
+/// deltatable's `json_extract` config and rebuild the custom_scan_tlist
+/// from scratch. Returns `None` when the rel isn't a deltax-managed table
+/// or has no extraction configured. Returns `Some(NIL)` to signal "tried
+/// but nothing to add" (caller treats as None).
+unsafe fn rebuild_custom_scan_tlist_from_catalog(
+    cscan: *mut pg_sys::CustomScan,
+    rtable: *mut pg_sys::List,
+) -> Option<*mut pg_sys::List> {
+    unsafe {
+        let scanrelid = (*cscan).scan.scanrelid;
+        if scanrelid == 0 || rtable.is_null() {
+            return None;
+        }
+        let rti_zero_indexed = (scanrelid as i32) - 1;
+        if rti_zero_indexed < 0 || rti_zero_indexed >= (*rtable).length {
+            return None;
+        }
+        let rte =
+            pg_sys::list_nth(rtable, rti_zero_indexed) as *mut pg_sys::RangeTblEntry;
+        if rte.is_null() {
+            return None;
+        }
+        let rel_oid = (*rte).relid;
+        if rel_oid == pg_sys::InvalidOid {
+            return None;
+        }
+
+        // SPI lookup of json_extract for this rel.
+        let specs = crate::scan::path::load_extract_specs_for_rel_pub(rel_oid);
+        if specs.is_empty() {
+            return None;
+        }
+
+        Some(build_custom_scan_tlist(scanrelid, rel_oid, &specs))
     }
 }
 

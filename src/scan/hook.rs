@@ -3583,7 +3583,7 @@ pub unsafe extern "C-unwind" fn deltax_planner(
             // to point at the synthetic columns produced by DeltaXDecompress.
             // The walker is a no-op when no DeltaXDecompress with json_extract
             // is found in the tree.
-            super::json_extract::rewrite_plan_tree((*pstmt).planTree);
+            super::json_extract::rewrite_plan_tree((*pstmt).planTree, (*pstmt).rtable);
         }
 
         pstmt

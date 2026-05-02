@@ -196,6 +196,14 @@ unsafe fn rti_to_rel_oid(
 /// Returns an empty Vec on any failure (no deltatable, no json_extract,
 /// parse error) — extraction is silently skipped rather than aborting
 /// query planning.
+/// Public wrapper around `load_extract_specs_for_rel` for use by the
+/// planner_hook walker (which lives in `src/scan/json_extract.rs`).
+pub(crate) unsafe fn load_extract_specs_for_rel_pub(
+    rel_oid: pg_sys::Oid,
+) -> Vec<crate::compress::ExtractSpec> {
+    unsafe { load_extract_specs_for_rel(rel_oid) }
+}
+
 unsafe fn load_extract_specs_for_rel(
     rel_oid: pg_sys::Oid,
 ) -> Vec<crate::compress::ExtractSpec> {
@@ -282,14 +290,12 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         //   - The post-setrefs planner_hook walker then reads our
         //     `custom_scan_tlist` to discover what's at each slot position
         //     and substitutes matching chain Exprs in upper plans.
-        if !extract_specs.is_empty() && scan_rel_oid != pg_sys::InvalidOid {
-            let cstlist = crate::scan::json_extract::build_custom_scan_tlist(
-                rti,
-                scan_rel_oid,
-                &extract_specs,
-            );
-            (*cscan).custom_scan_tlist = cstlist;
-        }
+        // Don't set custom_scan_tlist here. PG's set_customscan_references
+        // (or some path between plan_custom_path and there) empirically
+        // nulls it before our planner_hook walker can see it. The walker
+        // rebuilds custom_scan_tlist from catalog config after setrefs runs,
+        // sidestepping the issue. See `rebuild_custom_scan_tlist_from_catalog`.
+        let _ = (scan_rel_oid, &extract_specs, rti);
 
         // Build int-form custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
         let mut private_list =
