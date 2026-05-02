@@ -21,6 +21,169 @@ pub(crate) struct ColumnMeta {
     pub(crate) is_time_column: bool,
 }
 
+/// One JSON-path extraction directive — extract `path` from JSONB column
+/// `src_column`, store as a synthetic columnar column named `target_name` of
+/// `target_kind`. Built by `parse_extract_specs` from the user-supplied JSONB.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Wired up incrementally across the json-extract feature.
+pub(crate) struct ExtractSpec {
+    pub(crate) src_column: String,
+    pub(crate) path: Vec<String>,
+    pub(crate) target_name: String,
+    pub(crate) target_kind: ColumnKind,
+    /// User-provided PG type alias (e.g. "text", "bigint"). Kept verbatim so
+    /// it can be echoed back through the column-metadata pipeline alongside
+    /// physical columns, and so EXPLAIN can show the original type alias.
+    pub(crate) target_type: String,
+}
+
+/// Validate and parse the `json_extract` JSONB blob into a list of specs.
+/// Errors are emitted via `pgrx::error!` so they surface as PG ERRORs from
+/// `deltax_enable_compression`.
+#[allow(dead_code)] // Wired up incrementally across the json-extract feature.
+pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec> {
+    let arr = value.as_array().unwrap_or_else(|| {
+        pgrx::error!(
+            "pg_deltax: json_extract must be a JSON array of {{src,path,name,type}} objects"
+        )
+    });
+
+    let mut specs: Vec<ExtractSpec> = Vec::with_capacity(arr.len());
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (i, entry) in arr.iter().enumerate() {
+        let obj = entry.as_object().unwrap_or_else(|| {
+            pgrx::error!(
+                "pg_deltax: json_extract[{}] must be an object with src/path/name/type",
+                i
+            )
+        });
+
+        let src_column = obj
+            .get("src")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_deltax: json_extract[{}].src must be a string column name", i)
+            })
+            .to_string();
+
+        let path_value = obj.get("path").unwrap_or_else(|| {
+            pgrx::error!("pg_deltax: json_extract[{}].path is required", i)
+        });
+        let path_arr = path_value.as_array().unwrap_or_else(|| {
+            pgrx::error!("pg_deltax: json_extract[{}].path must be a JSON array of strings", i)
+        });
+        if path_arr.is_empty() {
+            pgrx::error!("pg_deltax: json_extract[{}].path must not be empty", i);
+        }
+        let path: Vec<String> = path_arr
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                v.as_str()
+                    .unwrap_or_else(|| {
+                        pgrx::error!(
+                            "pg_deltax: json_extract[{}].path[{}] must be a string (array indices not yet supported)",
+                            i, j
+                        )
+                    })
+                    .to_string()
+            })
+            .collect();
+
+        let target_name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_deltax: json_extract[{}].name must be a string", i)
+            })
+            .to_string();
+        if !is_valid_identifier(&target_name) {
+            pgrx::error!(
+                "pg_deltax: json_extract[{}].name {:?} is not a valid SQL identifier",
+                i, target_name
+            );
+        }
+        if !seen_names.insert(target_name.clone()) {
+            pgrx::error!(
+                "pg_deltax: json_extract has duplicate target name {:?}",
+                target_name
+            );
+        }
+
+        let target_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!("pg_deltax: json_extract[{}].type must be a string", i)
+            })
+            .to_string();
+        let target_kind = classify_column(&target_type, false);
+        if matches!(target_kind, ColumnKind::Jsonb) {
+            // jsonb-extracted-as-jsonb adds no value; reject for clarity.
+            pgrx::error!(
+                "pg_deltax: json_extract[{}].type=jsonb is not supported (use the source jsonb column directly)",
+                i
+            );
+        }
+        // Unknown type names fall through to `Text` in classify_column. Keep
+        // the user's spelling in `target_type` but warn on obvious typos by
+        // requiring the recognized ones explicitly.
+        if !is_recognized_extract_type(&target_type) {
+            pgrx::error!(
+                "pg_deltax: json_extract[{}].type {:?} is not recognized (expected one of: text, varchar, char, smallint, integer, bigint, real, double precision, boolean, timestamp, timestamp with time zone, date)",
+                i, target_type
+            );
+        }
+
+        specs.push(ExtractSpec {
+            src_column,
+            path,
+            target_name,
+            target_kind,
+            target_type,
+        });
+    }
+
+    specs
+}
+
+fn is_valid_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_recognized_extract_type(t: &str) -> bool {
+    let l = t.to_lowercase();
+    matches!(
+        l.as_str(),
+        "text"
+            | "varchar"
+            | "char"
+            | "smallint"
+            | "int2"
+            | "integer"
+            | "int4"
+            | "bigint"
+            | "int8"
+            | "real"
+            | "float4"
+            | "double precision"
+            | "float8"
+            | "boolean"
+            | "bool"
+            | "timestamp"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+            | "timestamptz"
+            | "date"
+    )
+}
+
 // ============================================================================
 // SQL-callable functions
 // ============================================================================
@@ -32,12 +195,24 @@ pub(crate) struct ColumnMeta {
 ///     segment_by => ARRAY['device_id'],
 ///     order_by => ARRAY['ts']);
 /// ```
+///
+/// `json_extract` (optional) is a JSON array of `{src, path, name, type}`
+/// objects describing JSON paths to extract from JSONB columns at COPY time
+/// into extra columnar columns. Example:
+///
+/// ```sql
+/// SELECT deltax_enable_compression('bluesky',
+///     order_by => ARRAY['ts'],
+///     json_extract => '[{"src":"data","path":["commit","collection"],
+///                        "name":"x_collection","type":"text"}]'::jsonb);
+/// ```
 #[pg_extern]
 fn deltax_enable_compression(
     relation: &str,
     segment_by: default!(Vec<String>, "ARRAY[]::text[]"),
     order_by: default!(Vec<String>, "ARRAY[]::text[]"),
     segment_size: default!(i32, "30000"),
+    json_extract: default!(Option<pgrx::datum::JsonB>, "NULL"),
 ) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
@@ -71,12 +246,77 @@ fn deltax_enable_compression(
 
         let effective_segment_size = if segment_size <= 0 { 30000 } else { segment_size };
 
-        catalog::update_deltatable_compression(client, ht.id, &segment_by, &effective_order_by, effective_segment_size)
-            .expect("failed to update compression settings");
+        // Validate json_extract specs (if any) before persisting. Each spec's
+        // src column must exist in the parent table and be jsonb. The names
+        // must not collide with any physical column.
+        let extract_summary = if let Some(ref jx) = json_extract {
+            let specs = parse_extract_specs(&jx.0);
+            for spec in &specs {
+                let row = client
+                    .select(
+                        "SELECT data_type FROM information_schema.columns
+                         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+                        None,
+                        &[
+                            schema.as_str().into(),
+                            table.as_str().into(),
+                            spec.src_column.as_str().into(),
+                        ],
+                    )
+                    .expect("failed to check src column");
+                let dt: Option<String> = row
+                    .first()
+                    .get_one::<String>()
+                    .expect("failed to read data_type");
+                match dt {
+                    None => pgrx::error!(
+                        "pg_deltax: json_extract src column '{}' not found in {}.{}",
+                        spec.src_column, schema, table
+                    ),
+                    Some(t) if t.to_lowercase() != "jsonb" => pgrx::error!(
+                        "pg_deltax: json_extract src column '{}' must be jsonb (is {})",
+                        spec.src_column, t
+                    ),
+                    Some(_) => {}
+                }
+                // target_name must not collide with a physical column
+                let collision = client
+                    .select(
+                        "SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+                        None,
+                        &[
+                            schema.as_str().into(),
+                            table.as_str().into(),
+                            spec.target_name.as_str().into(),
+                        ],
+                    )
+                    .expect("failed to check name collision");
+                if !collision.is_empty() {
+                    pgrx::error!(
+                        "pg_deltax: json_extract name '{}' collides with an existing column in {}.{}",
+                        spec.target_name, schema, table
+                    );
+                }
+            }
+            format!(", json_extract: {} path(s)", specs.len())
+        } else {
+            String::new()
+        };
+
+        catalog::update_deltatable_compression(
+            client,
+            ht.id,
+            &segment_by,
+            &effective_order_by,
+            effective_segment_size,
+            json_extract,
+        )
+        .expect("failed to update compression settings");
 
         format!(
-            "Compression enabled on {}.{} (segment_by: {:?}, order_by: {:?}, segment_size: {})",
-            schema, table, segment_by, effective_order_by, effective_segment_size
+            "Compression enabled on {}.{} (segment_by: {:?}, order_by: {:?}, segment_size: {}{})",
+            schema, table, segment_by, effective_order_by, effective_segment_size, extract_summary
         )
     })
 }
