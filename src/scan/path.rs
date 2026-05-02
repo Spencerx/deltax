@@ -274,18 +274,22 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         let extract_specs: Vec<crate::compress::ExtractSpec> =
             load_extract_specs_for_rel(scan_rel_oid);
 
-        // Chain rewriting is intentionally not yet activated. The naive
-        // `set custom_scan_tlist + add chain Expr to scan.plan.targetlist`
-        // breaks down at upper-plan setrefs: after `set_customscan_references`
-        // rewrites scan.plan.targetlist to `Var(INDEX_VAR, k)`, the upper
-        // plan's `set_upper_references` cannot match its chain Expr against
-        // the subplan's now-Var-only tlist (`tlist_member` uses `equal()`).
-        // The proper fix is to manually rewrite the upper plan tree before
-        // setrefs, similar to how `fix_indexqual_operand` substitutes
-        // expression-index references — but that's a deeper change than this
-        // commit aims for. The recognizer + chain builder are in place for
-        // follow-up; this stub keeps everything else working.
-        let _ = (scan_rel_oid, &extract_specs, rti);
+        // Activate the json_extract synthetic-tlist scaffolding when the
+        // deltatable has json_extract specs. We set `custom_scan_tlist` so:
+        //   - PG widens the scan slot to `physical_natts + M` positions.
+        //   - `set_customscan_references` rewrites our scan's tlist to
+        //     `Var(INDEX_VAR, k)` for both physical and synthetic positions.
+        //   - The post-setrefs planner_hook walker then reads our
+        //     `custom_scan_tlist` to discover what's at each slot position
+        //     and substitutes matching chain Exprs in upper plans.
+        if !extract_specs.is_empty() && scan_rel_oid != pg_sys::InvalidOid {
+            let cstlist = crate::scan::json_extract::build_custom_scan_tlist(
+                rti,
+                scan_rel_oid,
+                &extract_specs,
+            );
+            (*cscan).custom_scan_tlist = cstlist;
+        }
 
         // Build int-form custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
         let mut private_list =

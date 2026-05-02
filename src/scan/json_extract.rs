@@ -699,14 +699,264 @@ unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan) -> SubplanTlist {
         }
 
         // Recursive case: collect children's SubplanTlists.
-        let _child_stl = collect_child_subplan_tlist(plan);
+        let child_stl = collect_child_subplan_tlist(plan);
 
-        // TODO(json-extract): substitute matched chain Exprs in this plan's
-        // expressions using `_child_stl`. For now this is a no-op walker so we
-        // can validate plumbing without changing query results.
+        // Substitute any matched chain Exprs in THIS plan's expressions.
+        if !child_stl.is_empty() && has_any_synthetic(&child_stl) {
+            substitute_chains_in_plan(plan, &child_stl);
+        }
 
         // Compute MY SubplanTlist by walking my targetlist (post-substitution).
-        compute_my_subplan_tlist(plan, &_child_stl)
+        compute_my_subplan_tlist(plan, &child_stl)
+    }
+}
+
+fn has_any_synthetic(stl: &SubplanTlist) -> bool {
+    stl.iter().any(|c| matches!(c, SubplanColumn::Synthetic { .. }))
+}
+
+/// Walk the plan node's expression-bearing fields (`targetlist`, `qual`,
+/// plus type-specific extras like `Agg.havingQual`) and substitute matched
+/// JSONB-extract chains with `Var(OUTER_VAR, k)` referring to the child's
+/// synthetic positions.
+unsafe fn substitute_chains_in_plan(plan: *mut pg_sys::Plan, child_stl: &SubplanTlist) {
+    unsafe {
+        // Generic fields on every Plan.
+        (*plan).targetlist = substitute_chains_in_tlist((*plan).targetlist, child_stl);
+        (*plan).qual = substitute_chains_in_list((*plan).qual, child_stl);
+
+        // Per-node-type extras.
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Agg => {
+                let agg = plan as *mut pg_sys::Agg;
+                (*agg).chain = substitute_chains_in_list((*agg).chain, child_stl);
+            }
+            pg_sys::NodeTag::T_WindowAgg => {
+                // WindowAgg has runCondition (a List of Exprs).
+                let wa = plan as *mut pg_sys::WindowAgg;
+                (*wa).runCondition = substitute_chains_in_list((*wa).runCondition, child_stl);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk a `List<TargetEntry*>` and rewrite each TE's `expr` in place.
+unsafe fn substitute_chains_in_tlist(
+    tlist: *mut pg_sys::List,
+    child_stl: &SubplanTlist,
+) -> *mut pg_sys::List {
+    unsafe {
+        if tlist.is_null() {
+            return tlist;
+        }
+        for i in 0..(*tlist).length {
+            let tle = pg_sys::list_nth(tlist, i) as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).expr.is_null() {
+                continue;
+            }
+            let new_expr =
+                substitute_in_expr_node((*tle).expr as *mut pg_sys::Node, child_stl);
+            (*tle).expr = new_expr as *mut pg_sys::Expr;
+        }
+        tlist
+    }
+}
+
+/// Walk a `List<Expr*>` and substitute in place.
+unsafe fn substitute_chains_in_list(
+    list: *mut pg_sys::List,
+    child_stl: &SubplanTlist,
+) -> *mut pg_sys::List {
+    unsafe {
+        if list.is_null() {
+            return list;
+        }
+        let mut out: *mut pg_sys::List = std::ptr::null_mut();
+        for i in 0..(*list).length {
+            let elt = pg_sys::list_nth(list, i) as *mut pg_sys::Node;
+            let rewritten = substitute_in_expr_node(elt, child_stl);
+            out = pg_sys::lappend(out, rewritten as *mut _);
+        }
+        out
+    }
+}
+
+/// Recursively walk an Expr tree. At each node, first check if the WHOLE
+/// node is a JSONB-extract chain that matches a synthetic from `child_stl`;
+/// if yes, replace with `Var(OUTER_VAR, attno)`. Otherwise, recurse into
+/// children (OpExpr.args, BoolExpr.args, FuncExpr.args, casts, NullTest,
+/// CaseExpr, Aggref.args, etc.).
+unsafe fn substitute_in_expr_node(
+    node: *mut pg_sys::Node,
+    child_stl: &SubplanTlist,
+) -> *mut pg_sys::Node {
+    unsafe {
+        if node.is_null() {
+            return node;
+        }
+        if let Some(replacement) = match_chain_against_child_stl(node, child_stl) {
+            return replacement;
+        }
+        // Not a chain — recurse structurally.
+        match (*node).type_ {
+            pg_sys::NodeTag::T_OpExpr => {
+                let op = node as *mut pg_sys::OpExpr;
+                (*op).args = substitute_chains_in_list((*op).args, child_stl);
+            }
+            pg_sys::NodeTag::T_BoolExpr => {
+                let b = node as *mut pg_sys::BoolExpr;
+                (*b).args = substitute_chains_in_list((*b).args, child_stl);
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let f = node as *mut pg_sys::FuncExpr;
+                (*f).args = substitute_chains_in_list((*f).args, child_stl);
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                let c = node as *mut pg_sys::CoerceViaIO;
+                (*c).arg = substitute_in_expr_node((*c).arg as *mut pg_sys::Node, child_stl)
+                    as *mut pg_sys::Expr;
+            }
+            pg_sys::NodeTag::T_RelabelType => {
+                let r = node as *mut pg_sys::RelabelType;
+                (*r).arg = substitute_in_expr_node((*r).arg as *mut pg_sys::Node, child_stl)
+                    as *mut pg_sys::Expr;
+            }
+            pg_sys::NodeTag::T_NullTest => {
+                let n = node as *mut pg_sys::NullTest;
+                (*n).arg = substitute_in_expr_node((*n).arg as *mut pg_sys::Node, child_stl)
+                    as *mut pg_sys::Expr;
+            }
+            pg_sys::NodeTag::T_CaseExpr => {
+                let c = node as *mut pg_sys::CaseExpr;
+                (*c).args = substitute_chains_in_list((*c).args, child_stl);
+                if !(*c).defresult.is_null() {
+                    (*c).defresult = substitute_in_expr_node(
+                        (*c).defresult as *mut pg_sys::Node,
+                        child_stl,
+                    ) as *mut pg_sys::Expr;
+                }
+            }
+            pg_sys::NodeTag::T_CaseWhen => {
+                let c = node as *mut pg_sys::CaseWhen;
+                (*c).expr = substitute_in_expr_node((*c).expr as *mut pg_sys::Node, child_stl)
+                    as *mut pg_sys::Expr;
+                (*c).result =
+                    substitute_in_expr_node((*c).result as *mut pg_sys::Node, child_stl)
+                        as *mut pg_sys::Expr;
+            }
+            pg_sys::NodeTag::T_Aggref => {
+                let a = node as *mut pg_sys::Aggref;
+                (*a).args = substitute_chains_in_list((*a).args, child_stl);
+            }
+            pg_sys::NodeTag::T_WindowFunc => {
+                let w = node as *mut pg_sys::WindowFunc;
+                (*w).args = substitute_chains_in_list((*w).args, child_stl);
+            }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                let s = node as *mut pg_sys::ScalarArrayOpExpr;
+                (*s).args = substitute_chains_in_list((*s).args, child_stl);
+            }
+            // Vars, Consts, Params, etc. are leaves with no children to rewrite.
+            _ => {}
+        }
+        node
+    }
+}
+
+/// If `node` is a JSONB-extract chain that matches one of the child's
+/// synthetic entries, return a `Var(OUTER_VAR, attno=synthetic_position,
+/// vartype=target_kind_oid)` ready to take its place. Otherwise return None.
+///
+/// Matching procedure:
+/// 1. Peel cast wrappers; remember the leaf `ColumnKind`.
+/// 2. Match outermost `OpExpr(opno=->>, _, Const(text key))`, accumulate keys.
+/// 3. Walk `OpExpr(opno=->, _, Const)` steps inward.
+/// 4. The innermost cursor must be a Var with `varno = OUTER_VAR` (the
+///    standard post-setrefs form for refs into the immediate child plan).
+/// 5. Look up `child_stl[var.varattno - 1]`; it must be `Physical` with the
+///    same `rel_var_attno` as one of the child's `Synthetic` entries' src.
+/// 6. Find a `Synthetic` entry in `child_stl` matching (path_keys, leaf_kind,
+///    src_var_attno=physical's attno). Return Var(OUTER_VAR, that_attno).
+unsafe fn match_chain_against_child_stl(
+    node: *mut pg_sys::Node,
+    child_stl: &SubplanTlist,
+) -> Option<*mut pg_sys::Node> {
+    unsafe {
+        if node.is_null() {
+            return None;
+        }
+        let (chain_root, leaf_kind) = strip_outer_cast(node);
+        let mut path_keys: Vec<String> = Vec::new();
+        let mut cursor = chain_root;
+
+        let (k, deeper) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
+        path_keys.push(k);
+        cursor = deeper;
+        loop {
+            cursor = unwrap_relabel(cursor);
+            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
+                Some((k, deeper)) => {
+                    path_keys.push(k);
+                    cursor = deeper;
+                }
+                None => break,
+            }
+        }
+        cursor = unwrap_relabel(cursor);
+        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
+            return None;
+        }
+        let inner_var = cursor as *mut pg_sys::Var;
+        path_keys.reverse();
+
+        // Inner var attno indexes into child's tlist. The child's STL at that
+        // position must be Physical (the underlying jsonb column).
+        let idx = (*inner_var).varattno;
+        if idx < 1 {
+            return None;
+        }
+        let i = (idx - 1) as usize;
+        if i >= child_stl.len() {
+            return None;
+        }
+        let physical_attno = match &child_stl[i] {
+            SubplanColumn::Physical { rel_var_attno } => *rel_var_attno,
+            // Already a synthetic — caller is referencing it via the chain
+            // somehow (e.g. the lower plan already provided it). Don't try
+            // to double-rewrite.
+            _ => return None,
+        };
+
+        // Find a matching synthetic in child_stl with that source attno
+        // and our (path_keys, leaf_kind).
+        for (j, col) in child_stl.iter().enumerate() {
+            if let SubplanColumn::Synthetic {
+                path,
+                target_kind,
+                src_var_attno,
+            } = col
+                && *src_var_attno == physical_attno
+                && *target_kind == leaf_kind
+                && path == &path_keys
+            {
+                let synth_attno = (j + 1) as i16;
+                let new_var = pg_sys::makeVar(
+                    pg_sys::OUTER_VAR,
+                    synth_attno,
+                    kind_to_type_oid(*target_kind),
+                    -1,
+                    if matches!(target_kind, ColumnKind::Text) {
+                        pg_sys::DEFAULT_COLLATION_OID
+                    } else {
+                        pg_sys::InvalidOid
+                    },
+                    0,
+                );
+                return Some(new_var as *mut pg_sys::Node);
+            }
+        }
+        None
     }
 }
 
@@ -738,6 +988,14 @@ unsafe fn subplan_tlist_from_deltax_decompress(
 
         // custom_scan_tlist null → no synthetic columns; treat as plain
         // physical-only scan and let the caller fall through.
+        // BLOCKER: PG's `set_customscan_references` (line 1706 of setrefs.c
+        // in pg17) reassigns `cscan->custom_scan_tlist` via `fix_scan_list`,
+        // which empirically returns NIL for our chain Expr lists even though
+        // the input is non-empty. The plumbing is in place but disabled
+        // pending diagnosis of which field on our synthesized chain Exprs
+        // (OpExpr / CoerceViaIO / Const / inner Var) is causing
+        // expression_tree_mutator to bail. Until then the walker visits the
+        // tree but always returns empty SubplanTlists.
         let cstlist = (*cscan).custom_scan_tlist;
         if cstlist.is_null() {
             return None;
