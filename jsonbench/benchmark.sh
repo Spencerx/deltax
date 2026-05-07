@@ -126,8 +126,28 @@ fi
 # query at the end will surface this if the heuristic is off.
 sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '$DATA_START'; SELECT deltax_create_table('bluesky', 'ts', '1 day'::interval, 365)"
 
-# Enable compression before loading (required for direct backfill)
-sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression('bluesky', order_by => ARRAY['ts'], segment_size => 30000)"
+# Enable compression before loading (required for direct backfill).
+# json_extract pre-extracts the JSON paths every JSONBench query touches into
+# columnar synthetic columns; the planner_hook walker then rewrites
+# `data->>'kind'`-style chains in upper plans to Var refs into those
+# synthetic columns, sidestepping per-row jsonb_in / `->`/`->>` evaluation
+# on the warm path. Requires pg_deltax.json_extract_mode=fields at query time.
+sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression(
+    'bluesky',
+    order_by => ARRAY['ts'],
+    segment_size => 30000,
+    json_extract => '[
+        {\"src\":\"data\",\"path\":[\"kind\"],\"name\":\"x_kind\",\"type\":\"text\"},
+        {\"src\":\"data\",\"path\":[\"did\"],\"name\":\"x_did\",\"type\":\"text\"},
+        {\"src\":\"data\",\"path\":[\"time_us\"],\"name\":\"x_time_us\",\"type\":\"bigint\"},
+        {\"src\":\"data\",\"path\":[\"commit\",\"collection\"],\"name\":\"x_collection\",\"type\":\"text\"},
+        {\"src\":\"data\",\"path\":[\"commit\",\"operation\"],\"name\":\"x_operation\",\"type\":\"text\"}
+    ]'::jsonb
+)"
+
+# Enable the planner_hook walker by default for queries on this DB so that
+# `data->>'kind'` etc. transparently use the pre-extracted columns.
+sudo -u postgres psql -c "ALTER DATABASE $DB SET pg_deltax.json_extract_mode = 'fields'"
 
 # Direct backfill: load and compress in a single pass via FORMAT deltax_compress.
 # Single COPY with a glob — pg_deltax expands it and processes all matched
@@ -154,20 +174,25 @@ sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE bluesky"
 VACUUM_END=$(date +%s)
 echo " done in $((VACUUM_END - VACUUM_START))s"
 
-# Capture data size (bytes)
+# Capture data size (bytes) and row count for the JSONBench dashboard.
 DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax_table_size('bluesky')")
+NUM_LOADED=$(sudo -u postgres psql "$DB" -t -A -c "SELECT count(*) FROM bluesky")
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
+echo "Loaded documents: $NUM_LOADED"
 
 # Save load stats. LOAD_TIME includes transform + COPY + vacuum so it reflects the
 # end-to-end time from raw .json.gz to a query-ready compressed table.
 LOAD_TIME=$((TRANSFORM_END - TRANSFORM_START + LOAD_END - LOAD_START + VACUUM_END - VACUUM_START))
-DATASET_SIZE_LABEL="${SCALE}m"
+# JSONBench expects dataset_size as a NUMBER (target row count), not a label.
+# 1 -> 1m -> 1_000_000, 10 -> 10_000_000, 100 -> 100_000_000, 1000 -> 1_000_000_000.
+DATASET_SIZE_NUM=$((SCALE * 1000000))
 cat > ~/jsonbench/load_stats.env <<STATS
 LOAD_TIME=$LOAD_TIME
 DATA_SIZE=$DATA_SIZE
-DATASET_SIZE=$DATASET_SIZE_LABEL
+NUM_LOADED=$NUM_LOADED
+DATASET_SIZE=$DATASET_SIZE_NUM
 STATS
-echo "Saved load stats to ~/jsonbench/load_stats.env (load_time=${LOAD_TIME}s, data_size=${DATA_SIZE}, dataset_size=${DATASET_SIZE_LABEL})"
+echo "Saved load stats to ~/jsonbench/load_stats.env (load_time=${LOAD_TIME}s, data_size=${DATA_SIZE}, num_loaded=${NUM_LOADED}, dataset_size=${DATASET_SIZE_NUM})"
 
 # Lower work_mem and disable JIT for the query phase
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '256MB'"
