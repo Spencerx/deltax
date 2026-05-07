@@ -108,11 +108,14 @@ bench:
 	@echo "=== Archived to $(HISTORY_DIR)/$(TS)_$(COMMIT)/ ==="
 	@if [ -d "$(JSONBENCH_DIR)" ]; then \
 		DATASET_LABEL=$$(jq -r '.dataset_size' $(RESULTS_DIR)/pg_deltax.json); \
-		DEST=$(JSONBENCH_DIR)/postgresql/results/pg_deltax_m6i.8xlarge_$${DATASET_LABEL}.json; \
+		DEST=$(JSONBENCH_DIR)/pg_deltax/results/m6i.8xlarge_bluesky_$${DATASET_LABEL}.json; \
 		echo "=== Copying to upstream JSONBench dashboard inputs ==="; \
-		mkdir -p $(JSONBENCH_DIR)/postgresql/results; \
+		mkdir -p $(JSONBENCH_DIR)/pg_deltax/results; \
 		cp $(RESULTS_DIR)/pg_deltax.json $$DEST; \
 		echo "    -> $$DEST"; \
+		echo "=== Generating JSONBench HTML report ==="; \
+		cd $(JSONBENCH_DIR) && bash generate-results.sh; \
+		open $(JSONBENCH_DIR)/index.html; \
 	fi
 
 # EXPLAIN ANALYZE a single query. Usage: make query EC2=<ip> Q=2 [SET="SET pg_deltax.parallel_workers=4"]
