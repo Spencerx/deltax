@@ -7433,11 +7433,21 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
         let scan_slot = (*node).ss.ss_ScanTupleSlot;
         let state = &mut *((*node).custom_ps as *mut AggScanState);
 
-        // Phase C.1: parallel workers contribute via DSM and emit no rows
-        // themselves. The leader handles the merge + emit on its own
-        // `exec_agg_scan`. Phase C.2 will fill in the worker's contribution
-        // path before this returns.
+        // Phase C.2.d: parallel workers run the claim+aggregate+serialise
+        // loop on their first exec call. Subsequent calls return EOF — the
+        // leader picks up partial slabs in C.2.e via a spin-wait on
+        // `populated`. Workers emit no rows themselves.
         if state.is_parallel_worker {
+            if state.exec_ctx.is_some() {
+                let already_done = state
+                    .exec_ctx
+                    .as_ref()
+                    .map(|c| c.worker_done)
+                    .unwrap_or(true);
+                if !already_done {
+                    run_worker_partial_aggregate(state);
+                }
+            }
             pg_sys::ExecClearTuple(scan_slot);
             return scan_slot;
         }
@@ -7457,6 +7467,106 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
         // EOF
         pg_sys::ExecClearTuple(scan_slot);
         scan_slot
+    }
+}
+
+/// Phase C.2.d: claim segments from the shared cursor, run
+/// `process_segments_compact` on each chunk, accumulate into a worker-local
+/// `ParallelCompactResult`, then serialise the result into the worker's DSM
+/// slab. The leader's `exec_agg_scan` first call (Phase C.2.e) reads back
+/// the slab via `agg_wire::deserialize_partial`.
+///
+/// Chunked claim (`CHUNK = 4`) amortises atomic cache-line bouncing across N
+/// workers; load imbalance is bounded by `CHUNK` segments. Empty-claim case
+/// (cursor already exhausted) is handled naturally — `serialize_partial_into`
+/// emits a header-only ~96-byte wire that the leader's deserialiser turns
+/// into an empty result with no merge effect.
+///
+/// Memory ordering: `partial_lens[slot]` is written with `Release` here;
+/// `shutdown_deltax_agg` later writes `worker_timings[slot].populated = 1`
+/// (also Release). The leader's `Acquire` load on `populated` synchronises
+/// with both writes in program order.
+unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
+    unsafe {
+        const CHUNK: u64 = 4;
+
+        if state.pscan.is_null() {
+            return;
+        }
+        let ps = &*state.pscan;
+        let total_segments = ps.total_segments;
+        let slab_cap = ps.partial_slab_size;
+
+        let slot = current_agg_worker_slot();
+        if slot >= ps.n_worker_slots as usize {
+            return;
+        }
+        let slab_ptr = ps.slab_ptr(slot);
+
+        let ctx = match state.exec_ctx.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut local = ParallelCompactResult::empty(&ctx.agg_specs);
+
+        if total_segments > 0 {
+            let cfg = ParallelCompactConfig {
+                agg_specs: &ctx.agg_specs,
+                group_specs: &ctx.group_specs,
+                col_names: &ctx.meta.col_names,
+                col_types: &ctx.meta.col_types,
+                segment_by: &ctx.meta.segment_by,
+                needed_cols: &ctx.needed_cols,
+                batch_quals: &ctx.batch_quals,
+                seg_filters: &ctx.seg_filters,
+                time_min: ctx.time_min,
+                time_max: ctx.time_max,
+                topn_spec: ctx.topn_spec,
+            };
+
+            loop {
+                let start = ps.next_segment.fetch_add(CHUNK, Ordering::Relaxed);
+                if start >= total_segments {
+                    break;
+                }
+                let end = (start + CHUNK).min(total_segments);
+                let slice = &ctx.all_segments[start as usize..end as usize];
+                let chunk_result = process_segments_compact(slice, &cfg);
+
+                merge_compact_results(
+                    &mut local.compact_map,
+                    &mut local.compact_storage,
+                    &mut local.cd_sidecar,
+                    &chunk_result.compact_map,
+                    &chunk_result.compact_storage,
+                    &chunk_result.cd_sidecar,
+                    &ctx.agg_specs,
+                );
+                local.segments_processed += chunk_result.segments_processed;
+                local.rows_processed += chunk_result.rows_processed;
+                local.decompress_us = local.decompress_us.max(chunk_result.decompress_us);
+            }
+        }
+
+        match super::agg_wire::serialize_partial_into(slab_ptr, slab_cap, &local, &ctx.agg_specs) {
+            Ok(written) => {
+                // SAFETY: Release-store `partial_lens[slot]` after the slab
+                // bytes are written so the leader's Acquire-load on
+                // `populated` (in `shutdown_deltax_agg`) makes the slab
+                // contents visible.
+                (*state.pscan).partial_lens[slot].store(written as u64, Ordering::Release);
+                ctx.worker_done = true;
+            }
+            Err(super::agg_wire::SerError::Overflow { needed, have }) => {
+                pgrx::error!(
+                    "pg_deltax: parallel-agg partial slab overflow ({} bytes needed, {} available); \
+                     spill to per-worker tuplestore is Phase F",
+                    needed,
+                    have,
+                );
+            }
+        }
     }
 }
 
