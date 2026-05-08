@@ -7452,6 +7452,17 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
             return scan_slot;
         }
 
+        // Phase C.2.e: leader's first call in the parallel-aware path.
+        // Claim segments alongside workers, spin-wait for worker partials,
+        // deserialise + merge them into the leader-local accumulator,
+        // finalise into `result_rows`. Subsequent calls fall through to the
+        // shared row-emit loop below.
+        if let Some(ctx) = state.exec_ctx.as_ref()
+            && !ctx.merged
+        {
+            run_leader_merge_and_finalise(state);
+        }
+
         if state.result_idx < state.result_rows.len() {
             pg_sys::ExecClearTuple(scan_slot);
             let row = &state.result_rows[state.result_idx];
@@ -7467,6 +7478,200 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
         // EOF
         pg_sys::ExecClearTuple(scan_slot);
         scan_slot
+    }
+}
+
+/// Phase C.2.e: leader's first-call body. Run the same chunked-claim loop as
+/// workers (leader is slot 0), spin-wait for each worker slot's `populated`
+/// flag with `Acquire`, deserialise each populated slab, merge into the
+/// leader's global accumulator, finalise into `result_rows`, mark
+/// `ctx.merged = true`. Subsequent exec calls emit cached rows.
+unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
+    unsafe {
+        if state.pscan.is_null() {
+            return;
+        }
+        let total_segments;
+        let n_worker_slots;
+        {
+            let ps = &*state.pscan;
+            total_segments = ps.total_segments;
+            n_worker_slots = ps.n_worker_slots as usize;
+        }
+
+        let ctx = match state.exec_ctx.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Leader-local accumulator. Leader is slot 0 so it claims segments
+        // alongside workers; that's fine — `next_segment.fetch_add` is
+        // shared.
+        let mut global = ParallelCompactResult::empty(&ctx.agg_specs);
+
+        if total_segments > 0 {
+            let cfg = ParallelCompactConfig {
+                agg_specs: &ctx.agg_specs,
+                group_specs: &ctx.group_specs,
+                col_names: &ctx.meta.col_names,
+                col_types: &ctx.meta.col_types,
+                segment_by: &ctx.meta.segment_by,
+                needed_cols: &ctx.needed_cols,
+                batch_quals: &ctx.batch_quals,
+                seg_filters: &ctx.seg_filters,
+                time_min: ctx.time_min,
+                time_max: ctx.time_max,
+                topn_spec: ctx.topn_spec,
+            };
+
+            const CHUNK: u64 = 4;
+            loop {
+                let start = (*state.pscan).next_segment.fetch_add(CHUNK, Ordering::Relaxed);
+                if start >= total_segments {
+                    break;
+                }
+                let end = (start + CHUNK).min(total_segments);
+                let slice = &ctx.all_segments[start as usize..end as usize];
+                let chunk_result = process_segments_compact(slice, &cfg);
+                merge_compact_results(
+                    &mut global.compact_map,
+                    &mut global.compact_storage,
+                    &mut global.cd_sidecar,
+                    &chunk_result.compact_map,
+                    &chunk_result.compact_storage,
+                    &chunk_result.cd_sidecar,
+                    &ctx.agg_specs,
+                );
+                global.segments_processed += chunk_result.segments_processed;
+                global.rows_processed += chunk_result.rows_processed;
+                global.decompress_us = global.decompress_us.max(chunk_result.decompress_us);
+            }
+        }
+
+        // Spin-wait for each worker slot to publish its partial. Slot 0 is
+        // the leader (us) so iterate 1..n_worker_slots. Spin-loop with a
+        // backoff to avoid burning a core when all workers are CPU-bound on
+        // their final merge.
+        for slot in 1..n_worker_slots {
+            let mut spin: u32 = 0;
+            loop {
+                let populated = (*state.pscan).worker_timings[slot]
+                    .populated;
+                // The populated field is a plain u32; emit an Acquire fence
+                // after observing 1 so the slab + partial_lens writes
+                // become visible. (worker_timings isn't itself atomic to
+                // keep the struct POD-zeroable.)
+                if populated == 1 {
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    break;
+                }
+                spin = spin.saturating_add(1);
+                if spin < 1024 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                    spin = 0;
+                }
+            }
+        }
+
+        // Deserialise each populated slab and merge into the leader's global.
+        for slot in 1..n_worker_slots {
+            let len = (*state.pscan).partial_lens[slot].load(Ordering::Acquire);
+            if len == 0 {
+                continue; // empty/unused slot
+            }
+            let slab_ptr = (*state.pscan).slab_ptr(slot);
+            match super::agg_wire::deserialize_partial(slab_ptr, len, &ctx.agg_specs) {
+                Ok(worker) => {
+                    merge_compact_results(
+                        &mut global.compact_map,
+                        &mut global.compact_storage,
+                        &mut global.cd_sidecar,
+                        &worker.compact_map,
+                        &worker.compact_storage,
+                        &worker.cd_sidecar,
+                        &ctx.agg_specs,
+                    );
+                    global.segments_processed += worker.segments_processed;
+                    global.rows_processed += worker.rows_processed;
+                    global.decompress_us = global.decompress_us.max(worker.decompress_us);
+                }
+                Err(e) => {
+                    pgrx::error!(
+                        "pg_deltax: failed to deserialise worker slot {} partial: {:?}",
+                        slot,
+                        e,
+                    );
+                }
+            }
+        }
+
+        // Finalise into result_rows.
+        let result_rows = finalise_compact_into_result_rows(
+            &global.compact_map,
+            &global.compact_storage,
+            &ctx.agg_specs,
+            &ctx.group_specs,
+            &ctx.output_map,
+            ctx.num_result_cols,
+        );
+
+        state.total_segments = global.segments_processed;
+        state.total_rows_processed = global.rows_processed;
+        state.decompress_us = global.decompress_us;
+        state.result_rows = result_rows;
+        state.result_idx = 0;
+        ctx.merged = true;
+    }
+}
+
+/// Iterate `global_map`'s groups and turn each one into an output row using
+/// `compact_finalize` per agg spec and `output_map` for column placement.
+/// Mirrors the post-merge emit loop in `begin_agg_scan`'s rayon path.
+///
+/// The parallel-aware path's eligibility (C.2.f) excludes HAVING, Top-N, and
+/// CountDistinct, so this is the simplest variant — no filter pass, no sort,
+/// no special-case finalisation.
+unsafe fn finalise_compact_into_result_rows(
+    global_map: &CompactGroupMap,
+    global_storage: &CompactAccStorage,
+    agg_specs: &[AggExecSpec],
+    group_specs: &[GroupByColSpec],
+    output_map: &[OutputEntry],
+    num_result_cols: usize,
+) -> Vec<Vec<(pg_sys::Datum, bool)>> {
+    unsafe {
+        let num_group_keys = group_specs.len();
+        let mut rows: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::with_capacity(global_map.len());
+        for (&packed_key, &group_idx) in global_map {
+            let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(agg_specs.len());
+            for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                agg_results.push(compact_finalize(global_storage, group_idx, spec_idx, spec));
+            }
+            let keys = unpack_int_keys(packed_key, num_group_keys);
+            let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+            for entry in output_map {
+                match entry {
+                    OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                    OutputEntry::Group(gi) => {
+                        let v = keys[*gi];
+                        if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                            row.push((i128_to_numeric_datum(v as i128), false));
+                        } else {
+                            row.push((pg_sys::Datum::from(v as usize), false));
+                        }
+                    }
+                    OutputEntry::DerivedGroup { base_gi, delta } => {
+                        let v = keys[*base_gi] + delta;
+                        row.push((pg_sys::Datum::from(v as usize), false));
+                    }
+                    OutputEntry::Const(d, n) => row.push((*d, *n)),
+                }
+            }
+            rows.push(row);
+        }
+        rows
     }
 }
 
@@ -7608,6 +7813,11 @@ pub(super) unsafe extern "C-unwind" fn end_agg_scan(
 }
 
 /// ReScanCustomScan callback for DeltaXAgg.
+///
+/// For parallel-aware scans, also clears `result_rows` and `exec_ctx.merged`
+/// so the next exec re-runs the full claim+merge cycle. PG calls
+/// `reinit_dsm_deltax_agg` separately to zero the cursor + per-slot state in
+/// shared memory.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -7615,6 +7825,11 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
     unsafe {
         let state = &mut *((*node).custom_ps as *mut AggScanState);
         state.result_idx = 0;
+        if let Some(ctx) = state.exec_ctx.as_mut() {
+            ctx.merged = false;
+            ctx.worker_done = false;
+            state.result_rows.clear();
+        }
     }
 }
 
