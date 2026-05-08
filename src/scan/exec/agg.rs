@@ -5,6 +5,7 @@ use pgrx::pg_guard;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use regex::Regex;
@@ -346,8 +347,303 @@ pub(crate) struct AggScanState {
     /// F8 (`PERF_IMPROVEMENTS.md` #44): number of preselected keys used to
     /// filter Phase-1 rows. 0 when the optimization didn't fire.
     pub(crate) f8_preselected: u64,
+    /// Parallel-DeltaXAgg shared state (Phase C). Null when running serially
+    /// (no Gather above us). Set by `initialize_dsm_deltax_agg` on the
+    /// leader and by `init_worker_deltax_agg` on each worker.
+    #[allow(dead_code)] // Phase C.0 scaffold; consumers added in C.1+.
+    pub(crate) pscan: *mut DeltaXAggPState,
+    /// True for parallel workers; the worker's `begin_agg_scan` short-
+    /// circuits past SPI + heap scan + accumulator construction and the
+    /// leader handles result emission. False on the leader and on serial
+    /// scans.
+    #[allow(dead_code)] // Phase C.0 scaffold; consumers added in C.1+.
+    pub(crate) is_parallel_worker: bool,
 }
 
+
+// ============================================================================
+// Parallel-aware DSM scaffolding (Phase B of the parallel-DeltaXAgg plan).
+//
+// The full design lives in `dev/docs/JSON_EXTRACT.md` follow-up section /
+// the matching plan file. Phase B lays only the type + hook surface so a
+// future commit can flip `parallel_workers > 0` without further
+// CustomExecMethods churn. With `parallel_workers = 0` (current state in
+// `path.rs::add_agg_path`) PG never invokes these callbacks, so the stubs
+// stay dormant until Phase C wires real worker work in.
+//
+// `DeltaXAggPState` mirrors `DeltaXAppendPState` (`scan/exec/decompress.rs`)
+// — same `next_segment` cursor + per-worker timing slots. Phase C will
+// extend with `partial_offsets` / `partial_caps` / `partial_lens` describing
+// each worker's reserved slab in the DSM partial-state region.
+// ============================================================================
+
+/// Max combined leader+worker slots we track per scan. Matches
+/// `super::decompress::MAX_WORKER_SLOTS`; both must agree because Phase C
+/// shares the same per-process slot computation helper.
+#[allow(dead_code)] // Phase B scaffolding; activated in Phase C.
+pub(crate) const MAX_AGG_WORKER_SLOTS: usize =
+    super::decompress::MAX_WORKER_SLOTS;
+
+/// Per-worker timing counters in the DSM region. Phase C populates this
+/// during `shutdown_deltax_agg`; the leader aggregates for EXPLAIN. Default
+/// (zeros) is a valid "this slot was never populated" signal.
+#[allow(dead_code)] // Phase B scaffolding; activated in Phase C.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct AggTimingShmem {
+    pub(crate) populated: u32,
+    pub(crate) _pad: u32,
+    pub(crate) segments_decompressed: u64,
+    pub(crate) rows_in: u64,
+    pub(crate) rows_filtered_qual: u64,
+    pub(crate) groups_emitted_local: u64,
+    pub(crate) hash_probe_us: u64,
+    pub(crate) accum_update_us: u64,
+    pub(crate) distinct_union_us: u64,
+    pub(crate) partial_serialize_us: u64,
+}
+
+/// Per-worker partial-result slab size in bytes. Conservative default —
+/// fits ~1M groups for typical accumulator widths. Phase F adds a GUC
+/// (`pg_deltax.parallel_agg_partial_state_mb`) and tuplestore spill on
+/// overflow. Today, overflow erroes out cleanly via `serialize_partial_into`.
+pub(crate) const PARTIAL_SLAB_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Shared DSM state for parallel `DeltaXAgg`. POD; zero-initialised state is
+/// the empty "no segments claimed yet" condition. The full DSM region is
+/// `[DeltaXAggPState][slab 0 (leader)][slab 1 (worker 0)]…` — each slab is
+/// `PARTIAL_SLAB_SIZE_BYTES` long and at offset
+/// `size_of::<DeltaXAggPState>() + slot_idx * PARTIAL_SLAB_SIZE_BYTES`.
+///
+/// Synchronisation contract: workers serialise their `ParallelCompactResult`
+/// into their slab, write `partial_lens[k]` (the byte count actually written),
+/// then set `worker_timings[k].populated = 1` with `Release`. The leader
+/// spin-waits on `populated` reads with `Acquire`, then deserialises the
+/// first `partial_lens[k]` bytes of slot k's slab. Skipping the
+/// Release/Acquire pair on `populated` is undefined behaviour.
+#[allow(dead_code)] // Phase B scaffolding; partial_lens used in C.2.
+#[repr(C)]
+pub(crate) struct DeltaXAggPState {
+    /// Workers `fetch_add(1)` to claim the next segment index.
+    pub(crate) next_segment: AtomicU64,
+    /// Total segments the leader pre-loaded; set in `initialize_dsm_deltax_agg`.
+    pub(crate) total_segments: u64,
+    /// Number of timing slots populated (leader + nworkers).
+    pub(crate) n_worker_slots: u32,
+    /// Per-slab byte capacity; mirrors `PARTIAL_SLAB_SIZE_BYTES` so workers
+    /// don't have to reach into a const.
+    pub(crate) partial_slab_size: u32,
+    /// Bytes actually written into each slab by the corresponding process.
+    /// `partial_lens[k]` is set BEFORE `worker_timings[k].populated = 1`
+    /// (with Release ordering) so the leader's Acquire read on `populated`
+    /// makes the slab contents visible.
+    pub(crate) partial_lens: [AtomicU64; MAX_AGG_WORKER_SLOTS],
+    /// Per-process timing aggregation. Slot 0 = leader, 1..=N = workers.
+    pub(crate) worker_timings: [AggTimingShmem; MAX_AGG_WORKER_SLOTS],
+}
+
+impl DeltaXAggPState {
+    /// Pointer to slot `slot_idx`'s slab. Caller must ensure the DSM
+    /// region was sized for this slot count.
+    #[allow(dead_code)] // Phase C.2.
+    #[inline]
+    pub(crate) unsafe fn slab_ptr(&self, slot_idx: usize) -> *mut u8 {
+        unsafe {
+            let base = self as *const _ as *const u8;
+            base.add(std::mem::size_of::<DeltaXAggPState>())
+                .add(slot_idx * PARTIAL_SLAB_SIZE_BYTES) as *mut u8
+        }
+    }
+}
+
+/// EstimateDSMCustomScan: bytes for `DeltaXAggPState` + N+1 partial-state
+/// slabs (one per leader/worker). The slab count is fixed at the cap so
+/// re-sizing isn't needed if the planner picks a smaller worker count
+/// later — wasted DSM bytes in that case are bounded by
+/// `PARTIAL_SLAB_SIZE_BYTES * (MAX_AGG_WORKER_SLOTS - 1 - nworkers)`.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn estimate_dsm_deltax_agg(
+    _node: *mut pg_sys::CustomScanState,
+    pcxt: *mut pg_sys::ParallelContext,
+) -> pg_sys::Size {
+    unsafe {
+        let nworkers = (*pcxt).nworkers as usize;
+        let nslots = (nworkers + 1).min(MAX_AGG_WORKER_SLOTS);
+        (std::mem::size_of::<DeltaXAggPState>() + nslots * PARTIAL_SLAB_SIZE_BYTES)
+            as pg_sys::Size
+    }
+}
+
+/// InitializeDSMCustomScan: leader populates the shared region after its own
+/// `BeginCustomScan` has run. `coordinate` is a `DeltaXAggPState` carved out
+/// of PG's parallel-context DSM segment.
+///
+/// Phase C.1 wires the cursor + slot count. Phase C.2 will set
+/// `total_segments` from the leader's `segments_data` and slot the per-
+/// worker partial-result region offsets.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn initialize_dsm_deltax_agg(
+    node: *mut pg_sys::CustomScanState,
+    pcxt: *mut pg_sys::ParallelContext,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let ps = coordinate as *mut DeltaXAggPState;
+        std::ptr::write_bytes(ps as *mut u8, 0, std::mem::size_of::<DeltaXAggPState>());
+
+        let nworkers = (*pcxt).nworkers as usize;
+        if nworkers + 1 > MAX_AGG_WORKER_SLOTS {
+            pgrx::error!(
+                "pg_deltax: parallel worker count {} exceeds MAX_AGG_WORKER_SLOTS {}",
+                nworkers,
+                MAX_AGG_WORKER_SLOTS - 1,
+            );
+        }
+
+        // `next_segment` is zero from `write_bytes`; AtomicU64 has the same
+        // memory representation as `u64` so that's a valid initial state.
+        (*ps).total_segments = 0;
+        (*ps).n_worker_slots = (nworkers + 1) as u32;
+        (*ps).partial_slab_size = PARTIAL_SLAB_SIZE_BYTES as u32;
+        // `partial_lens` is zero-initialised by `write_bytes`; AtomicU64
+        // shares layout with u64.
+
+        let state_ptr = (*node).custom_ps as *mut AggScanState;
+        if !state_ptr.is_null() {
+            (*state_ptr).pscan = ps;
+        }
+    }
+}
+
+/// ReInitializeDSMCustomScan: reset the shared cursor and per-slot timing
+/// before a rescan. The leader is the only caller.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn reinit_dsm_deltax_agg(
+    _node: *mut pg_sys::CustomScanState,
+    _pcxt: *mut pg_sys::ParallelContext,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let ps = coordinate as *mut DeltaXAggPState;
+        (*ps).next_segment.store(0, Ordering::Relaxed);
+        for slot in (*ps).worker_timings.iter_mut() {
+            *slot = AggTimingShmem::default();
+        }
+        for len in (*ps).partial_lens.iter_mut() {
+            len.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// InitializeWorkerCustomScan: worker picks up the shared DSM pointer and
+/// flags itself as a parallel worker. The worker's `begin_agg_scan` already
+/// short-circuited past SPI/heap-scan into a minimal state (see
+/// `build_minimal_worker_state`); this just attaches the DSM region.
+///
+/// Phase C.2 will add the worker's segment-claim + partial-aggregate loop.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn init_worker_deltax_agg(
+    node: *mut pg_sys::CustomScanState,
+    _toc: *mut pg_sys::shm_toc,
+    coordinate: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let state_ptr = (*node).custom_ps as *mut AggScanState;
+        if state_ptr.is_null() {
+            return;
+        }
+        (*state_ptr).pscan = coordinate as *mut DeltaXAggPState;
+        (*state_ptr).is_parallel_worker = true;
+    }
+}
+
+/// ShutdownCustomScan: each process records its worker-slot timing into
+/// `worker_timings[slot]` while DSM is still attached, so the leader can
+/// aggregate per-process numbers for EXPLAIN.
+///
+/// Phase C.1 just stamps `populated = 1` so the leader sees that this slot
+/// participated. Phase C.2 will serialise the process's local
+/// `ParallelCompactResult` into the slot's slab and copy timing.
+#[pg_guard]
+pub(super) unsafe extern "C-unwind" fn shutdown_deltax_agg(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state_ptr = (*node).custom_ps as *mut AggScanState;
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        if state.pscan.is_null() {
+            return;
+        }
+        let slot_idx = current_agg_worker_slot();
+        let ps = &mut *state.pscan;
+        if slot_idx >= ps.n_worker_slots as usize {
+            return;
+        }
+        let slot = &mut ps.worker_timings[slot_idx];
+        slot.populated = 1;
+    }
+}
+
+/// Returns the DSM slot index for the current process. Slot 0 is the
+/// leader; worker N (0-indexed in PG) gets slot N+1.
+#[allow(dead_code)] // Phase C.1; widely used in C.2.
+unsafe fn current_agg_worker_slot() -> usize {
+    unsafe {
+        let n = pg_sys::ParallelWorkerNumber;
+        if n < 0 {
+            0
+        } else {
+            ((n as usize) + 1).min(MAX_AGG_WORKER_SLOTS - 1)
+        }
+    }
+}
+
+/// Allocate a minimal `AggScanState` for parallel-worker processes that
+/// short-circuit past the leader's heavy SPI + heap-scan + accumulator
+/// construction. The worker won't emit rows (its `exec_agg_scan` returns
+/// EOF immediately); Phase C.2 will replace this with an actual segment-
+/// claim + partial-aggregate loop driving real `ParallelCompactResult`
+/// state on the worker.
+#[allow(dead_code)] // Phase C.1; activated by `begin_agg_scan` short-circuit.
+fn build_minimal_worker_state() -> AggScanState {
+    AggScanState {
+        _agg_specs: Vec::new(),
+        _group_specs: Vec::new(),
+        result_rows: Vec::new(),
+        result_idx: 0,
+        _num_result_cols: 0,
+        metadata_us: 0,
+        heap_scan_us: 0,
+        detoast_us: 0,
+        decompress_us: 0,
+        agg_us: 0,
+        total_segments: 0,
+        total_rows_processed: 0,
+        batch_quals_count: 0,
+        where_quals_null: true,
+        segments_metadata_resolved: 0,
+        segments_decompressed: 0,
+        regex_cache_size: 0,
+        regex_cache_calls: 0,
+        topn_limit: 0,
+        topn_sort_col: -1,
+        topn_ascending: true,
+        pre_topn_groups: 0,
+        merge_us: 0,
+        finalize_us: 0,
+        topn_select_us: 0,
+        n_workers: 0,
+        bare_limit: 0,
+        wall_us: 0,
+        buf_stats: super::segments::ScanBufferStats::default(),
+        f8_preselected: 0,
+        pscan: std::ptr::null_mut(),
+        is_parallel_worker: true,
+    }
+}
 
 /// Static CustomExecMethods struct for DeltaXAgg.
 pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
@@ -359,11 +655,20 @@ pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods>
         ReScanCustomScan: Some(rescan_agg_scan),
         MarkPosCustomScan: None,
         RestrPosCustomScan: None,
-        EstimateDSMCustomScan: None,
-        InitializeDSMCustomScan: None,
-        ReInitializeDSMCustomScan: None,
-        InitializeWorkerCustomScan: None,
-        ShutdownCustomScan: None,
+        // Phase C.1: hook bodies are functional scaffolding. Workers can
+        // attach to DSM and flag themselves as `is_parallel_worker = true`,
+        // but they don't yet claim segments — `begin_agg_scan` short-
+        // circuits into `build_minimal_worker_state` and `exec_agg_scan`
+        // returns EOF. Phase C.2 wires up the actual segment-claim and
+        // partial-aggregate work.
+        //
+        // `add_agg_path` still sets `parallel_workers = 0` until C.4, so
+        // these hooks remain unused under the default cost path.
+        EstimateDSMCustomScan: Some(estimate_dsm_deltax_agg),
+        InitializeDSMCustomScan: Some(initialize_dsm_deltax_agg),
+        ReInitializeDSMCustomScan: Some(reinit_dsm_deltax_agg),
+        InitializeWorkerCustomScan: Some(init_worker_deltax_agg),
+        ShutdownCustomScan: Some(shutdown_deltax_agg),
         ExplainCustomScan: Some(super::super::explain::explain_agg_scan),
     });
 
@@ -816,7 +1121,7 @@ fn try_catalog_shortcut(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
     })
 }
 
@@ -1105,7 +1410,7 @@ fn try_metadata_fast_path(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
     })
 }
 
@@ -1407,6 +1712,39 @@ unsafe fn accumulate_segment_decompressed(
     }
 }
 
+/// Load metadata via SPI for a `DeltaXAgg` plan. Returns the
+/// `MetadataInfo` plus elapsed micros for the `metadata_us` timer.
+///
+/// Phase-A extraction from `begin_agg_scan`. The same metadata structure
+/// (`col_names`, `col_types`, `col_typmods`, `segment_by`, `time_column`)
+/// is what Phase C's `init_worker_deltax_agg` will hydrate from
+/// `append_wire` instead of running SPI a second time per worker.
+unsafe fn load_agg_metadata_from_plan(
+    companion_oids: &[pg_sys::Oid],
+) -> (super::segments::MetadataInfo, u64) {
+    unsafe {
+        if companion_oids.is_empty() {
+            pgrx::error!("pg_deltax: load_agg_metadata_from_plan called with empty oids");
+        }
+        let first_name = {
+            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+            if name_ptr.is_null() {
+                pgrx::error!(
+                    "pg_deltax: companion table not found for OID {}",
+                    u32::from(companion_oids[0])
+                );
+            }
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let t0 = Instant::now();
+        let meta = Spi::connect(|client| load_metadata(client, &first_name));
+        let metadata_us = t0.elapsed().as_micros() as u64;
+        (meta, metadata_us)
+    }
+}
+
 /// BeginCustomScan callback for DeltaXAgg: decompress and aggregate.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
@@ -1415,6 +1753,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
     _eflags: i32,
 ) {
     unsafe {
+        // Phase C.1: parallel-worker short-circuit. Each worker process runs
+        // its own `BeginCustomScan` (PG calls it per-process for parallel-
+        // aware paths). Workers must NOT duplicate the leader's SPI + heap
+        // scan + accumulator construction — they'd spend the leader-once
+        // cost N times. Instead they install a minimal placeholder state and
+        // wait for `init_worker_deltax_agg` to attach the DSM region.
+        // Phase C.2 will replace the empty body with an actual segment-
+        // claim + `process_segments_compact` loop driven off the DSM cursor.
+        if pg_sys::ParallelWorkerNumber >= 0 {
+            let state = build_minimal_worker_state();
+            let state_ptr = Box::into_raw(Box::new(state));
+            (*node).custom_ps = state_ptr as *mut pg_sys::List;
+            return;
+        }
         let t_wall = Instant::now();
         // Reset per-phase buffer accumulator for this scan. `load_segments_heap`
         // writes to the thread-local; the AggScanState ctor reads it back out
@@ -1431,24 +1783,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
         }
 
-        // Get first companion table name for metadata
-        let first_name = {
-            let name_ptr = pg_sys::get_rel_name(plan.companion_oids[0]);
-            if name_ptr.is_null() {
-                pgrx::error!(
-                    "pg_deltax: companion table not found for OID {}",
-                    u32::from(plan.companion_oids[0])
-                );
-            }
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        // Load metadata via SPI
-        let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(client, &first_name));
-        let metadata_us = t0.elapsed().as_micros() as u64;
+        let (meta, metadata_us) = load_agg_metadata_from_plan(&plan.companion_oids);
 
         // Fast path 1: answer from catalog metadata (no segment scan at all)
         {
@@ -2378,7 +2713,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
                     };
 
                     let state_box = Box::new(state);
@@ -2544,7 +2879,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us: spec_fail_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
                     };
 
                     let state_box = Box::new(state);
@@ -2712,7 +3047,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     wall_us: t_wall.elapsed().as_micros() as u64,
                     buf_stats: super::segments::take_scan_buf_stats(),
                     // Compact (int-only) path doesn't wire F8 today.
-                    f8_preselected: 0,
+                    f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
                 };
 
                 let state_box = Box::new(state);
@@ -3033,7 +3368,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
                 };
 
                 let state_box = Box::new(state);
@@ -3184,7 +3519,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
             };
 
             let state_box = Box::new(state);
@@ -3683,7 +4018,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
                     };
 
                     let state_box = Box::new(state);
@@ -3860,7 +4195,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
                     };
 
                     let state_box = Box::new(state);
@@ -4074,6 +4409,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     buf_stats: super::segments::take_scan_buf_stats(),
                     f8_preselected: preselected_keys.as_ref()
                         .map(|s| s.len() as u64).unwrap_or(0),
+                    pscan: std::ptr::null_mut(),
+                    is_parallel_worker: false,
                 };
 
                 let state_box = Box::new(state);
@@ -4434,7 +4771,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
                 };
 
                 let state_box = Box::new(state);
@@ -4731,7 +5068,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
             };
 
             let state_box = Box::new(state);
@@ -5150,7 +5487,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us: 0,
                 topn_select_us: 0,
                 n_workers: actual_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
             };
 
             let state_box = Box::new(state);
@@ -6514,7 +6851,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             finalize_us,
             topn_select_us,
             n_workers: 0,
-            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0,
+            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(), f8_preselected: 0, pscan: std::ptr::null_mut(), is_parallel_worker: false,
         };
 
         let state_box = Box::new(state);
@@ -6823,6 +7160,15 @@ pub(super) unsafe extern "C-unwind" fn exec_agg_scan(
     unsafe {
         let scan_slot = (*node).ss.ss_ScanTupleSlot;
         let state = &mut *((*node).custom_ps as *mut AggScanState);
+
+        // Phase C.1: parallel workers contribute via DSM and emit no rows
+        // themselves. The leader handles the merge + emit on its own
+        // `exec_agg_scan`. Phase C.2 will fill in the worker's contribution
+        // path before this returns.
+        if state.is_parallel_worker {
+            pg_sys::ExecClearTuple(scan_slot);
+            return scan_slot;
+        }
 
         if state.result_idx < state.result_rows.len() {
             pg_sys::ExecClearTuple(scan_slot);
