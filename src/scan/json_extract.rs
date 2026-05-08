@@ -700,9 +700,20 @@ pub(crate) unsafe fn rewrite_plan_tree(plan: *mut pg_sys::Plan, rtable: *mut pg_
         ) {
             return;
         }
+        // Phase 0: pre-walk the plan tree to collect every chain Expr's
+        // (path, leaf_kind) signature. Phase 1 below uses this set to narrow
+        // its synthetic-forwarder propagation to only the synthetics some
+        // upper-plan chain Expr could actually reference. Without this the
+        // walker propagates ALL of the cscan's synthetics into every ancestor
+        // tlist — fine for correctness, but per-row slot copy overhead shows
+        // up as a 30-50% regression on simple GROUP BY queries that don't
+        // need any propagation at all (JSONBench Q0/Q2).
+        let mut needed: std::collections::HashSet<ChainSig> = std::collections::HashSet::new();
+        collect_chain_signatures_in_plan(plan, &mut needed);
+
         // Phase 1: rewrite chain Exprs in upper plans to Var(OUTER_VAR, k) refs
         // into our scan's synthetic forwarder positions.
-        let _ = rewrite_plan_subtree(plan, rtable);
+        let _ = rewrite_plan_subtree(plan, rtable, &needed);
         // Phase 2: ref-count upper-plan Var(OUTER_VAR, k) refs and rewrite each
         // touched cscan's custom_private to load only the col_idx values that
         // are actually needed (referenced in upper plans, or by scan-level
@@ -713,9 +724,231 @@ pub(crate) unsafe fn rewrite_plan_tree(plan: *mut pg_sys::Plan, rtable: *mut pg_
     }
 }
 
+/// `(path, leaf_kind)` — uniquely identifies a chain Expr's shape. Used by
+/// the phase-0 pre-walk to mark which cscan synthetics are worth propagating
+/// up through intermediate plan tlists.
+type ChainSig = (Vec<String>, ColumnKind);
+
+/// Walk the plan tree and accumulate signatures of every chain Expr found in
+/// any plan's tlist, qual, or Aggref/WindowFunc args. Stops at cscan boundary
+/// (chain Exprs at the cscan are handled by `rewrite_scan_qual_chains` and
+/// don't need propagation).
+unsafe fn collect_chain_signatures_in_plan(
+    plan: *mut pg_sys::Plan,
+    out: &mut std::collections::HashSet<ChainSig>,
+) {
+    unsafe {
+        if plan.is_null() {
+            return;
+        }
+        if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
+            return;
+        }
+        collect_chain_signatures_in_list((*plan).targetlist, out);
+        collect_chain_signatures_in_list((*plan).qual, out);
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Agg => {
+                let a = plan as *mut pg_sys::Agg;
+                collect_chain_signatures_in_list((*a).chain, out);
+            }
+            pg_sys::NodeTag::T_WindowAgg => {
+                let w = plan as *mut pg_sys::WindowAgg;
+                collect_chain_signatures_in_list((*w).runCondition, out);
+            }
+            _ => {}
+        }
+        if !(*plan).lefttree.is_null() {
+            collect_chain_signatures_in_plan((*plan).lefttree, out);
+        }
+        if !(*plan).righttree.is_null() {
+            collect_chain_signatures_in_plan((*plan).righttree, out);
+        }
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Append => {
+                let app = plan as *mut pg_sys::Append;
+                let lst = (*app).appendplans;
+                if !lst.is_null() {
+                    for i in 0..(*lst).length {
+                        let child = pg_sys::list_nth(lst, i) as *mut pg_sys::Plan;
+                        collect_chain_signatures_in_plan(child, out);
+                    }
+                }
+            }
+            pg_sys::NodeTag::T_MergeAppend => {
+                let mapp = plan as *mut pg_sys::MergeAppend;
+                let lst = (*mapp).mergeplans;
+                if !lst.is_null() {
+                    for i in 0..(*lst).length {
+                        let child = pg_sys::list_nth(lst, i) as *mut pg_sys::Plan;
+                        collect_chain_signatures_in_plan(child, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+unsafe fn collect_chain_signatures_in_list(
+    list: *mut pg_sys::List,
+    out: &mut std::collections::HashSet<ChainSig>,
+) {
+    unsafe {
+        if list.is_null() {
+            return;
+        }
+        for i in 0..(*list).length {
+            let elt = pg_sys::list_nth(list, i) as *mut pg_sys::Node;
+            collect_chain_signatures_in_node(elt, out);
+        }
+    }
+}
+
+unsafe fn collect_chain_signatures_in_node(
+    node: *mut pg_sys::Node,
+    out: &mut std::collections::HashSet<ChainSig>,
+) {
+    unsafe {
+        if node.is_null() {
+            return;
+        }
+        if let Some(sig) = chain_signature_of(node) {
+            out.insert(sig);
+        }
+        // Recurse — chain Exprs may be nested inside larger Exprs (CASE,
+        // FuncExpr args, etc.), and we want signatures from every chain.
+        match (*node).type_ {
+            pg_sys::NodeTag::T_OpExpr => {
+                let op = node as *mut pg_sys::OpExpr;
+                collect_chain_signatures_in_list((*op).args, out);
+            }
+            pg_sys::NodeTag::T_BoolExpr => {
+                let b = node as *mut pg_sys::BoolExpr;
+                collect_chain_signatures_in_list((*b).args, out);
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let f = node as *mut pg_sys::FuncExpr;
+                collect_chain_signatures_in_list((*f).args, out);
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                let c = node as *mut pg_sys::CoerceViaIO;
+                collect_chain_signatures_in_node((*c).arg as *mut pg_sys::Node, out);
+            }
+            pg_sys::NodeTag::T_RelabelType => {
+                let r = node as *mut pg_sys::RelabelType;
+                collect_chain_signatures_in_node((*r).arg as *mut pg_sys::Node, out);
+            }
+            pg_sys::NodeTag::T_NullTest => {
+                let n = node as *mut pg_sys::NullTest;
+                collect_chain_signatures_in_node((*n).arg as *mut pg_sys::Node, out);
+            }
+            pg_sys::NodeTag::T_BooleanTest => {
+                let b = node as *mut pg_sys::BooleanTest;
+                collect_chain_signatures_in_node((*b).arg as *mut pg_sys::Node, out);
+            }
+            pg_sys::NodeTag::T_CaseExpr => {
+                let c = node as *mut pg_sys::CaseExpr;
+                collect_chain_signatures_in_list((*c).args, out);
+                if !(*c).defresult.is_null() {
+                    collect_chain_signatures_in_node((*c).defresult as *mut pg_sys::Node, out);
+                }
+                if !(*c).arg.is_null() {
+                    collect_chain_signatures_in_node((*c).arg as *mut pg_sys::Node, out);
+                }
+            }
+            pg_sys::NodeTag::T_CaseWhen => {
+                let c = node as *mut pg_sys::CaseWhen;
+                collect_chain_signatures_in_node((*c).expr as *mut pg_sys::Node, out);
+                collect_chain_signatures_in_node((*c).result as *mut pg_sys::Node, out);
+            }
+            pg_sys::NodeTag::T_Aggref => {
+                let a = node as *mut pg_sys::Aggref;
+                collect_chain_signatures_in_list((*a).args, out);
+                if !(*a).aggfilter.is_null() {
+                    collect_chain_signatures_in_node((*a).aggfilter as *mut pg_sys::Node, out);
+                }
+            }
+            pg_sys::NodeTag::T_WindowFunc => {
+                let w = node as *mut pg_sys::WindowFunc;
+                collect_chain_signatures_in_list((*w).args, out);
+                if !(*w).aggfilter.is_null() {
+                    collect_chain_signatures_in_node((*w).aggfilter as *mut pg_sys::Node, out);
+                }
+            }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                let s = node as *mut pg_sys::ScalarArrayOpExpr;
+                collect_chain_signatures_in_list((*s).args, out);
+            }
+            pg_sys::NodeTag::T_TargetEntry => {
+                let t = node as *mut pg_sys::TargetEntry;
+                collect_chain_signatures_in_node((*t).expr as *mut pg_sys::Node, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk a candidate chain Expr; return its `(path, leaf_kind)` signature if
+/// it has the JSON-extract chain shape (cast?(`->>`(`->`*(Var, key), key))).
+unsafe fn chain_signature_of(node: *mut pg_sys::Node) -> Option<ChainSig> {
+    unsafe {
+        if node.is_null() {
+            return None;
+        }
+        let (chain_root, leaf_kind) = strip_outer_cast(node);
+        let mut path_keys: Vec<String> = Vec::new();
+        let mut cursor = chain_root;
+        let (k, deeper) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
+        path_keys.push(k);
+        cursor = deeper;
+        loop {
+            cursor = unwrap_relabel(cursor);
+            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
+                Some((k, deeper)) => {
+                    path_keys.push(k);
+                    cursor = deeper;
+                }
+                None => break,
+            }
+        }
+        cursor = unwrap_relabel(cursor);
+        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
+            return None;
+        }
+        path_keys.reverse();
+        Some((path_keys, leaf_kind))
+    }
+}
+
 /// Walk a plan subtree. Returns the `SubplanTlist` describing what each
 /// position of THIS plan's targetlist provides to the parent.
-unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan, rtable: *mut pg_sys::List) -> SubplanTlist {
+///
+/// `parent_stack` records the chain of ancestors visited during recursion
+/// (root first, immediate parent last). When we reach a cscan leaf, we use
+/// this stack to propagate synthetic forwarders up through every ancestor
+/// — without that, intermediate plans like `GatherMerge` that PG built with
+/// only the columns it thought necessary (typically passing raw `data`)
+/// would never expose the synthetic to upper-level Aggrefs, and chains
+/// inside `count(distinct data->>'did')`-style aggregates couldn't be
+/// rewritten. Forwarders added here are `resjunk = true` so they don't
+/// affect the user-visible output shape.
+unsafe fn rewrite_plan_subtree(
+    plan: *mut pg_sys::Plan,
+    rtable: *mut pg_sys::List,
+    needed: &std::collections::HashSet<ChainSig>,
+) -> SubplanTlist {
+    unsafe {
+        let mut stack: Vec<*mut pg_sys::Plan> = Vec::new();
+        rewrite_plan_subtree_with_stack(plan, &mut stack, rtable, needed)
+    }
+}
+
+unsafe fn rewrite_plan_subtree_with_stack(
+    plan: *mut pg_sys::Plan,
+    parent_stack: &mut Vec<*mut pg_sys::Plan>,
+    rtable: *mut pg_sys::List,
+    needed: &std::collections::HashSet<ChainSig>,
+) -> SubplanTlist {
     unsafe {
         if plan.is_null() {
             return Vec::new();
@@ -724,11 +957,26 @@ unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan, rtable: *mut pg_sys::Lis
         // Leaf cases first.
         if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
             let cscan = plan as *mut pg_sys::CustomScan;
-            return subplan_tlist_from_deltax_decompress(cscan, rtable).unwrap_or_default();
+            let stl = subplan_tlist_from_deltax_decompress(cscan, rtable).unwrap_or_default();
+            if !stl.is_empty() {
+                // Add resjunk forwarder TLEs to every ancestor so chains in
+                // upper-level Aggrefs/exprs can reference the synthetic via
+                // `Var(OUTER_VAR, k)`. Without this, intermediate plans that
+                // weren't asked to project the synthetic (e.g. GatherMerge
+                // when the upper plan only "needs" raw `data` per PG's plan
+                // analysis) hide it from the chain matcher above. We only
+                // propagate synthetics whose `(path, kind)` matches a chain
+                // Expr seen anywhere in the plan tree (phase-0 set), so simple
+                // queries like `SELECT data->>'kind', count(*) GROUP BY 1`
+                // don't pay propagation overhead for paths nothing references.
+                propagate_synthetics_through_ancestors(parent_stack, &stl, needed);
+            }
+            return stl;
         }
 
-        // Recursive case: collect children's SubplanTlists.
-        let child_stl = collect_child_subplan_tlist(plan, rtable);
+        parent_stack.push(plan);
+        let child_stl = collect_child_subplan_tlist(plan, parent_stack, rtable, needed);
+        parent_stack.pop();
 
         // Substitute any matched chain Exprs in THIS plan's expressions.
         if !child_stl.is_empty() && has_any_synthetic(&child_stl) {
@@ -737,6 +985,106 @@ unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan, rtable: *mut pg_sys::Lis
 
         // Compute MY SubplanTlist by walking my targetlist (post-substitution).
         compute_my_subplan_tlist(plan, &child_stl)
+    }
+}
+
+/// For each synthetic in `cscan_stl`, walk up `ancestors` (immediate parent
+/// first) and ensure each ancestor's targetlist exposes a `Var(OUTER_VAR, k)`
+/// forwarder pointing at the synthetic. Stops at the first ancestor that
+/// already exposes the position (de-dup), so multiple sibling cscans of an
+/// Append don't double-add. New TLEs are `resjunk = true`.
+unsafe fn propagate_synthetics_through_ancestors(
+    ancestors: &[*mut pg_sys::Plan],
+    cscan_stl: &SubplanTlist,
+    needed: &std::collections::HashSet<ChainSig>,
+) {
+    unsafe {
+        for col in cscan_stl.iter() {
+            let SubplanColumn::Synthetic {
+                forwarder_resno,
+                target_kind,
+                path,
+                ..
+            } = col
+            else {
+                continue;
+            };
+            // Skip synthetics no upper-plan chain references — propagation
+            // is purely overhead in that case.
+            let sig: ChainSig = (path.clone(), *target_kind);
+            if !needed.contains(&sig) {
+                continue;
+            }
+            // `forwarder_resno` is the synthetic's position in cscan's
+            // `scan.plan.targetlist`. From there we walk up: each ancestor
+            // adds (or finds) a forwarder TLE that references the position
+            // exposed by the ancestor's immediate child.
+            let var_type = kind_to_type_oid(*target_kind);
+            let var_collid = if matches!(target_kind, ColumnKind::Text) {
+                pg_sys::DEFAULT_COLLATION_OID
+            } else {
+                pg_sys::InvalidOid
+            };
+            let mut current_pos: i16 = *forwarder_resno;
+            for &ancestor in ancestors.iter().rev() {
+                if ancestor.is_null() || (*ancestor).targetlist.is_null() {
+                    continue;
+                }
+                // Reuse an existing TLE that already forwards the same
+                // position — typical when a sibling cscan or a chain
+                // already added one. That keeps the tlist tight and makes
+                // the forwarder chain consistent across siblings.
+                if let Some(existing_resno) =
+                    find_outer_var_forwarder((*ancestor).targetlist, current_pos)
+                {
+                    current_pos = existing_resno;
+                    continue;
+                }
+                let new_resno = ((*(*ancestor).targetlist).length + 1) as i16;
+                let new_var = pg_sys::makeVar(
+                    pg_sys::OUTER_VAR,
+                    current_pos,
+                    var_type,
+                    -1,
+                    var_collid,
+                    0,
+                );
+                let new_tle = pg_sys::makeTargetEntry(
+                    new_var as *mut pg_sys::Expr,
+                    new_resno,
+                    std::ptr::null_mut(),
+                    true,
+                );
+                (*ancestor).targetlist =
+                    pg_sys::lappend((*ancestor).targetlist, new_tle as *mut _);
+                current_pos = new_resno;
+            }
+        }
+    }
+}
+
+/// If `tlist` contains a `TargetEntry` whose expr is `Var(OUTER_VAR, k)` with
+/// `k == varattno`, return that TLE's resno. Otherwise None.
+unsafe fn find_outer_var_forwarder(tlist: *mut pg_sys::List, varattno: i16) -> Option<i16> {
+    unsafe {
+        if tlist.is_null() {
+            return None;
+        }
+        for i in 0..(*tlist).length {
+            let tle = pg_sys::list_nth(tlist, i) as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).expr.is_null() {
+                continue;
+            }
+            let expr = (*tle).expr as *mut pg_sys::Node;
+            if (*expr).type_ != pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            let v = expr as *mut pg_sys::Var;
+            if (*v).varno == pg_sys::OUTER_VAR && (*v).varattno == varattno {
+                return Some((*tle).resno);
+            }
+        }
+        None
     }
 }
 
@@ -883,6 +1231,17 @@ unsafe fn substitute_in_expr_node(
             pg_sys::NodeTag::T_ScalarArrayOpExpr => {
                 let s = node as *mut pg_sys::ScalarArrayOpExpr;
                 (*s).args = substitute_chains_in_list((*s).args, child_stl);
+            }
+            pg_sys::NodeTag::T_TargetEntry => {
+                // Aggref.args is a list of TargetEntry, not raw Exprs.
+                // Without descending into TargetEntry.expr, chain Exprs
+                // inside aggregates like `count(distinct data->>'did')`
+                // never get rewritten — the walker stops at the TargetEntry
+                // boundary and the COUNT DISTINCT case in JSONBench Q1 stays
+                // on the slow chain-eval path.
+                let t = node as *mut pg_sys::TargetEntry;
+                (*t).expr = substitute_in_expr_node((*t).expr as *mut pg_sys::Node, child_stl)
+                    as *mut pg_sys::Expr;
             }
             // Vars, Consts, Params, etc. are leaves with no children to rewrite.
             _ => {}
@@ -2032,21 +2391,27 @@ unsafe fn classify_custom_scan_tlist_entry(
 /// every child can serve it. For everything else, take the lefttree's STL.
 unsafe fn collect_child_subplan_tlist(
     plan: *mut pg_sys::Plan,
+    parent_stack: &mut Vec<*mut pg_sys::Plan>,
     rtable: *mut pg_sys::List,
+    needed: &std::collections::HashSet<ChainSig>,
 ) -> SubplanTlist {
     unsafe {
         match (*plan).type_ {
             pg_sys::NodeTag::T_Append => {
                 let app = plan as *mut pg_sys::Append;
-                intersect_children_subplan_tlists((*app).appendplans, rtable)
+                intersect_children_subplan_tlists(
+                    (*app).appendplans, parent_stack, rtable, needed,
+                )
             }
             pg_sys::NodeTag::T_MergeAppend => {
                 let mapp = plan as *mut pg_sys::MergeAppend;
-                intersect_children_subplan_tlists((*mapp).mergeplans, rtable)
+                intersect_children_subplan_tlists(
+                    (*mapp).mergeplans, parent_stack, rtable, needed,
+                )
             }
             _ => {
                 if !(*plan).lefttree.is_null() {
-                    rewrite_plan_subtree((*plan).lefttree, rtable)
+                    rewrite_plan_subtree_with_stack((*plan).lefttree, parent_stack, rtable, needed)
                 } else {
                     Vec::new()
                 }
@@ -2057,7 +2422,9 @@ unsafe fn collect_child_subplan_tlist(
 
 unsafe fn intersect_children_subplan_tlists(
     plan_list: *mut pg_sys::List,
+    parent_stack: &mut Vec<*mut pg_sys::Plan>,
     rtable: *mut pg_sys::List,
+    needed: &std::collections::HashSet<ChainSig>,
 ) -> SubplanTlist {
     unsafe {
         if plan_list.is_null() || (*plan_list).length == 0 {
@@ -2065,10 +2432,10 @@ unsafe fn intersect_children_subplan_tlists(
         }
         let n = (*plan_list).length;
         let first = pg_sys::list_nth(plan_list, 0) as *mut pg_sys::Plan;
-        let mut acc = rewrite_plan_subtree(first, rtable);
+        let mut acc = rewrite_plan_subtree_with_stack(first, parent_stack, rtable, needed);
         for i in 1..n {
             let child = pg_sys::list_nth(plan_list, i) as *mut pg_sys::Plan;
-            let stl = rewrite_plan_subtree(child, rtable);
+            let stl = rewrite_plan_subtree_with_stack(child, parent_stack, rtable, needed);
             // Intersect element-wise: positions disagreeing become Other.
             // If lengths differ, truncate to shorter — over-approximation that
             // never produces wrong substitutions.
@@ -2181,7 +2548,23 @@ unsafe fn compute_my_subplan_tlist(
                 if (*v).varno == pg_sys::OUTER_VAR {
                     let k = (*v).varattno as usize;
                     if k >= 1 && k <= child_stl.len() {
-                        my_stl.push(child_stl[k - 1].clone());
+                        // Clone the child STL entry but rebase the
+                        // synthetic's `forwarder_resno` to MY tlist
+                        // position (i + 1, 1-based). When a chain at
+                        // a level above me matches against `my_stl`,
+                        // the matcher returns `Var(OUTER_VAR, fr)` —
+                        // that varattno needs to index into MY tlist
+                        // (= my parent's immediate child), not into
+                        // some deeper descendant's tlist.
+                        let mut entry = child_stl[k - 1].clone();
+                        if let SubplanColumn::Synthetic {
+                            ref mut forwarder_resno,
+                            ..
+                        } = entry
+                        {
+                            *forwarder_resno = (i + 1) as i16;
+                        }
+                        my_stl.push(entry);
                         continue;
                     }
                 }

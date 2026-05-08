@@ -60,6 +60,15 @@ sudo -u postgres psql -c "CREATE DATABASE $DB"
 sudo -u postgres psql "$DB" -c "CREATE EXTENSION pg_deltax"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '1GB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET min_parallel_table_scan_size TO '0'"
+# Use the box: PG defaults cap at 2 workers per Gather (~3 cores total),
+# which leaves a 32-vCPU m6i.8xlarge mostly idle during scans. Sized for
+# m6i.8xlarge — bump if you swap instance class.
+sudo -u postgres psql -c "ALTER DATABASE $DB SET max_parallel_workers_per_gather TO 16"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers TO 32"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_worker_processes TO 64"
+# max_worker_processes requires a full restart, the others reload.
+sudo -u postgres psql -c "SELECT pg_reload_conf()"
+sudo systemctl restart postgresql
 
 # Download data
 mkdir -p "$RAW_DIR"

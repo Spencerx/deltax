@@ -887,7 +887,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 // ============================================================================
 
 /// Classifies how to read a column from SPI.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ColumnKind {
     Text,         // text, varchar, char — read as String
     Int16,        // smallint/int2

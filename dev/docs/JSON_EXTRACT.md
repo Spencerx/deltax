@@ -13,13 +13,15 @@ Tier 1 (`pg_deltax.json_extract_mode = 'fields'`) is end-to-end functional:
 
 JSONBench results (m6i.8xlarge, 100M rows, warm):
 
-| Q | Pre-walker | After ref-count + qual rewrite | Notes |
-|---|---|---|---|
-| Q0 | 26s | **5.8s** (4.5×) | filter-free GROUP BY; cleanest case |
-| Q1 | 354s | 353s (≈ baseline) | hits the COUNT(DISTINCT) elision limit (Functional #4) |
-| Q2 | 51s | 26.8s (1.9×) | GROUP BY collection + EXTRACT(time_us) |
-| Q3 | 33s | 25.6s (1.3×) | GROUP BY did + MIN(time_us); LIMIT 3 |
-| Q4 | 34s | 26.3s (1.3×) | GROUP BY did + MAX(time_us)-MIN(time_us); LIMIT 3 |
+| Q | Pre-walker | After walker fixes (3 cores) | +16 workers per gather | Cumulative |
+|---|---|---|---|---|
+| Q0 | 26s | 5.7s | **1.1s** | 24× |
+| Q1 | 354s | 90s | **43s** | 8.2× |
+| Q2 | 51s | 28.3s | **17.0s** | 3.0× |
+| Q3 | 33s | 7.4s | **3.2s** | 10× |
+| Q4 | 34s | 7.9s | **3.6s** | 9.4× |
+
+Total warm time across the 5 queries dropped from ~498s baseline to ~68s — about 7.3× overall. The benchmark setup script (`jsonbench/benchmark.sh`) now bumps `max_parallel_workers_per_gather=16`, `max_parallel_workers=32`, `max_worker_processes=64` to use the 32-vCPU box; PG defaults of 2 workers per gather + 1 leader were leaving ~28 cores idle on every scan.
 
 Earlier numbers in this doc cited a much steeper speedup (Q1 4.1s, Q2-Q4 ~4.1s). Those came from an interim "unconditional Section::Cols prune" walker that silently dropped raw `data` from needed-cols. For queries with chain-Expr filters at the scan level, that prune broke correctness — the chain evaluated to NULL and all rows were filtered out, producing empty result sets very quickly. The bench harness only captured timings, not row counts, so the regression went undetected. The current ref-count walker returns correct results; the speedups above are real.
 
@@ -54,19 +56,29 @@ Tests in `tests/test_jsonb_extract.py`: `test_coalesce_with_chain`, `test_chain_
 
 Still hand-rolled and incomplete: `substitute_in_expr_node` and `substitute_scan_chains_in_node` (the rewrite-side walkers). They mutate node trees in place so can't trivially be replaced with `pull_var_clause`. Coverage today: `OpExpr`, `BoolExpr`, `FuncExpr`, `CoerceViaIO`, `RelabelType`, `NullTest`, `CaseExpr`/`CaseWhen`, `Aggref`, `WindowFunc`, `ScalarArrayOpExpr`. Missing the JSON-related ones (`JsonValueExpr`, `JsonExpr`) plus `CoalesceExpr`/`MinMaxExpr`/`RowExpr`/`NullIfExpr`. The miss is a perf gap (chain Exprs inside those nodes don't get rewritten — fall through to slow path) but not correctness, since the ref-counter now keeps `data` for those quals automatically. Migrate to `expression_tree_mutator` when convenient.
 
-### 4. Inject synthetics through intermediate-plan tlist elision
+### 4. ~~Inject synthetics through intermediate-plan tlist elision~~ — DONE
 
-Triggered by JSONBench Q1's `COUNT(DISTINCT data->>'did')`. The PG planner builds intermediate plan tlists (Sort, GatherMerge) to pass through only what the *next* level needs. When an upper-level Aggref contains a chain Expr but the immediate child's tlist doesn't carry the corresponding synthetic, the walker can't match — the chain stays, raw `data` flows up the tree, and the perf win evaporates.
+Two changes in `json_extract.rs`:
 
-Two implementation directions:
-- **Tlist injection at plan time**: hook into the planner earlier (`set_rel_pathlist_hook` or `create_partial_grouping_paths`) to ensure that any synthetic needed by an upper-level chain Expr is added to all intermediate plan tlists between the cscan and the level where the Aggref lives. This is the most robust but touches more of PG's planning machinery.
-- **Aggref-args pre-walk**: scan top-level Aggref/WindowFunc args for chain Exprs first, then push the matching synthetic into the cscan tlist + every intermediate tlist before phase-1 rewrite runs. Less invasive but only handles aggregates (not e.g. lateral subqueries).
+1. **`propagate_synthetics_through_ancestors`**: when the walker descends into a cscan, it walks back up the parent stack and injects resjunk forwarder `TargetEntry` nodes into every ancestor's tlist for each cscan synthetic. Each forwarder is `Var(OUTER_VAR, k)` pointing at the next-level-down's just-added forwarder. `find_outer_var_forwarder` de-dups when the same position is propagated by multiple sibling cscans of an Append.
+2. **`compute_my_subplan_tlist` rebases `forwarder_resno`**: when propagating a `Synthetic` SubplanColumn up via a `Var(OUTER_VAR, k)` ref, the cloned entry's `forwarder_resno` is reset to the position in MY tlist (`i + 1`). Without this, the matcher's returned `Var(OUTER_VAR, fr)` would carry the cscan-level position and wrongly index into the immediate child's tlist.
+3. **`substitute_in_expr_node` descends into `T_TargetEntry`**: `Aggref.args` is a list of TargetEntries (not raw Exprs). Without this, chain Exprs nested inside aggregates like `COUNT(DISTINCT data->>'did')` and `MIN((data->>'time_us')::bigint)` never reached the matcher — the walker stopped at the TargetEntry boundary and the entire aggregate stayed on the slow chain-eval path.
+
+JSONBench results post-fix (warm, 100M rows, m6i.8xlarge):
+
+| Q | Pre-fix | Post-fix |
+|---|---|---|
+| Q0 | 5.8s | 8.7s (regression — propagation overhead) |
+| Q1 | 354s | **94s** (3.8×) — was the canonical case |
+| Q2 | 26.8s | 32.3s (regression) |
+| Q3 | 25.6s | **7.8s** (3.3×) — `MIN((data->>'time_us')::bigint)` |
+| Q4 | 26.3s | **8.3s** (3.2×) — `MAX-MIN((data->>'time_us')::bigint)` |
+
+Net: 437s total warm → 151s. About 3× overall.
+
+**Narrow-propagation pre-pass (`collect_chain_signatures_in_plan`)**: phase 0 walks the plan tree and collects every chain Expr's `(path, leaf_kind)` signature. The propagation step then only injects forwarders for cscan synthetics whose signature appears in that set. Without this, simple queries like Q0 (`SELECT data->>'kind', count(*) GROUP BY 1`) paid 5 forwarders × 4 plan levels of per-row slot copies even though only one synthetic mattered. With it, propagation cost scales with what the query actually needs — Q0 went 8.7s → 5.7s (down to its pre-propagation level), Q2 32.3s → 28.3s.
 
 SubqueryScan / CTE pass-through is a related but separable issue: subqueries opacify the chain at the boundary. Walker would descend into `SubqueryScan.subplan` and map its tlist 1:1.
-
-Tests:
-- Q1-style: `SELECT collection, COUNT(DISTINCT data->>'did') FROM bluesky GROUP BY 1` — assert the cscan's `custom_private` has `did` synthetic in Section::Synth, not raw `data` in Section::Cols. Pair with a timing assertion that the warm run is sub-second on a small dataset.
-- CTE: `WITH t AS (SELECT data FROM bluesky) SELECT data->>'kind', count(*) FROM t GROUP BY 1` — assert the rewrite still fires.
 
 ### 5. Type coverage
 
@@ -110,9 +122,11 @@ Q3/Q4 are `... ORDER BY ... LIMIT 3`. The existing Top-N early-exit path should 
 
 Test: small LIMIT query asserting `Phase 2 skipped` segments > 0 in the EXPLAIN annotation.
 
-### P4. Push GROUP BY / count(\*) into DeltaXAppend
+### P4. Push GROUP BY / count(\*) into DeltaXAppend (and make it synthetic-aware)
 
 The bulk of the ClickHouse gap sits in PG's per-row HashAgg over decompressed rows. Pushing simple aggregations into the custom scan (return per-segment partial aggregates, let PG's HashAgg combine) is the multi-hundred-percent lever — but big surgery. Helps ClickBench too.
+
+json_extract interaction worth calling out: the existing pushdown (`DeltaXCount`, future `DeltaXAgg`) keys off bare `Var` references at the scan level. After the walker rewrites a chain Expr in an upper plan to `Var(OUTER_VAR, k_synth)`, that ref lives at the upper plan, not the scan — so pushdown won't see it as an aggregable column. Closing this requires teaching the pushdown planner to look through forwarders (or, equivalently, doing the json_extract rewrite in `set_rel_pathlist_hook` early enough that the synthetic Var is visible to the existing pushdown machinery as if it were a physical column). Without that, aggregates over chain Exprs lose both the json_extract speedup AND the aggregate-pushdown speedup — Q3/Q4's `MIN(time_us)` patterns are the obvious cases.
 
 Cross-reference: `dev/docs/VECTORIZE.md` may already sketch this for the non-JSON path.
 
