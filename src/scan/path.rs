@@ -1812,6 +1812,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, 0);
         }
 
+        // Phase C.2 activation trailer: is_partial flag. False for now;
+        // C.2 activation flips this to true on the partial-mode CustomPath.
+        // parse_agg_private treats absence as false for backward-compat.
+        private_list = pg_sys::lappend_int(private_list, 0);
+
         (*cscan).custom_private = private_list;
         (*cscan).scan.plan.qual = std::ptr::null_mut();
 

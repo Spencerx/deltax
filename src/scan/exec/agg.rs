@@ -416,6 +416,12 @@ pub(crate) struct AggExecContext {
     /// True after a worker has serialised its partial into the slab.
     /// Reset by `rescan_agg_scan`. Unused on the leader.
     pub(super) worker_done: bool,
+    /// Phase C.2 activation: when true, this CustomScan emits per-group
+    /// partial-aggregate transition states (via `compact_emit_partial`) for
+    /// a Final Aggregate above to combine. Default false for the existing
+    /// complete-aggregate path.
+    #[allow(dead_code)] // wired by C.2 activation
+    pub(super) is_partial: bool,
 }
 
 // ============================================================================
@@ -773,6 +779,7 @@ unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> AggExecContex
             topn_sort_col,
             topn_ascending,
             bare_limit: _,
+            is_partial,
         } = plan;
 
         let num_cols = meta.col_names.len();
@@ -861,6 +868,7 @@ unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> AggExecContex
             num_result_cols,
             merged: false,
             worker_done: false,
+            is_partial,
         }
     }
 }
@@ -984,6 +992,13 @@ pub(super) struct ParsedAggPlan {
     pub(super) topn_sort_col: usize,
     pub(super) topn_ascending: bool,
     pub(super) bare_limit: i64,
+    /// Phase C.2 activation: when true, this CustomScan is the partial-mode
+    /// node below a Gather + Final Aggregate. exec_agg_scan emits per-group
+    /// rows whose values match PG's `aggtranstype` (via `compact_emit_partial`)
+    /// instead of final-aggregate values. Default false → existing
+    /// complete-aggregate path.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub(super) is_partial: bool,
 }
 
 /// Deserialize a CaseWhenValue from a custom_private integer list.
@@ -1293,6 +1308,16 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
             }
         }
     }
+    // Phase C.2 activation: trailing `is_partial` flag (1 byte). Older
+    // plans / test fixtures may end without it — default false in that
+    // case so existing paths stay compatible.
+    let is_partial = if idx < list_len {
+        let v = pg_sys::list_nth_int(custom_private, idx) != 0;
+        idx += 1;
+        v
+    } else {
+        false
+    };
     let _ = idx;
 
     ParsedAggPlan {
@@ -1306,6 +1331,7 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
         topn_sort_col,
         topn_ascending,
         bare_limit,
+        is_partial,
     }
     } // unsafe
 }
@@ -2167,7 +2193,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let ParsedAggPlan {
             companion_oids, agg_specs, group_specs, output_map,
             having_filters, where_quals, topn_limit, topn_sort_col, topn_ascending,
-            bare_limit,
+            bare_limit, is_partial: _,
         } = plan;
 
         // Build needed_cols: only columns referenced by aggregates and group-by
@@ -7623,7 +7649,9 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
             }
         }
 
-        // Finalise into result_rows.
+        // Finalise into result_rows. When ctx.is_partial, emit each agg
+        // slot's PG aggtranstype value (combined upstream by Final Agg);
+        // otherwise emit the user-visible final value.
         let result_rows = finalise_compact_into_result_rows(
             &global.compact_map,
             &global.compact_storage,
@@ -7631,6 +7659,7 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
             &ctx.group_specs,
             &ctx.output_map,
             ctx.num_result_cols,
+            ctx.is_partial,
         );
 
         state.total_segments = global.segments_processed;
@@ -7649,6 +7678,11 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
 /// The parallel-aware path's eligibility (C.2.f) excludes HAVING, Top-N, and
 /// CountDistinct, so this is the simplest variant — no filter pass, no sort,
 /// no special-case finalisation.
+///
+/// When `is_partial = true` (Phase C.2 activation), each agg slot is emitted
+/// via `compact_emit_partial` (returning the PG `aggtranstype` value) instead
+/// of the user-visible final value — a Final Aggregate node above DeltaXAgg
+/// then combines the partials via `aggcombinefn`.
 unsafe fn finalise_compact_into_result_rows(
     global_map: &CompactGroupMap,
     global_storage: &CompactAccStorage,
@@ -7656,6 +7690,7 @@ unsafe fn finalise_compact_into_result_rows(
     group_specs: &[GroupByColSpec],
     output_map: &[OutputEntry],
     num_result_cols: usize,
+    is_partial: bool,
 ) -> Vec<Vec<(pg_sys::Datum, bool)>> {
     unsafe {
         let num_group_keys = group_specs.len();
@@ -7663,7 +7698,12 @@ unsafe fn finalise_compact_into_result_rows(
         for (&packed_key, &group_idx) in global_map {
             let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(agg_specs.len());
             for (spec_idx, spec) in agg_specs.iter().enumerate() {
-                agg_results.push(compact_finalize(global_storage, group_idx, spec_idx, spec));
+                let val = if is_partial {
+                    compact_emit_partial(global_storage, group_idx, spec_idx, spec)
+                } else {
+                    compact_finalize(global_storage, group_idx, spec_idx, spec)
+                };
+                agg_results.push(val);
             }
             let keys = unpack_int_keys(packed_key, num_group_keys);
             let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
@@ -10912,6 +10952,7 @@ mod tests {
             topn_sort_col: 0,
             topn_ascending: true,
             bare_limit: 0,
+            is_partial: false,
         }
     }
 
