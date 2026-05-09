@@ -828,16 +828,13 @@ unsafe fn collect_chain_signatures_in_plan(
         }
         collect_chain_signatures_in_list((*plan).targetlist, out);
         collect_chain_signatures_in_list((*plan).qual, out);
-        match (*plan).type_ {
-            pg_sys::NodeTag::T_Agg => {
-                let a = plan as *mut pg_sys::Agg;
-                collect_chain_signatures_in_list((*a).chain, out);
-            }
-            pg_sys::NodeTag::T_WindowAgg => {
-                let w = plan as *mut pg_sys::WindowAgg;
-                collect_chain_signatures_in_list((*w).runCondition, out);
-            }
-            _ => {}
+        // `Agg.chain` is a list of sub-Agg *plan* nodes (GROUPING SETS
+        // rollup) — not expressions — so don't pass it through the
+        // expression walker. Each chain Agg's targetlist/qual is
+        // processed via the normal plan-tree recursion below.
+        if let pg_sys::NodeTag::T_WindowAgg = (*plan).type_ {
+            let w = plan as *mut pg_sys::WindowAgg;
+            collect_chain_signatures_in_list((*w).runCondition, out);
         }
         if !(*plan).lefttree.is_null() {
             collect_chain_signatures_in_plan((*plan).lefttree, out);
@@ -1461,6 +1458,23 @@ unsafe fn subplan_tlist_from_deltax_decompress(
             return None;
         }
 
+        // Skip the cstlist rebuild entirely when no chain Expr in the plan
+        // could reference any synthetic. Without this gate, queries that
+        // don't touch any chain Expr but run over a parent table whose
+        // deltatable has json_extract configured ended up with a cstlist
+        // containing all synthetics, which widens the cscan's scan tuple
+        // descriptor (it's sized from custom_scan_tlist, not
+        // scan.plan.targetlist). The widened tuple shape then breaks
+        // direct-feed JOINs over the cscan output: setrefs computes
+        // `Var(OUTER_VAR, k)` against scan.plan.targetlist, but the
+        // slot-position math in HashJoin / NestLoop reads from the wider
+        // scan tuple slot — the join's probe value comes from the wrong
+        // physical slot position and matches nothing.
+        let needs_chain_rewrite = check_cscan_has_relevant_synthetics(cscan, rtable, needed);
+        if !needs_chain_rewrite {
+            return None;
+        }
+
         // Rebuild `custom_scan_tlist` here. We can't trust whatever
         // `plan_custom_path` set on it: empirically, that value is
         // observed as NIL by the time `planner_hook` runs (post-
@@ -1996,16 +2010,18 @@ unsafe fn add_node_specific_referenced_positions(
 
 /// Collect `Var(OUTER_VAR, k)` refs from node-specific expression-bearing
 /// fields beyond `tlist` and `qual` (which the caller already walks).
+///
+/// Note: `Agg.chain` is intentionally **not** walked here — its entries
+/// are sub-Agg *plan* nodes (the GROUPING SETS rollup chain), not
+/// expressions, so passing them to `pull_var_clause` errors with
+/// "unrecognized node type" on T_Agg. Each chain Agg has its own
+/// targetlist/qual that PG processes separately at execution time.
 unsafe fn add_node_specific_outer_var_refs(
     plan: *mut pg_sys::Plan,
     out: &mut PosSet,
 ) {
     unsafe {
         match (*plan).type_ {
-            pg_sys::NodeTag::T_Agg => {
-                let a = plan as *mut pg_sys::Agg;
-                collect_outer_var_attnos_in_list((*a).chain, out);
-            }
             pg_sys::NodeTag::T_WindowAgg => {
                 let w = plan as *mut pg_sys::WindowAgg;
                 collect_outer_var_attnos_in_list((*w).runCondition, out);
@@ -2560,6 +2576,51 @@ unsafe fn intersect_children_subplan_tlists(
 /// from scratch. Returns `None` when the rel isn't a deltax-managed table
 /// or has no extraction configured. Returns `Some(NIL)` to signal "tried
 /// but nothing to add" (caller treats as None).
+/// Companion to `rebuild_custom_scan_tlist_from_catalog`: returns true iff
+/// any `json_extract` spec for this cscan's parent rel matches a chain
+/// signature in `needed` (the set collected from upper-plan chain Exprs).
+/// When false, the cscan can stay at the shape `plan_custom_path` set,
+/// avoiding a slot-descriptor widening that breaks setrefs's slot-position
+/// math in direct-feed JOINs over the cscan output.
+unsafe fn check_cscan_has_relevant_synthetics(
+    cscan: *mut pg_sys::CustomScan,
+    rtable: *mut pg_sys::List,
+    needed: &std::collections::HashSet<ChainSig>,
+) -> bool {
+    unsafe {
+        if needed.is_empty() {
+            return false;
+        }
+        let scanrelid = (*cscan).scan.scanrelid;
+        if scanrelid == 0 || rtable.is_null() {
+            return false;
+        }
+        let rti_zero_indexed = (scanrelid as i32) - 1;
+        if rti_zero_indexed < 0 || rti_zero_indexed >= (*rtable).length {
+            return false;
+        }
+        let rte = pg_sys::list_nth(rtable, rti_zero_indexed) as *mut pg_sys::RangeTblEntry;
+        if rte.is_null() {
+            return false;
+        }
+        let rel_oid = (*rte).relid;
+        if rel_oid == pg_sys::InvalidOid {
+            return false;
+        }
+        let specs = crate::scan::path::load_extract_specs_for_rel_pub(rel_oid);
+        if specs.is_empty() {
+            return false;
+        }
+        // Any spec whose (path, target_kind) is in `needed` triggers the
+        // rewrite. Otherwise the synthetics in this deltatable are
+        // unreferenced by this query and we can skip the rewrite entirely.
+        specs.iter().any(|s| {
+            let sig: ChainSig = (s.path.clone(), s.target_kind);
+            needed.contains(&sig)
+        })
+    }
+}
+
 unsafe fn rebuild_custom_scan_tlist_from_catalog(
     cscan: *mut pg_sys::CustomScan,
     rtable: *mut pg_sys::List,

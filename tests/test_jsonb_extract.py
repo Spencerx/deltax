@@ -569,6 +569,113 @@ class TestWalkerForwarderGate:
         assert len(rows) == 5
         assert all(r[1] == "Delivered" for r in rows)
 
+    def test_chain_unreferenced_direct_feed_join(self, db):
+        """Regression for the direct-feed JOIN returning 0 rows: cscan
+        output feeds straight into a Hash/NestLoop join (no Materialize,
+        no CTE in between) on a query that doesn't reference any chain
+        Expr. Without the gate, the cscan's slot tuple descriptor is
+        widened by `rebuild_custom_scan_tlist_from_catalog` adding
+        synthetics, but PG's `set_customscan_references` resolved
+        `Var(OUTER_VAR, k)` against the original (un-widened) shape —
+        the join's probe side reads the wrong physical slot position
+        and every comparison fails."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE oe (
+                order_id integer NOT NULL,
+                event_created timestamptz NOT NULL,
+                event_type text NOT NULL,
+                data jsonb
+            )
+        """)
+        db.execute("CREATE TABLE oi (order_id integer NOT NULL, amount integer NOT NULL)")
+        db.execute("SELECT deltax_create_table('oe', 'event_created', '1 day'::interval, 5)")
+        db.execute(
+            "SELECT deltax_enable_compression('oe', "
+            "order_by => ARRAY['order_id','event_created'], segment_size => 50, "
+            "json_extract => '[{\"src\":\"data\","
+            "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
+        )
+        db.execute("SET pg_deltax.json_extract_mode = 'fields'")
+        db.commit()
+
+        rows = []
+        for oid in range(1, 11):
+            for i in range(3):
+                rows.append((str(oid), f"2025-01-{15 + i % 3:02d} 10:00:00+00",
+                             "Delivered", json.dumps({"terminal": "Berlin"})))
+        text = "\n".join("\t".join(r) for r in rows) + "\n"
+        with db.cursor() as cur:
+            with cur.copy("COPY oe FROM STDIN WITH (FORMAT deltax_compress)") as cp:
+                cp.write(text)
+            i_text = "\n".join(f"{i}\t1" for i in range(1, 11)) + "\n"
+            with cur.copy("COPY oi FROM STDIN") as cp:
+                cp.write(i_text)
+        db.commit()
+
+        # Direct-feed Hash Join — no Materialize, no CTE.
+        n = db.execute(
+            "SELECT count(*) FROM oe JOIN oi USING (order_id) "
+            "WHERE event_type='Delivered'"
+        ).fetchone()[0]
+        # 30 events × 1 matching item each = 30.
+        assert n == 30, f"direct-feed join: expected 30 rows, got {n}"
+
+    def test_grouping_sets_with_walker_active(self, db):
+        """Regression for the `unrecognized node type` error on Agg.chain:
+        a query with GROUPING SETS that has no chain Expr, no synthetic
+        column in its plan, but runs while the walker is active. Without
+        the fix, the walker passed `Agg.chain` (a List of *plan* nodes —
+        the GROUPING SETS rollup) to `pull_var_clause` (an
+        expression-tree walker), which errored on T_Agg = node 361 in
+        PG17."""
+        # Set up a table with json_extract configured (to activate the
+        # walker) — but the test query won't touch the chain.
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE events_gs (
+                ts TIMESTAMPTZ NOT NULL,
+                country TEXT,
+                state TEXT,
+                amount INTEGER,
+                data JSONB
+            )
+        """)
+        db.execute(
+            "SELECT deltax_create_table('events_gs', 'ts', '1 day'::interval, 5)"
+        )
+        db.execute(
+            "SELECT deltax_enable_compression('events_gs', "
+            "order_by => ARRAY['ts'], segment_size => 50, "
+            "json_extract => '[{\"src\":\"data\","
+            "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
+        )
+        db.execute("SET pg_deltax.json_extract_mode = 'fields'")
+        db.commit()
+
+        rows = []
+        for i in range(20):
+            rows.append((f"2025-01-15 {i:02d}:00:00+00",
+                         "DE" if i % 2 else "US",
+                         "Berlin" if i % 3 == 0 else "Hamburg",
+                         str(i + 1),
+                         json.dumps({"terminal": "T"})))
+        text = "\n".join("\t".join(r) for r in rows) + "\n"
+        with db.cursor() as cur:
+            with cur.copy("COPY events_gs FROM STDIN WITH (FORMAT deltax_compress)") as cp:
+                cp.write(text)
+        db.commit()
+
+        # GROUPING SETS query — without the fix, this errored with
+        # `unrecognized node type: 361` during planning.
+        rows = db.execute(
+            "SELECT country, state, sum(amount) FROM events_gs "
+            "GROUP BY GROUPING SETS ((country), (country, state), ()) "
+            "ORDER BY country NULLS LAST, state NULLS LAST"
+        ).fetchall()
+        # Always > 0 since GROUPING SETS includes the empty-group row.
+        assert len(rows) > 0
+
 
 class TestMixedPartitionGate:
     """Partitions compressed before `json_extract` was added don't have
