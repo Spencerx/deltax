@@ -377,6 +377,42 @@ def test_phase_d_count_distinct_with_where(db):
     assert fast == ref, f"Phase D + WHERE: fast={fast} ref={ref}"
 
 
+def test_c3_segment_skipping_with_numeric_where(db):
+    """C.3 per-segment fast path: a numeric WHERE that rejects an entire
+    segment via col_minmax should let the worker skip it without
+    decompression. Correctness gate: result matches the same query with
+    `pg_deltax.parallel_workers=1` (forces the serial path that doesn't
+    use the C.3 short-circuit), proving NonePass classification matches
+    per-row evaluation."""
+    _seed(db, n_partitions=3, rows_per_partition=30_000)
+    # WHERE val < 1000 — only the first ~1000 rows of each partition
+    # match. Per-segment col_minmax should resolve most segments as
+    # NonePass (val >= 1000 throughout).
+    sql = (
+        "SELECT count(*), sum(val) FROM events WHERE val < 1000"
+    )
+    fast = db.execute(sql).fetchone()
+    db.execute("SET pg_deltax.parallel_workers = 1")
+    try:
+        ref = db.execute(sql).fetchone()
+    finally:
+        db.execute("RESET pg_deltax.parallel_workers")
+    assert fast == ref, f"C.3 NonePass: fast={fast} ref={ref}"
+
+
+def test_c3_segment_allpass_with_numeric_where(db):
+    """C.3 AllPass path: a WHERE that's satisfied by every row (val >= 0
+    over a non-negative-only `val` column) should let the worker skip
+    `evaluate_batch_quals` entirely. Result must equal the unfiltered
+    aggregate."""
+    _seed(db, n_partitions=3, rows_per_partition=30_000)
+    sql_filtered = "SELECT count(*), sum(val) FROM events WHERE val >= 0"
+    sql_unfiltered = "SELECT count(*), sum(val) FROM events"
+    a = db.execute(sql_filtered).fetchone()
+    b = db.execute(sql_unfiltered).fetchone()
+    assert a == b, f"C.3 AllPass: filtered={a} unfiltered={b}"
+
+
 def test_phase_d_null_count_distinct(db):
     """COUNT(DISTINCT col) excludes NULLs by SQL semantics. Phase D's
     bitset path must observe this — the dict NULL sentinel maps to

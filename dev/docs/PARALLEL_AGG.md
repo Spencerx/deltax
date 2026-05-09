@@ -1,21 +1,32 @@
 # Parallel-aware DeltaXAgg — implementation plan
 
+> **Note (2026-05)**: this doc has been revised in place after a mid-flight design pivot. The original plan (Phases A–F, all built around DSM-slab worker parallelism for the complete CustomScan path) was abandoned in favour of a partial+Gather+FinalAgg model — see "C.2 activation followup". As a result, items C.2.b–e and C.4 are marked superseded (⊘) rather than deleted; the body of the doc still describes the original DSM design in places (Phase C "Approach", Critical files, Reuse list) for historical context. The Status section + the C.2 activation followup + Partial-path coverage extensions sections together describe **what's actually live and what's open**.
+
+## What's actually open
+
+After the pivot:
+- **C.3** — tri-state `BatchEval` + `SegmentEval` per-segment fast path. Independent of pivot, still useful.
+- **Partial-path coverage extensions** (modern C.4 equivalent) — text WHERE, SUM(int8) / AVG, HAVING, COUNT(DISTINCT). Each broadens the partial+Gather+FinalAgg path's eligibility.
+- **Phase E** — HAVING in the partial path (overlaps with the coverage extensions).
+- **Phase F** — EXPLAIN per-worker stats + GUCs + hardening.
+- **Phase G follow-ups** for high-cardinality COUNT(DISTINCT text)** — pre-hashed text sidecars / hash-as-storage encodings / approximate count-distinct (HLL). Not in original doc; surfaced when Phase D didn't move JSONBench Q1.
+
 ## Status
 
 - [x] DeltaXAgg already exists for serial CustomScan-based aggregation (`src/scan/exec/agg.rs`, ~11K lines). Supports COUNT, COUNT(DISTINCT), MIN, MAX, SUM, AVG with optional GROUP BY/HAVING. Internal `std::thread::scope` parallelism via `process_segments_compact` + `merge_compact_results`.
 - [x] **Phase A (refactor for reuse)** — much smaller than originally planned because the per-segment work and merge logic were **already extracted** as standalone functions in the existing codebase. Only addition was `load_agg_metadata_from_plan` helper (`agg.rs`) so worker hydration in Phase C can call the same SPI loader the leader does. The thread-scope path's per-segment body is already callable from anywhere as `process_segments_compact(segments, config) -> ParallelCompactResult`; merge as `merge_compact_results(...)`. No further extraction needed.
 - [x] **Phase B (DSM hook scaffolding)** — `DeltaXAggPState` struct + `AggTimingShmem` + `MAX_AGG_WORKER_SLOTS` const + 5 stub DSM hook functions all `#[allow(dead_code)]`. `DELTAX_AGG_EXEC_METHODS` still has `None` for DSM slots; `add_agg_path` keeps `parallel_workers = 0`. No behaviour change. Tests + clippy clean.
-- [ ] Phase C — workers do real partial-aggregate work; per-segment fast path; tri-state `BatchEval`. **The big remaining chunk** (~3-5 sessions). Sub-tasks:
+- [~] Phase C — workers do real partial-aggregate work; per-segment fast path; tri-state `BatchEval`. **Pivoted mid-flight**: the original DSM-slab parallel-aware design (C.2.b–e, C.4) was abandoned after the C.2 activation followup proved it incompatible with PG's Gather semantics. The replacement — a partial+Gather+FinalAgg model — is documented under "C.2 activation followup" below and is **active in production for numeric-WHERE queries**. C.3 (per-segment fast path) is the only remaining sub-task that survives the pivot intact. Sub-tasks:
   - [x] **C.0**: `AggScanState` carries `pscan: *mut DeltaXAggPState` and `is_parallel_worker: bool` (initialised at every construction site). Phase B's `DeltaXAggPState` struct is now reachable from state. Tests + clippy clean.
-  - [x] **C.1**: DSM hook bodies are functional. `estimate_dsm_deltax_agg` sizes `DeltaXAggPState`. `initialize_dsm_deltax_agg` zeroes the struct + sets `n_worker_slots`. `reinit_dsm_deltax_agg` resets the cursor + clears timing. `init_worker_deltax_agg` stores `pscan` + flags `is_parallel_worker = true`. `shutdown_deltax_agg` stamps `populated = 1` in the worker's slot. `begin_agg_scan` short-circuits for workers via `build_minimal_worker_state`; `exec_agg_scan` returns EOF for workers. All 5 hooks wired into `DELTAX_AGG_EXEC_METHODS`. `add_agg_path` keeps `parallel_workers = 0` so the path is dormant at runtime — no behavior change.
-  - [ ] **C.2**: serialize `ParallelCompactResult` to DSM bytes (compact format). Workers `process_segments_compact` over claimed segments and write the result to their DSM slab. Leader's `exec_agg_scan` first call deserialises every populated slab and feeds `merge_compact_results`. Sub-tasks:
-    - [x] **C.2.a**: extend `DeltaXAggPState` with `partial_slab_size: u32` + `partial_lens: [AtomicU64; N]` + `slab_ptr(slot)` helper. `PARTIAL_SLAB_SIZE_BYTES = 32 MB` const. `estimate_dsm_deltax_agg` sizes for `[state][N+1 slabs]`. `initialize_dsm_deltax_agg` populates `partial_slab_size`. `reinit_dsm_deltax_agg` zeroes `partial_lens`. Tests + clippy clean.
-    - [ ] **C.2.b**: serialize / deserialize `ParallelCompactResult` (no `cd_sidecar` — Phase D). Fixed-size header + map entries + storage buf + arena buf + optional topk keys. `Result<bytes_written, ()>` API for serialise; `ParallelCompactResult` reconstruction for deserialise. Round-trip unit test.
-    - [ ] **C.2.c**: restructure `begin_agg_scan` for parallel-aware mode — leader stops short of `process_segments_compact`, stores `segments_data` + parsed plan + agg/group specs on `AggScanState` instead. Workers' `init_worker_deltax_agg` extends C.1 with metadata-load (re-SPI for now) + plan-parse + spec build.
-    - [ ] **C.2.d**: worker `exec_agg_scan` first-call body — claim segments via `next_segment.fetch_add(1)`, run `process_segments_compact`, accumulate into local `ParallelCompactResult`, serialize to slab, write `partial_lens[k]`, set `populated = 1` with Release ordering, return EOF.
-    - [ ] **C.2.e**: leader `exec_agg_scan` first-call body — claim segments alongside workers (leader is slot 0), spin-wait for workers' `populated == 1` with Acquire, deserialise each populated slab, merge via `merge_compact_results`, finalize, cache `result_rows`, emit row 0.
-    - [x] **C.2.f (partial)**: cost-aware infrastructure in place — eligibility predicate, `recommend_agg_workers` helper in `cost.rs`, `estimate_agg_cost(..., workers)` parallel-divisor adjustment, `path::peek_agg_topn_info`, `agg::can_use_compact_keys_path` re-export. **Runtime activation deferred** — see "C.2 activation follow-up" below.
-    - [ ] **C.2.g**: tests in `tests/test_aggregate_pushdown.py` parameterised over `max_parallel_workers_per_gather ∈ {0, 2, 4}`. Pending C.2 activation.
+  - [x] **C.1**: DSM hook bodies are functional. `estimate_dsm_deltax_agg` sizes `DeltaXAggPState`. `initialize_dsm_deltax_agg` zeroes the struct + sets `n_worker_slots`. `reinit_dsm_deltax_agg` resets the cursor + clears timing. `init_worker_deltax_agg` stores `pscan` + flags `is_parallel_worker = true`. `shutdown_deltax_agg` stamps `populated = 1` in the worker's slot. `begin_agg_scan` short-circuits for workers via `build_minimal_worker_state`; `exec_agg_scan` returns EOF for workers. All 5 hooks wired into `DELTAX_AGG_EXEC_METHODS`. `add_agg_path` keeps `parallel_workers = 0` so the path is dormant at runtime — no behavior change. **Hooks themselves are dead code post-pivot — kept compiled in case the DSM model is revived.**
+  - [~] **C.2**: serialize `ParallelCompactResult` to DSM bytes. **Superseded** by the partial+Gather+FinalAgg activation (see "C.2 activation followup" below). Sub-tasks:
+    - [x] **C.2.a**: extend `DeltaXAggPState` with `partial_slab_size: u32` + `partial_lens: [AtomicU64; N]` + `slab_ptr(slot)` helper. Scaffolding only; not exercised by the live partial-path.
+    - [⊘] **C.2.b**: ~~serialize / deserialize `ParallelCompactResult`~~. Superseded — the partial path emits per-group rows through PG's tuple stream, no DSM round-trip needed.
+    - [⊘] **C.2.c**: ~~restructure `begin_agg_scan` for DSM-parallel mode~~. Superseded — partial mode runs the same body in every process via `run_partial_aggregate_in_process`.
+    - [⊘] **C.2.d**: ~~worker `exec_agg_scan` writes to DSM slab~~. Superseded — workers emit rows directly.
+    - [⊘] **C.2.e**: ~~leader merges DSM slabs~~. Superseded — PG's standard Aggregate node above Gather merges via the aggregate's `aggcombinefn`.
+    - [x] **C.2.f**: cost-aware infrastructure in place — eligibility predicate, `recommend_agg_workers` helper in `cost.rs`, `estimate_agg_cost(..., workers)` parallel-divisor adjustment, `path::peek_agg_topn_info`, `agg::can_use_compact_keys_path` re-export.
+    - [x] **C.2.g**: ~~tests parametrised over `max_parallel_workers_per_gather ∈ {0, 2, 4}`~~. Superseded by the activation tests folded into the C.2 activation followup's RTABench / ClickBench validation; the parameter sweep was tied to the DSM model.
 
 ### C.2 activation follow-up (research-state)
 
@@ -44,18 +55,23 @@ The DSM-merge model from C.2.b–e turned out to be a poor fit for PG's `Gather`
 
 **Coverage today** is intentionally narrow: partial path activates only when (a) no HAVING / Top-N / DISTINCT, (b) all aggs are Count / SUM(int4/float) / MIN/MAX(text), (c) all group keys are integer-packable, and (d) all WHERE-clause Vars are numeric (int / float / timestamp / date / bool). Most ClickBench / RTABench queries have text WHEREs (URL, SearchPhrase, event_type, etc.) so they fall back to the existing complete path — correctness preserved, no parallel speedup yet.
 
-**Follow-ups to broaden coverage**:
-- SUM(int8) / AVG via `int8_avg_serialize` for the partial state's `internal` transtype.
-- Text WHERE clauses by mirroring the serial parallel-mixed code path inside `process_segments_compact` (or a sibling).
-- HAVING in the partial path (Phase E).
-- COUNT(DISTINCT) for dict-encoded text (Phase D — fundamentally different from PG's combinefn model; needs the dictionary union approach in PARALLEL_AGG.md Phase D).
+**Follow-ups to broaden coverage**: see the "Partial-path coverage extensions" section below.
 
-  - [ ] **C.3**: extend `evaluate_batch_quals` (`batch_qual.rs:495`) to return tri-state `BatchEval { AllPass, AllReject, Selective(Bitmap) }`; add `enum SegmentEval { FullMetadata, PerSegmentByGroup, PerRow }` so per-segment metadata (`col_minmax / col_sums / row_count`) can short-circuit decompression for full-segment cases.
-  - [ ] **C.4**: gate `add_agg_path` for parallel (`parallel_safe = true, parallel_workers = recommend_agg_workers(...)`). Update `cost::estimate_agg_cost` so the planner picks the parallel variant on large inputs. Add `tests/test_aggregate_pushdown.py` (parametrize over `max_parallel_workers_per_gather ∈ {0, 2, 4, 8}`) for correctness, and an EXPLAIN assertion that DeltaXAgg picks `parallel_workers > 0` on Q3/Q4-shaped queries.
-- [x] **JSON-extract chain eligibility for DeltaXAgg path** (out-of-band — not in the original plan). Without this, the upper-paths classifier rejected JSONB chain Exprs in agg args, GROUP BY, tlist projections, and WHERE quals, so DeltaXAgg never got a path for any json_extract query. Q1 went from 49s (PG `Gather Merge → external sort → GroupAggregate`) to 2.1s warm (`Custom Scan (DeltaXAgg)` direct, internal rayon). Q0 1.1s → 285ms. Phase D is no longer load-bearing for Q1 — see "JSON-extract chain eligibility" section below.
+- [ ] **C.3** (independent of pivot): extend `evaluate_batch_quals` (`batch_qual.rs:495`) to return tri-state `BatchEval { AllPass, AllReject, Selective(Bitmap) }`; add `enum SegmentEval { FullMetadata, PerSegmentByGroup, PerRow }` so per-segment metadata (`col_minmax / col_sums / row_count`) can short-circuit decompression for full-segment cases. Helps both DeltaXAgg and DeltaXAppend; survives the C.2 pivot intact.
+- [⊘] **C.4**: ~~gate `add_agg_path` (the complete CustomScan path) for DSM parallelism via `parallel_safe = true, parallel_workers = recommend_agg_workers(...)`~~. Superseded by the partial+Gather+FinalAgg activation, which provides PG-level parallelism through a separate `add_agg_partial_path`. The complete CustomScan path stays serial (or internally parallel via `std::thread::scope`) and serves as a fallback when the partial path doesn't apply. Broadening *the partial path's* coverage — text WHERE, HAVING, COUNT(DISTINCT) — is the modern equivalent and lives under "Partial-path coverage extensions" below.
+- [x] **JSON-extract chain eligibility for DeltaXAgg path** (out-of-band — not in the original plan). Without this, the upper-paths classifier rejected JSONB chain Exprs in agg args, GROUP BY, tlist projections, and WHERE quals, so DeltaXAgg never got a path for any json_extract query. Q1 went from 49s (PG `Gather Merge → external sort → GroupAggregate`) to 2.1s warm (`Custom Scan (DeltaXAgg)` direct, internal rayon). Q0 1.1s → 285ms. See "JSON-extract chain eligibility" section below.
 - [~] Phase D — parallel `COUNT(DISTINCT)` for dictionary-encoded text columns. **Infrastructure landed (parallel pre-pass shipped); doesn't move JSONBench Q1.** `Bitset`, `DictDistinctRemap`, `build_dict_distinct_remaps` (parallel via two `std::thread::scope` calls + sequential merge), `CdKind::DictBitset`, and the `process_segments_mixed` insert/merge/finalise switch are all in place + tested. **Phase D fundamentally cannot help Q1** — `x_did` has ~25-30K unique values per 30K-row segment, fails the dict-encoder's `cardinality <= rows/2` heuristic, gets stored as `Lz4Blocked` instead of `Dictionary`. Phase D's bitset path requires every relevant segment to be dict-encoded for the column; Q1's eligibility check correctly bails on the first Lz4Blocked segment and falls back to the existing `HashSet<u128>` path. See "Phase D" section below for details.
-- [ ] Phase E — HAVING in the parallel path.
-- [ ] Phase F — EXPLAIN, GUCs, hardening.
+- [ ] Phase E — HAVING in the parallel path. Half-day per the original plan; "parallel path" now means the partial+Gather+FinalAgg path, not the DSM model.
+- [ ] Phase F — EXPLAIN, GUCs, hardening. EXPLAIN per-worker stats; GUCs (`pg_deltax.parallel_agg_partial_state_mb`, `pg_deltax.disable_parallel_agg`); operator-level escape hatches.
+
+### Partial-path coverage extensions (modern C.4 equivalent)
+
+The partial+Gather+FinalAgg path is gated narrowly today — most queries fall back to the complete CustomScan path. Each of these gates is a separate work item:
+
+- [ ] **Text WHERE clauses**: lift `quals_reference_only_numeric_vars`. Requires mirroring the serial parallel-mixed code path's `apply_text_eq_filter` / `apply_text_like_filter` selection-vector logic inside `process_segments_compact` (or a sibling). Most impactful single follow-up — would unlock RTABench Q9-style shapes.
+- [ ] **SUM(int8) / AVG via `int8_avg_serialize`** for the partial state's `internal` transtype.
+- [ ] **HAVING in the partial path** (also tracked under Phase E).
+- [ ] **COUNT(DISTINCT) for dict-encoded text** — see Phase D. PG core has no `aggcombinefn` for COUNT(DISTINCT), so this can't go through the standard partial-path machinery; needs the dictionary-union approach Phase D shipped.
 
 ### JSON-extract chain eligibility for DeltaXAgg path ✅ DONE
 

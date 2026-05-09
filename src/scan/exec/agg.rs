@@ -26,7 +26,7 @@ use super::datum_utils::{
 use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
     segment_skippable_by_dict, extract_segment_filters,
-    classify_segment_quals, SegmentQualResult, is_zero_const,
+    classify_segment_quals, classify_segment_quals_numeric, SegmentQualResult, is_zero_const,
     detoast_lazy_blobs,
 };
 use super::text_col::{SegTextColumn, TextQualInfo, decompress_length_sidecar, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
@@ -9578,6 +9578,24 @@ fn process_segments_compact(
             continue;
         }
 
+        // C.3 per-segment fast path: classify the segment vs batch_quals
+        // using col_minmax / nonzero_count metadata BEFORE any decompression.
+        // The partial path's eligibility predicate ensures every batch_qual
+        // is numeric (`is_batch_comparable_type`), so classify_segment_quals
+        // always has the metadata it needs — no Ambiguous-from-mixed-types
+        // edge case here (that's only relevant in `process_segments_mixed`).
+        let seg_qual_result = if config.batch_quals.is_empty() {
+            SegmentQualResult::AllPass
+        } else {
+            classify_segment_quals(seg, config.batch_quals, config.col_names)
+        };
+        if matches!(seg_qual_result, SegmentQualResult::NonePass) {
+            // No row in this segment passes the quals — skip entirely.
+            // Saves the full decompression cost for the segment.
+            continue;
+        }
+        let quals_all_pass = matches!(seg_qual_result, SegmentQualResult::AllPass);
+
         segments_processed += 1;
 
         // Decompress needed columns (pure Rust, no PG calls)
@@ -9623,8 +9641,14 @@ fn process_segments_compact(
 
         let row_count = seg.row_count as usize;
 
-        // Evaluate batch quals (pure Rust for numeric types)
-        let selection = evaluate_batch_quals(&decompressed, row_count, config.batch_quals, Vec::new());
+        // Evaluate batch quals — but only if metadata couldn't already
+        // prove all rows pass. AllPass means we can use an empty selection
+        // (every row included) and skip the per-row qual evaluation loop.
+        let selection = if quals_all_pass {
+            Vec::new()
+        } else {
+            evaluate_batch_quals(&decompressed, row_count, config.batch_quals, Vec::new())
+        };
 
         // Compact aggregation loop (identical to single-threaded path)
         for row in 0..row_count {
@@ -10677,6 +10701,23 @@ fn process_segments_mixed(
             continue;
         }
 
+        // C.3 per-segment fast path: classify against the **numeric subset**
+        // of batch_quals using col_minmax / nonzero_count. NonePass on any
+        // numeric qual rules out the segment (text quals can only narrow
+        // further); AllPass lets us skip the per-row numeric eval below
+        // while still applying text quals on top of an empty selection.
+        // No-op when batch_quals has no numeric entries (helper returns
+        // Ambiguous in that case).
+        let numeric_quals_all_pass = if config.batch_quals.is_empty() {
+            true
+        } else {
+            match classify_segment_quals_numeric(seg, config.batch_quals, config.col_names) {
+                SegmentQualResult::NonePass => continue,
+                SegmentQualResult::AllPass => true,
+                SegmentQualResult::Ambiguous => false,
+            }
+        };
+
         segments_processed += 1;
 
         // Decompress needed columns
@@ -10763,8 +10804,14 @@ fn process_segments_mixed(
         let row_count = seg.row_count as usize;
 
         // Build selection vector from quals
-        // First: numeric batch quals
-        let mut selection = evaluate_batch_quals(&numeric_cols, row_count, config.batch_quals, Vec::new());
+        // First: numeric batch quals — skip the per-row eval when C.3
+        // metadata classification already proved every row passes the
+        // numeric subset.
+        let mut selection = if numeric_quals_all_pass {
+            Vec::new()
+        } else {
+            evaluate_batch_quals(&numeric_cols, row_count, config.batch_quals, Vec::new())
+        };
 
         // Then: text quals (applied on SegTextColumn, short-circuiting via selection)
         for tqi in config.text_qual_infos {
