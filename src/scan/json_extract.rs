@@ -51,6 +51,88 @@ pub(crate) struct PhysicalCols {
     pub(crate) by_attno: HashMap<i16, String>,
 }
 
+/// Plan-time helper for translating JSONB chain Exprs into synthetic-column
+/// references during DeltaXAgg path construction. Built once per call to
+/// `deltax_create_upper_paths` (or `plan_agg_path`) and consulted by:
+///
+///   - `hook.rs`'s aggregate-arg / GROUP BY classifier — to accept chains
+///     that map to extracted columns and emit `AggSpec` / `GroupByColSpec`
+///     entries with `col_idx = physical_count + spec_position`.
+///   - `path.rs::plan_agg_path` — to rewrite chains in the WHERE qual list
+///     before `nodeToString` serialisation, so `extract_batch_quals` sees
+///     plain Var nodes at execution time.
+///
+/// Returns `None` from `from_root` when the query has no inh parent, the
+/// parent has no `json_extract` configuration, or the rewrite would touch
+/// partitions compressed before json_extract was added (mixed-partition
+/// gate).
+pub(crate) struct AggChainCtx {
+    pub(crate) specs: Vec<ExtractSpec>,
+    pub(crate) phys: PhysicalCols,
+    pub(crate) parent_rti: pg_sys::Index,
+    pub(crate) physical_count: i16,
+}
+
+impl AggChainCtx {
+    /// Discover the inh parent of this query, load its `json_extract` specs
+    /// + physical columns, and confirm the rewrite is partition-safe.
+    pub(crate) unsafe fn from_root(
+        root: *mut pg_sys::PlannerInfo,
+    ) -> Option<Self> {
+        unsafe {
+            let array_size = (*root).simple_rel_array_size;
+            for rti in 1..array_size {
+                let rte = *(*root).simple_rte_array.add(rti as usize);
+                if rte.is_null() {
+                    continue;
+                }
+                if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION || !(*rte).inh {
+                    continue;
+                }
+                let parent_oid = (*rte).relid;
+                let specs = crate::scan::path::load_extract_specs_for_rel_pub(parent_oid);
+                if specs.is_empty() {
+                    return None;
+                }
+                if !crate::scan::path::is_json_extract_safe_for_rel(parent_oid) {
+                    return None;
+                }
+                let phys = PhysicalCols::from_rel_oid(parent_oid);
+                let physical_count = phys.by_attno.len() as i16;
+                return Some(Self {
+                    specs,
+                    phys,
+                    parent_rti: rti as pg_sys::Index,
+                    physical_count,
+                });
+            }
+            None
+        }
+    }
+
+    /// Try to interpret `node` as a JSONB extract chain rooted at the inh
+    /// parent's RTI. On match returns `(col_idx, type_oid)` where `col_idx`
+    /// is the position of the synthetic column in `MetadataInfo::col_names`
+    /// (= `physical_count + spec_index`).
+    pub(crate) unsafe fn match_to_synthetic(
+        &self,
+        node: *const pg_sys::Node,
+    ) -> Option<(i32, pg_sys::Oid)> {
+        unsafe {
+            let spec_idx = match_extract_chain(
+                node as *mut pg_sys::Node,
+                self.parent_rti,
+                &self.specs,
+                &self.phys,
+            )?;
+            let spec = &self.specs[spec_idx];
+            let col_idx = self.physical_count as i32 + spec_idx as i32;
+            let type_oid = kind_to_type_oid(spec.target_kind);
+            Some((col_idx, type_oid))
+        }
+    }
+}
+
 impl PhysicalCols {
     #[allow(dead_code)] // Wired up in step 4 follow-up.
     pub(crate) unsafe fn from_rel_oid(rel_oid: pg_sys::Oid) -> Self {

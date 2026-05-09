@@ -1463,6 +1463,15 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         // type is NUMERIC; we don't build NUMERIC datums from i128 yet).
         let mut all_meta_answerable = true;
 
+        // json_extract chain context — built once on first use, reused by
+        // both the agg-arg classifier (this loop) and the GROUP BY classifier
+        // below. `Some(None)` means we've checked and there's no extract
+        // configuration / unsafe partitions; `None` means we haven't checked
+        // yet. Only the chain-match branches consult it, so plain queries
+        // pay a single SPI lookup at most (when they happen to hit a chain
+        // Expr that no other branch recognises).
+        let mut json_extract_ctx: Option<Option<super::json_extract::AggChainCtx>> = None;
+
         for &aggref in &aggrefs {
             // FILTER clause not supported
             if !(*aggref).aggfilter.is_null() {
@@ -1513,7 +1522,22 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             }
 
             let mut agg_const_offset: i64 = 0;
-            let (var_node, expr_kind): (*const pg_sys::Var, AggExpr) = if (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
+            let (col_idx, col_type_oid, expr_kind): (i32, pg_sys::Oid, AggExpr) = 'resolve: {
+                // First, try interpreting the arg as a JSONB chain over a
+                // synthetic column. This must come BEFORE the OpExpr branch
+                // below (which expects `Var + Const` shapes) — a chain like
+                // `data->>'did'` is itself an OpExpr but with the JSONB ->>
+                // operator, so the Var+Const matcher would reject it.
+                if json_extract_ctx.is_none() {
+                    json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+                }
+                if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
+                    && let Some((col_idx, type_oid)) = ctx.match_to_synthetic(arg_expr)
+                {
+                    break 'resolve (col_idx, type_oid, AggExpr::Column);
+                }
+
+            let (var_node, ek): (*const pg_sys::Var, AggExpr) = if (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
                 (arg_expr as *const pg_sys::Var, AggExpr::Column)
             } else if (*arg_expr).type_ == pg_sys::NodeTag::T_RelabelType {
                 // Unwrap RelabelType → Var
@@ -1601,23 +1625,26 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 return; // Only plain column references, length(col), or col + const
             };
 
-            let varattno = (*var_node).varattno;
-            let col_idx = varattno as i32 - 1;
+                let varattno = (*var_node).varattno;
+                let col_idx = varattno as i32 - 1;
 
-            // Get source column type
-            let varno = (*var_node).varno as usize;
-            if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
-                return;
-            }
-            let rte = *(*root).simple_rte_array.add(varno);
-            if rte.is_null() {
-                return;
-            }
-            let relid = (*rte).relid;
-            let mut col_type_oid = pg_sys::InvalidOid;
-            let mut col_typmod: i32 = -1;
-            let mut col_collation: pg_sys::Oid = pg_sys::InvalidOid;
-            pg_sys::get_atttypetypmodcoll(relid, varattno, &mut col_type_oid, &mut col_typmod, &mut col_collation);
+                // Get source column type
+                let varno = (*var_node).varno as usize;
+                if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
+                    return;
+                }
+                let rte = *(*root).simple_rte_array.add(varno);
+                if rte.is_null() {
+                    return;
+                }
+                let relid = (*rte).relid;
+                let mut col_type_oid = pg_sys::InvalidOid;
+                let mut col_typmod: i32 = -1;
+                let mut col_collation: pg_sys::Oid = pg_sys::InvalidOid;
+                pg_sys::get_atttypetypmodcoll(relid, varattno, &mut col_type_oid, &mut col_typmod, &mut col_collation);
+
+                (col_idx, col_type_oid, ek)
+            };
 
             // For length() expressions, the effective type for aggregation is INT4
             let effective_col_type_oid = if expr_kind == AggExpr::LengthOf {
@@ -2022,24 +2049,46 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         let a0 = unwrap_relabel(raw_arg0);
                         let a1 = unwrap_relabel(raw_arg1);
 
-                        let (var_node, const_node, var_on_left) =
-                            if (*a0).type_ == pg_sys::NodeTag::T_Var
+                        // Resolve `(Var/chain, Const)` or `(Const, Var/chain)`
+                        // — chain Exprs map to synthetic Vars whose type is
+                        // the spec's `target_kind`. `plan_agg_path` rewrites
+                        // chains in the qual list before serialisation, so by
+                        // execution time `extract_batch_quals` sees a real
+                        // Var; this validator just confirms the shape is
+                        // pushable.
+                        if json_extract_ctx.is_none() {
+                            json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+                        }
+                        let ctx_ref = json_extract_ctx.as_ref().unwrap().as_ref();
+
+                        let resolve_side = |node: *const pg_sys::Node| -> Option<pg_sys::Oid> {
+                            if (*node).type_ == pg_sys::NodeTag::T_Var {
+                                return Some((*(node as *const pg_sys::Var)).vartype);
+                            }
+                            ctx_ref
+                                .and_then(|c| c.match_to_synthetic(node))
+                                .map(|(_idx, type_oid)| type_oid)
+                        };
+
+                        let lhs_type = resolve_side(a0);
+                        let rhs_type = resolve_side(a1);
+
+                        let (type_oid, var_on_left, const_node) =
+                            if let Some(ty) = lhs_type
                                 && (*a1).type_ == pg_sys::NodeTag::T_Const
                             {
-                                (a0 as *const pg_sys::Var, a1 as *const pg_sys::Const, true)
-                            } else if (*a0).type_ == pg_sys::NodeTag::T_Const
-                                && (*a1).type_ == pg_sys::NodeTag::T_Var
+                                (ty, true, a1 as *const pg_sys::Const)
+                            } else if let Some(ty) = rhs_type
+                                && (*a0).type_ == pg_sys::NodeTag::T_Const
                             {
-                                (a1 as *const pg_sys::Var, a0 as *const pg_sys::Const, false)
+                                (ty, false, a0 as *const pg_sys::Const)
                             } else {
-                                return; // neither (Var,Const) nor (Const,Var)
+                                return; // neither (Var/chain, Const) nor (Const, Var/chain)
                             };
 
                         if (*const_node).constisnull {
                             return;
                         }
-
-                        let type_oid = (*var_node).vartype;
 
                         if is_like || is_not_like {
                             if !var_on_left {
@@ -2166,6 +2215,28 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 let expr = (*tle).expr as *const pg_sys::Node;
                 if expr.is_null() {
                     return;
+                }
+
+                // Try interpreting as a JSONB chain over a synthetic column
+                // (json_extract). Must come before the OpExpr/FuncExpr branches
+                // since chains share those node tags. We don't set
+                // group_by_relid in this branch — the parent table doesn't
+                // expose synthetic columns through pg_attribute, so the
+                // ndistinct heuristic below would mis-resolve them. Falling
+                // through to the pathlist's row estimate is fine for now;
+                // synthetic-column ndistinct is a follow-up.
+                if json_extract_ctx.is_none() {
+                    json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+                }
+                if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
+                    && let Some((col_idx, type_oid)) = ctx.match_to_synthetic(expr)
+                {
+                    group_specs.push(super::exec::GroupByColSpec {
+                        col_idx,
+                        type_oid,
+                        expr: GroupByExpr::Column,
+                    });
+                    continue;
                 }
 
                 if (*expr).type_ == pg_sys::NodeTag::T_Const {
@@ -2527,8 +2598,31 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 }
             }
 
-            // Validate that each non_agg_op_exprs entry matches a GROUP BY AddConst spec.
+            // Validate that each non_agg_op_exprs entry matches a GROUP BY spec.
+            // Two shapes are accepted:
+            //   1. JSONB chain (`data->>'k'`) — matches a synthetic-column
+            //      GroupByExpr::Column whose col_idx equals the chain's
+            //      synthetic position.
+            //   2. `Var +/- Const` — matches a GroupByExpr::AddConst with the
+            //      same col_idx and operator OID.
             for &(_tlist_idx, opexpr) in &non_agg_op_exprs {
+                // Try chain match first.
+                if json_extract_ctx.is_none() {
+                    json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+                }
+                if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
+                    && let Some((chain_col_idx, _type_oid)) =
+                        ctx.match_to_synthetic(opexpr as *const pg_sys::Node)
+                {
+                    let matched = group_specs.iter().any(|gs| {
+                        matches!(gs.expr, GroupByExpr::Column) && gs.col_idx == chain_col_idx
+                    });
+                    if !matched {
+                        return; // chain Expr in target doesn't match any GROUP BY synthetic
+                    }
+                    continue;
+                }
+
                 let op_oid = u32::from((*opexpr).opno);
                 let op_args = (*opexpr).args;
                 if op_args.is_null() || (*op_args).length != 2 {

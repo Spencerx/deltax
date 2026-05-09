@@ -2078,6 +2078,29 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             qual_list = extract_quals_from_baserestrictinfo(root);
         }
 
+        // Rewrite JSONB chain Exprs in the qual list against the parent's
+        // json_extract specs so the serialised quals deserialise into Var
+        // nodes that `extract_batch_quals` can recognise. Without this,
+        // queries like `WHERE data->>'kind' = 'commit'` hit DeltaXAgg with
+        // unrewritten chains, `extract_batch_quals` skips them silently
+        // (Var-only matcher), and the WHERE filter is dropped — wrong
+        // results. The post-`standard_planner` walker only handles
+        // DeltaXDecompress / DeltaXAppend cscans; DeltaXAgg keeps its quals
+        // in `custom_private` (not in `scan.plan.qual`) so the walker can't
+        // touch them after the fact. Doing it here, while the parse tree is
+        // still in scope, is the natural fit.
+        if !qual_list.is_null()
+            && let Some(ctx) = super::json_extract::AggChainCtx::from_root(root)
+        {
+            qual_list = super::json_extract::rewrite_chains_in_list(
+                qual_list,
+                ctx.parent_rti,
+                &ctx.specs,
+                &ctx.phys,
+                ctx.physical_count,
+            );
+        }
+
         if !qual_list.is_null() {
             let s = pg_sys::nodeToString(qual_list as *const _);
             let s_bytes = std::ffi::CStr::from_ptr(s).to_bytes();

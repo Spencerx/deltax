@@ -49,21 +49,64 @@ The DSM-merge model from C.2.b–e turned out to be a poor fit for PG's `Gather`
 - Text WHERE clauses by mirroring the serial parallel-mixed code path inside `process_segments_compact` (or a sibling).
 - HAVING in the partial path (Phase E).
 - COUNT(DISTINCT) for dict-encoded text (Phase D — fundamentally different from PG's combinefn model; needs the dictionary union approach in PARALLEL_AGG.md Phase D).
+
   - [ ] **C.3**: extend `evaluate_batch_quals` (`batch_qual.rs:495`) to return tri-state `BatchEval { AllPass, AllReject, Selective(Bitmap) }`; add `enum SegmentEval { FullMetadata, PerSegmentByGroup, PerRow }` so per-segment metadata (`col_minmax / col_sums / row_count`) can short-circuit decompression for full-segment cases.
   - [ ] **C.4**: gate `add_agg_path` for parallel (`parallel_safe = true, parallel_workers = recommend_agg_workers(...)`). Update `cost::estimate_agg_cost` so the planner picks the parallel variant on large inputs. Add `tests/test_aggregate_pushdown.py` (parametrize over `max_parallel_workers_per_gather ∈ {0, 2, 4, 8}`) for correctness, and an EXPLAIN assertion that DeltaXAgg picks `parallel_workers > 0` on Q3/Q4-shaped queries.
-- [ ] Phase D — parallel `COUNT(DISTINCT)` for dictionary-encoded text columns.
+- [x] **JSON-extract chain eligibility for DeltaXAgg path** (out-of-band — not in the original plan). Without this, the upper-paths classifier rejected JSONB chain Exprs in agg args, GROUP BY, tlist projections, and WHERE quals, so DeltaXAgg never got a path for any json_extract query. Q1 went from 49s (PG `Gather Merge → external sort → GroupAggregate`) to 2.1s warm (`Custom Scan (DeltaXAgg)` direct, internal rayon). Q0 1.1s → 285ms. Phase D is no longer load-bearing for Q1 — see "JSON-extract chain eligibility" section below.
+- [ ] Phase D — parallel `COUNT(DISTINCT)` for dictionary-encoded text columns. **Deprioritised**: Q1 is already at 2.1s warm without it. Larger remaining gaps are Q3/Q4 (3-3.7s, blocked by complex `MIN(timestamp + interval * cast)` Aggref args, not parallelism) and Q2 (17s, EXTRACT(HOUR) per-row).
 - [ ] Phase E — HAVING in the parallel path.
 - [ ] Phase F — EXPLAIN, GUCs, hardening.
 
+### JSON-extract chain eligibility for DeltaXAgg path ✅ DONE
+
+Discovered while investigating why JSONBench Q1 stayed on the `Gather Merge → external sort → GroupAggregate` plan even after the partial+Gather+FinalAgg activation. Three classifier blockers and one runtime-correctness bug were silently keeping `add_agg_path` from firing for any json_extract query (and would have produced wrong results if it had).
+
+The post-`standard_planner` walker rewrites chains in upper plans for `DeltaXDecompress`/`DeltaXAppend` cscans, but `deltax_create_upper_paths` runs *during* `standard_planner` — it sees raw JSONB chain Exprs (e.g. `data->>'did'`) before the walker has a chance to substitute synthetic Vars. JSON_EXTRACT.md §P4 calls this out as the known interaction blocker.
+
+**Shipped** (all in `src/scan/hook.rs` + `src/scan/path.rs` + a shared helper in `src/scan/json_extract.rs`):
+
+1. **`json_extract::AggChainCtx`** — lazy planner-side context: walks `simple_rte_array` for the inh parent, loads `json_extract` specs via `load_extract_specs_for_rel_pub`, builds `PhysicalCols`, gates on `is_json_extract_safe_for_rel` (mixed-partition gate). Exposes `match_to_synthetic(node) → Option<(col_idx, type_oid)>` where `col_idx = physical_count + spec_index` (matches `MetadataInfo::col_names` layout from `load_metadata`).
+
+2. **Agg-arg classifier** (in `deltax_create_upper_paths`'s aggregate loop) — refactored to a labeled block; chain-match attempt comes first, falls back to the existing `Var / RelabelType / length(Var) / Var+Const` shapes. Chains map to `AggSpec { col_idx, col_type_oid: kind_to_type_oid(spec.target_kind), expr_kind: AggExpr::Column, ... }`.
+
+3. **GROUP BY classifier** — chain-match attempt at the top of the per-clause loop, emitting `GroupByExpr::Column` with the synthetic position. Skips setting `group_by_relid` (parent's `pg_attribute` doesn't expose synthetic attnos), so the ndistinct heuristic falls back to the pathlist row estimate for synthetic-only group queries. Loading synthetic ndistinct from `deltax_partition.column_ndistinct` is a follow-up.
+
+4. **`non_agg_op_exprs` validator** (the projection-vs-GROUP-BY equivalence check) — accepts a chain Expr in tlist when it matches a `GroupByExpr::Column` synthetic; otherwise falls back to the existing `AddConst`-shape match. Without this, every Q0/Q1-style query with a chain `event` projection bailed because `data->'commit'->>'collection'` is a T_OpExpr but not a `Var + Const`.
+
+5. **WHERE qual validator** — `(Var, Const)` shape check now accepts `(chain, Const)` and `(Const, chain)` too, taking the type from the matched spec. The validator just confirms the shape is pushable; the actual rewriting happens in (6).
+
+6. **`plan_agg_path` qual rewriter** — calls `json_extract::rewrite_chains_in_list` on `qual_list` before `nodeToString` serialisation. **Correctness-critical**: chains end up in DeltaXAgg's `custom_private` (not in `scan.plan.qual` — the post-planner walker can't touch them). At exec time `extract_batch_quals` only recognises `Var` nodes; unrewritten chains would be silently dropped → wrong WHERE results. Rewriter reuses the existing `rewrite_walker` infrastructure (produces `Var(INDEX_VAR, k)`); `extract_batch_quals` keys off `varattno` only and doesn't care that the varno is `INDEX_VAR`.
+
+**Validation** (m6i.8xlarge, 100M rows, warm):
+
+| Q  | Before  | After   | Plan after change |
+|----|--------:|--------:|-------------------|
+| Q0 | 1.1s    | 285ms   | `Custom Scan (DeltaXAgg)` (was `Gather Merge → GroupAggregate`) |
+| Q1 | **43s** | **2.1s** | `Custom Scan (DeltaXAgg)` direct |
+| Q2 | 17s     | 17s     | unchanged — EXTRACT(HOUR) per-row, separate gap |
+| Q3 | 3.2s    | 3.2s    | unchanged — `MIN(timestamp + interval * cast)` Aggref shape rejected by classifier |
+| Q4 | 3.6s    | 3.6s    | unchanged — same Aggref shape blocker as Q3 |
+
+Total warm 68s → ~26s (~2.6×). ClickBench (43 q): 1199 → 1215 ms (within run-to-run noise, no chain Exprs so the new branches are dead code). RTABench (31 q): 3300 → 3319 ms (same). All 216 integration tests pass, including all 5 JSONBench correctness tests.
+
+**Why Phase D is no longer load-bearing**: the existing internal-rayon path at `agg.rs::run_grouped_aggregate` (or wherever the grouped CountDistinct emit loop now lives) handles Q1 in 2.1s once it actually runs — the `did` per-segment dictionaries keep the per-row `HashSet<u128>` insertions cheap, and the rayon thread-scope chunking spreads the work. Phase D's bitset-OR optimisation would still cut another ~1s, but at 2.1s vs ClickHouse's ~1s the bigger lever for total bench time is Q2/Q3/Q4.
+
+**Remaining JSONBench-specific work** (not strictly part of this plan, but the next obvious gaps):
+
+- **Q3/Q4 — complex Aggref args**: `MIN(TIMESTAMP WITH TIME ZONE 'epoch' + INTERVAL '1 microsecond' * (data->>'time_us')::BIGINT)`. The agg-arg classifier today only accepts plain `Var`, `RelabelType(Var)`, `length(Var)`, or `Var + Const`. After json_extract, the inner chain becomes a synthetic Var, but the surrounding arithmetic (`epoch + interval * cast`) is still a non-trivial expression tree the classifier rejects. Two options: extend the classifier to recognise specific timestamp-arithmetic patterns (narrow), or emit the inner Var as the agg's storage column and apply the arithmetic in `output_map` finalisation (broader, more aligned with how the executor materialises group keys).
+- **Q2 — EXTRACT(HOUR) per-row**: the `EXTRACT(HOUR FROM TO_TIMESTAMP(... / 1000000))` group key currently runs per-row above the scan. Already partially anticipated by `GroupByExpr::Extract` in the executor; the gap is plumbing it through the json_extract chain matcher.
+
 ## Context
 
-After json-extract, JSONBench warm timings on m6i.8xlarge are: Q0 1.1s, Q1 43s, Q2 17s, Q3 3.2s, Q4 3.6s. ClickHouse is ~1s on each. The dominant remaining cost is **single-threaded final aggregation above the parallel scan**: COUNT(DISTINCT) on Q1, MIN/MAX on Q3/Q4. Workers do parallel scan + parallel sort fine; PG's `GroupAggregate` runs single-threaded above the `Gather Merge` boundary because partial COUNT(DISTINCT) results can't be combined without re-deduping.
+After json-extract, JSONBench warm timings on m6i.8xlarge were: Q0 1.1s, Q1 43s, Q2 17s, Q3 3.2s, Q4 3.6s. ClickHouse is ~1s on each. After the chain-Expr eligibility work above, Q0 dropped to 285ms and Q1 to 2.1s; Q2/Q3/Q4 still on the old plan, total bench warm 68s → ~26s. The notes below preserve the original premise (single-threaded final aggregation as the dominant cost) since it still applies to Q3/Q4 and motivates Phase D's design — even if Q1 was solved by a different lever.
+
+Original premise (still valid for Q3/Q4): the dominant remaining cost is **single-threaded final aggregation above the parallel scan**: COUNT(DISTINCT) on Q1 (now solved), MIN/MAX on Q3/Q4. Workers do parallel scan + parallel sort fine; PG's `GroupAggregate` runs single-threaded above the `Gather Merge` boundary because partial COUNT(DISTINCT) results can't be combined without re-deduping.
 
 ClickHouse's `uniqExact` (the function JSONBench Q1 uses) is **exact** (hash set), not HLL. The gap is parallel hash-set construction + merge that PG core can't do for `COUNT(DISTINCT)`. pg_deltax can: each worker builds a local hash table per group, leader unions, finalizes. For dictionary-encoded text columns (e.g. the `did` synthetic), workers union segment dictionaries directly without per-row work.
 
 `DeltaXAgg` already pushes the entire aggregation into a CustomScan that replaces `Aggregate → Scan`. **But it is `parallel_safe = false` and has no DSM hooks** — PG runs it single-process. The fix is to make it PG-parallel-aware along the same axes `DeltaXAppend` already is: DSM region, atomic segment-claiming cursor, per-worker partial state, leader-side merge, output emitted at the leader after `Gather` shutdown. The internal rayon path stays as a leader-only fallback.
 
-Expected outcome: Q1 43s → ~3s, Q3/Q4 3s → ~0.8s, total bench warm 68s → ~22s. Closes most of the gap to ClickHouse's ~5s aggregate.
+Original expected outcome: Q1 43s → ~3s, Q3/Q4 3s → ~0.8s, total bench warm 68s → ~22s. Actual after the chain-Expr eligibility work: Q1 → 2.1s (already past the Phase D target, no parallelism needed), Q3/Q4 unchanged (waiting on a different blocker — see "Remaining JSONBench-specific work" above), total ~26s. The remaining ~4s gap to the original 22s target lives in Q3/Q4's complex Aggref args, not in COUNT(DISTINCT).
 
 ## Approach
 
@@ -196,7 +239,9 @@ HAVING is already supported in serial DeltaXAgg. Trivial extension: `merge_and_f
 - `src/scan/exec/batch_qual.rs` — extend `evaluate_batch_quals` to return tri-state `BatchEval`.
 - `src/scan/path.rs::add_agg_path` (~line 1010) — flip `parallel_safe = true`, set `parallel_workers` via `recommend_agg_workers`.
 - `src/scan/cost.rs::estimate_agg_cost` — adjust to make parallel variant cheaper than serial on large inputs so the planner picks it.
-- `src/scan/hook.rs::deltax_create_upper_paths` (~line 1293) — already gates eligibility; add `is_parallel_safe` check on upper-rel pathtarget.
+- `src/scan/hook.rs::deltax_create_upper_paths` (~line 1293) — already gates eligibility; add `is_parallel_safe` check on upper-rel pathtarget. Also hosts the `AggChainCtx`-driven chain-Expr branches in the agg / GROUP BY / non_agg_op_exprs / WHERE qual classifiers (see "JSON-extract chain eligibility" section).
+- `src/scan/path.rs::plan_agg_path` — for json_extract queries, calls `json_extract::rewrite_chains_in_list` on `qual_list` before `nodeToString`, so chains in DeltaXAgg's `custom_private` deserialise as Vars at exec time.
+- `src/scan/json_extract.rs` — `AggChainCtx::from_root` / `match_to_synthetic` (planner-side helper), plus the existing `rewrite_chains_in_node / _in_list / rewrite_walker` pipeline reused for qual rewriting.
 - `src/scan/explain.rs` — Phase F render.
 - `src/compression/dictionary.rs` — `decode_dict` reused for the leader-side global interner pre-pass.
 
@@ -240,9 +285,12 @@ Bench (`pytest.mark.benchmark`):
 |---|---|---|---|
 | A (no behaviour change) | 43s | 3.2s | 3.6s |
 | B (scaffolding only) | 43s | 3.2s | 3.6s |
-| C (no DISTINCT) | 43s | ~0.8s | ~0.8s |
-| D (DISTINCT + dict) | ~3s | ~0.8s | ~0.8s |
-| F (final) | ~2-3s | ~0.8s | ~0.8s |
+| Chain-Expr eligibility ✅ | **2.1s** | 3.2s | 3.6s |
+| C (no DISTINCT) | 2.1s | ~0.8s¹ | ~0.8s¹ |
+| D (DISTINCT + dict) | ~1s | ~0.8s | ~0.8s |
+| F (final) | ~1s | ~0.8s | ~0.8s |
+
+¹ Phase C's Q3/Q4 target assumes the underlying `MIN(timestamp + interval * cast)` Aggref shape is already accepted by the agg classifier. With the current shape blocker, Phase C alone won't move Q3/Q4 — see "Remaining JSONBench-specific work" in the chain-Expr section.
 
 Targets land within 2× safety of ClickHouse's ~1s.
 
