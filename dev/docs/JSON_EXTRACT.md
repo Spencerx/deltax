@@ -80,6 +80,28 @@ Net: 437s total warm → 151s. About 3× overall.
 
 SubqueryScan / CTE pass-through is a related but separable issue: subqueries opacify the chain at the boundary. Walker would descend into `SubqueryScan.subplan` and map its tlist 1:1.
 
+### 4b. ~~Forwarder gate against `chain_signatures`~~ — DONE
+
+`extend_scan_targetlist_with_forwarders` (in `json_extract.rs`) now consults the same `(path, leaf_kind)` set that `propagate_synthetics_through_ancestors` uses, and only emits a forwarder TargetEntry for synthetics whose chain signature appears somewhere in the plan tree. Without this gate, queries that don't reference any chain Expr but run over a parent table whose deltatable has `json_extract` configured ended up with the synthetic in cscan output → Append width mismatch when mixed with non-cscan partition children → `psycopg.DatabaseError: unexpected field count in "D" message`. Regression test: `test_jsonb_extract.py::TestWalkerForwarderGate::test_chain_unreferenced_query_over_mixed_partitions`.
+
+### 4c. Direct-feed JOIN over deltax cscan with json_extract — KNOWN BUG
+
+When `json_extract` is configured on a deltatable and a `SELECT … JOIN order_events oe USING (order_id) WHERE oe.event_type='X'` shape feeds the cscan output **directly** into a Hash/NestLoop join, the join produces 0 rows even though `SELECT order_id FROM oe WHERE oe.event_type='X'` and `SELECT count(*)` over the same WHERE both return correct values. Materialising the cscan output through a `WITH … AS MATERIALIZED` CTE before joining produces the correct result, so the cscan returns the right values when read in a single pass — but something about the tuple slot or projection in the direct-feed case breaks across the join boundary.
+
+Discovered while attempting to enable `json_extract` on RTABench's `order_events.event_payload->>'terminal'` (the only chain RTABench queries touch). The integration test setup at `tests/test_rtabench_correctness.py::_create_schema` and the bench setup at `tests/rtabench_data.py::setup_schema` + `rtabench/benchmark.sh` deliberately do NOT configure `json_extract` to avoid hitting this bug — RTABench queries fall through to the slow per-row JSONB chain path instead. The chain-Expr eligibility infrastructure shipped on the json-extract branch is dormant for RTABench until this is fixed.
+
+Repro shape:
+```sql
+SELECT count(*) FROM order_events oe JOIN order_items oi USING (order_id)
+ WHERE oe.event_type = 'Delivered'
+   AND oe.event_created >= '2024-05-03' AND oe.event_created < '2024-05-10';
+-- With json_extract on event_payload: returns 0
+-- Without: returns the correct count
+-- Wrap the cscan in WITH ... AS MATERIALIZED: returns the correct count
+```
+
+Likely the same bug affects similar JOIN shapes on jsonbench-style tables (haven't explicitly verified — JSONBench queries don't have this exact shape). Investigating + fixing requires tracing the cscan's tuple slot lifetime through the join executor; not yet attempted.
+
 ### 5. Type coverage
 
 Currently: `text, bigint, integer, double precision, boolean, timestamptz`. Add: `numeric`, `date`, `time`, `jsonb` (extract sub-object so chains can extract from it). `jsonb` in particular unlocks compositional extraction without re-parsing the original row.

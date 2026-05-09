@@ -506,6 +506,70 @@ JSONBENCH_QUERIES = [
 ]
 
 
+class TestWalkerForwarderGate:
+    """The post-`standard_planner` walker rebuilds each touched cscan's
+    `custom_scan_tlist` from the deltatable catalog (physical columns +
+    one synthetic per `json_extract` spec) and extends
+    `scan.plan.targetlist` with synthetic forwarder TargetEntries so
+    upper plans' `Var(OUTER_VAR, k)` refs resolve. Without a gate, the
+    extension fires for every synthetic in cstlist regardless of
+    whether any plan node references it — which silently widens cscan
+    output. That's harmless for non-Append plans (PG projection
+    narrows it) but for `Append`/`MergeAppend` over a mix of
+    compressed (cscan, gets +1 col) and uncompressed (SeqScan, no
+    forwarder) partitions, child output widths disagree and PG hits
+    `unexpected field count in 'D' message`."""
+
+    def test_chain_unreferenced_query_over_mixed_partitions(self, db):
+        """Regression for the protocol-level "unexpected field count"
+        bug: query touches only physical columns + spans an Append over
+        compressed and uncompressed partitions. With the gate, every
+        Append child has the same output width and PG accepts the
+        result; without, the cscan child emits an extra synthetic
+        column and the protocol decoder errors out."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE events (
+                ts TIMESTAMPTZ NOT NULL,
+                kind TEXT NOT NULL,
+                data JSONB NOT NULL
+            )
+        """)
+        db.execute("SELECT deltax_create_table('events', 'ts', '1 day'::interval, 5)")
+        db.execute(
+            "SELECT deltax_enable_compression('events', "
+            "order_by => ARRAY['ts'], segment_size => 50, "
+            "json_extract => '[{\"src\":\"data\","
+            "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
+        )
+        db.execute("SET pg_deltax.json_extract_mode = 'fields'")
+        db.commit()
+
+        # Load via direct-backfill into the first day's partition. The
+        # subsequent (premake'd) partitions stay empty + uncompressed,
+        # which puts both flavours in the same Append at query time.
+        rows = []
+        for i in range(50):
+            rows.append((f"2025-01-15 {i // 60:02d}:{i % 60:02d}:00+00",
+                         "Created" if i % 2 else "Delivered",
+                         json.dumps({"terminal": "Berlin"})))
+        text = "\n".join("\t".join(c for c in r) for r in rows) + "\n"
+        with db.cursor() as cur:
+            with cur.copy("COPY events FROM STDIN WITH (FORMAT deltax_compress)") as cp:
+                cp.write(text)
+        db.commit()
+
+        # Query references only physical columns. With the gate broken,
+        # `psycopg.DatabaseError: unexpected field count in "D" message`
+        # fires here.
+        rows = db.execute(
+            "SELECT ts, kind FROM events WHERE kind = 'Delivered' "
+            "ORDER BY ts LIMIT 5"
+        ).fetchall()
+        assert len(rows) == 5
+        assert all(r[1] == "Delivered" for r in rows)
+
+
 class TestMixedPartitionGate:
     """Partitions compressed before `json_extract` was added don't have
     synthetic columns in their companion blobs. The walker must detect

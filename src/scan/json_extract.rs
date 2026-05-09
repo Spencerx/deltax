@@ -1039,7 +1039,7 @@ unsafe fn rewrite_plan_subtree_with_stack(
         // Leaf cases first.
         if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
             let cscan = plan as *mut pg_sys::CustomScan;
-            let stl = subplan_tlist_from_deltax_decompress(cscan, rtable).unwrap_or_default();
+            let stl = subplan_tlist_from_deltax_decompress(cscan, rtable, needed).unwrap_or_default();
             if !stl.is_empty() {
                 // Add resjunk forwarder TLEs to every ancestor so chains in
                 // upper-level Aggrefs/exprs can reference the synthetic via
@@ -1441,6 +1441,7 @@ unsafe fn match_chain_against_child_stl(
 unsafe fn subplan_tlist_from_deltax_decompress(
     cscan: *mut pg_sys::CustomScan,
     rtable: *mut pg_sys::List,
+    needed: &std::collections::HashSet<ChainSig>,
 ) -> Option<SubplanTlist> {
     unsafe {
         if cscan.is_null() {
@@ -1483,7 +1484,7 @@ unsafe fn subplan_tlist_from_deltax_decompress(
         // forwarder TargetEntries — one per chain Expr in cstlist — so
         // upper plans' `Var(OUTER_VAR, forwarder_resno)` refs resolve to
         // the right slot positions.
-        let _ = extend_scan_targetlist_with_forwarders(cscan, cstlist);
+        let _ = extend_scan_targetlist_with_forwarders(cscan, cstlist, needed);
 
         // Rewrite chain Exprs in the cscan's own scan-level qual to use
         // `Var(INDEX_VAR, synth_position)` refs into the synthetic columns.
@@ -2320,6 +2321,7 @@ unsafe fn collect_index_and_rel_var_attnos_in_list(
 unsafe fn extend_scan_targetlist_with_forwarders(
     cscan: *mut pg_sys::CustomScan,
     cstlist: *mut pg_sys::List,
+    needed: &std::collections::HashSet<ChainSig>,
 ) -> Vec<i16> {
     unsafe {
         // Build (varno, varattno) -> k_in_cstlist map for physical entries.
@@ -2382,6 +2384,25 @@ unsafe fn extend_scan_targetlist_with_forwarders(
             let cs_expr = (*cs_tle).expr;
             if (*(cs_expr as *mut pg_sys::Node)).type_ == pg_sys::NodeTag::T_Var {
                 continue; // skip physical entries
+            }
+            // Only emit forwarders for synthetics whose `(path, leaf_kind)`
+            // signature is in the plan tree. Without this gate, queries that
+            // don't reference a chain Expr but run over a parent table whose
+            // deltatable has json_extract configured end up with the
+            // synthetic in cscan output → Append width mismatch when mixed
+            // with non-cscan partition children.
+            // Only emit forwarders for synthetics whose `(path, leaf_kind)`
+            // signature is in the plan tree. Without this gate, queries that
+            // don't reference a chain Expr but run over a parent table whose
+            // deltatable has json_extract configured end up with the
+            // synthetic in cscan output → Append width mismatch when mixed
+            // with non-cscan partition children.
+            match classify_custom_scan_tlist_entry(cs_expr as *mut pg_sys::Node, (*cs_tle).resno) {
+                SubplanColumn::Synthetic { ref path, target_kind, .. } => {
+                    let sig: ChainSig = (path.clone(), target_kind);
+                    if !needed.contains(&sig) { continue; }
+                }
+                _ => continue,
             }
             let vartype = pg_sys::exprType(cs_expr as *const _);
             let varcollid = pg_sys::exprCollation(cs_expr as *const _);
