@@ -982,6 +982,100 @@ unsafe fn deserialize_case_when_value(
     }
 }
 
+/// Phase C.2 activation — shared `custom_private` (path-level) builder for the
+/// DeltaXAgg complete-mode and partial-mode CustomPaths. Both modes use the
+/// same plan_agg_path callback so the wire format must match exactly except
+/// the trailing `is_partial` flag.
+unsafe fn build_agg_path_private(
+    companion_oids: &[pg_sys::Oid],
+    agg_specs: &[AggSpec],
+    group_specs: &[super::exec::GroupByColSpec],
+    is_partial: bool,
+) -> *mut pg_sys::List {
+    unsafe {
+        let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
+        for &oid in companion_oids {
+            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
+        }
+        private_list = pg_sys::lappend_int(private_list, -1); // sentinel
+        private_list = pg_sys::lappend_int(private_list, agg_specs.len() as i32);
+        for spec in agg_specs {
+            private_list = pg_sys::lappend_int(private_list, spec.agg_type as i32);
+            private_list = pg_sys::lappend_int(private_list, spec.col_idx);
+            private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
+            private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
+            private_list = pg_sys::lappend_int(private_list, spec.expr_kind as i32);
+            if matches!(spec.expr_kind, super::exec::AggExpr::AddConst) {
+                private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
+            }
+        }
+        private_list = pg_sys::lappend_int(private_list, group_specs.len() as i32);
+        for gs in group_specs {
+            private_list = pg_sys::lappend_int(private_list, gs.col_idx);
+            private_list = pg_sys::lappend_int(private_list, u32::from(gs.type_oid) as i32);
+            match &gs.expr {
+                super::exec::GroupByExpr::Column => {
+                    private_list = pg_sys::lappend_int(private_list, 0);
+                }
+                super::exec::GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation } => {
+                    private_list = pg_sys::lappend_int(private_list, 1);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, *collation as i32);
+                    private_list = pg_sys::lappend_int(private_list, pattern.len() as i32);
+                    for &b in pattern.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                    private_list = pg_sys::lappend_int(private_list, replacement.len() as i32);
+                    for &b in replacement.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+                super::exec::GroupByExpr::DateTrunc { unit, func_oid, .. } => {
+                    private_list = pg_sys::lappend_int(private_list, 2);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
+                    for &b in unit.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+                super::exec::GroupByExpr::Extract { unit, func_oid } => {
+                    private_list = pg_sys::lappend_int(private_list, 3);
+                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
+                    for &b in unit.as_bytes() {
+                        private_list = pg_sys::lappend_int(private_list, b as i32);
+                    }
+                }
+                super::exec::GroupByExpr::AddConst { offset, op_oid } => {
+                    private_list = pg_sys::lappend_int(private_list, 4);
+                    private_list = pg_sys::lappend_int(private_list, *offset as i32);
+                    private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
+                }
+                super::exec::GroupByExpr::CaseWhen(spec) => {
+                    private_list = pg_sys::lappend_int(private_list, 5);
+                    private_list = pg_sys::lappend_int(private_list, spec.clauses.len() as i32);
+                    for clause in &spec.clauses {
+                        private_list = pg_sys::lappend_int(private_list, clause.conditions.len() as i32);
+                        for cond in &clause.conditions {
+                            private_list = pg_sys::lappend_int(private_list, cond.col_idx as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.op as i32);
+                            private_list = pg_sys::lappend_int(private_list, (cond.const_val >> 32) as i32);
+                            private_list = pg_sys::lappend_int(private_list, cond.const_val as i32);
+                        }
+                        serialize_case_when_value(&clause.result, &mut private_list);
+                    }
+                    serialize_case_when_value(&spec.default, &mut private_list);
+                }
+            }
+        }
+        // Trailer: is_partial. plan_agg_path reads this and forwards into
+        // plan_private; runtime uses it to decide between compact_finalize
+        // and compact_emit_partial.
+        private_list = pg_sys::lappend_int(private_list, if is_partial { 1 } else { 0 });
+        private_list
+    }
+}
+
 /// Phase C.2.f — predicate mirroring `agg::can_use_compact_accs` but operating
 /// on `AggSpec` (the path-level type). Both check the same conditions: fixed-
 /// size accumulators on integer/float/text columns. Diverging would silently
@@ -1092,96 +1186,20 @@ pub unsafe fn add_agg_path(
         (*cpath).path.parallel_safe = false;
         (*cpath).path.pathkeys = if pathkeys.is_null() { std::ptr::null_mut() } else { pathkeys };
 
-        // Store in custom_private:
-        // [oid1, oid2, ..., -1, num_aggs,
-        //  agg_type_0, col_idx_0, result_oid_0, col_type_oid_0, expr_kind_0,
-        //  ...,
-        //  num_groups, group_col_idx_0, group_type_oid_0, ...]
-        let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
-        for &oid in companion_oids {
-            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
-        }
-        private_list = pg_sys::lappend_int(private_list, -1);  // sentinel
-        private_list = pg_sys::lappend_int(private_list, agg_specs.len() as i32);
-        for spec in agg_specs {
-            private_list = pg_sys::lappend_int(private_list, spec.agg_type as i32);
-            private_list = pg_sys::lappend_int(private_list, spec.col_idx);
-            private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
-            private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
-            private_list = pg_sys::lappend_int(private_list, spec.expr_kind as i32);
-            if matches!(spec.expr_kind, super::exec::AggExpr::AddConst) {
-                private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
-            }
-        }
-        private_list = pg_sys::lappend_int(private_list, group_specs.len() as i32);
-        for gs in group_specs {
-            private_list = pg_sys::lappend_int(private_list, gs.col_idx);
-            private_list = pg_sys::lappend_int(private_list, u32::from(gs.type_oid) as i32);
-            match &gs.expr {
-                super::exec::GroupByExpr::Column => {
-                    private_list = pg_sys::lappend_int(private_list, 0); // expr_tag=0
-                }
-                super::exec::GroupByExpr::RegexpReplace { pattern, replacement, func_oid, collation } => {
-                    private_list = pg_sys::lappend_int(private_list, 1); // expr_tag=1
-                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
-                    private_list = pg_sys::lappend_int(private_list, *collation as i32);
-                    private_list = pg_sys::lappend_int(private_list, pattern.len() as i32);
-                    for &b in pattern.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                    private_list = pg_sys::lappend_int(private_list, replacement.len() as i32);
-                    for &b in replacement.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                }
-                super::exec::GroupByExpr::DateTrunc { unit, func_oid, .. } => {
-                    private_list = pg_sys::lappend_int(private_list, 2); // expr_tag=2
-                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
-                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
-                    for &b in unit.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                }
-                super::exec::GroupByExpr::Extract { unit, func_oid } => {
-                    private_list = pg_sys::lappend_int(private_list, 3); // expr_tag=3
-                    private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
-                    private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
-                    for &b in unit.as_bytes() {
-                        private_list = pg_sys::lappend_int(private_list, b as i32);
-                    }
-                }
-                super::exec::GroupByExpr::AddConst { offset, op_oid } => {
-                    private_list = pg_sys::lappend_int(private_list, 4); // expr_tag=4
-                    private_list = pg_sys::lappend_int(private_list, *offset as i32);
-                    private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
-                }
-                super::exec::GroupByExpr::CaseWhen(spec) => {
-                    private_list = pg_sys::lappend_int(private_list, 5); // expr_tag=5
-                    private_list = pg_sys::lappend_int(private_list, spec.clauses.len() as i32);
-                    for clause in &spec.clauses {
-                        private_list = pg_sys::lappend_int(private_list, clause.conditions.len() as i32);
-                        for cond in &clause.conditions {
-                            private_list = pg_sys::lappend_int(private_list, cond.col_idx as i32);
-                            private_list = pg_sys::lappend_int(private_list, cond.op as i32);
-                            // Store i64 const_val as two i32s (high, low)
-                            private_list = pg_sys::lappend_int(private_list, (cond.const_val >> 32) as i32);
-                            private_list = pg_sys::lappend_int(private_list, cond.const_val as i32);
-                        }
-                        serialize_case_when_value(&clause.result, &mut private_list);
-                    }
-                    serialize_case_when_value(&spec.default, &mut private_list);
-                }
-            }
-        }
+        // Store in custom_private. Wire format: see `build_agg_path_private`.
+        // Trailer is_partial = false on the complete path; the partial path
+        // constructor (add_agg_partial_path) sets it true.
+        let private_list = build_agg_path_private(
+            companion_oids,
+            agg_specs,
+            group_specs,
+            /* is_partial */ false,
+        );
+
         // Store HAVING filters for thread-local passing to plan_agg_path
         if !having_filters.is_empty() {
             set_agg_having_filters(having_filters.to_vec());
         }
-
-        // Phase C.2 activation trailer: complete-path always 0. The partial
-        // path constructor (add_agg_partial_path) appends 1 at the same
-        // position so plan_agg_path can route to compact_emit_partial.
-        private_list = pg_sys::lappend_int(private_list, 0);
 
         (*cpath).custom_private = private_list;
 
