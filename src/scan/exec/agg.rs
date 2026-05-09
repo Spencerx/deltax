@@ -8490,6 +8490,106 @@ unsafe fn compact_finalize(
     }
 }
 
+/// Phase C.2 activation — emit a partial-aggregate transition state into a
+/// `(Datum, is_null)` pair for the Final Aggregate node above us to combine
+/// via `aggcombinefn`. Mirrors `compact_finalize` but stops one step earlier:
+/// returns the value at PG's `aggtranstype` rather than the user-visible
+/// final type.
+///
+/// Coverage:
+/// - `Count` → `int8` count (combinefn `int8pl`). Same as finalize for this slot.
+/// - `SumIntNarrow` (SUM only) → `int8` sum (combinefn `int8pl`).
+/// - `SumFloat` (SUM only) → `float8` sum (combinefn `float8_combine` —
+///   actually pl, since float8 sum has no count component).
+/// - `MinStr` / `MaxStr` → `text` directly (combinefn `text_smaller` /
+///   `text_larger`).
+/// - `SumInt` (SUM(int8) / AVG / SumIntNarrow AVG / SumFloat AVG) — NOT yet
+///   implemented because the `aggtranstype = internal` path needs
+///   `int8_avg_serialize` to produce a `bytea` partial state. Add eligibility
+///   gate in `add_agg_path` so we don't reach this with an unsupported shape.
+/// - `Count` for COUNT(DISTINCT) — has no `aggcombinefn` in PG core; must be
+///   excluded by gating.
+///
+/// `unreachable!` in the unsupported branches is the bug-catcher: if planner
+/// gating drifts and we land here at runtime, we'd produce silently-wrong
+/// results otherwise.
+#[allow(dead_code)] // wired by the C.2 activation planner code in path.rs
+unsafe fn compact_emit_partial(
+    storage: &CompactAccStorage,
+    group_idx: u32,
+    slot: usize,
+    spec: &AggExecSpec,
+) -> (pg_sys::Datum, bool) {
+    unsafe {
+        let (_, kind) = storage.layout.slots[slot];
+        match kind {
+            CompactAccKind::Count => {
+                // partial state for `count` and `count(*)` is `int8`.
+                let count = storage.read_count(group_idx, slot);
+                (pg_sys::Datum::from(count as usize), false)
+            }
+            CompactAccKind::SumIntNarrow => {
+                // SUM(int2/int4): partial state is `int8` (the running sum).
+                // count is unused at the partial level for SUM. AVG path
+                // not supported here yet — gating must reject it.
+                if spec.agg_type != AggType::Sum {
+                    unreachable!(
+                        "compact_emit_partial: SumIntNarrow only supports Sum (got {:?}); \
+                         planner gating drift",
+                        spec.agg_type,
+                    );
+                }
+                let (sum, _count) = storage.read_sum_int_narrow(group_idx, slot);
+                (pg_sys::Datum::from(sum as usize), false)
+            }
+            CompactAccKind::SumFloat => {
+                // SUM(float4/float8): partial state is `float8` (the running
+                // sum). count is unused at the partial level. combinefn is
+                // `float8pl`.
+                if spec.agg_type != AggType::Sum {
+                    unreachable!(
+                        "compact_emit_partial: SumFloat only supports Sum (got {:?}); \
+                         planner gating drift",
+                        spec.agg_type,
+                    );
+                }
+                let (sum, count) = storage.read_sum_float(group_idx, slot);
+                if count == 0 {
+                    return (pg_sys::Datum::from(0usize), true);
+                }
+                (pg_sys::Datum::from(sum.to_bits() as usize), false)
+            }
+            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                // partial state for MIN/MAX is the value itself; combinefn
+                // is `text_smaller` / `text_larger`. Same emit as finalize.
+                let (off, len) = storage.read_min_max_str(group_idx, slot);
+                if off == u32::MAX {
+                    (pg_sys::Datum::from(0usize), true)
+                } else {
+                    let s = storage.str_arena.get(off, len);
+                    let datum = string_to_datum(s, spec.col_type_oid);
+                    (datum, false)
+                }
+            }
+            CompactAccKind::SumInt => {
+                // SUM(int8) partial state is `internal` via int8_avg_serialize
+                // → `bytea`. Not implemented yet; gating must reject SUM(int8)
+                // / AVG until we wire int8_avg_serialize.
+                unreachable!(
+                    "compact_emit_partial: SumInt (transtype=internal) not yet supported \
+                     for partial emit; planner gating drift",
+                );
+            }
+            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                unreachable!(
+                    "compact_emit_partial: COUNT(DISTINCT) has no PG aggcombinefn; \
+                     planner gating drift",
+                );
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Packed Integer Keys (Phase 2)
 // ============================================================================
