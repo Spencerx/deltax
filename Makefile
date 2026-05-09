@@ -11,6 +11,7 @@ VENV         = .venv
 
 .PHONY: dev-image image image-fresh test build clippy coverage coverage-all run psql cargo clean \
        integration-test \
+       correctness-smoke correctness correctness-fuzz correctness-clean \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
        bench-rtabench bench-rtabench-keep bench-rtabench-full bench-rtabench-clean \
        bench-rtabench-distclean \
@@ -185,6 +186,18 @@ integration-test: $(VENV)/.stamp
 		$(MAKE) image PG_MAJOR=$$v; \
 		PG_DELTAX_IMAGE=pg_deltax:pg$$v $(VENV)/bin/pytest tests/ -v; \
 	done
+
+correctness-smoke: $(VENV)/.stamp image
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/correctness/ -v -s
+
+correctness: correctness-smoke
+
+correctness-fuzz:
+	@echo "Seeded generated correctness tests are not implemented yet."
+
+correctness-clean:
+	find tests/correctness -type d -name __pycache__ -prune -exec rm -rf {} +
+	rm -rf tests/correctness/.pytest_cache tests/.correctness_failures
 
 bench-clickbench: $(VENV)/.stamp image
 	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/bench_clickbench.py -v -s
