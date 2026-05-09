@@ -1,6 +1,9 @@
 /target
 /coverage
 /.venv
+__pycache__/
+*.py[cod]
+*$py.class
 tests/__pycache__/
 .claude/
 *.swp
