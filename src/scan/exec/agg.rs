@@ -85,6 +85,27 @@ pub(crate) enum AggExpr {
     AddConst,
 }
 
+/// H.2: post-storage transform applied at finalize / partial-emit time.
+///
+/// MIN/MAX are linear in the input, so a monotonic affine transform on the
+/// argument can be lifted to a transform on the result without changing the
+/// argmin/argmax. We exploit this for JSONBench Q3/Q4's
+/// `MIN(<const_timestamptz> + INTERVAL <unit> * <bigint>)` shape: store the
+/// raw bigint (`time_us`), pick the min, then shift by `delta` at emit time
+/// to recover the timestamptz value PG expects.
+///
+/// `None` is the identity (no shift); existing code paths default to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OutputTransform {
+    None,
+    /// Final emitted value = `stored_i64 + delta` (wrapping i64 add).
+    /// Stored accumulator is i64 microseconds; emitted Datum is reinterpreted
+    /// as TIMESTAMPTZOID (PG's internal representation is i64 µs from 2000-01-01).
+    /// `delta` is precomputed by the recognizer in `hook.rs` from the
+    /// constant epoch + interval coefficient.
+    PgUsShift { delta: i64 },
+}
+
 /// `hashbrown` HashSet with ahash — the insert hot path for
 /// COUNT(DISTINCT) accumulators. Swapped from `std::collections::HashSet`
 /// (SipHash) for ~2-3× faster inserts; the serial CD merge on Q4 goes
@@ -194,6 +215,10 @@ pub(crate) struct AggExecSpec {
     /// false`.
     #[allow(dead_code)] // wired by C.2 activation in path.rs
     pub(crate) transtype_oid: pg_sys::Oid,
+    /// H.2: monotonic transform applied at finalize / partial-emit. Default
+    /// `None` for all existing call sites; recognizer in `hook.rs` sets
+    /// `PgUsShift { delta }` for the timestamptz_pl_interval Aggref shape.
+    pub(crate) output_transform: OutputTransform,
 }
 
 // SAFETY: AggExecSpec contains only value types (i32, i64, Oid=u32, enums).
@@ -1151,6 +1176,26 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 }
                 _ => (AggExpr::Column, 0i64),
             };
+            // H.2: OutputTransform trailer — only present for Min/Max
+            // (keeps the wire format identical for Count/Sum/Avg/CountDistinct).
+            // tag(0=None,1=PgUsShift); when tag==1, followed by lo+hi i32s
+            // for the i64 delta.
+            let output_transform = if matches!(agg_type, AggType::Min | AggType::Max) && idx < list_len {
+                let tag = pg_sys::list_nth_int(custom_private, idx);
+                idx += 1;
+                match tag {
+                    1 => {
+                        let lo = pg_sys::list_nth_int(custom_private, idx) as u32 as u64;
+                        let hi = pg_sys::list_nth_int(custom_private, idx + 1) as u32 as u64;
+                        idx += 2;
+                        let delta = ((hi << 32) | lo) as i64;
+                        OutputTransform::PgUsShift { delta }
+                    }
+                    _ => OutputTransform::None,
+                }
+            } else {
+                OutputTransform::None
+            };
             let _ = result_oid; // parsed for offset, not stored
             agg_specs.push(AggExecSpec {
                 agg_type,
@@ -1160,6 +1205,7 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 const_offset,
                 is_partial: false,
                 transtype_oid: pg_sys::InvalidOid,
+                output_transform,
             });
         }
     }
@@ -3026,6 +3072,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                         }
                                     }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx_w, slot_idx);
+                                        if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx_w, slot_idx);
+                                        if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                    }
                                     CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                         // Handled by parallel pass above.
                                     }
@@ -3189,6 +3243,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 }
                                             }
                                         }
+                                        CompactAccKind::MinInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                        }
+                                        CompactAccKind::MaxInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                        }
                                         CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                             spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
                                         }
@@ -3349,6 +3411,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
                                             }
                                         }
+                                    }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
                                     }
                                     CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                         bare_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
@@ -3531,6 +3601,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                         storage.write_min_max_str(gidx, slot_idx, new_off, new_len);
                                                     }
                                                 }
+                                            }
+                                            CompactAccKind::MinInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_min_int(gidx, slot_idx, w_val); }
+                                            }
+                                            CompactAccKind::MaxInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_max_int(gidx, slot_idx, w_val); }
                                             }
                                             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                                 cd_sidecar.union_from(slot_idx, gidx, &worker.cd_sidecar, wgidx);
@@ -4314,6 +4392,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 }
                                             }
                                         }
+                                        CompactAccKind::MinInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                        }
+                                        CompactAccKind::MaxInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                        }
                                         CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                             spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
                                         }
@@ -4489,6 +4575,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                     storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
                                                 }
                                             }
+                                        }
+                                        CompactAccKind::MinInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                        }
+                                        CompactAccKind::MaxInt => {
+                                            let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                            if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
                                         }
                                         CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                             spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
@@ -4686,6 +4780,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                 final_storage.write_min_max_str(group_idx, slot_idx, new_off, new_len);
                                             }
                                         }
+                                    }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_gidx, slot_idx);
+                                        if w_has { final_storage.update_min_int(group_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_gidx, slot_idx);
+                                        if w_has { final_storage.update_max_int(group_idx, slot_idx, w_val); }
                                     }
                                     CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                         final_cd_sidecar.union_from(slot_idx, group_idx, &result.cd_sidecar, worker_gidx);
@@ -4912,6 +5014,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                                         storage.write_min_max_str(gidx, slot_idx, new_off, new_len);
                                                     }
                                                 }
+                                            }
+                                            CompactAccKind::MinInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_min_int(gidx, slot_idx, w_val); }
+                                            }
+                                            CompactAccKind::MaxInt => {
+                                                let (w_val, w_has) = worker.compact_storage.read_min_max_int(wgidx, slot_idx);
+                                                if w_has { storage.update_max_int(gidx, slot_idx, w_val); }
                                             }
                                             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                                 cd_sidecar.union_from(slot_idx, gidx, &worker.cd_sidecar, wgidx);
@@ -5257,6 +5367,14 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         storage.write_min_max_str(global_group_idx, slot_idx, new_off, new_len);
                                     }
                                 }
+                            }
+                            CompactAccKind::MinInt => {
+                                let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_group_idx, slot_idx);
+                                if w_has { storage.update_min_int(global_group_idx, slot_idx, w_val); }
+                            }
+                            CompactAccKind::MaxInt => {
+                                let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_group_idx, slot_idx);
+                                if w_has { storage.update_max_int(global_group_idx, slot_idx, w_val); }
                             }
                             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                                 merged_cd_sidecar.union_from(slot_idx, global_group_idx, &result.cd_sidecar, worker_group_idx);
@@ -6648,6 +6766,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             let (new_off, new_len) = storage.str_arena.alloc(s);
                                             storage.write_min_max_str(group_idx, spec_idx, new_off, new_len);
                                         }
+                                }
+                            }
+                            CompactAccKind::MinInt => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let v = col[row].0.value() as i64;
+                                    storage.update_min_int(group_idx, spec_idx, v);
+                                }
+                            }
+                            CompactAccKind::MaxInt => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    let v = col[row].0.value() as i64;
+                                    storage.update_max_int(group_idx, spec_idx, v);
                                 }
                             }
                             CompactAccKind::CountDistinctInt => {
@@ -8108,6 +8240,8 @@ pub(super) enum CompactAccKind {
     MaxStr,             // 8 bytes: u32 arena_offset + u32 length (sentinel: u32::MAX, 0)
     CountDistinctInt,   // 8 bytes: i64 count cache (real data in CountDistinctSideCar)
     CountDistinctStr,   // 8 bytes: i64 count cache (real data in CountDistinctSideCar)
+    MinInt,             // 16 bytes: i64 val + i64 has_value flag (0 = unset)
+    MaxInt,             // 16 bytes: i64 val + i64 has_value flag (0 = unset)
 }
 
 impl CompactAccKind {
@@ -8124,6 +8258,8 @@ impl CompactAccKind {
             CompactAccKind::MaxStr => 5,
             CompactAccKind::CountDistinctInt => 6,
             CompactAccKind::CountDistinctStr => 7,
+            CompactAccKind::MinInt => 8,
+            CompactAccKind::MaxInt => 9,
         }
     }
 
@@ -8136,6 +8272,7 @@ impl CompactAccKind {
             CompactAccKind::SumIntNarrow => 16,
             CompactAccKind::SumFloat => 16,
             CompactAccKind::MinStr | CompactAccKind::MaxStr => 8,
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => 16,
         }
     }
 
@@ -8148,6 +8285,7 @@ impl CompactAccKind {
             CompactAccKind::SumIntNarrow => 8,
             CompactAccKind::SumFloat => 8,
             CompactAccKind::MinStr | CompactAccKind::MaxStr => 4,
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => 8,
         }
     }
 }
@@ -8210,16 +8348,26 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
             let t = spec.col_type_oid;
             if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
                 CompactAccKind::MinStr
+            } else if t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                || t == pg_sys::DATEOID
+                || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
+            {
+                CompactAccKind::MinInt
             } else {
-                unreachable!("compact_acc_kind: MIN on non-text not supported in compact path")
+                unreachable!("compact_acc_kind: MIN on type {:?} not supported in compact path", t)
             }
         }
         AggType::Max => {
             let t = spec.col_type_oid;
             if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
                 CompactAccKind::MaxStr
+            } else if t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                || t == pg_sys::DATEOID
+                || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
+            {
+                CompactAccKind::MaxInt
             } else {
-                unreachable!("compact_acc_kind: MAX on non-text not supported in compact path")
+                unreachable!("compact_acc_kind: MAX on type {:?} not supported in compact path", t)
             }
         }
         AggType::CountDistinct => {
@@ -8927,6 +9075,53 @@ impl CompactAccStorage {
         }
     }
 
+    /// Read MinInt/MaxInt: returns (value, has_value). `has_value=false` means
+    /// no value has been observed yet (zero-init from `alloc_group`).
+    #[inline]
+    pub(super) unsafe fn read_min_max_int(&self, group_idx: u32, slot: usize) -> (i64, bool) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            let val = *(base as *const i64);
+            let has = *(base.add(8) as *const i64);
+            (val, has != 0)
+        }
+    }
+
+    /// Write MinInt/MaxInt value + has_value flag.
+    #[inline]
+    pub(super) unsafe fn write_min_max_int(&mut self, group_idx: u32, slot: usize, val: i64, has: bool) {
+        unsafe {
+            let (offset, _) = self.layout.slots[slot];
+            let base = self.buf.as_mut_ptr()
+                .add(group_idx as usize * self.layout.group_stride + offset);
+            *(base as *mut i64) = val;
+            *(base.add(8) as *mut i64) = if has { 1 } else { 0 };
+        }
+    }
+
+    /// Update MinInt: replace stored value if `candidate < stored` or no value yet.
+    #[inline]
+    pub(super) unsafe fn update_min_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
+        unsafe {
+            let (val, has) = self.read_min_max_int(group_idx, slot);
+            if !has || candidate < val {
+                self.write_min_max_int(group_idx, slot, candidate, true);
+            }
+        }
+    }
+
+    /// Update MaxInt: replace stored value if `candidate > stored` or no value yet.
+    #[inline]
+    pub(super) unsafe fn update_max_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
+        unsafe {
+            let (val, has) = self.read_min_max_int(group_idx, slot);
+            if !has || candidate > val {
+                self.write_min_max_int(group_idx, slot, candidate, true);
+            }
+        }
+    }
 }
 
 /// Check if all aggregates can use the compact accumulator path.
@@ -8945,6 +9140,9 @@ fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
             AggType::Min | AggType::Max => {
                 let t = spec.col_type_oid;
                 t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+                    || t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                    || t == pg_sys::DATEOID
+                    || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
             }
             AggType::CountDistinct => {
                 let t = spec.col_type_oid;
@@ -9127,6 +9325,20 @@ unsafe fn compact_finalize(
                     (datum, false)
                 }
             }
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                let (val, has) = storage.read_min_max_int(group_idx, slot);
+                if !has {
+                    (pg_sys::Datum::from(0usize), true) // NULL
+                } else {
+                    // H.2: monotonic post-shift for the timestamptz_pl_interval
+                    // recognizer. `OutputTransform::None` is the no-op identity.
+                    let out = match spec.output_transform {
+                        OutputTransform::None => val,
+                        OutputTransform::PgUsShift { delta } => val.wrapping_add(delta),
+                    };
+                    (pg_sys::Datum::from(out as usize), false)
+                }
+            }
             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                 // Count was pre-written into the compact slot by write_counts_to_storage
                 let count = storage.read_count(group_idx, slot);
@@ -9215,6 +9427,23 @@ unsafe fn compact_emit_partial(
                     let s = storage.str_arena.get(off, len);
                     let datum = string_to_datum(s, spec.col_type_oid);
                     (datum, false)
+                }
+            }
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                // partial state for MIN/MAX(int|timestamp) is the value itself;
+                // combinefn is `int*smaller`/`int*larger` (or `timestamp*_smaller`
+                // / `timestamp*_larger`). Same emit as finalize — apply the
+                // monotonic OutputTransform here too so the post-shift value
+                // is what flows up to PG's combinefn.
+                let (val, has) = storage.read_min_max_int(group_idx, slot);
+                if !has {
+                    (pg_sys::Datum::from(0usize), true)
+                } else {
+                    let out = match spec.output_transform {
+                        OutputTransform::None => val,
+                        OutputTransform::PgUsShift { delta } => val.wrapping_add(delta),
+                    };
+                    (pg_sys::Datum::from(out as usize), false)
                 }
             }
             CompactAccKind::SumInt => {
@@ -9858,6 +10087,20 @@ fn process_segments_compact(
                         // so MinStr/MaxStr cannot appear here
                         unreachable!("MinStr/MaxStr in compact parallel worker")
                     }
+                    CompactAccKind::MinInt => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_min_int(group_idx, spec_idx, v); }
+                        }
+                    }
+                    CompactAccKind::MaxInt => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_max_int(group_idx, spec_idx, v); }
+                        }
+                    }
                     CompactAccKind::CountDistinctInt => {
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
@@ -10032,6 +10275,18 @@ fn merge_compact_results(
                             let (new_off, new_len) = global_storage.str_arena.alloc(w_str);
                             global_storage.write_min_max_str(global_group_idx, slot_idx, new_off, new_len);
                         }
+                    }
+                },
+                CompactAccKind::MinInt => unsafe {
+                    let (w_val, w_has) = worker_storage.read_min_max_int(worker_group_idx, slot_idx);
+                    if w_has {
+                        global_storage.update_min_int(global_group_idx, slot_idx, w_val);
+                    }
+                },
+                CompactAccKind::MaxInt => unsafe {
+                    let (w_val, w_has) = worker_storage.read_min_max_int(worker_group_idx, slot_idx);
+                    if w_has {
+                        global_storage.update_max_int(global_group_idx, slot_idx, w_val);
                     }
                 },
                 CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
@@ -11140,6 +11395,20 @@ fn process_segments_mixed(
                                 }
                         }
                     }
+                    CompactAccKind::MinInt => {
+                        let col = &numeric_cols[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_min_int(group_idx, spec_idx, v); }
+                        }
+                    }
+                    CompactAccKind::MaxInt => {
+                        let col = &numeric_cols[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            unsafe { compact_storage.update_max_int(group_idx, spec_idx, v); }
+                        }
+                    }
                     CompactAccKind::CountDistinctInt => {
                         let col = &numeric_cols[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
@@ -11308,8 +11577,8 @@ mod tests {
                 2, -1, 0, 0, 0,  // CountStar
                 3, 2, 0, 701, 0, // Avg, col=2, FLOAT8OID=701
                 4, 3, 0, 25, 0,  // CountDistinct, col=3, TEXTOID=25
-                5, 0, 0, 23, 0,  // Min, col=0
-                6, 0, 0, 23, 0,  // Max, col=0
+                5, 0, 0, 23, 0, 0,  // Min, col=0, OutputTransform=None
+                6, 0, 0, 23, 0, 0,  // Max, col=0, OutputTransform=None
             ]);
 
             let plan = parse_agg_private(list);
@@ -11720,6 +11989,7 @@ mod tests {
             const_offset: 0,
             is_partial: false,
             transtype_oid: pg_sys::InvalidOid,
+            output_transform: OutputTransform::None,
         }
     }
 

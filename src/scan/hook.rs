@@ -1284,6 +1284,287 @@ unsafe fn parse_case_when_value(
     }
 }
 
+/// H.2: recognizer for the JSONBench Q3/Q4 Aggref shape:
+///
+/// ```text
+/// timestamptz_pl_interval(
+///     Const(timestamptz, EPOCH_PGUS),
+///     interval_mul(
+///         Const(interval, UNIT_USECS),
+///         FuncExpr(int8 → float8, [chain (data->>'time_us')::bigint])
+///     )
+/// )
+/// ```
+///
+/// MIN/MAX over this expression equals MIN/MAX over `time_us` (the bigint
+/// chain) shifted by a constant — `pg_us = epoch_pgus + unit_usecs * time_us`.
+/// We pick MIN/MAX on the raw bigint and apply the affine shift at finalize
+/// via `OutputTransform::PgUsShift { delta }`.
+///
+/// Returns `Some((col_idx, type_oid, delta))` where `col_idx` is the
+/// synthetic chain column, `type_oid = INT8OID` (storage type), and `delta`
+/// is the i64 µs offset added at emit time. Falls back when:
+///  - constants don't reduce to a positive integer µs coefficient,
+///  - the unit coefficient × INT8 max would overflow i64,
+///  - the chain doesn't resolve via `AggChainCtx`.
+unsafe fn try_match_timestamp_interval_min_max(
+    ctx: &super::json_extract::AggChainCtx,
+    arg_expr: *const pg_sys::Node,
+) -> Option<(i32, pg_sys::Oid, i64)> {
+    unsafe {
+        if arg_expr.is_null() || (*arg_expr).type_ != pg_sys::NodeTag::T_OpExpr {
+            return None;
+        }
+        let outer = arg_expr as *const pg_sys::OpExpr;
+        // Outer op must be `timestamptz + interval` returning timestamptz.
+        // Resolve by name + operand types to be PG-version-safe.
+        if !is_op_named(
+            (*outer).opno,
+            "+",
+            Some(pg_sys::TIMESTAMPTZOID),
+            Some(pg_sys::INTERVALOID),
+            pg_sys::TIMESTAMPTZOID,
+        ) {
+            return None;
+        }
+        let oargs = (*outer).args;
+        if oargs.is_null() || (*oargs).length != 2 {
+            return None;
+        }
+        let l = (*(*oargs).elements.add(0)).ptr_value as *const pg_sys::Node;
+        let r = (*(*oargs).elements.add(1)).ptr_value as *const pg_sys::Node;
+        if l.is_null() || r.is_null() {
+            return None;
+        }
+
+        // Identify epoch Const (timestamptz) and the inner interval_mul OpExpr.
+        let (epoch_const, inner_op): (*const pg_sys::Const, *const pg_sys::OpExpr) =
+            if (*l).type_ == pg_sys::NodeTag::T_Const && (*r).type_ == pg_sys::NodeTag::T_OpExpr {
+                (l as *const pg_sys::Const, r as *const pg_sys::OpExpr)
+            } else if (*r).type_ == pg_sys::NodeTag::T_Const
+                && (*l).type_ == pg_sys::NodeTag::T_OpExpr
+            {
+                (r as *const pg_sys::Const, l as *const pg_sys::OpExpr)
+            } else {
+                return None;
+            };
+        if (*epoch_const).constisnull || (*epoch_const).consttype != pg_sys::TIMESTAMPTZOID {
+            return None;
+        }
+        let epoch_pgus: i64 = (*epoch_const).constvalue.value() as i64;
+
+        // Inner op must be `interval * <numeric>` returning interval. The
+        // numeric side is typically float8 (PG's preferred coercion for
+        // bigint × interval), but we accept either operand position.
+        if !is_op_named(
+            (*inner_op).opno,
+            "*",
+            None,
+            None,
+            pg_sys::INTERVALOID,
+        ) {
+            return None;
+        }
+        let iargs = (*inner_op).args;
+        if iargs.is_null() || (*iargs).length != 2 {
+            return None;
+        }
+        let il = (*(*iargs).elements.add(0)).ptr_value as *const pg_sys::Node;
+        let ir = (*(*iargs).elements.add(1)).ptr_value as *const pg_sys::Node;
+        if il.is_null() || ir.is_null() {
+            return None;
+        }
+
+        // Pick the Const(interval) operand, the other is the numeric chain.
+        let (iv_const, num_node): (*const pg_sys::Const, *const pg_sys::Node) =
+            if (*il).type_ == pg_sys::NodeTag::T_Const
+                && (*(il as *const pg_sys::Const)).consttype == pg_sys::INTERVALOID
+            {
+                (il as *const pg_sys::Const, ir)
+            } else if (*ir).type_ == pg_sys::NodeTag::T_Const
+                && (*(ir as *const pg_sys::Const)).consttype == pg_sys::INTERVALOID
+            {
+                (ir as *const pg_sys::Const, il)
+            } else {
+                return None;
+            };
+        if (*iv_const).constisnull {
+            return None;
+        }
+
+        // Decode interval Const → i64 µs coefficient. PG's Interval is
+        // {time: i64 µs, day: i32, month: i32}. Reject month/day intervals
+        // (variable length) — only fixed-width `time` units (sub-day) are
+        // representable as a constant µs coefficient.
+        let iv_ptr = (*iv_const).constvalue.value() as *const pg_sys::Interval;
+        if iv_ptr.is_null() {
+            return None;
+        }
+        let iv = *iv_ptr;
+        if iv.month != 0 || iv.day != 0 || iv.time <= 0 {
+            return None;
+        }
+        let coeff_us: i64 = iv.time;
+
+        // Strip the int8 → float8 cast from the numeric side. The cast may
+        // be a FuncExpr (funcid for `float8(int8)` is 482) or RelabelType.
+        let stripped = strip_numeric_cast(num_node);
+        // Resolve the chain via AggChainCtx → must yield (col_idx, INT8OID).
+        let (col_idx, chain_type) = ctx.match_to_synthetic(stripped)?;
+        if chain_type != pg_sys::INT8OID {
+            return None;
+        }
+
+        // For Q3/Q4 with `1 microsecond`, coeff_us = 1 → no overflow risk.
+        // For larger units (e.g., 1ms = 1000), the worst-case product
+        // `coeff_us * INT8::MAX` overflows i64 — bail unless coeff_us fits
+        // in a small bound. JSONBench's `time_us` is below 2^53; we apply
+        // a conservative gate.
+        if coeff_us != 1 {
+            // Reject anything other than identity for now — H.2 only
+            // targets the 1µs unit. Larger coefficients need a runtime
+            // multiply per row, which conflicts with the pure-min-of-i64
+            // shape of MinInt/MaxInt.
+            return None;
+        }
+
+        // delta = epoch_pgus (since coeff_us = 1, pg_us = time_us + epoch_pgus).
+        Some((col_idx, pg_sys::INT8OID, epoch_pgus))
+    }
+}
+
+/// Helper: check an OpExpr's identity by name + (optional) left/right
+/// operand types + result type. PG-version-safe alternative to hard-coding
+/// OIDs (e.g., 1327 for timestamptz_pl_interval).
+unsafe fn is_op_named(
+    opno: pg_sys::Oid,
+    expected_name: &str,
+    expected_left: Option<pg_sys::Oid>,
+    expected_right: Option<pg_sys::Oid>,
+    expected_result: pg_sys::Oid,
+) -> bool {
+    unsafe {
+        let opname_ptr = pg_sys::get_opname(opno);
+        if opname_ptr.is_null() {
+            return false;
+        }
+        let opname = std::ffi::CStr::from_ptr(opname_ptr)
+            .to_str()
+            .unwrap_or("");
+        if opname != expected_name {
+            return false;
+        }
+        let tup = pg_sys::SearchSysCache1(
+            pg_sys::SysCacheIdentifier::OPEROID as i32,
+            pg_sys::Datum::from(u32::from(opno) as usize),
+        );
+        if tup.is_null() {
+            return false;
+        }
+        let op = pg_sys::GETSTRUCT(tup) as *const pg_sys::FormData_pg_operator;
+        let ok = (*op).oprresult == expected_result
+            && expected_left.is_none_or(|t| (*op).oprleft == t)
+            && expected_right.is_none_or(|t| (*op).oprright == t);
+        pg_sys::ReleaseSysCache(tup);
+        ok
+    }
+}
+
+/// H.2: predicate for the `non_agg_op_exprs` tlist validator. Returns true
+/// when `node` is composed entirely of `Aggref` references, constants, and
+/// pure expression wrappers (`OpExpr`, `FuncExpr`, `RelabelType`,
+/// `CoerceViaIO`). Such expressions are always valid in a post-aggregation
+/// projection — PG computes them after `Aggregate` finishes — so they don't
+/// need to match a GROUP BY column.
+///
+/// Bails on any `Var` reference (which would have to match GROUP BY) and on
+/// any other node type (`SubLink`, `WindowFunc`, etc.) we don't want to
+/// silently accept. The walk is intentionally narrow.
+unsafe fn expr_only_uses_aggrefs_and_consts(node: *const pg_sys::Node) -> bool {
+    unsafe {
+        if node.is_null() {
+            return true;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_Aggref | pg_sys::NodeTag::T_Const => true,
+            pg_sys::NodeTag::T_RelabelType => {
+                let r = node as *const pg_sys::RelabelType;
+                expr_only_uses_aggrefs_and_consts((*r).arg as *const pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                let c = node as *const pg_sys::CoerceViaIO;
+                expr_only_uses_aggrefs_and_consts((*c).arg as *const pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_OpExpr => {
+                let op = node as *const pg_sys::OpExpr;
+                let args = (*op).args;
+                if args.is_null() {
+                    return true;
+                }
+                for i in 0..(*args).length {
+                    let a = (*(*args).elements.add(i as usize)).ptr_value as *const pg_sys::Node;
+                    if !expr_only_uses_aggrefs_and_consts(a) {
+                        return false;
+                    }
+                }
+                true
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let f = node as *const pg_sys::FuncExpr;
+                let args = (*f).args;
+                if args.is_null() {
+                    return true;
+                }
+                for i in 0..(*args).length {
+                    let a = (*(*args).elements.add(i as usize)).ptr_value as *const pg_sys::Node;
+                    if !expr_only_uses_aggrefs_and_consts(a) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Strip `int8 → float8` cast wrappers (`FuncExpr` with funcid for
+/// `float8(int8)` = 482, or `RelabelType`) so the underlying chain can be
+/// matched by `AggChainCtx`.
+unsafe fn strip_numeric_cast(node: *const pg_sys::Node) -> *const pg_sys::Node {
+    unsafe {
+        let mut cur = node;
+        loop {
+            if cur.is_null() {
+                return cur;
+            }
+            match (*cur).type_ {
+                pg_sys::NodeTag::T_FuncExpr => {
+                    let f = cur as *const pg_sys::FuncExpr;
+                    let args = (*f).args;
+                    if !args.is_null()
+                        && (*args).length == 1
+                        // funcid 482 is float8(int8); accept any funcformat
+                        // that produces a float — the OutputTransform layer
+                        // only cares that the inner chain is INT8.
+                        && (*f).funcid == pg_sys::Oid::from(482u32)
+                    {
+                        cur = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        continue;
+                    }
+                    return cur;
+                }
+                pg_sys::NodeTag::T_RelabelType => {
+                    let r = cur as *const pg_sys::RelabelType;
+                    cur = (*r).arg as *const pg_sys::Node;
+                    continue;
+                }
+                _ => return cur,
+            }
+        }
+    }
+}
+
 /// The create_upper_paths hook. Detects aggregate patterns over deltax
 /// scans and injects optimized custom paths:
 /// - COUNT(*) alone → DeltaXCount (sum of segment row_counts, metadata-only)
@@ -1489,6 +1770,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     const_offset: 0,
                     is_partial: false,
                     transtype_oid: pg_sys::InvalidOid,
+                    output_transform: super::exec::OutputTransform::None,
                 });
                 all_minmax = false;
                 has_non_minmax = true;
@@ -1522,6 +1804,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             }
 
             let mut agg_const_offset: i64 = 0;
+            let mut agg_output_transform: super::exec::OutputTransform =
+                super::exec::OutputTransform::None;
             let (col_idx, col_type_oid, expr_kind): (i32, pg_sys::Oid, AggExpr) = 'resolve: {
                 // First, try interpreting the arg as a JSONB chain over a
                 // synthetic column. This must come BEFORE the OpExpr branch
@@ -1535,6 +1819,21 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     && let Some((col_idx, type_oid)) = ctx.match_to_synthetic(arg_expr)
                 {
                     break 'resolve (col_idx, type_oid, AggExpr::Column);
+                }
+
+                // H.2: monotonic timestamptz-pl-interval recognizer for MIN/MAX.
+                // Match the JSONBench Q3/Q4 shape:
+                //   timestamptz_pl_interval(<const_tstz>, interval_mul(<const_iv>, float8(int8(chain))))
+                // and lift it to MIN/MAX over the bigint synthetic with an
+                // OutputTransform::PgUsShift applied at finalize. Only fires
+                // when the inner chain resolves via the synthetic-Var path
+                // and the constants reduce to an exact i64 µs delta.
+                if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
+                    && let Some((c_idx, type_oid, delta)) =
+                        try_match_timestamp_interval_min_max(ctx, arg_expr)
+                {
+                    agg_output_transform = super::exec::OutputTransform::PgUsShift { delta };
+                    break 'resolve (c_idx, type_oid, AggExpr::Column);
                 }
 
             let (var_node, ek): (*const pg_sys::Var, AggExpr) = if (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
@@ -1678,6 +1977,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         const_offset: agg_const_offset,
                         is_partial: false,
                         transtype_oid: pg_sys::InvalidOid,
+                        output_transform: super::exec::OutputTransform::None,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -1695,6 +1995,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         const_offset: agg_const_offset,
                         is_partial: false,
                         transtype_oid: pg_sys::InvalidOid,
+                        output_transform: super::exec::OutputTransform::None,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -1711,6 +2012,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             const_offset: agg_const_offset,
                             is_partial: false,
                             transtype_oid: pg_sys::InvalidOid,
+                            output_transform: super::exec::OutputTransform::None,
                         });
                         all_meta_answerable = false;
                     } else {
@@ -1723,6 +2025,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             const_offset: agg_const_offset,
                             is_partial: false,
                             transtype_oid: pg_sys::InvalidOid,
+                            output_transform: super::exec::OutputTransform::None,
                         });
                         if !count_meta_ok {
                             all_meta_answerable = false;
@@ -1741,6 +2044,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         const_offset: agg_const_offset,
                         is_partial: false,
                         transtype_oid: pg_sys::InvalidOid,
+                        output_transform: agg_output_transform,
                     });
                     if has_non_minmax {
                         // Mixed MIN/MAX with SUM/COUNT/AVG → falls through to general AggScan
@@ -1748,6 +2052,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     }
                     if !matches!(expr_kind, AggExpr::Column)
                         || !is_minmax_meta_type(effective_col_type_oid)
+                        || !matches!(agg_output_transform, super::exec::OutputTransform::None)
                     {
                         all_meta_answerable = false;
                     }
@@ -1763,12 +2068,14 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         const_offset: agg_const_offset,
                         is_partial: false,
                         transtype_oid: pg_sys::InvalidOid,
+                        output_transform: agg_output_transform,
                     });
                     if has_non_minmax {
                         all_minmax = false;
                     }
                     if !matches!(expr_kind, AggExpr::Column)
                         || !is_minmax_meta_type(effective_col_type_oid)
+                        || !matches!(agg_output_transform, super::exec::OutputTransform::None)
                     {
                         all_meta_answerable = false;
                     }
@@ -2844,14 +3151,24 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             }
 
             // Validate that each non_agg_op_exprs entry matches a GROUP BY spec.
-            // Two shapes are accepted:
+            // Three shapes are accepted:
             //   1. JSONB chain (`data->>'k'`) — matches a synthetic-column
             //      GroupByExpr::Column whose col_idx equals the chain's
             //      synthetic position.
             //   2. `Var +/- Const` — matches a GroupByExpr::AddConst with the
             //      same col_idx and operator OID.
+            //   3. **Agg-only tree** (H.2): expression composed solely of
+            //      Aggref / Const / nested OpExpr / FuncExpr / RelabelType
+            //      / CoerceViaIO. PG computes these post-aggregation, so they
+            //      don't need a GROUP BY match — Q4's
+            //      `EXTRACT(EPOCH FROM (MAX-MIN)) * 1000` lives here.
             for &(_tlist_idx, opexpr) in &non_agg_op_exprs {
-                // Try chain match first.
+                // Agg-only tree: accept without further matching. The MIN/MAX
+                // Aggrefs were already classified into `classified_aggs` above.
+                if expr_only_uses_aggrefs_and_consts(opexpr as *const pg_sys::Node) {
+                    continue;
+                }
+                // Try chain match next.
                 if json_extract_ctx.is_none() {
                     json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
                 }

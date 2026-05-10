@@ -930,6 +930,10 @@ pub struct AggSpec {
     /// when `is_partial = true`.
     #[allow(dead_code)] // wired by C.2 activation in path.rs
     pub transtype_oid: pg_sys::Oid,
+    /// H.2: monotonic transform applied to the stored MIN/MAX value at
+    /// finalize / partial-emit. Default `None`. Recognizer in `hook.rs` sets
+    /// `PgUsShift { delta }` for the timestamptz_pl_interval Aggref shape.
+    pub output_transform: super::exec::OutputTransform,
 }
 
 /// Serialize a CaseWhenValue into the integer list.
@@ -1007,6 +1011,22 @@ unsafe fn build_agg_path_private(
             private_list = pg_sys::lappend_int(private_list, spec.expr_kind as i32);
             if matches!(spec.expr_kind, super::exec::AggExpr::AddConst) {
                 private_list = pg_sys::lappend_int(private_list, spec.const_offset as i32);
+            }
+            // H.2: per-MIN/MAX OutputTransform trailer. Only emitted for
+            // Min/Max — keeps the existing wire format for Count/Sum/Avg/CD
+            // intact (no test churn). Tag 0 = None (no follow-up); tag 1 =
+            // PgUsShift, followed by lo + hi i32 halves of the i64 delta.
+            if matches!(spec.agg_type, super::exec::AggType::Min | super::exec::AggType::Max) {
+                match spec.output_transform {
+                    super::exec::OutputTransform::None => {
+                        private_list = pg_sys::lappend_int(private_list, 0);
+                    }
+                    super::exec::OutputTransform::PgUsShift { delta } => {
+                        private_list = pg_sys::lappend_int(private_list, 1);
+                        private_list = pg_sys::lappend_int(private_list, delta as i32);
+                        private_list = pg_sys::lappend_int(private_list, (delta >> 32) as i32);
+                    }
+                }
             }
         }
         private_list = pg_sys::lappend_int(private_list, group_specs.len() as i32);
@@ -1545,6 +1565,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             col_type_oid: u32,
             expr_kind: i32,  // 0=Column, 1=LengthOf, 2=AddConst
             const_offset: i32, // Only used when expr_kind == 2
+            // H.2: OutputTransform trailer (only for MIN/MAX in path_private).
+            // tag: 0=None, 1=PgUsShift. lo/hi only meaningful when tag==1.
+            output_tag: i32,
+            output_lo: i32,
+            output_hi: i32,
         }
         #[derive(Clone)]
         enum ParsedGroupExpr {
@@ -1597,7 +1622,32 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                 } else {
                     0
                 };
-                parsed_aggs.push(ParsedAgg { agg_type, col_idx, result_oid, col_type_oid, expr_kind, const_offset });
+                // H.2: per-MIN/MAX OutputTransform trailer. tag(0=None, 1=PgUsShift)
+                // followed by 2 i32 halves of i64 delta when tag==1. Capture on
+                // the path side and re-emit on plan_private below — exec parse
+                // expects the same shape.
+                let (output_tag, output_lo, output_hi) =
+                    if (agg_type == super::exec::AggType::Min as i32
+                        || agg_type == super::exec::AggType::Max as i32)
+                        && idx < path_len
+                    {
+                        let tag = pg_sys::list_nth_int(path_private, idx);
+                        idx += 1;
+                        if tag == 1 {
+                            let lo = pg_sys::list_nth_int(path_private, idx);
+                            let hi = pg_sys::list_nth_int(path_private, idx + 1);
+                            idx += 2;
+                            (1, lo, hi)
+                        } else {
+                            (0, 0, 0)
+                        }
+                    } else {
+                        (0, 0, 0)
+                    };
+                parsed_aggs.push(ParsedAgg {
+                    agg_type, col_idx, result_oid, col_type_oid, expr_kind, const_offset,
+                    output_tag, output_lo, output_hi,
+                });
             }
         }
         // Parse group specs (variable-length due to RegexpReplace)
@@ -1992,6 +2042,16 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, a.expr_kind);
             if a.expr_kind == 2 {
                 private_list = pg_sys::lappend_int(private_list, a.const_offset);
+            }
+            // H.2: re-emit OutputTransform trailer for MIN/MAX. Mirrors the
+            // path_private layout so exec's `parse_agg_private` reads the same
+            // shape it expects.
+            if a.agg_type == super::exec::AggType::Min as i32 || a.agg_type == super::exec::AggType::Max as i32 {
+                private_list = pg_sys::lappend_int(private_list, a.output_tag);
+                if a.output_tag == 1 {
+                    private_list = pg_sys::lappend_int(private_list, a.output_lo);
+                    private_list = pg_sys::lappend_int(private_list, a.output_hi);
+                }
             }
         }
         private_list = pg_sys::lappend_int(private_list, parsed_groups.len() as i32);

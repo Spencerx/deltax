@@ -470,7 +470,7 @@ pub(super) unsafe fn deserialize_partial(
 #[pgrx::pg_schema]
 mod tests {
     use super::*;
-    use crate::scan::exec::agg::{AggExpr, AggType};
+    use crate::scan::exec::agg::{AggExpr, AggType, OutputTransform};
     use pgrx::pg_sys;
 
     fn count_star_specs() -> Vec<AggExecSpec> {
@@ -482,6 +482,7 @@ mod tests {
             const_offset: 0,
             is_partial: false,
             transtype_oid: pg_sys::InvalidOid,
+            output_transform: OutputTransform::None,
         }]
     }
 
@@ -495,6 +496,7 @@ mod tests {
                 const_offset: 0,
                 is_partial: false,
                 transtype_oid: pg_sys::InvalidOid,
+                output_transform: OutputTransform::None,
             },
             AggExecSpec {
                 agg_type: AggType::CountStar,
@@ -504,6 +506,7 @@ mod tests {
                 const_offset: 0,
                 is_partial: false,
                 transtype_oid: pg_sys::InvalidOid,
+                output_transform: OutputTransform::None,
             },
         ]
     }
@@ -517,6 +520,7 @@ mod tests {
             const_offset: 0,
             is_partial: false,
             transtype_oid: pg_sys::InvalidOid,
+            output_transform: OutputTransform::None,
         }]
     }
 

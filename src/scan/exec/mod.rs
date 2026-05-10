@@ -19,7 +19,7 @@ pub(crate) use agg::AggScanState;
 
 // Re-exports for hook.rs
 pub(crate) use agg::{AggType, AggExpr, GroupByExpr, GroupByColSpec, HavingOp, HavingFilter,
-    CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenValue};
+    CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenValue, OutputTransform};
 
 // Re-export for cost.rs (parallel-agg worker recommendation needs the slot cap).
 pub(crate) use agg::MAX_AGG_WORKER_SLOTS;
