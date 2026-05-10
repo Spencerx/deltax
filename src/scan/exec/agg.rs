@@ -30,7 +30,7 @@ use super::segments::{
     classify_segment_quals, classify_segment_quals_numeric, SegmentQualResult, is_zero_const,
     detoast_lazy_blobs,
 };
-use super::text_col::{SegTextColumn, TextQualInfo, decompress_length_sidecar, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
+use super::text_col::{SegTextColumn, TextQualInfo, decompress_length_sidecar, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter, strcoll_cmp};
 
 /// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
 /// Uses two AHasher instances (AES-NI accelerated) with different fixed keys
@@ -4081,18 +4081,26 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 });
                             }
                         }
+                        BatchCompareOp::InList => {
+                            if let Some(ref vals) = bq.in_list_text {
+                                text_qual_infos.push(TextQualInfo::InList {
+                                    col_idx: bq.col_idx,
+                                    values: vals.clone(),
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
             // Reorder: cheap filters first to maximize short-circuit benefit.
-            // EQ/NE are O(1) per row (simple comparison); LIKE requires substring
-            // search. Running cheap filters first reduces the row count for
-            // expensive LIKE checks.
+            // EQ/NE are O(1) per row; InList against a small list is also O(1)
+            // in the dict fast path; LIKE requires substring search.
             text_qual_infos.sort_by_key(|tqi| match tqi {
                 TextQualInfo::EqNe { .. } => 0,                // EQ/NE — cheapest
-                TextQualInfo::Like { negate: false, .. } => 1,  // positive LIKE
-                TextQualInfo::Like { negate: true, .. } => 2,   // NOT LIKE
+                TextQualInfo::InList { .. } => 1,              // dict-keyed IN
+                TextQualInfo::Like { negate: false, .. } => 2,  // positive LIKE
+                TextQualInfo::Like { negate: true, .. } => 3,   // NOT LIKE
             });
 
             // Pipeline detoast with parallel processing when enough segments.
@@ -10792,7 +10800,8 @@ fn can_parallel_mixed(
         }
     }
 
-    // Text batch quals must be EQ/NE with text_const or LIKE/NotLike with like_strategy
+    // Text batch quals must be EQ/NE with text_const, LIKE/NotLike with
+    // like_strategy, or InList with in_list_text.
     for bq in batch_quals {
         let t = bq.type_oid;
         if t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID {
@@ -10802,6 +10811,9 @@ fn can_parallel_mixed(
                 }
                 BatchCompareOp::Like | BatchCompareOp::NotLike => {
                     if bq.like_strategy.is_none() { return false; }
+                }
+                BatchCompareOp::InList => {
+                    if bq.in_list_text.is_none() { return false; }
                 }
                 _ => return false, // unsupported text comparison
             }
@@ -11164,6 +11176,11 @@ fn process_segments_mixed(
                 TextQualInfo::Like { col_idx, strategy, negate } => {
                     if let Some(ref seg_col) = text_seg_cols[*col_idx] {
                         apply_text_like_filter(seg_col, strategy, *negate, row_count, &mut selection);
+                    }
+                }
+                TextQualInfo::InList { col_idx, values } => {
+                    if let Some(ref seg_col) = text_seg_cols[*col_idx] {
+                        apply_text_in_filter(seg_col, values, row_count, &mut selection);
                     }
                 }
             }

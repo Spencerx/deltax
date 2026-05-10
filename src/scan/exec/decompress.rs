@@ -23,7 +23,7 @@ use super::segments::{
     segment_skippable_by_dict,
     extract_segment_filters,
 };
-use super::text_col::{TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
+use super::text_col::{TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter, strcoll_cmp};
 
 /// Decompression state stored as a raw pointer in the CustomScanState.
 pub(crate) struct DecompressState {
@@ -1862,6 +1862,37 @@ fn process_topn_text_chunk(
                         continue;
                     };
                     apply_text_like_filter(seg_col, strategy, *negate, row_count, &mut selection);
+                }
+                TextQualInfo::InList { col_idx, values } => {
+                    let col_name = &config.col_names[*col_idx];
+                    if config.segment_by.contains(col_name) {
+                        let seg_val_idx = config.segment_by.iter()
+                            .position(|sb| sb == col_name).unwrap();
+                        let passes = match &seg.segment_values[seg_val_idx] {
+                            Some(s) => values.iter().any(|v| v == s),
+                            None => false,
+                        };
+                        if !passes {
+                            selection = vec![false; row_count];
+                            break;
+                        }
+                        continue;
+                    }
+                    let seg_col = if *col_idx == config.sort_col {
+                        &sort_seg_col
+                    } else {
+                        let blob_idx = col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
+                        let blob = &seg.compressed_blobs[blob_idx];
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                            apply_text_in_filter(sc, values, row_count, &mut selection);
+                        } else if selection.is_empty() {
+                            selection = vec![false; row_count];
+                        } else {
+                            selection.iter_mut().for_each(|s| *s = false);
+                        }
+                        continue;
+                    };
+                    apply_text_in_filter(seg_col, values, row_count, &mut selection);
                 }
             }
         }
