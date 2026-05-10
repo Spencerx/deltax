@@ -2,9 +2,51 @@
 
 from __future__ import annotations
 
+import csv
+import io
+
 
 MOCK_NOW = "2025-01-15 12:00:00+00"
 BASE_TS = "2025-01-15 00:00:00+00"
+
+PARTITION_SEGMENT_EDGE_ROWS = (
+    ("2025-01-13 23:58:00+00", 100, 0, "default_old", -100, 1.00, "before-start-a"),
+    ("2025-01-13 23:59:59.999999+00", 101, 1, "default_old", -99, None, "before-start-b"),
+    ("2025-01-13 12:00:00+00", 102, None, "default_old", -98, 1.25, "before-start-c"),
+    ("2025-01-14 00:00:00+00", 0, 0, "compressed_4", 0, 0.00, "p14-start"),
+    ("2025-01-14 00:00:00.000001+00", 1, 1, "compressed_4", 1, 0.10, "p14-after-start"),
+    ("2025-01-14 12:00:00+00", 2, None, "compressed_4", None, 0.20, "p14-mid"),
+    ("2025-01-14 23:59:59.999999+00", 3, 1, "compressed_4", 3, None, "p14-end-minus"),
+    ("2025-01-15 00:00:00+00", 10, 0, "compressed_5", 10, 1.00, "p15-start"),
+    ("2025-01-15 00:00:00.000001+00", 11, 1, "compressed_5", 11, 1.10, "p15-after-start"),
+    ("2025-01-15 06:00:00+00", 12, 2, "compressed_5", 12, None, "p15-morning"),
+    ("2025-01-15 18:00:00+00", 13, None, "compressed_5", None, 1.30, "p15-evening"),
+    ("2025-01-15 23:59:59.999999+00", 14, 2, "compressed_5", 14, 1.40, "p15-end-minus"),
+    ("2025-01-16 00:00:00+00", 20, 0, "uncompressed_6", 20, 2.00, "p16-start"),
+    ("2025-01-16 00:00:00.000001+00", 21, 1, "uncompressed_6", 21, None, "p16-after-start"),
+    ("2025-01-16 04:00:00+00", 22, 2, "uncompressed_6", 22, 2.20, "p16-early"),
+    ("2025-01-16 08:00:00+00", 23, None, "uncompressed_6", None, 2.30, "p16-mid"),
+    ("2025-01-16 12:00:00+00", 24, 1, "uncompressed_6", 24, 2.40, "p16-noon"),
+    ("2025-01-16 23:59:59.999999+00", 25, 2, "uncompressed_6", 25, 2.50, "p16-end-minus"),
+    ("2025-01-17 00:00:00+00", 30, 0, "compressed_10", 30, 3.00, "p17-00"),
+    ("2025-01-17 01:00:00+00", 31, 1, "compressed_10", 31, 3.10, "p17-01"),
+    ("2025-01-17 02:00:00+00", 32, 2, "compressed_10", 32, None, "p17-02"),
+    ("2025-01-17 03:00:00+00", 33, None, "compressed_10", None, 3.30, "p17-03"),
+    ("2025-01-17 04:00:00+00", 34, 1, "compressed_10", 34, 3.40, "p17-04"),
+    ("2025-01-17 05:00:00+00", 35, 2, "compressed_10", 35, 3.50, "p17-05"),
+    ("2025-01-17 06:00:00+00", 36, 0, "compressed_10", 36, None, "p17-06"),
+    ("2025-01-17 07:00:00+00", 37, 1, "compressed_10", 37, 3.70, "p17-07"),
+    ("2025-01-17 08:00:00+00", 38, None, "compressed_10", 38, 3.80, "p17-08"),
+    ("2025-01-17 23:59:59.999999+00", 39, 2, "compressed_10", 39, 3.90, "p17-end-minus"),
+    ("2025-01-19 00:00:00+00", 110, 0, "default_future", 110, 4.00, "after-end-a"),
+    ("2025-01-19 00:00:00.000001+00", 111, 1, "default_future", None, None, "after-end-b"),
+)
+
+PARTITION_SEGMENT_EDGE_REGISTERED_ROWS = tuple(
+    row
+    for row in PARTITION_SEGMENT_EDGE_ROWS
+    if "default_" not in row[3]
+)
 
 
 def _compress_non_default_partitions(conn, table_name: str) -> None:
@@ -19,12 +61,78 @@ def _compress_non_default_partitions(conn, table_name: str) -> None:
     conn.commit()
 
 
+def _compress_partitions_by_start_date(
+    conn,
+    table_name: str,
+    start_dates: tuple[str, ...],
+) -> None:
+    for start_date in start_dates:
+        rows = conn.execute(
+            f"""
+            SELECT partition_name
+            FROM deltax_partition_info('{table_name}')
+            WHERE range_start::date = %s::date
+            ORDER BY range_start
+            """,
+            (start_date,),
+        ).fetchall()
+        for (partition_name,) in rows:
+            row_count = conn.execute(f'SELECT count(*) FROM "{partition_name}"').fetchone()[0]
+            if row_count > 0:
+                conn.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    conn.commit()
+
+
 def _analyze_tables(conn, *table_names: str) -> None:
     conn.rollback()
     conn.autocommit = True
     for table_name in table_names:
         conn.execute(f"ANALYZE {table_name}")
     conn.autocommit = False
+
+
+def _create_partition_segment_edges_schema(conn, table_name: str) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {table_name} (
+            ts timestamptz NOT NULL,
+            id integer NOT NULL,
+            device_id integer,
+            bucket text,
+            val integer,
+            metric double precision,
+            payload text
+        )
+        """
+    )
+
+
+def _insert_partition_segment_edge_rows(conn, table_name: str, rows: tuple[tuple, ...]) -> None:
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"""
+            INSERT INTO {table_name} (ts, id, device_id, bucket, val, metric, payload)
+            VALUES (%s::timestamptz, %s, %s, %s, %s, %s, %s)
+            """,
+            rows,
+        )
+
+
+def _copy_partition_segment_edge_rows_deltax(
+    conn,
+    table_name: str,
+    rows: tuple[tuple, ...],
+) -> None:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    for row in rows:
+        writer.writerow("" if value is None else value for value in row)
+
+    with conn.cursor() as cur:
+        with cur.copy(
+            f"COPY {table_name} FROM STDIN WITH (FORMAT deltax_compress_csv)"
+        ) as copy:
+            copy.write(buf.getvalue().encode())
 
 
 def create_tiny_events_pair(conn, *, segment_size: int = 16) -> tuple[str, str]:
@@ -310,6 +418,80 @@ def create_aggregate_matrix_pair(
     conn.commit()
 
     _compress_non_default_partitions(conn, deltax_table)
+    _analyze_tables(conn, plain_table, deltax_table)
+
+    return plain_table, deltax_table
+
+
+def create_partition_segment_edges_pair(
+    conn,
+    *,
+    deltax_table: str = "partition_segment_edges",
+    segment_size: int = 5,
+) -> tuple[str, str]:
+    """Create a mixed compressed/uncompressed layout around partition edges."""
+    plain_table = f"{deltax_table}_plain"
+
+    conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for table_name in (plain_table, deltax_table):
+        _create_partition_segment_edges_schema(conn, table_name)
+
+    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(
+        "SELECT deltax_enable_compression("
+        f"'{deltax_table}', segment_by => ARRAY['device_id'], "
+        "order_by => ARRAY['ts', 'id'], segment_size => %s)",
+        (segment_size,),
+    )
+    conn.commit()
+
+    _insert_partition_segment_edge_rows(conn, plain_table, PARTITION_SEGMENT_EDGE_ROWS)
+    _insert_partition_segment_edge_rows(conn, deltax_table, PARTITION_SEGMENT_EDGE_ROWS)
+    conn.commit()
+
+    _compress_partitions_by_start_date(
+        conn,
+        deltax_table,
+        ("2025-01-14", "2025-01-15", "2025-01-17"),
+    )
+    _analyze_tables(conn, plain_table, deltax_table)
+
+    return plain_table, deltax_table
+
+
+def create_partition_segment_edges_direct_backfill_pair(
+    conn,
+    *,
+    deltax_table: str = "partition_segment_edges_direct",
+    segment_size: int = 5,
+) -> tuple[str, str]:
+    """Create registered partition edge rows via direct compressed COPY."""
+    plain_table = f"{deltax_table}_plain"
+
+    conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for table_name in (plain_table, deltax_table):
+        _create_partition_segment_edges_schema(conn, table_name)
+
+    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(
+        "SELECT deltax_enable_compression("
+        f"'{deltax_table}', segment_by => ARRAY[]::text[], "
+        "order_by => ARRAY['ts', 'id'], segment_size => %s)",
+        (segment_size,),
+    )
+    conn.commit()
+
+    _insert_partition_segment_edge_rows(
+        conn,
+        plain_table,
+        PARTITION_SEGMENT_EDGE_REGISTERED_ROWS,
+    )
+    _copy_partition_segment_edge_rows_deltax(
+        conn,
+        deltax_table,
+        PARTITION_SEGMENT_EDGE_REGISTERED_ROWS,
+    )
+    conn.commit()
     _analyze_tables(conn, plain_table, deltax_table)
 
     return plain_table, deltax_table

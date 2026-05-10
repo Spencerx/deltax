@@ -210,6 +210,8 @@ Purpose:
 
 ### Session 5: Partition and Segment Edges
 
+Status: done.
+
 Datasets:
 
 - `partition_edges`: timestamps exactly at partition starts and ends.

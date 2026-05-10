@@ -560,3 +560,482 @@ def aggregate_extended_cases() -> Iterable[QueryCase]:
         ORDER BY group_key NULLS LAST
         """,
     )
+
+
+def partition_segment_edge_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "exact_partition_start_inclusive",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts >= '2025-01-15 00:00:00+00'
+          AND ts < '2025-01-16 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "partition_end_exclusive",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-15 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "single_boundary_timestamp",
+        """
+        SELECT id, bucket, payload
+        FROM {table}
+        WHERE ts = '2025-01-16 00:00:00+00'
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "half_open_crosses_compressed_and_uncompressed",
+        """
+        SELECT id, ts, bucket, val, metric
+        FROM {table}
+        WHERE ts >= '2025-01-15 18:00:00+00'
+          AND ts < '2025-01-17 02:00:00+00'
+        ORDER BY ts, id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "default_partition_only",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts < '2025-01-14 00:00:00+00'
+           OR ts >= '2025-01-19 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "empty_partition_range",
+        """
+        SELECT id, ts, bucket
+        FROM {table}
+        WHERE ts >= '2025-01-18 00:00:00+00'
+          AND ts < '2025-01-19 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "count_all_mixed_storage",
+        """
+        SELECT count(*)
+        FROM {table}
+        """,
+    )
+    yield QueryCase(
+        "count_half_open_registered_partitions",
+        """
+        SELECT count(*), count(val), min(id), max(id)
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-18 00:00:00+00'
+        """,
+    )
+    yield QueryCase(
+        "grouped_aggregate_across_boundaries",
+        """
+        SELECT bucket, count(*), count(val), sum(val), avg(metric), min(ts), max(ts)
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-18 00:00:00+00'
+        GROUP BY bucket
+        ORDER BY bucket
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "segment_size_minus_one_projection",
+        """
+        SELECT id, device_id, val, payload
+        FROM {table}
+        WHERE bucket = 'compressed_4'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "segment_size_exact_projection",
+        """
+        SELECT id, device_id, val, payload
+        FROM {table}
+        WHERE bucket = 'compressed_5'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "segment_size_plus_one_projection",
+        """
+        SELECT id, device_id, val, payload
+        FROM {table}
+        WHERE bucket = 'uncompressed_6'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "two_segments_exact_projection",
+        """
+        SELECT id, device_id, val, payload
+        FROM {table}
+        WHERE bucket = 'compressed_10'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "topn_across_default_compressed_uncompressed",
+        """
+        SELECT id, ts, bucket, payload, val
+        FROM {table}
+        ORDER BY ts DESC, id DESC
+        LIMIT 9
+        """,
+    )
+    yield QueryCase(
+        "filtered_topn_across_mixed_storage",
+        """
+        SELECT id, ts, device_id, bucket, payload
+        FROM {table}
+        WHERE device_id IS NULL OR val >= 35
+        ORDER BY ts ASC, id ASC
+        LIMIT 12
+        """,
+    )
+
+
+def partition_segment_boundary_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "inclusive_upper_end_minus_epsilon",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts >= '2025-01-15 00:00:00+00'
+          AND ts <= '2025-01-15 23:59:59.999999+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "strict_before_partition_start",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts < '2025-01-15 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "between_includes_next_partition_start",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts BETWEEN '2025-01-15 00:00:00+00'
+                     AND '2025-01-16 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "default_old_plus_compressed_partition",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts < '2025-01-15 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "compressed_partition_plus_default_future",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts >= '2025-01-17 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+
+
+def partition_segment_direct_backfill_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "direct_backfill_registered_projection",
+        """
+        SELECT id, ts, device_id, bucket, val, metric, payload
+        FROM {table}
+        ORDER BY ts, id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "direct_backfill_half_open_boundaries",
+        """
+        SELECT id, ts, bucket, val, metric
+        FROM {table}
+        WHERE ts >= '2025-01-15 00:00:00+00'
+          AND ts < '2025-01-17 00:00:00+00'
+        ORDER BY ts, id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "direct_backfill_grouped_aggregate",
+        """
+        SELECT bucket, count(*), count(val), sum(val), avg(metric), min(ts), max(ts)
+        FROM {table}
+        GROUP BY bucket
+        ORDER BY bucket
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "direct_backfill_topn",
+        """
+        SELECT id, ts, bucket, payload, val
+        FROM {table}
+        ORDER BY ts DESC, id DESC
+        LIMIT 8
+        """,
+    )
+
+
+def partition_segment_fastpath_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "count_all_mixed_storage",
+        """
+        SELECT count(*)
+        FROM {table}
+        """,
+    )
+    yield QueryCase(
+        "count_half_open_registered_partitions",
+        """
+        SELECT count(*), count(val), min(id), max(id)
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-18 00:00:00+00'
+        """,
+    )
+    yield QueryCase(
+        "grouped_aggregate_across_boundaries",
+        """
+        SELECT bucket, count(*), count(val), sum(val), avg(metric), min(ts), max(ts)
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-18 00:00:00+00'
+        GROUP BY bucket
+        ORDER BY bucket
+        """,
+        comparator="float_tolerant",
+    )
+
+
+def partition_segment_plan_shape_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "or_ranges_across_pruning_boundaries",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE (
+            ts >= '2025-01-14 00:00:00+00'
+            AND ts < '2025-01-15 00:00:00+00'
+        )
+        OR (
+            ts >= '2025-01-17 00:00:00+00'
+            AND ts < '2025-01-18 00:00:00+00'
+        )
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "negated_time_range",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE NOT (
+            ts >= '2025-01-15 00:00:00+00'
+            AND ts < '2025-01-16 00:00:00+00'
+        )
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "date_cast_time_filter",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts::date = DATE '2025-01-15'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "date_trunc_time_filter",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE date_trunc('day', ts) = '2025-01-15 00:00:00+00'::timestamptz
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "distinct_bucket_across_boundaries",
+        """
+        SELECT DISTINCT bucket
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-19 00:00:00+00'
+        ORDER BY bucket
+        """,
+    )
+    yield QueryCase(
+        "distinct_on_latest_per_bucket",
+        """
+        SELECT DISTINCT ON (bucket) bucket, id, ts, payload
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-19 00:00:00+00'
+        ORDER BY bucket, ts DESC, id DESC
+        """,
+    )
+    yield QueryCase(
+        "window_row_number_by_bucket",
+        """
+        SELECT
+            id,
+            bucket,
+            row_number() OVER (PARTITION BY bucket ORDER BY ts, id) AS bucket_rownum,
+            count(*) OVER (PARTITION BY bucket) AS bucket_count
+        FROM {table}
+        WHERE ts >= '2025-01-14 00:00:00+00'
+          AND ts < '2025-01-18 00:00:00+00'
+        ORDER BY bucket, bucket_rownum, id
+        """,
+    )
+    yield QueryCase(
+        "union_all_default_and_registered",
+        """
+        SELECT id, bucket, source
+        FROM (
+            SELECT id, bucket, 'default_old' AS source
+            FROM {table}
+            WHERE ts < '2025-01-14 00:00:00+00'
+            UNION ALL
+            SELECT id, bucket, 'registered' AS source
+            FROM {table}
+            WHERE ts >= '2025-01-17 00:00:00+00'
+              AND ts < '2025-01-18 00:00:00+00'
+        ) AS unioned
+        ORDER BY source, id
+        """,
+    )
+    yield QueryCase(
+        "intersect_registered_ids",
+        """
+        SELECT id
+        FROM (
+            SELECT id
+            FROM {table}
+            WHERE ts >= '2025-01-14 00:00:00+00'
+              AND ts < '2025-01-18 00:00:00+00'
+            INTERSECT
+            SELECT id
+            FROM {table}
+            WHERE val IS NULL OR val >= 30
+        ) AS intersected
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "except_removes_uncompressed_partition",
+        """
+        SELECT id
+        FROM (
+            SELECT id
+            FROM {table}
+            WHERE ts >= '2025-01-14 00:00:00+00'
+              AND ts < '2025-01-18 00:00:00+00'
+            EXCEPT
+            SELECT id
+            FROM {table}
+            WHERE ts >= '2025-01-16 00:00:00+00'
+              AND ts < '2025-01-17 00:00:00+00'
+        ) AS remaining
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "semi_join_exists_bucket_peer",
+        """
+        SELECT t.id, t.ts, t.bucket, t.payload
+        FROM {table} t
+        WHERE t.ts >= '2025-01-14 00:00:00+00'
+          AND t.ts < '2025-01-18 00:00:00+00'
+          AND EXISTS (
+              SELECT 1
+              FROM {table} peer
+              WHERE peer.bucket = t.bucket
+                AND peer.id <> t.id
+                AND peer.val IS NULL
+          )
+        ORDER BY t.ts, t.id
+        """,
+    )
+    yield QueryCase(
+        "anti_join_not_exists_later_bucket_row",
+        """
+        SELECT t.id, t.ts, t.bucket, t.payload
+        FROM {table} t
+        WHERE t.ts >= '2025-01-14 00:00:00+00'
+          AND t.ts < '2025-01-18 00:00:00+00'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM {table} later
+              WHERE later.bucket = t.bucket
+                AND later.ts > t.ts
+                AND later.ts < '2025-01-18 00:00:00+00'
+          )
+        ORDER BY t.ts, t.id
+        """,
+    )
+    yield QueryCase(
+        "lateral_top1_per_bucket",
+        """
+        SELECT buckets.bucket, picked.id, picked.ts, picked.payload
+        FROM (
+            SELECT DISTINCT bucket
+            FROM {table}
+            WHERE ts >= '2025-01-14 00:00:00+00'
+              AND ts < '2025-01-18 00:00:00+00'
+        ) AS buckets
+        CROSS JOIN LATERAL (
+            SELECT id, ts, payload
+            FROM {table} t
+            WHERE t.bucket = buckets.bucket
+              AND t.ts >= '2025-01-14 00:00:00+00'
+              AND t.ts < '2025-01-18 00:00:00+00'
+            ORDER BY ts DESC, id DESC
+            LIMIT 1
+        ) AS picked
+        ORDER BY buckets.bucket
+        """,
+    )
+    yield QueryCase(
+        "full_ordered_scan_across_all_storage",
+        """
+        SELECT id, ts, bucket, device_id, val, metric, payload
+        FROM {table}
+        ORDER BY ts, id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "empty_partition_aggregate_semantics",
+        """
+        SELECT count(*), count(val), sum(val), avg(metric), min(ts), max(ts)
+        FROM {table}
+        WHERE ts >= '2025-01-18 00:00:00+00'
+          AND ts < '2025-01-19 00:00:00+00'
+        """,
+        comparator="float_tolerant",
+    )
