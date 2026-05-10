@@ -184,6 +184,7 @@ def create_ordering_edges_pair(
                 id integer NOT NULL,
                 device_id integer,
                 sort_val integer,
+                text_sort text,
                 tie_val integer NOT NULL,
                 payload text,
                 extra text,
@@ -204,13 +205,21 @@ def create_ordering_edges_pair(
 
     insert_sql = f"""
         INSERT INTO {{table}} (
-            ts, id, device_id, sort_val, tie_val, payload, extra, active, metric
+            ts, id, device_id, sort_val, text_sort, tie_val, payload, extra, active, metric
         )
         SELECT
             '{BASE_TS}'::timestamptz + ((i % 48) * interval '2 minutes') AS ts,
             i AS id,
             CASE WHEN i % 17 = 0 THEN NULL ELSE i % 7 END AS device_id,
             CASE WHEN i % 11 = 0 THEN NULL ELSE (i % 19) - 9 END AS sort_val,
+            CASE
+                WHEN i % 10 = 0 THEN NULL
+                WHEN i % 5 = 0 THEN 'echo-' || lpad((i % 23)::text, 2, '0')
+                WHEN i % 5 = 1 THEN 'bravo-' || lpad((i % 17)::text, 2, '0')
+                WHEN i % 5 = 2 THEN 'delta-' || lpad((i % 19)::text, 2, '0')
+                WHEN i % 5 = 3 THEN 'alpha-' || lpad((i % 13)::text, 2, '0')
+                ELSE 'charlie-' || lpad((i % 11)::text, 2, '0')
+            END AS text_sort,
             i % 5 AS tie_val,
             CASE
                 WHEN i % 4 = 0 THEN 'alpha-' || lpad(i::text, 3, '0')

@@ -967,6 +967,7 @@ struct TextTopNCandidate {
     row_idx: usize,
     /// Sort key datum (points into phase1_persist_mcxt, survives segment resets).
     sort_datum: pg_sys::Datum,
+    sort_is_null: bool,
     /// Datums for Phase 1 columns (filter + sort), keyed by col_idx.
     phase1_datums: Vec<(usize, pg_sys::Datum, bool)>,
 }
@@ -983,6 +984,100 @@ unsafe fn cmp_text_datums(a: pg_sys::Datum, b: pg_sys::Datum) -> std::cmp::Order
         let b_len = pgrx::varsize_any_exhdr(b_vl) as i32;
         let result = pg_sys::varstr_cmp(a_ptr, a_len, b_ptr, b_len, pg_sys::DEFAULT_COLLATION_OID);
         result.cmp(&0)
+    }
+}
+
+unsafe fn cmp_text_key(
+    a: pg_sys::Datum,
+    a_is_null: bool,
+    b: pg_sys::Datum,
+    b_is_null: bool,
+    ascending: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    unsafe {
+        match (a_is_null, b_is_null) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => {
+                if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }
+            }
+            (false, true) => {
+                if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+            }
+            (false, false) => {
+                if ascending {
+                    cmp_text_datums(a, b)
+                } else {
+                    cmp_text_datums(b, a)
+                }
+            }
+        }
+    }
+}
+
+unsafe fn cmp_text_candidate(
+    a: &TextTopNCandidate,
+    b: &TextTopNCandidate,
+    ascending: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    unsafe {
+        cmp_text_key(
+            a.sort_datum,
+            a.sort_is_null,
+            b.sort_datum,
+            b.sort_is_null,
+            ascending,
+            nulls_first,
+        )
+    }
+}
+
+fn cmp_nullable_str_byte(
+    a: Option<&str>,
+    b: Option<&str>,
+    ascending: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => {
+            if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }
+        }
+        (Some(_), None) => {
+            if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+        }
+        (Some(a), Some(b)) => {
+            if ascending {
+                a.cmp(b)
+            } else {
+                b.cmp(a)
+            }
+        }
+    }
+}
+
+fn cmp_nullable_str_collation(
+    a: Option<&str>,
+    b: Option<&str>,
+    ascending: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => {
+            if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }
+        }
+        (Some(_), None) => {
+            if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+        }
+        (Some(a), Some(b)) => {
+            if ascending {
+                strcoll_cmp(a, b)
+            } else {
+                strcoll_cmp(b, a)
+            }
+        }
     }
 }
 
@@ -1797,6 +1892,7 @@ struct ParallelTopNTextConfig<'a> {
     sort_col: usize,
     sort_blob_idx: usize,
     ascending: bool,
+    nulls_first: bool,
     prune_limit: usize,
     /// Blob indices for columns that have batch quals (non-text, for evaluate_batch_quals)
     phase1_blob_col_map: Vec<(usize, usize)>, // (col_idx, blob_idx) for non-segby qual columns
@@ -1804,8 +1900,8 @@ struct ParallelTopNTextConfig<'a> {
 
 /// Result of parallel top-N text worker.
 struct ParallelTopNTextResult {
-    /// (global_seg_idx, row_idx, sort_string)
-    candidates: Vec<(usize, usize, String)>,
+    /// (global_seg_idx, row_idx, sort_string), with None representing NULL.
+    candidates: Vec<(usize, usize, Option<String>)>,
     segments_decompressed: u64,
     decompress_us: u64,
     batch_eval_us: u64,
@@ -1817,8 +1913,8 @@ fn process_topn_text_chunk(
     seg_indices: &[usize],
     config: &ParallelTopNTextConfig,
 ) -> ParallelTopNTextResult {
-    let mut candidates: Vec<(usize, usize, String)> = Vec::new();
-    let mut threshold: Option<String> = None;
+    let mut candidates: Vec<(usize, usize, Option<String>)> = Vec::new();
+    let mut threshold: Option<Option<String>> = None;
     let mut segments_decompressed: u64 = 0;
     let mut decompress_us: u64 = 0;
     let mut batch_eval_us: u64 = 0;
@@ -1946,34 +2042,34 @@ fn process_topn_text_chunk(
             if !passes {
                 continue;
             }
-            let sort_str = match sort_seg_col.get_str(row_idx) {
-                Some(s) => s,
-                None => continue, // NULL sort key
-            };
+            let sort_key = sort_seg_col.get_str(row_idx);
 
             // Byte-order threshold pruning
             if let Some(ref thr) = threshold {
-                let dominated = if config.ascending {
-                    sort_str > thr.as_str()
-                } else {
-                    sort_str < thr.as_str()
-                };
-                if dominated {
+                if cmp_nullable_str_byte(
+                    sort_key,
+                    thr.as_deref(),
+                    config.ascending,
+                    config.nulls_first,
+                ) == std::cmp::Ordering::Greater {
                     continue;
                 }
             }
 
-            candidates.push((seg_idx, row_idx, sort_str.to_string()));
+            candidates.push((seg_idx, row_idx, sort_key.map(str::to_string)));
         }
 
         // Update byte-order threshold
         if candidates.len() >= config.prune_limit {
             let k = config.prune_limit - 1;
-            if config.ascending {
-                candidates.select_nth_unstable_by(k, |a, b| a.2.cmp(&b.2));
-            } else {
-                candidates.select_nth_unstable_by(k, |a, b| b.2.cmp(&a.2));
-            }
+            candidates.select_nth_unstable_by(k, |a, b| {
+                cmp_nullable_str_byte(
+                    a.2.as_deref(),
+                    b.2.as_deref(),
+                    config.ascending,
+                    config.nulls_first,
+                )
+            });
             candidates.truncate(config.prune_limit);
             threshold = Some(candidates[k].2.clone());
         }
@@ -2199,6 +2295,7 @@ unsafe fn exec_topn_text(
                 sort_col,
                 sort_blob_idx,
                 ascending: state.topn_ascending,
+                nulls_first: state.topn_nulls_first,
                 prune_limit,
                 phase1_blob_col_map,
             };
@@ -2226,7 +2323,7 @@ unsafe fn exec_topn_text(
             }
 
             // Merge all candidates
-            let mut all_candidates: Vec<(usize, usize, String)> = Vec::new();
+            let mut all_candidates: Vec<(usize, usize, Option<String>)> = Vec::new();
             for result in results {
                 all_candidates.extend(result.candidates);
             }
@@ -2244,30 +2341,39 @@ unsafe fn exec_topn_text(
 
             // Byte-order pre-prune if too many candidates
             if all_candidates.len() > prune_limit {
-                if state.topn_ascending {
-                    all_candidates.select_nth_unstable_by(prune_limit - 1, |a, b| a.2.cmp(&b.2));
-                } else {
-                    all_candidates.select_nth_unstable_by(prune_limit - 1, |a, b| b.2.cmp(&a.2));
-                }
+                all_candidates.select_nth_unstable_by(prune_limit - 1, |a, b| {
+                    cmp_nullable_str_byte(
+                        a.2.as_deref(),
+                        b.2.as_deref(),
+                        state.topn_ascending,
+                        state.topn_nulls_first,
+                    )
+                });
                 all_candidates.truncate(prune_limit);
             }
 
             // Collation-aware final sort using strcoll_cmp
-            if state.topn_ascending {
-                all_candidates.sort_by(|a, b| strcoll_cmp(&a.2, &b.2));
-            } else {
-                all_candidates.sort_by(|a, b| strcoll_cmp(&b.2, &a.2));
-            }
+            all_candidates.sort_by(|a, b| {
+                cmp_nullable_str_collation(
+                    a.2.as_deref(),
+                    b.2.as_deref(),
+                    state.topn_ascending,
+                    state.topn_nulls_first,
+                )
+            });
 
             // Truncate to effective_limit (handle multi_col_sort ties)
             if state.topn_multi_col_sort {
                 let threshold_idx = std::cmp::min(effective_limit - 1, all_candidates.len() - 1);
                 let threshold_str = all_candidates[threshold_idx].2.clone();
-                if state.topn_ascending {
-                    all_candidates.retain(|c| strcoll_cmp(&c.2, &threshold_str) != std::cmp::Ordering::Greater);
-                } else {
-                    all_candidates.retain(|c| strcoll_cmp(&c.2, &threshold_str) != std::cmp::Ordering::Less);
-                }
+                all_candidates.retain(|c| {
+                    cmp_nullable_str_collation(
+                        c.2.as_deref(),
+                        threshold_str.as_deref(),
+                        state.topn_ascending,
+                        state.topn_nulls_first,
+                    ) != std::cmp::Ordering::Greater
+                });
             } else {
                 all_candidates.truncate(effective_limit);
             }
@@ -2292,12 +2398,12 @@ unsafe fn exec_topn_text(
             pg_sys::MemoryContextReset(state.segment_mcxt);
 
             // Build a lookup: (seg_idx, row_idx) -> sort_string for final ordering
-            let candidate_sort_strings: HashMap<(usize, usize), String> = all_candidates.iter()
+            let candidate_sort_strings: HashMap<(usize, usize), Option<String>> = all_candidates.iter()
                 .map(|(si, ri, s)| ((*si, *ri), s.clone()))
                 .collect();
 
             struct RowData {
-                sort_string: String,
+                sort_string: Option<String>,
                 datums: Vec<(pg_sys::Datum, bool)>,
             }
             let mut result_rows: Vec<RowData> = Vec::with_capacity(effective_limit);
@@ -2379,18 +2485,21 @@ unsafe fn exec_topn_text(
                     let sort_string = candidate_sort_strings
                         .get(&(seg_idx, ri))
                         .cloned()
-                        .unwrap_or_default();
+                        .unwrap_or(None);
                     result_rows.push(RowData { sort_string, datums: row_datums });
                 }
             }
 
             // Sort result rows (collation-aware)
             if !state.topn_multi_col_sort {
-                if state.topn_ascending {
-                    result_rows.sort_by(|a, b| strcoll_cmp(&a.sort_string, &b.sort_string));
-                } else {
-                    result_rows.sort_by(|a, b| strcoll_cmp(&b.sort_string, &a.sort_string));
-                }
+                result_rows.sort_by(|a, b| {
+                    cmp_nullable_str_collation(
+                        a.sort_string.as_deref(),
+                        b.sort_string.as_deref(),
+                        state.topn_ascending,
+                        state.topn_nulls_first,
+                    )
+                });
             }
 
             state.topn_buffer = result_rows.into_iter().map(|r| r.datums).collect();
@@ -2432,7 +2541,7 @@ unsafe fn exec_topn_text_sequential(
         );
 
         let mut candidates: Vec<TextTopNCandidate> = Vec::new();
-        let mut threshold_datum: Option<pg_sys::Datum> = None;
+        let mut threshold_datum: Option<(pg_sys::Datum, bool)> = None;
 
         for &seg_idx in surviving_seg_indices {
             let seg = &state.segments_data[seg_idx];
@@ -2597,19 +2706,17 @@ unsafe fn exec_topn_text_sequential(
                     continue;
                 }
                 let (datum, is_null) = sort_datums[row_idx];
-                if is_null {
-                    continue;
-                }
 
                 // Skip if worse than threshold (collation-aware comparison)
-                if let Some(threshold) = threshold_datum {
-                    let cmp = cmp_text_datums(datum, threshold);
-                    let dominated = if state.topn_ascending {
-                        cmp == std::cmp::Ordering::Greater
-                    } else {
-                        cmp == std::cmp::Ordering::Less
-                    };
-                    if dominated {
+                if let Some((threshold, threshold_is_null)) = threshold_datum {
+                    if cmp_text_key(
+                        datum,
+                        is_null,
+                        threshold,
+                        threshold_is_null,
+                        state.topn_ascending,
+                        state.topn_nulls_first,
+                    ) == std::cmp::Ordering::Greater {
                         continue;
                     }
                 }
@@ -2647,6 +2754,7 @@ unsafe fn exec_topn_text_sequential(
                     segment_idx: seg_idx,
                     row_idx,
                     sort_datum: sort_datum_copy,
+                    sort_is_null: is_null,
                     phase1_datums: p1_datums,
                 });
             }
@@ -2654,13 +2762,10 @@ unsafe fn exec_topn_text_sequential(
             // Update threshold
             if candidates.len() >= effective_limit {
                 let n = effective_limit - 1;
-                if state.topn_ascending {
-                    candidates.select_nth_unstable_by(n, |a, b| cmp_text_datums(a.sort_datum, b.sort_datum));
-                    threshold_datum = Some(candidates[n].sort_datum);
-                } else {
-                    candidates.select_nth_unstable_by(n, |a, b| cmp_text_datums(b.sort_datum, a.sort_datum));
-                    threshold_datum = Some(candidates[n].sort_datum);
-                }
+                candidates.select_nth_unstable_by(n, |a, b| {
+                    cmp_text_candidate(a, b, state.topn_ascending, state.topn_nulls_first)
+                });
+                threshold_datum = Some((candidates[n].sort_datum, candidates[n].sort_is_null));
             }
         }
 
@@ -2678,19 +2783,23 @@ unsafe fn exec_topn_text_sequential(
         }
 
         // Sort and truncate to top-N (using collation-aware comparison)
-        if state.topn_ascending {
-            candidates.sort_by(|a, b| cmp_text_datums(a.sort_datum, b.sort_datum));
-        } else {
-            candidates.sort_by(|a, b| cmp_text_datums(b.sort_datum, a.sort_datum));
-        }
+        candidates.sort_by(|a, b| {
+            cmp_text_candidate(a, b, state.topn_ascending, state.topn_nulls_first)
+        });
         if state.topn_multi_col_sort {
             let threshold_idx = std::cmp::min(effective_limit - 1, candidates.len() - 1);
             let threshold_datum_val = candidates[threshold_idx].sort_datum;
-            if state.topn_ascending {
-                candidates.retain(|c| cmp_text_datums(c.sort_datum, threshold_datum_val) != std::cmp::Ordering::Greater);
-            } else {
-                candidates.retain(|c| cmp_text_datums(c.sort_datum, threshold_datum_val) != std::cmp::Ordering::Less);
-            }
+            let threshold_is_null = candidates[threshold_idx].sort_is_null;
+            candidates.retain(|c| {
+                cmp_text_key(
+                    c.sort_datum,
+                    c.sort_is_null,
+                    threshold_datum_val,
+                    threshold_is_null,
+                    state.topn_ascending,
+                    state.topn_nulls_first,
+                ) != std::cmp::Ordering::Greater
+            });
         } else {
             candidates.truncate(effective_limit);
         }
@@ -2708,6 +2817,7 @@ unsafe fn exec_topn_text_sequential(
 
         struct RowData {
             sort_datum: pg_sys::Datum,
+            sort_is_null: bool,
             datums: Vec<(pg_sys::Datum, bool)>,
         }
         let mut result_rows: Vec<RowData> = Vec::with_capacity(effective_limit);
@@ -2814,17 +2924,26 @@ unsafe fn exec_topn_text_sequential(
                     row_datums[ci] = (d, isnull);
                 }
 
-                result_rows.push(RowData { sort_datum: candidate.sort_datum, datums: row_datums });
+                result_rows.push(RowData {
+                    sort_datum: candidate.sort_datum,
+                    sort_is_null: candidate.sort_is_null,
+                    datums: row_datums,
+                });
             }
         }
 
         // Sort result rows (collation-aware)
         if !state.topn_multi_col_sort {
-            if state.topn_ascending {
-                result_rows.sort_by(|a, b| cmp_text_datums(a.sort_datum, b.sort_datum));
-            } else {
-                result_rows.sort_by(|a, b| cmp_text_datums(b.sort_datum, a.sort_datum));
-            }
+            result_rows.sort_by(|a, b| {
+                cmp_text_key(
+                    a.sort_datum,
+                    a.sort_is_null,
+                    b.sort_datum,
+                    b.sort_is_null,
+                    state.topn_ascending,
+                    state.topn_nulls_first,
+                )
+            });
         }
 
         state.topn_buffer = result_rows.into_iter().map(|r| r.datums).collect();

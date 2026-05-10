@@ -251,6 +251,33 @@ def ordering_topn_cases() -> Iterable[QueryCase]:
         """,
     )
     yield QueryCase(
+        "mixed_direction_multi_column",
+        """
+        SELECT id, sort_val, ts, payload
+        FROM {table}
+        ORDER BY sort_val ASC NULLS LAST, ts DESC, id ASC
+        LIMIT 20
+        """,
+    )
+    yield QueryCase(
+        "text_asc_nulls_first",
+        """
+        SELECT id, text_sort, payload
+        FROM {table}
+        ORDER BY text_sort ASC NULLS FIRST, id ASC
+        LIMIT 20
+        """,
+    )
+    yield QueryCase(
+        "text_desc_nulls_last_late_projection",
+        """
+        SELECT id, text_sort, extra, metric
+        FROM {table}
+        ORDER BY text_sort DESC NULLS LAST, id DESC
+        LIMIT 18
+        """,
+    )
+    yield QueryCase(
         "limit_offset",
         """
         SELECT id, ts, payload
@@ -297,4 +324,32 @@ def ordering_topn_cases() -> Iterable[QueryCase]:
         LIMIT 10
         """,
         comparator="limit_ties",
+    )
+    yield QueryCase(
+        "limit_above_topn_cap",
+        """
+        SELECT id, ts, payload
+        FROM {table}
+        ORDER BY ts ASC, id ASC
+        LIMIT 10001
+        """,
+    )
+    yield QueryCase(
+        "non_constant_limit",
+        """
+        SELECT id, sort_val, payload
+        FROM {table}
+        ORDER BY sort_val ASC NULLS LAST, id ASC
+        LIMIT (SELECT 17)
+        """,
+    )
+    yield QueryCase(
+        "aggregate_order_limit",
+        """
+        SELECT active, count(*), min(sort_val), max(sort_val)
+        FROM {table}
+        GROUP BY active
+        ORDER BY count(*) DESC, active NULLS LAST
+        LIMIT 3
+        """,
     )
