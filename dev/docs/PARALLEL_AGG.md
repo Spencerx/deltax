@@ -22,6 +22,99 @@
 
 The body of the doc below still describes the original DSM-slab plan in places (Phase C "Approach", Critical files, Reuse list) for historical context. Items C.2.b–e and C.4 are marked superseded (⊘) rather than deleted.
 
+## Phase H — parallel DeltaXAgg for text-grouping with int aggs (JSONBench Q3/Q4)
+
+> Status (2026-05-10): **scoped, not started**. Q2 was unblocked separately (32× warm via the Extract recognizer + text-IN runtime + chain-target output_map fix; commits `47ec3ec` and `33aed1e`, suite total warm 26.6s → 10.0s = 2.6×). Q3/Q4 remain at 3.3s / 3.7s warm — the dominant ~70% of remaining suite time. The path to landing them is several distinct gaps; this section captures the ordered work.
+
+**Why Q3/Q4 stay slow today**: their plan today is `DeltaXAppend → Sort 7.9M rows → GroupAggregate → Limit 3` (parallel via 16 workers, in-memory sort fits in `work_mem=8GB`). The direct DeltaXAgg path doesn't fire because:
+- The aggregate arg is `MIN(<const_timestamptz> + INTERVAL '1 microsecond' * <bigint_chain>)` — a monotonic transform of a bigint synthetic, not a plain Var. Today's recognizer in `hook.rs` accepts `MIN(Var)` and `MIN(length(Var))` and `MIN(Var + Const)` only.
+- Even if we recognized it and pushed `MIN(int8)` into DeltaXAgg, the **mixed parallel path** (`process_segments_mixed`, `can_parallel_mixed`) requires the agg-spec storage type be one of its `CompactAccKind` variants. There is no `MinInt`/`MaxInt` variant — `compact_acc_kind` literally `unreachable!()`s on integer MIN/MAX. So the path falls back to the serial GENERIC path, which on 1.3M groups runs at 15s — much worse than PG's parallel sort+groupby at 3.3s.
+
+**Realistic ceiling**: even if everything below lands, expect Q3 3.3s → ~1.5s, Q4 3.7s → ~1.7s, suite total 10s → ~6-7s. The PG sort+groupby plan is already well-optimized; the win comes from skipping the Sort step (which spills nothing on this workload but still touches every row twice).
+
+### Phase H.1 — `CompactAccKind::MinInt` / `MaxInt` (~300 LOC + tests)
+
+The foundational change. Without this, `MIN/MAX(int8)` on a synthetic column has nowhere to live in compact storage, so the mixed parallel path's `can_use_compact_accs` predicate rejects.
+
+- `enum CompactAccKind` (`agg.rs:8102`): add `MinInt`, `MaxInt` (16 bytes each: i64 val + i64 has_value flag at +8). Update `wire_tag` (8, 9), `byte_size` (16), `alignment` (8).
+- `CompactAccStorage` (`agg.rs:8755`): add `read_min_max_int(group, slot) -> Option<i64>`, `update_min_int(group, slot, candidate)`, `update_max_int(group, slot, candidate)`. Mirror the `MinStr`/`MaxStr` shape.
+- `compact_acc_kind` (`agg.rs:8197`): replace the `MIN/MAX on non-text → unreachable!()` arm with `INT2/4/8/DATE/TIMESTAMP/TIMESTAMPTZ → MinInt/MaxInt`.
+- `can_use_compact_accs` (`agg.rs:8933`): add the integer types alongside the existing text branch for `Min/Max`.
+- The 13+ exhaustive `match` sites that match on `CompactAccKind` (per-row update, merge, finalize, emit_partial in both `process_segments_compact` and `process_segments_mixed`):
+  - 2983 (merge, leader-side full path)
+  - 3146, 3307, 4271, 4447, 4644, 5215, 6577 (per-row update sites in mixed/compact paths)
+  - 3490, 4871 (chunk-level merge inside `process_segments_*`)
+  - 9894, 10083 (`agg_wire.rs` DSM serialization — likely `unreachable!()` since DSM is dormant post-pivot, but still need exhaustiveness coverage)
+  - 11134 (test fixture)
+- `compact_finalize` + `compact_emit_partial` (`agg.rs:9103, 9240`): add `MinInt`/`MaxInt` arms emitting i64 datum on `Some(v)`, NULL on `None`. Same emit for both functions — partial state is the value itself; PG's `int*smaller`/`int*larger`/`timestamptz_smaller`/`timestamptz_larger` is the combinefn.
+- Test on EC2: `EXPLAIN ANALYZE SELECT data->>'did', MIN((data->>'time_us')::BIGINT) FROM bluesky WHERE data->>'kind'='commit' AND data->'commit'->>'collection'='app.bsky.feed.post' GROUP BY 1 ORDER BY 2 LIMIT 3`. Today this lands in serial `Custom Scan (DeltaXAgg)` at 15s. After H.1, expect mixed path with internal `std::thread::scope` parallelism — target ~1-2s.
+
+### Phase H.2 — monotonic-MIN/MAX recognizer (~200 LOC)
+
+Once H.1 makes integer MIN/MAX a first-class compact-path citizen, recognize Q3/Q4's actual aggregate shape so the user query lands without needing manual rewrite.
+
+The shape from `EXPLAIN VERBOSE`:
+```
+min(('1970-01-01 00:00:00+00'::timestamptz
+     + ('00:00:00.000001'::interval
+        * ((((data ->> 'time_us'::text))::bigint))::double precision)))
+```
+
+Tree structure:
+```
+Aggref(min, args=[
+    OpExpr(timestamptz_pl_interval, [
+        Const(timestamptz, '1970-01-01 00:00:00+00'),
+        OpExpr(interval_mul, [
+            Const(interval, '00:00:00.000001'),
+            FuncExpr(float8(int8), [chain (data->>'time_us')::bigint])
+        ])
+    ])
+])
+```
+
+- In `hook.rs` (`'resolve` block at `~1525`): when arg is `T_OpExpr` and the existing `Var ± Const` matcher rejects, try the timestamptz-pl-interval shape. Match by op-OID: outer `+` must be `timestamptz_pl_interval` (1327), inner `*` must be `interval_mul` (1583 or similar — look up by name to be PG-version-safe). Inner Const must be a positive interval representable as integer pg_us. Strip the int8→float8 cast (`FuncExpr` with funcid=482 or `RelabelType`). Resolve the bigint via `match_to_synthetic` to col_idx + INT8OID.
+- Compute the constant `pg_us_delta`: pg_us = `(epoch_const_pgus) + interval_us_per_unit * x_time_us`. For Q3/Q4 with `'epoch'` and `'1µs'`, delta = `epoch_const_pgus = -946684800000000` (timestamptz internal of unix epoch), and the interval coefficient is exactly 1. For other intervals (e.g. 1ms = 1000), the coefficient must divide cleanly into i64 multiplication or we bail.
+- Add `OutputTransform` to `AggExecSpec` + `AggSpec` + wire format:
+  ```rust
+  pub(crate) enum OutputTransform {
+      None,
+      /// pg_us = i64_value + delta. Used for MIN/MAX over bigint synthetic
+      /// where the SQL expression is `<const_timestamptz> + INTERVAL <unit> *
+      /// <coeff_factor>·<bigint>`, recognized as monotonic.
+      PgUsShift { delta: i64 },
+  }
+  ```
+  Wire format: 1 i32 tag + i64 hi/lo split (3 ints) per spec.
+- `compact_finalize` MinInt/MaxInt arm: if `spec.output_transform = PgUsShift(delta)`, emit `Datum::from((v + delta) as usize)` (the timestamptz datum = pg_us i64 cast). Result type stays `TIMESTAMPTZOID` per `spec.result_type_oid`; cscan's tuple slot already declares the column as TIMESTAMPTZ via the Aggref's `aggtype`.
+- `compact_emit_partial` mirrors finalize for the partial path (the partial state IS the post-transform timestamptz value, which `timestamptz_smaller`/`timestamptz_larger` combine over).
+
+Validation: Q3 plan today drops to `Custom Scan (DeltaXAgg)` (mixed parallel internal) on EC2; result-set still equals the slow path bytewise. Q4 same with MAX added.
+
+### Phase H.3 — relax partial-path text-WHERE gate (~50 LOC)
+
+`add_agg_partial_path` rejects WHEREs touching text columns via `quals_reference_only_numeric_vars` (path.rs:1151). Runtime already supports text Eq/Ne (`decompress_text_blob_with_eq_filter`) and text IN (added in `33aed1e`'s `decompress_text_blob_with_in_filter`). Lifting the gate is straightforward but separate from H.1/H.2 — H.1/H.2 alone get Q3/Q4 onto the mixed serial path; H.3 promotes them to the **partial CustomScan + Gather + FinalAgg** model (genuine PG parallel workers vs internal threads).
+
+- Replace `quals_reference_only_numeric_vars` with a predicate that walks the qual list and accepts: numeric/date/timestamp Vars + chain Exprs + text-Eq/Ne/IN/LIKE on text Vars (matching what `extract_batch_quals` actually handles at runtime).
+- Cost-model nudge in `cost::estimate_agg_cost` to account for the parallel speedup; without it, the planner may continue picking the complete (single-process internal-rayon) DeltaXAgg path because the cost model under-counts internal-rayon's contribution.
+- Test: confirm Q3/Q4 land in `Parallel Custom Scan (DeltaXAgg)` (vs internal-thread `Custom Scan (DeltaXAgg)`); EXPLAIN ANALYZE shows `Workers Launched > 0`.
+
+Risk: enabling text-WHERE for partial path opens it for queries that today fall back to the complete path — same regression vector noted under "Partial-path coverage extensions" (RTABench / ClickBench picked the partial path for shapes where the complete path's internal-rayon was faster, 5-7% regression). Need to re-validate the cost model on RTABench + ClickBench before shipping.
+
+### Phase H.4 — bench, regression check, ship
+
+- JSONBench EC2: Q3 3.3s → ≤2s warm, Q4 3.7s → ≤2s warm, no regression on Q0/Q1/Q2. Suite total target 10s → ≤7s.
+- RTABench full + ClickBench full: zero regression > noise (~3%). The text-WHERE gate is the highest-risk change here.
+- Correctness: full integration suite (`make test PG_MAJOR=18 && make integration-test PG_VERSIONS=18`) green at every phase boundary. Add focused unit tests in `agg.rs` for MinInt/MaxInt update/merge/finalize/emit_partial.
+- Decide ship-or-revert based on bench delta. Revert path: `compact_acc_kind` keeps the new variants but `can_use_compact_accs` and the recognizer can be reverted independently.
+
+### What's already in place
+
+- `Custom Scan (DeltaXAgg)` mixed-path infrastructure (`process_segments_mixed`, `can_parallel_mixed`) handles text group keys + integer-encoded compact accs. The only gap is that integer MIN/MAX has no `CompactAccKind` slot.
+- The Q2 work added `decompress_text_blob_with_in_filter` and lifted the SAOP planner gate to text + chains, which is also a prerequisite for any Q3/Q4 query that uses `IN (...)` on chain text. Q3/Q4 specifically use only `=` on text (one value per filter), so they're already covered by the text-Eq runtime path.
+- `output_map` chain handling (path.rs:1862, fixed in `33aed1e`) covers the JSONB-chain target case for Q3/Q4's `data->>'did'` GROUP BY column.
+- `AggChainCtx::match_to_synthetic` resolves `(data->>'time_us')::bigint` chains to INT8 synthetic col_idx — used by H.2's recognizer.
+
 ## Status
 
 - [x] DeltaXAgg already exists for serial CustomScan-based aggregation (`src/scan/exec/agg.rs`, ~11K lines). Supports COUNT, COUNT(DISTINCT), MIN, MAX, SUM, AVG with optional GROUP BY/HAVING. Internal `std::thread::scope` parallelism via `process_segments_compact` + `merge_compact_results`.
