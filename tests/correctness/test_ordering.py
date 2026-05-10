@@ -7,6 +7,9 @@ from .harness import assert_query_case
 from .querygen import ordering_topn_cases
 
 
+pytestmark = pytest.mark.smoke
+
+
 ORDERING_LAYOUTS = (
     ("ts_ordered", ("ts",)),
     ("value_ordered", ("sort_val", "ts")),

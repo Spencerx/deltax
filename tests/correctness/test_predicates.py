@@ -7,6 +7,9 @@ from .harness import assert_query_case
 from .querygen import predicate_matrix_cases
 
 
+pytestmark = pytest.mark.smoke
+
+
 PREDICATE_LAYOUTS = (
     ("time_ordered", ("ts", "id")),
     ("value_ordered", ("int_val", "ts", "id")),

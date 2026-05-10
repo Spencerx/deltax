@@ -1,6 +1,8 @@
 PG_MAJOR ?= 17
 DEV_IMAGE  = pg_deltax-dev:pg$(PG_MAJOR)
 IMAGE      = pg_deltax:pg$(PG_MAJOR)
+WORKTREE_ID = $(shell printf '%s' '$(CURDIR)' | shasum | cut -c1-12)
+CORRECTNESS_IMAGE = pg_deltax-correctness:pg$(PG_MAJOR)-$(WORKTREE_ID)
 COV_IMAGE  = pg_deltax-cov:pg$(PG_MAJOR)
 TARGET_VOL      = pg_deltax_target_pg$(PG_MAJOR)
 CARGO_VOL       = pg_deltax_cargo
@@ -9,7 +11,7 @@ QUERY_CONTAINER = pg_deltax_query
 PG_VERSIONS ?= 17 18
 VENV         = .venv
 
-.PHONY: dev-image image image-fresh test build clippy coverage coverage-all run psql cargo clean \
+.PHONY: dev-image image image-fresh correctness-image test build clippy coverage coverage-all run psql cargo clean \
        integration-test \
        correctness-smoke correctness correctness-fuzz correctness-clean \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
@@ -115,6 +117,11 @@ image: dev-image
 image-fresh: dev-image
 	docker build --no-cache -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
 
+# Build a worktree-scoped runtime image for correctness tests. This avoids
+# cross-worktree races with integration tests rebuilding the shared $(IMAGE) tag.
+correctness-image: dev-image
+	docker build -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(CORRECTNESS_IMAGE) .
+
 # Run postgres with the extension for manual testing
 run: image
 	docker run --rm --name pg_deltax -p 5432:5432 -e POSTGRES_PASSWORD=postgres $(IMAGE) \
@@ -187,10 +194,11 @@ integration-test: $(VENV)/.stamp
 		PG_DELTAX_IMAGE=pg_deltax:pg$$v $(VENV)/bin/pytest tests/ -v; \
 	done
 
-correctness-smoke: $(VENV)/.stamp image
-	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/correctness/ -v -s
+correctness-smoke: $(VENV)/.stamp correctness-image
+	PG_DELTAX_IMAGE=$(CORRECTNESS_IMAGE) $(VENV)/bin/pytest tests/correctness/ -m smoke -v -s
 
-correctness: correctness-smoke
+correctness: $(VENV)/.stamp correctness-image
+	PG_DELTAX_IMAGE=$(CORRECTNESS_IMAGE) $(VENV)/bin/pytest tests/correctness/ -v -s
 
 correctness-fuzz:
 	@echo "Seeded generated correctness tests are not implemented yet."

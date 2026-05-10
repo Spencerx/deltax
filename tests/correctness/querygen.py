@@ -353,3 +353,210 @@ def ordering_topn_cases() -> Iterable[QueryCase]:
         LIMIT 3
         """,
     )
+
+
+def aggregate_matrix_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "count_star_and_count_col",
+        """
+        SELECT count(*), count(int_nullable), count(all_null_input)
+        FROM {table}
+        """,
+    )
+    yield QueryCase(
+        "numeric_min_max_sum_avg",
+        """
+        SELECT
+            min(int_not_null),
+            max(int_not_null),
+            sum(int_nullable),
+            avg(int_nullable)
+        FROM {table}
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "float_sum_avg",
+        """
+        SELECT sum(float_val), avg(float_val), min(float_val), max(float_val)
+        FROM {table}
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "group_by_segment_key",
+        """
+        SELECT
+            group_key,
+            count(*),
+            count(int_nullable),
+            sum(int_nullable),
+            min(int_nullable),
+            max(int_nullable)
+        FROM {table}
+        GROUP BY group_key
+        ORDER BY group_key NULLS LAST
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "group_by_multiple_keys",
+        """
+        SELECT
+            group_key,
+            sub_key,
+            count(*),
+            sum(int_not_null),
+            avg(float_val)
+        FROM {table}
+        GROUP BY group_key, sub_key
+        ORDER BY group_key NULLS LAST, sub_key NULLS LAST
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "all_null_group_inputs",
+        """
+        SELECT
+            group_key,
+            count(all_null_input),
+            sum(all_null_input),
+            avg(all_null_input),
+            min(all_null_input),
+            max(all_null_input)
+        FROM {table}
+        GROUP BY group_key
+        ORDER BY group_key NULLS LAST
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "having_on_aggregate",
+        """
+        SELECT group_key, count(*), sum(int_not_null)
+        FROM {table}
+        GROUP BY group_key
+        HAVING count(*) >= 20 AND sum(int_not_null) <> 0
+        ORDER BY group_key NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "where_segment_by_equality",
+        """
+        SELECT count(*), count(int_nullable), min(int_nullable), max(int_nullable), sum(int_nullable)
+        FROM {table}
+        WHERE group_key = 3
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "where_non_key_column",
+        """
+        SELECT group_key, count(*), sum(int_not_null), avg(float_val)
+        FROM {table}
+        WHERE filter_val BETWEEN -3 AND 4
+        GROUP BY group_key
+        ORDER BY group_key NULLS LAST
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "aligned_time_range",
+        """
+        SELECT count(*), sum(int_not_null), min(int_nullable), max(int_nullable)
+        FROM {table}
+        WHERE ts >= '2025-01-15 00:00:00+00'
+          AND ts < '2025-01-18 00:00:00+00'
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "partial_time_range",
+        """
+        SELECT group_key, count(*), sum(int_not_null), avg(float_val)
+        FROM {table}
+        WHERE ts >= '2025-01-15 06:00:00+00'
+          AND ts < '2025-01-16 18:00:00+00'
+        GROUP BY group_key
+        ORDER BY group_key NULLS LAST
+        """,
+        comparator="float_tolerant",
+    )
+
+
+def aggregate_extended_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "count_distinct_repeated_values",
+        """
+        SELECT
+            count(DISTINCT repeat_val),
+            count(DISTINCT group_key),
+            count(DISTINCT int_nullable)
+        FROM {table}
+        """,
+    )
+    yield QueryCase(
+        "grouped_count_distinct_repeated_values",
+        """
+        SELECT
+            group_key,
+            count(DISTINCT repeat_val),
+            count(DISTINCT int_nullable)
+        FROM {table}
+        GROUP BY group_key
+        ORDER BY group_key NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "aggregate_filter_clauses",
+        """
+        SELECT
+            count(*) FILTER (WHERE filter_val > 0),
+            count(int_nullable) FILTER (WHERE filter_val <= 0),
+            sum(int_not_null) FILTER (WHERE filter_val BETWEEN -3 AND 3)
+        FROM {table}
+        """,
+    )
+    yield QueryCase(
+        "group_by_not_null_bucket",
+        """
+        SELECT
+            bucket_not_null,
+            count(*),
+            sum(int_not_null),
+            avg(float_val)
+        FROM {table}
+        GROUP BY bucket_not_null
+        ORDER BY bucket_not_null
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "order_by_aggregate_limit",
+        """
+        SELECT group_key, count(*), sum(int_not_null)
+        FROM {table}
+        GROUP BY group_key
+        ORDER BY sum(int_not_null) DESC NULLS LAST, count(*) DESC, group_key NULLS LAST
+        LIMIT 5
+        """,
+    )
+    yield QueryCase(
+        "where_group_key_is_null",
+        """
+        SELECT count(*), count(int_nullable), sum(int_not_null), avg(float_val)
+        FROM {table}
+        WHERE group_key IS NULL
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "having_null_sensitive_aggregate",
+        """
+        SELECT group_key, count(*), count(all_null_input), sum(all_null_input)
+        FROM {table}
+        GROUP BY group_key
+        HAVING sum(all_null_input) IS NULL
+        ORDER BY group_key NULLS LAST
+        """,
+    )

@@ -1793,7 +1793,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         };
 
         // Compact keys: pack integer GROUP BY keys into u128
-        let use_compact_keys = has_group_by && can_use_compact_keys(&group_specs);
+        let use_compact_keys = has_group_by && can_use_compact_keys(&group_specs, &meta.col_not_null);
         let mut compact_group_map: CompactGroupMap = CompactGroupMap::with_hasher(BuildHasherDefault::default());
         let mut cd_sidecar = CountDistinctSideCar::new(&agg_specs);
 
@@ -7508,20 +7508,23 @@ unsafe fn compact_finalize(
 // ============================================================================
 
 /// Check if all GROUP BY columns produce integer values and can be packed into u128.
-fn can_use_compact_keys(group_specs: &[GroupByColSpec]) -> bool {
+fn can_use_compact_keys(group_specs: &[GroupByColSpec], col_not_null: &[bool]) -> bool {
     if group_specs.is_empty() || group_specs.len() > 2 {
         return false; // u128 fits at most 2 x i64
     }
     group_specs.iter().all(|gs| {
         match &gs.expr {
             GroupByExpr::Column => {
+                if !col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false) {
+                    return false;
+                }
                 let t = gs.type_oid;
                 t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
                     || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
             }
-            GroupByExpr::DateTrunc { .. } => true, // returns i64
-            GroupByExpr::Extract { .. } => true,   // returns i64
-            GroupByExpr::AddConst { .. } => true,  // returns i64
+            GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {
+                col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false)
+            }
             GroupByExpr::RegexpReplace { .. } => false,
             GroupByExpr::CaseWhen(_) => false,
         }

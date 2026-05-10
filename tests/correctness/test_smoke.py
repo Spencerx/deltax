@@ -7,6 +7,9 @@ from .harness import assert_query_case
 from .querygen import curated_smoke_cases
 
 
+pytestmark = pytest.mark.smoke
+
+
 @pytest.fixture()
 def tiny_events(db):
     return create_tiny_events_pair(db)
@@ -21,4 +24,3 @@ def test_tiny_events_matches_plain_postgres(tiny_events, db, case):
         plain_table=plain_table,
         deltax_table=deltax_table,
     )
-

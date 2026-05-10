@@ -240,3 +240,76 @@ def create_ordering_edges_pair(
     _analyze_tables(conn, plain_table, deltax_table)
 
     return plain_table, deltax_table
+
+
+def create_aggregate_matrix_pair(
+    conn,
+    *,
+    deltax_table: str = "aggregate_matrix",
+    segment_by: tuple[str, ...] = ("group_key",),
+    order_by: tuple[str, ...] = ("ts", "id"),
+    segment_size: int = 10,
+) -> tuple[str, str]:
+    """Create a numeric-heavy aggregate dataset and compress it."""
+    plain_table = f"{deltax_table}_plain"
+    segment_by_sql = ", ".join(f"'{column}'" for column in segment_by)
+    order_by_sql = ", ".join(f"'{column}'" for column in order_by)
+
+    conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for table_name in (plain_table, deltax_table):
+        conn.execute(
+            f"""
+            CREATE TABLE {table_name} (
+                ts timestamptz NOT NULL,
+                id integer NOT NULL,
+                group_key integer,
+                sub_key integer,
+                device_id integer,
+                bucket_not_null integer NOT NULL,
+                int_not_null integer NOT NULL,
+                int_nullable integer,
+                all_null_input integer,
+                repeat_val integer,
+                float_val double precision,
+                filter_val integer
+            )
+            """
+        )
+
+    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(
+        "SELECT deltax_enable_compression("
+        f"'{deltax_table}', segment_by => ARRAY[{segment_by_sql}], "
+        f"order_by => ARRAY[{order_by_sql}], segment_size => %s)",
+        (segment_size,),
+    )
+    conn.commit()
+
+    insert_sql = f"""
+        INSERT INTO {{table}} (
+            ts, id, group_key, sub_key, device_id, bucket_not_null,
+            int_not_null, int_nullable, all_null_input, repeat_val, float_val, filter_val
+        )
+        SELECT
+            '{BASE_TS}'::timestamptz + (i * interval '20 minutes') AS ts,
+            i AS id,
+            CASE WHEN i % 29 = 0 THEN NULL ELSE i % 6 END AS group_key,
+            CASE WHEN i % 13 = 0 THEN NULL ELSE i % 4 END AS sub_key,
+            CASE WHEN i % 17 = 0 THEN NULL ELSE i % 8 END AS device_id,
+            i % 6 AS bucket_not_null,
+            (i % 43) - 21 AS int_not_null,
+            CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 37) - 18 END AS int_nullable,
+            CASE WHEN i % 6 = 5 THEN NULL ELSE (i % 23) - 11 END AS all_null_input,
+            (i % 5) - 2 AS repeat_val,
+            CASE WHEN i % 11 = 0 THEN NULL ELSE ((i % 41) - 20)::float8 / 7.0 END AS float_val,
+            (i % 19) - 9 AS filter_val
+        FROM generate_series(0, 215) AS g(i)
+    """
+    conn.execute(insert_sql.format(table=plain_table))
+    conn.execute(insert_sql.format(table=deltax_table))
+    conn.commit()
+
+    _compress_non_default_partitions(conn, deltax_table)
+    _analyze_tables(conn, plain_table, deltax_table)
+
+    return plain_table, deltax_table

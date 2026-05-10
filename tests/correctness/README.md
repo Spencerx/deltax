@@ -14,9 +14,9 @@ make correctness-smoke
 make correctness
 ```
 
-`correctness-smoke` runs the small deterministic suite in this directory.
-`correctness` is the broader entry point; for now it points at the same suite
-and is intended to grow as more datasets and query families are added.
+`correctness-smoke` runs tests marked `smoke`.
+`correctness` runs the full curated suite, including broader tests marked
+`extended`.
 
 ## Layout
 
