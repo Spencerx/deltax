@@ -2388,7 +2388,15 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             expr: GroupByExpr::DateTrunc { unit, unit_usecs, func_oid },
                         });
                     } else if fn_name == "extract" {
-                        // Validate: extract(Const text, Var timestamp/tz)
+                        // Validate: extract(Const text, <inner>)
+                        // <inner> is either:
+                        //   (a) a plain Var of type timestamp/timestamptz, or
+                        //   (b) `to_timestamp(<dividend> / <int_const>)` where
+                        //       <dividend> is a Var or json_extract chain that
+                        //       resolves to an INT8 synthetic — used by the
+                        //       JSONBench Q2 shape:
+                        //         extract(hour FROM
+                        //           to_timestamp((data->>'time_us')::bigint / 1000000))
                         let fn_args = (*funcexpr).args;
                         if fn_args.is_null() || (*fn_args).length != 2 {
                             return;
@@ -2399,24 +2407,172 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         if arg0.is_null() || (*arg0).type_ != pg_sys::NodeTag::T_Const {
                             return;
                         }
-                        if arg1.is_null() || (*arg1).type_ != pg_sys::NodeTag::T_Var {
+                        if arg1.is_null() {
                             return;
                         }
 
-                        let var_node = arg1 as *const pg_sys::Var;
-                        let col_idx = (*var_node).varattno as i32 - 1;
+                        // Try shape (a): plain Var of timestamp/tz.
+                        let mut col_idx_opt: Option<i32> = None;
+                        let mut divisor: i64 = 0;
+                        let mut record_relid: pg_sys::Oid = pg_sys::InvalidOid;
 
-                        // Get column type — must be timestamp or timestamptz
-                        let rte = *(*root).simple_rte_array.add((*var_node).varno as usize);
-                        if rte.is_null() {
-                            return;
+                        if (*arg1).type_ == pg_sys::NodeTag::T_Var {
+                            let var_node = arg1 as *const pg_sys::Var;
+                            let varno = (*var_node).varno as usize;
+                            if varno != 0 && varno < (*root).simple_rel_array_size as usize {
+                                let rte = *(*root).simple_rte_array.add(varno);
+                                if !rte.is_null() {
+                                    let relid = (*rte).relid;
+                                    let mut type_oid = pg_sys::InvalidOid;
+                                    let mut typmod: i32 = -1;
+                                    let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+                                    pg_sys::get_atttypetypmodcoll(
+                                        relid, (*var_node).varattno,
+                                        &mut type_oid, &mut typmod, &mut collation,
+                                    );
+                                    if type_oid == pg_sys::TIMESTAMPOID
+                                        || type_oid == pg_sys::TIMESTAMPTZOID
+                                    {
+                                        col_idx_opt = Some((*var_node).varattno as i32 - 1);
+                                        record_relid = relid;
+                                    }
+                                }
+                            }
                         }
-                        let mut type_oid = pg_sys::InvalidOid;
-                        let mut typmod: i32 = -1;
-                        let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
-                        pg_sys::get_atttypetypmodcoll((*rte).relid, (*var_node).varattno, &mut type_oid, &mut typmod, &mut collation);
-                        if type_oid != pg_sys::TIMESTAMPOID && type_oid != pg_sys::TIMESTAMPTZOID {
+
+                        // Try shape (b): `to_timestamp(dividend / int_const)`.
+                        if col_idx_opt.is_none()
+                            && (*arg1).type_ == pg_sys::NodeTag::T_FuncExpr
+                        {
+                            let inner_fe = arg1 as *const pg_sys::FuncExpr;
+                            let inner_name_ptr = pg_sys::get_func_name((*inner_fe).funcid);
+                            if !inner_name_ptr.is_null()
+                                && std::ffi::CStr::from_ptr(inner_name_ptr).to_str()
+                                    .map(|s| s == "to_timestamp")
+                                    .unwrap_or(false)
+                                && !(*inner_fe).args.is_null()
+                                && (*(*inner_fe).args).length == 1
+                            {
+                                let mut inner_arg = (*(*(*inner_fe).args).elements.add(0))
+                                    .ptr_value as *const pg_sys::Node;
+                                // PG inserts an `int8 → double precision`
+                                // cast around the division result so it
+                                // matches `to_timestamp(double precision)`.
+                                // The cast appears as a single-arg FuncExpr
+                                // (e.g. `float8(int8)`, oid 482) or as a
+                                // RelabelType. Peek through either to find
+                                // the OpExpr underneath.
+                                if !inner_arg.is_null()
+                                    && (*inner_arg).type_ == pg_sys::NodeTag::T_FuncExpr
+                                {
+                                    let cast_fe = inner_arg as *const pg_sys::FuncExpr;
+                                    if !(*cast_fe).args.is_null()
+                                        && (*(*cast_fe).args).length == 1
+                                    {
+                                        inner_arg = (*(*(*cast_fe).args).elements.add(0))
+                                            .ptr_value as *const pg_sys::Node;
+                                    }
+                                } else if !inner_arg.is_null()
+                                    && (*inner_arg).type_ == pg_sys::NodeTag::T_RelabelType
+                                {
+                                    let rt = inner_arg as *const pg_sys::RelabelType;
+                                    inner_arg = (*rt).arg as *const pg_sys::Node;
+                                }
+                                if !inner_arg.is_null()
+                                    && (*inner_arg).type_ == pg_sys::NodeTag::T_OpExpr
+                                {
+                                    let op = inner_arg as *const pg_sys::OpExpr;
+                                    let opname_ptr = pg_sys::get_opname((*op).opno);
+                                    if !opname_ptr.is_null()
+                                        && std::ffi::CStr::from_ptr(opname_ptr).to_str()
+                                            .map(|s| s == "/")
+                                            .unwrap_or(false)
+                                        && !(*op).args.is_null()
+                                        && (*(*op).args).length == 2
+                                    {
+                                        let dividend = (*(*(*op).args).elements.add(0))
+                                            .ptr_value as *const pg_sys::Node;
+                                        let div_const = (*(*(*op).args).elements.add(1))
+                                            .ptr_value as *const pg_sys::Node;
+
+                                        // Divisor must be a positive int constant.
+                                        if !div_const.is_null()
+                                            && (*div_const).type_ == pg_sys::NodeTag::T_Const
+                                        {
+                                            let c = div_const as *const pg_sys::Const;
+                                            if !(*c).constisnull {
+                                                let v = match (*c).consttype {
+                                                    pg_sys::INT2OID => {
+                                                        (*c).constvalue.value() as i16 as i64
+                                                    }
+                                                    pg_sys::INT4OID => {
+                                                        (*c).constvalue.value() as i32 as i64
+                                                    }
+                                                    pg_sys::INT8OID => {
+                                                        (*c).constvalue.value() as i64
+                                                    }
+                                                    _ => 0,
+                                                };
+                                                if v > 0 {
+                                                    divisor = v;
+                                                }
+                                            }
+                                        }
+
+                                        if divisor > 0 && !dividend.is_null() {
+                                            // Dividend may be a plain Var (BIGINT) or
+                                            // a JSONB chain over a synthetic.
+                                            if (*dividend).type_ == pg_sys::NodeTag::T_Var {
+                                                let dv = dividend as *const pg_sys::Var;
+                                                let varno = (*dv).varno as usize;
+                                                if varno != 0
+                                                    && varno < (*root).simple_rel_array_size as usize
+                                                {
+                                                    let rte = *(*root).simple_rte_array.add(varno);
+                                                    if !rte.is_null() {
+                                                        let relid = (*rte).relid;
+                                                        let mut type_oid = pg_sys::InvalidOid;
+                                                        let mut typmod: i32 = -1;
+                                                        let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+                                                        pg_sys::get_atttypetypmodcoll(
+                                                            relid, (*dv).varattno,
+                                                            &mut type_oid, &mut typmod, &mut collation,
+                                                        );
+                                                        if type_oid == pg_sys::INT8OID {
+                                                            col_idx_opt = Some((*dv).varattno as i32 - 1);
+                                                            record_relid = relid;
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                // Try JSONB chain match against synthetic.
+                                                if json_extract_ctx.is_none() {
+                                                    json_extract_ctx = Some(
+                                                        super::json_extract::AggChainCtx::from_root(root),
+                                                    );
+                                                }
+                                                if let Some(Some(ctx)) =
+                                                    json_extract_ctx.as_ref()
+                                                    && let Some((ci, ti)) =
+                                                        ctx.match_to_synthetic(dividend)
+                                                    && ti == pg_sys::INT8OID
+                                                {
+                                                    col_idx_opt = Some(ci);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let Some(col_idx) = col_idx_opt else {
                             return;
+                        };
+                        if record_relid != pg_sys::InvalidOid
+                            && group_by_relid == pg_sys::InvalidOid
+                        {
+                            group_by_relid = record_relid;
                         }
 
                         // Extract unit string from Const
@@ -2428,16 +2584,29 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         let unit = std::ffi::CStr::from_ptr(unit_cstr).to_string_lossy().into_owned();
                         pg_sys::pfree(unit_cstr as *mut _);
 
-                        // Only accept fields computable with pure arithmetic
-                        match unit.as_str() {
-                            "microsecond" | "microseconds"
-                            | "millisecond" | "milliseconds"
-                            | "second" | "seconds"
-                            | "minute" | "minutes"
-                            | "hour" | "hours"
-                            | "dow"
-                            | "epoch" => {}
-                            _ => return, // calendar-based fields not supported
+                        // For the divisor>0 (bigint unix-µs) path, restrict to
+                        // sub-day units that depend only on `unix_secs %
+                        // 86400`. dow/epoch differ by a constant offset
+                        // between unix and PG epochs and would need extra
+                        // handling — defer.
+                        let unit_ok = if divisor == 0 {
+                            matches!(unit.as_str(),
+                                "microsecond" | "microseconds"
+                                | "millisecond" | "milliseconds"
+                                | "second" | "seconds"
+                                | "minute" | "minutes"
+                                | "hour" | "hours"
+                                | "dow" | "epoch")
+                        } else {
+                            matches!(unit.as_str(),
+                                "microsecond" | "microseconds"
+                                | "millisecond" | "milliseconds"
+                                | "second" | "seconds"
+                                | "minute" | "minutes"
+                                | "hour" | "hours")
+                        };
+                        if !unit_ok {
+                            return;
                         }
 
                         let func_oid = u32::from((*funcexpr).funcid);
@@ -2445,7 +2614,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         group_specs.push(super::exec::GroupByColSpec {
                             col_idx,
                             type_oid: pg_sys::NUMERICOID,
-                            expr: GroupByExpr::Extract { unit, func_oid },
+                            expr: GroupByExpr::Extract { unit, func_oid, divisor },
                         });
                     } else {
                         return; // Unsupported function in GROUP BY
@@ -2574,6 +2743,70 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         let var_node = arg as *const pg_sys::Var;
                         col_idx = (*var_node).varattno as i32 - 1;
                         break;
+                    }
+                }
+                // For the `extract(hour FROM to_timestamp(<chain>/<const>))`
+                // shape there's no plain Var in `args` — recover the
+                // synthetic col_idx by matching the chain that lives
+                // inside to_timestamp's OpExpr divisor.
+                if col_idx < 0 && nargs == 2 {
+                    let arg1 = (*(*fn_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                    if !arg1.is_null() && (*arg1).type_ == pg_sys::NodeTag::T_FuncExpr {
+                        let inner_fe = arg1 as *const pg_sys::FuncExpr;
+                        let inner_name_ptr = pg_sys::get_func_name((*inner_fe).funcid);
+                        if !inner_name_ptr.is_null()
+                            && std::ffi::CStr::from_ptr(inner_name_ptr).to_str()
+                                .map(|s| s == "to_timestamp")
+                                .unwrap_or(false)
+                            && !(*inner_fe).args.is_null()
+                            && (*(*inner_fe).args).length == 1
+                        {
+                            let mut inner_arg = (*(*(*inner_fe).args).elements.add(0))
+                                .ptr_value as *const pg_sys::Node;
+                            // Peek through the int8 → float8 cast.
+                            if !inner_arg.is_null()
+                                && (*inner_arg).type_ == pg_sys::NodeTag::T_FuncExpr
+                            {
+                                let cast_fe = inner_arg as *const pg_sys::FuncExpr;
+                                if !(*cast_fe).args.is_null()
+                                    && (*(*cast_fe).args).length == 1
+                                {
+                                    inner_arg = (*(*(*cast_fe).args).elements.add(0))
+                                        .ptr_value as *const pg_sys::Node;
+                                }
+                            } else if !inner_arg.is_null()
+                                && (*inner_arg).type_ == pg_sys::NodeTag::T_RelabelType
+                            {
+                                let rt = inner_arg as *const pg_sys::RelabelType;
+                                inner_arg = (*rt).arg as *const pg_sys::Node;
+                            }
+                            if !inner_arg.is_null()
+                                && (*inner_arg).type_ == pg_sys::NodeTag::T_OpExpr
+                            {
+                                let op = inner_arg as *const pg_sys::OpExpr;
+                                if !(*op).args.is_null() && (*(*op).args).length == 2 {
+                                    let dividend = (*(*(*op).args).elements.add(0))
+                                        .ptr_value as *const pg_sys::Node;
+                                    if !dividend.is_null() {
+                                        if (*dividend).type_ == pg_sys::NodeTag::T_Var {
+                                            let dv = dividend as *const pg_sys::Var;
+                                            col_idx = (*dv).varattno as i32 - 1;
+                                        } else if json_extract_ctx.is_none() {
+                                            json_extract_ctx = Some(
+                                                super::json_extract::AggChainCtx::from_root(root),
+                                            );
+                                        }
+                                        if col_idx < 0
+                                            && let Some(Some(ctx)) = json_extract_ctx.as_ref()
+                                            && let Some((ci, _ti)) =
+                                                ctx.match_to_synthetic(dividend)
+                                        {
+                                            col_idx = ci;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if col_idx < 0 {

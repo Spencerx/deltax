@@ -208,8 +208,22 @@ pub(crate) enum GroupByExpr {
     RegexpReplace { pattern: String, replacement: String, func_oid: u32, collation: u32 },
     /// date_trunc(unit, timestamp_col): GROUP BY date_trunc('minute', ts)
     DateTrunc { unit: String, unit_usecs: i64, func_oid: u32 },
-    /// extract(field FROM timestamp_col): GROUP BY extract(minute FROM ts)
-    Extract { unit: String, func_oid: u32 },
+    /// extract(field FROM timestamp_col): GROUP BY extract(minute FROM ts).
+    ///
+    /// When `divisor == 0`, the input column at `col_idx` is a TIMESTAMP /
+    /// TIMESTAMPTZ — read as i64 microseconds since the PG epoch
+    /// (2000-01-01) and passed to `extract_field_from_usecs`.
+    ///
+    /// When `divisor > 0`, the input column is a BIGINT carrying microseconds
+    /// since the unix epoch (1970-01-01) — typically a json_extract synthetic
+    /// recovered from `(data->>'time_us')::bigint`. The recognizer matches
+    /// `extract(unit FROM to_timestamp(<bigint_col> / <const>))`; `divisor`
+    /// is the SQL-level divisor (e.g. 1_000_000 for `time_us / 1000000`),
+    /// applied at evaluation time to recover unix seconds. Restricted to
+    /// period-86400-invariant units (sub-day fields), where the unix-vs-PG
+    /// epoch shift drops out of the answer; calendar-based fields fall back
+    /// to the executor.
+    Extract { unit: String, func_oid: u32, divisor: i64 },
     /// col +/- const: GROUP BY col - 1  (offset is always stored as addition, so col-1 → offset=-1)
     AddConst { offset: i64, op_oid: u32 },
     /// CASE WHEN ... THEN ... ELSE ... END
@@ -302,6 +316,57 @@ fn extract_field_from_usecs(pg_usec: i64, unit: &str) -> i64 {
             (pg_usec / 1_000_000) + 946_684_800
         }
         _ => 0, // Should not happen (validated in hook)
+    }
+}
+
+/// Evaluate a `GroupByExpr::Extract` on a single column-row value. When
+/// `divisor == 0` the input is interpreted as PG-usec (existing path); when
+/// `divisor > 0` the input is interpreted as bigint unix microseconds via
+/// `extract_subday_from_bigint_scaled` below. Centralised so the five
+/// per-row extract sites in this file stay one-line and consistent.
+#[inline]
+pub(crate) fn eval_extract(value: i64, divisor: i64, unit: &str) -> i64 {
+    if divisor > 0 {
+        extract_subday_from_bigint_scaled(value, divisor, unit)
+    } else {
+        extract_field_from_usecs(value, unit)
+    }
+}
+
+/// Extract a sub-day field from a BIGINT column whose value, when divided
+/// by `divisor`, yields seconds since the unix epoch (1970-01-01). Used for
+/// the `extract(unit FROM to_timestamp(bigint_col / divisor))` shape — the
+/// recognizer in `hook.rs` only emits this for units whose value depends
+/// only on `unix_secs % 86400` (microsecond/millisecond/second/minute/hour),
+/// so the unix-vs-PG epoch shift (a multiple of 86400) drops out and we
+/// don't need to convert to PG-usec first.
+///
+/// `divisor` must be positive; the recognizer enforces this.
+fn extract_subday_from_bigint_scaled(value: i64, divisor: i64, unit: &str) -> i64 {
+    let unix_secs = value.div_euclid(divisor);
+    let secs_in_day = unix_secs.rem_euclid(86_400);
+    match unit {
+        "microsecond" | "microseconds" => {
+            // Whole-second arithmetic only: `to_timestamp(bigint / divisor)`
+            // already truncated below the second, so any sub-second component
+            // of the original bigint is lost. The recognizer accepts the unit
+            // anyway because the answer remains exact for divisors that are
+            // multiples of 1_000_000 (the only shape we've seen in practice).
+            (secs_in_day % 60) * 1_000_000
+        }
+        "millisecond" | "milliseconds" => {
+            (secs_in_day % 60) * 1_000
+        }
+        "second" | "seconds" => {
+            secs_in_day % 60
+        }
+        "minute" | "minutes" => {
+            (secs_in_day / 60) % 60
+        }
+        "hour" | "hours" => {
+            secs_in_day / 3_600
+        }
+        _ => 0, // recognizer rejects other units in the divisor>0 path
     }
 }
 
@@ -1143,9 +1208,14 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 let unit_usecs = date_trunc_unit_to_usecs(&unit);
                 GroupByExpr::DateTrunc { unit, unit_usecs, func_oid }
             } else if expr_tag == 3 {
-                // Extract: func_oid, unit_len, unit_bytes...
+                // Extract: func_oid, divisor_hi, divisor_lo, unit_len, unit_bytes...
                 let func_oid = pg_sys::list_nth_int(custom_private, idx) as u32;
                 idx += 1;
+                let div_hi = pg_sys::list_nth_int(custom_private, idx) as i64;
+                idx += 1;
+                let div_lo = pg_sys::list_nth_int(custom_private, idx) as u32 as i64;
+                idx += 1;
+                let divisor = (div_hi << 32) | div_lo;
                 let unit_len = pg_sys::list_nth_int(custom_private, idx) as usize;
                 idx += 1;
                 let mut unit_bytes = Vec::with_capacity(unit_len);
@@ -1154,7 +1224,7 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                     idx += 1;
                 }
                 let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
-                GroupByExpr::Extract { unit, func_oid }
+                GroupByExpr::Extract { unit, func_oid, divisor }
             } else if expr_tag == 4 {
                 // AddConst: offset_i32, op_oid
                 let offset = pg_sys::list_nth_int(custom_private, idx) as i64;
@@ -6436,9 +6506,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 let pg_usec = col[row].0.value() as i64;
                                 pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                             }
-                            GroupByExpr::Extract { unit, .. } => {
-                                let pg_usec = col[row].0.value() as i64;
-                                extract_field_from_usecs(pg_usec, unit)
+                            GroupByExpr::Extract { unit, divisor, .. } => {
+                                eval_extract(col[row].0.value() as i64, *divisor, unit)
                             }
                             GroupByExpr::AddConst { offset, .. } => {
                                 col[row].0.value() as i64 + offset
@@ -6666,9 +6735,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     let truncated = pg_usec.div_euclid(*unit_usecs) * *unit_usecs;
                                     key_ref.push(GroupKeyRef::Int(truncated));
                                 }
-                                GroupByExpr::Extract { unit, .. } => {
-                                    let pg_usec = col[row].0.value() as i64;
-                                    let extracted = extract_field_from_usecs(pg_usec, unit);
+                                GroupByExpr::Extract { unit, divisor, .. } => {
+                                    let extracted = eval_extract(col[row].0.value() as i64, *divisor, unit);
                                     key_ref.push(GroupKeyRef::Int(extracted));
                                 }
                                 GroupByExpr::AddConst { offset, .. } => {
@@ -9671,9 +9739,8 @@ fn process_segments_compact(
                         let pg_usec = col[row].0.value() as i64;
                         pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                     }
-                    GroupByExpr::Extract { unit, .. } => {
-                        let pg_usec = col[row].0.value() as i64;
-                        extract_field_from_usecs(pg_usec, unit)
+                    GroupByExpr::Extract { unit, divisor, .. } => {
+                        eval_extract(col[row].0.value() as i64, *divisor, unit)
                     }
                     GroupByExpr::AddConst { offset, .. } => {
                         col[row].0.value() as i64 + offset
@@ -10603,9 +10670,8 @@ fn try_build_preselected(
                             let pg_usec = col[row].0.value() as i64;
                             pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                         }
-                        GroupByExpr::Extract { unit, .. } => {
-                            let pg_usec = col[row].0.value() as i64;
-                            extract_field_from_usecs(pg_usec, unit)
+                        GroupByExpr::Extract { unit, divisor, .. } => {
+                            eval_extract(col[row].0.value() as i64, *divisor, unit)
                         }
                         GroupByExpr::AddConst { offset, .. } => {
                             col[row].0.value() as i64 + offset
@@ -10901,9 +10967,8 @@ fn process_segments_mixed(
                             let pg_usec = col[row].0.value() as i64;
                             pg_usec.div_euclid(*unit_usecs) * *unit_usecs
                         }
-                        GroupByExpr::Extract { unit, .. } => {
-                            let pg_usec = col[row].0.value() as i64;
-                            extract_field_from_usecs(pg_usec, unit)
+                        GroupByExpr::Extract { unit, divisor, .. } => {
+                            eval_extract(col[row].0.value() as i64, *divisor, unit)
                         }
                         GroupByExpr::AddConst { offset, .. } => {
                             col[row].0.value() as i64 + offset
@@ -11313,7 +11378,7 @@ mod tests {
 
     #[pg_test]
     fn test_parse_group_by_extract() {
-        // GROUP BY extract(minute FROM ts): expr_tag=3
+        // GROUP BY extract(minute FROM ts): expr_tag=3, divisor=0
         unsafe {
             let unit = b"minute";
             let mut vals = vec![
@@ -11322,6 +11387,7 @@ mod tests {
                 1,                  // num_groups
                 0, 1184, 3,        // col_idx=0, TIMESTAMPTZOID, expr_tag=3(Extract)
                 200,               // func_oid
+                0, 0,              // divisor (i64 hi/lo): 0 = pg_usec input
                 unit.len() as i32,
             ];
             for &b in unit.iter() {
@@ -11331,13 +11397,75 @@ mod tests {
 
             let plan = parse_agg_private(list);
             match &plan.group_specs[0].expr {
-                GroupByExpr::Extract { unit, func_oid } => {
+                GroupByExpr::Extract { unit, func_oid, divisor } => {
                     assert_eq!(unit, "minute");
                     assert_eq!(*func_oid, 200);
+                    assert_eq!(*divisor, 0);
                 }
                 other => panic!("expected Extract, got {:?}", other),
             }
         }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_extract_with_divisor() {
+        // GROUP BY extract(hour FROM to_timestamp(bigint_col / 1_000_000)):
+        // expr_tag=3 with non-zero divisor.
+        unsafe {
+            let unit = b"hour";
+            let divisor: i64 = 1_000_000;
+            let mut vals = vec![
+                42i32, -1,
+                0,                  // num_aggs
+                1,                  // num_groups
+                0, 20, 3,          // col_idx=0, INT8OID, expr_tag=3(Extract)
+                200,               // func_oid
+                (divisor >> 32) as i32,
+                divisor as i32,
+                unit.len() as i32,
+            ];
+            for &b in unit.iter() {
+                vals.push(b as i32);
+            }
+            let list = build_int_list(&vals);
+
+            let plan = parse_agg_private(list);
+            match &plan.group_specs[0].expr {
+                GroupByExpr::Extract { unit, func_oid, divisor } => {
+                    assert_eq!(unit, "hour");
+                    assert_eq!(*func_oid, 200);
+                    assert_eq!(*divisor, 1_000_000);
+                }
+                other => panic!("expected Extract, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_subday_from_bigint_scaled_hour() {
+        // 2024-05-09 12:34:56 UTC = unix epoch seconds 1715258096
+        // hour-of-day at that point is 12.
+        let unix_us: i64 = 1_715_258_096_000_000;
+        assert_eq!(
+            extract_subday_from_bigint_scaled(unix_us, 1_000_000, "hour"),
+            12,
+        );
+        // minute = 34, second = 56
+        assert_eq!(
+            extract_subday_from_bigint_scaled(unix_us, 1_000_000, "minute"),
+            34,
+        );
+        assert_eq!(
+            extract_subday_from_bigint_scaled(unix_us, 1_000_000, "second"),
+            56,
+        );
+        // Pre-unix-epoch (negative) — div_euclid handles the sign correctly,
+        // so hour-of-day is still positive within [0, 24).
+        let pre_epoch: i64 = -1; // -1us before 1970 → 23:59:59 prev day
+        assert_eq!(
+            extract_subday_from_bigint_scaled(pre_epoch, 1_000_000, "hour"),
+            23,
+        );
     }
 
     #[pg_test]

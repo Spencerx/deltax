@@ -1038,9 +1038,12 @@ unsafe fn build_agg_path_private(
                         private_list = pg_sys::lappend_int(private_list, b as i32);
                     }
                 }
-                super::exec::GroupByExpr::Extract { unit, func_oid } => {
+                super::exec::GroupByExpr::Extract { unit, func_oid, divisor } => {
+                    // tag=3, func_oid, divisor (i64 split hi/lo), unit_len, unit_bytes...
                     private_list = pg_sys::lappend_int(private_list, 3);
                     private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, (*divisor >> 32) as i32);
+                    private_list = pg_sys::lappend_int(private_list, *divisor as i32);
                     private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
                     for &b in unit.as_bytes() {
                         private_list = pg_sys::lappend_int(private_list, b as i32);
@@ -1548,7 +1551,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             Column,
             RegexpReplace { func_oid: u32, collation: u32, pattern: String, replacement: String },
             DateTrunc { func_oid: u32, unit: String },
-            Extract { func_oid: u32, unit: String },
+            Extract { func_oid: u32, unit: String, divisor: i64 },
             AddConst { offset: i32, op_oid: u32 },
             CaseWhen(super::exec::CaseWhenSpec),
         }
@@ -1640,8 +1643,14 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
                     ParsedGroupExpr::DateTrunc { func_oid, unit }
                 } else if expr_tag == 3 {
+                    // Extract: func_oid, divisor (i64 hi/lo), unit_len, unit_bytes...
                     let func_oid = pg_sys::list_nth_int(path_private, idx) as u32;
                     idx += 1;
+                    let div_hi = pg_sys::list_nth_int(path_private, idx) as i64;
+                    idx += 1;
+                    let div_lo = pg_sys::list_nth_int(path_private, idx) as u32 as i64;
+                    idx += 1;
+                    let divisor = (div_hi << 32) | div_lo;
                     let unit_len = pg_sys::list_nth_int(path_private, idx) as usize;
                     idx += 1;
                     let mut unit_bytes = Vec::with_capacity(unit_len);
@@ -1650,7 +1659,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                         idx += 1;
                     }
                     let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
-                    ParsedGroupExpr::Extract { func_oid, unit }
+                    ParsedGroupExpr::Extract { func_oid, unit, divisor }
                 } else if expr_tag == 4 {
                     let offset = pg_sys::list_nth_int(path_private, idx);
                     let op_oid = pg_sys::list_nth_int(path_private, idx + 1) as u32;
@@ -1994,9 +2003,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                         private_list = pg_sys::lappend_int(private_list, b as i32);
                     }
                 }
-                ParsedGroupExpr::Extract { func_oid, unit } => {
+                ParsedGroupExpr::Extract { func_oid, unit, divisor } => {
                     private_list = pg_sys::lappend_int(private_list, 3);
                     private_list = pg_sys::lappend_int(private_list, *func_oid as i32);
+                    private_list = pg_sys::lappend_int(private_list, (*divisor >> 32) as i32);
+                    private_list = pg_sys::lappend_int(private_list, *divisor as i32);
                     private_list = pg_sys::lappend_int(private_list, unit.len() as i32);
                     for &b in unit.as_bytes() {
                         private_list = pg_sys::lappend_int(private_list, b as i32);

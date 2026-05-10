@@ -812,3 +812,33 @@ class TestJsonBenchQueryCorrectness:
         assert len(fields) >= expected_min_rows, (
             f"{name}: only {len(fields)} rows; data fixture or filter pushdown is wrong"
         )
+
+
+class TestJsonBenchQ2AggPushdown:
+    """JSONBench Q2 groups by `EXTRACT(HOUR FROM TO_TIMESTAMP(<bigint
+    chain> / 1_000_000))`. The recognizer in `hook.rs::extract` peeks
+    through the `to_timestamp(... / Const)` shape so this lands in
+    DeltaXAgg instead of the fallback DeltaXAppend → Sort → GroupAgg
+    plan that disk-spills 416 MB / worker on the full bench."""
+
+    def test_extract_hour_from_to_timestamp_correctness(self, db):
+        """End-to-end: the bigint-scaled extract produces the same hour
+        values whether the walker is active (mode='fields') or not
+        (mode='none'). The full Q2 shape is also covered by
+        `TestJsonBenchQueryCorrectness::test_jsonbench[q2_...]`; this
+        narrower variant pins the specific recognizer pattern in
+        isolation."""
+        _setup(db); _enable_extracts(db); _insert(db)
+        none, fields = _ab(db, """
+            SELECT EXTRACT(HOUR FROM TO_TIMESTAMP((data->>'time_us')::BIGINT / 1000000)) AS hour,
+                   COUNT(*)
+            FROM events
+            WHERE data->>'kind' = 'commit'
+            GROUP BY hour
+            ORDER BY hour
+        """)
+        assert none == fields, (
+            f"Hour-of-day group counts differ between mode='none' "
+            f"and mode='fields':\n  none={none}\n  fields={fields}"
+        )
+        assert len(fields) > 0, "no hour groups; fixture or pushdown broken"

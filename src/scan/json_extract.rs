@@ -2021,12 +2021,9 @@ unsafe fn add_node_specific_outer_var_refs(
     out: &mut PosSet,
 ) {
     unsafe {
-        match (*plan).type_ {
-            pg_sys::NodeTag::T_WindowAgg => {
-                let w = plan as *mut pg_sys::WindowAgg;
-                collect_outer_var_attnos_in_list((*w).runCondition, out);
-            }
-            _ => {}
+        if (*plan).type_ == pg_sys::NodeTag::T_WindowAgg {
+            let w = plan as *mut pg_sys::WindowAgg;
+            collect_outer_var_attnos_in_list((*w).runCondition, out);
         }
     }
 }
