@@ -1528,6 +1528,56 @@ unsafe fn expr_only_uses_aggrefs_and_consts(node: *const pg_sys::Node) -> bool {
     }
 }
 
+/// Walk an Expr tree and push every `Aggref` encountered into `out`. Descends
+/// through the same wrappers that `expr_only_uses_aggrefs_and_consts` accepts
+/// (`OpExpr`, `FuncExpr`, `RelabelType`, `CoerceViaIO`). Stops at any other
+/// node type — in particular Vars, which signal a GROUP BY reference rather
+/// than a nested aggregate.
+unsafe fn collect_aggrefs_in_expr(
+    node: *const pg_sys::Node,
+    out: &mut Vec<*const pg_sys::Aggref>,
+) {
+    unsafe {
+        if node.is_null() {
+            return;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_Aggref => out.push(node as *const pg_sys::Aggref),
+            pg_sys::NodeTag::T_RelabelType => {
+                let r = node as *const pg_sys::RelabelType;
+                collect_aggrefs_in_expr((*r).arg as *const pg_sys::Node, out);
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                let c = node as *const pg_sys::CoerceViaIO;
+                collect_aggrefs_in_expr((*c).arg as *const pg_sys::Node, out);
+            }
+            pg_sys::NodeTag::T_OpExpr => {
+                let op = node as *const pg_sys::OpExpr;
+                let args = (*op).args;
+                if args.is_null() {
+                    return;
+                }
+                for i in 0..(*args).length {
+                    let a = (*(*args).elements.add(i as usize)).ptr_value as *const pg_sys::Node;
+                    collect_aggrefs_in_expr(a, out);
+                }
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let f = node as *const pg_sys::FuncExpr;
+                let args = (*f).args;
+                if args.is_null() {
+                    return;
+                }
+                for i in 0..(*args).length {
+                    let a = (*(*args).elements.add(i as usize)).ptr_value as *const pg_sys::Node;
+                    collect_aggrefs_in_expr(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Strip `int8 → float8` cast wrappers (`FuncExpr` with funcid for
 /// `float8(int8)` = 482, or `RelabelType`) so the underlying chain can be
 /// matched by `AggChainCtx`.
@@ -1665,10 +1715,18 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 // Non-aggregate Var in target list — must be a GROUP BY column
                 non_agg_vars.push(expr as *const pg_sys::Var);
             } else if (*expr).type_ == pg_sys::NodeTag::T_FuncExpr && has_group_by {
-                // Non-aggregate FuncExpr in target list — must match a GROUP BY expression
+                // Non-aggregate FuncExpr in target list — must match a GROUP BY expression.
+                // If it contains nested Aggrefs (e.g. EXTRACT(EPOCH FROM MAX(x))),
+                // collect them so they get classified — the agg-only-tree validator
+                // below accepts the surrounding shape.
+                collect_aggrefs_in_expr(expr, &mut aggrefs);
                 non_agg_func_exprs.push((i, expr as *const pg_sys::FuncExpr));
             } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr && has_group_by {
-                // Non-aggregate OpExpr in target list (e.g. col - 1) — must match a GROUP BY expression
+                // Non-aggregate OpExpr in target list (e.g. col - 1) — must match a GROUP BY
+                // expression. If it contains nested Aggrefs (Q4's
+                // `EXTRACT(EPOCH FROM (MAX(...) - MIN(...))) * 1000`), collect them so they
+                // get classified — the agg-only-tree validator below accepts the surrounding shape.
+                collect_aggrefs_in_expr(expr, &mut aggrefs);
                 non_agg_op_exprs.push((i, expr as *const pg_sys::OpExpr));
             } else if (*expr).type_ == pg_sys::NodeTag::T_CaseExpr && has_group_by {
                 // CASE WHEN in target list — must match a GROUP BY expression
