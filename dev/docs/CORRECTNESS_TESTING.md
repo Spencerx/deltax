@@ -241,6 +241,8 @@ Purpose:
 
 ### Session 6: Compression Codecs and Direct Backfill
 
+Status: done.
+
 Dataset:
 
 - `codec_matrix`: columns chosen to trigger:

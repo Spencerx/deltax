@@ -48,6 +48,133 @@ PARTITION_SEGMENT_EDGE_REGISTERED_ROWS = tuple(
     if "default_" not in row[3]
 )
 
+CODEC_MATRIX_ROWS = tuple(
+    (
+        f"2025-01-15 {i // 60:02d}:{i % 60:02d}:00+00",
+        i,
+        None if i % 19 == 0 else i % 7,
+        None
+        if i % 23 == 0
+        else ("alpha" if i % 4 == 0 else "beta" if i % 4 == 1 else "gamma" if i % 4 == 2 else "delta"),
+        None if i % 29 == 0 else f"token-{i:04d}-{(i * 7919) % 104729:05d}",
+        None if i % 17 == 0 else i % 2 == 0,
+        None if i % 31 == 0 else (i % 61) - 30,
+        None if i % 43 == 0 else (i % 97) - 48,
+        None if i % 37 == 0 else ((i * 1_000_003) % 2_000_000_033) - 1_000_000_016,
+        42 if i % 11 else -42,
+        None if i % 13 == 0 else ((i % 43) - 21) / 8.0,
+        f"2025-01-14 {(i // 24) % 24:02d}:{(i * 7) % 60:02d}:00+00",
+        f"always-{i % 5}",
+        None if i % 9 == 0 else ("" if i % 9 == 1 else f"pattern-{i % 4}"),
+        None if i % 41 == 0 else (f"nullable-repeat-{i % 3}" if i % 5 else "same-value"),
+    )
+    for i in range(288)
+) + (
+    (
+        "2025-01-15 10:00:00+00",
+        1000,
+        0,
+        "alpha",
+        "",
+        True,
+        -32768,
+        -2147483648,
+        -9223372036854775807,
+        7,
+        -0.0,
+        "2025-01-14 23:59:59.999999+00",
+        "",
+        "",
+        "",
+    ),
+    (
+        "2025-01-15 10:00:01+00",
+        1001,
+        1,
+        "beta",
+        "text with, comma and \"quote\"",
+        False,
+        32767,
+        2147483647,
+        9223372036854775806,
+        7,
+        1.0e-12,
+        "2025-01-14 00:00:00.000001+00",
+        "always-special",
+        "under_score_%_literal",
+        "nullable-repeat-special",
+    ),
+    (
+        "2025-01-15 10:00:02+00",
+        1002,
+        2,
+        "gamma",
+        "long-" + ("x" * 600),
+        None,
+        0,
+        0,
+        0,
+        -7,
+        1.0e12,
+        "2025-01-14 12:34:56.123456+00",
+        "always-long",
+        None,
+        "same-value",
+    ),
+    (
+        "2025-01-15 10:00:03+00",
+        1003,
+        None,
+        None,
+        "token-boundary-null-segment",
+        True,
+        None,
+        None,
+        None,
+        -7,
+        -1.0e12,
+        "2025-01-14 12:34:56.654321+00",
+        "always-null-edge",
+        None,
+        None,
+    ),
+    (
+        "2025-01-15 10:00:04+00",
+        1004,
+        3,
+        "delta",
+        "escaped-percent-100%_done",
+        True,
+        -1,
+        -1,
+        -1,
+        7,
+        3.1415926535,
+        "2025-01-14 18:00:00+00",
+        "always-symbols",
+        "literal%underscore_",
+        "contains,comma",
+    ),
+)
+
+CODEC_MATRIX_COLUMNS = (
+    "ts",
+    "id",
+    "device_id",
+    "dict_text",
+    "unique_text",
+    "active",
+    "small_int",
+    "int_val",
+    "large_int",
+    "repeated_int",
+    "float_val",
+    "observed_at",
+    "always_text",
+    "pattern_text",
+    "nullable_text",
+)
+
 
 def _compress_non_default_partitions(conn, table_name: str) -> None:
     partitions = conn.execute(
@@ -132,6 +259,86 @@ def _copy_partition_segment_edge_rows_deltax(
         with cur.copy(
             f"COPY {table_name} FROM STDIN WITH (FORMAT deltax_compress_csv)"
         ) as copy:
+            copy.write(buf.getvalue().encode())
+
+
+def _create_codec_matrix_schema(conn, table_name: str) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {table_name} (
+            ts timestamptz NOT NULL,
+            id integer NOT NULL,
+            device_id integer,
+            dict_text text,
+            unique_text text,
+            active boolean,
+            small_int smallint,
+            int_val integer,
+            large_int bigint,
+            repeated_int integer NOT NULL,
+            float_val double precision,
+            observed_at timestamptz NOT NULL,
+            always_text text NOT NULL,
+            pattern_text text,
+            nullable_text text
+        )
+        """
+    )
+
+
+def _insert_codec_matrix_rows(conn, table_name: str) -> None:
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"""
+            INSERT INTO {table_name} (
+                {", ".join(CODEC_MATRIX_COLUMNS)}
+            )
+            VALUES (
+                %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s::timestamptz, %s, %s, %s
+            )
+            """,
+            CODEC_MATRIX_ROWS,
+        )
+
+
+def _copy_codec_matrix_rows_deltax(
+    conn,
+    table_name: str,
+    *,
+    copy_format: str,
+    copy_variant: str = "default",
+) -> None:
+    buf = io.StringIO()
+    if copy_format == "deltax_compress_csv":
+        null_string = "NULL" if copy_variant == "options" else r"\N"
+        writer = csv.writer(buf)
+        if copy_variant == "options":
+            writer.writerow(CODEC_MATRIX_COLUMNS)
+        for row in CODEC_MATRIX_ROWS:
+            writer.writerow(null_string if value is None else value for value in row)
+        copy_options = "FORMAT deltax_compress_csv"
+        if copy_variant == "options":
+            copy_options += ", HEADER true, NULL 'NULL'"
+        else:
+            copy_options += r", NULL '\N'"
+        copy_sql = f"COPY {table_name} FROM STDIN WITH ({copy_options})"
+    elif copy_format == "deltax_compress":
+        delimiter = "|" if copy_variant == "options" else "\t"
+        null_string = "NULL" if copy_variant == "options" else r"\N"
+        for row in CODEC_MATRIX_ROWS:
+            fields = [null_string if value is None else str(value) for value in row]
+            buf.write(delimiter.join(fields))
+            buf.write("\n")
+        copy_options = "FORMAT deltax_compress"
+        if copy_variant == "options":
+            copy_options += ", DELIMITER '|', NULL 'NULL'"
+        copy_sql = f"COPY {table_name} FROM STDIN WITH ({copy_options})"
+    else:
+        raise ValueError(f"unsupported direct backfill format: {copy_format}")
+
+    with conn.cursor() as cur:
+        with cur.copy(copy_sql) as copy:
             copy.write(buf.getvalue().encode())
 
 
@@ -492,6 +699,81 @@ def create_partition_segment_edges_direct_backfill_pair(
         PARTITION_SEGMENT_EDGE_REGISTERED_ROWS,
     )
     conn.commit()
+    _analyze_tables(conn, plain_table, deltax_table)
+
+    return plain_table, deltax_table
+
+
+def create_codec_matrix_pair(
+    conn,
+    *,
+    deltax_table: str = "codec_matrix",
+    load_path: str = "regular",
+    segment_by: tuple[str, ...] = ("device_id",),
+    order_by: tuple[str, ...] = ("ts", "id"),
+    segment_size: int = 9,
+) -> tuple[str, str]:
+    """Create codec-targeted rows using regular compression or direct backfill."""
+    plain_table = f"{deltax_table}_plain"
+    segment_by_sql = (
+        "ARRAY[]::text[]"
+        if not segment_by
+        else "ARRAY[" + ", ".join(f"'{column}'" for column in segment_by) + "]"
+    )
+    order_by_sql = ", ".join(f"'{column}'" for column in order_by)
+
+    conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for table_name in (plain_table, deltax_table):
+        _create_codec_matrix_schema(conn, table_name)
+
+    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(
+        "SELECT deltax_enable_compression("
+        f"'{deltax_table}', segment_by => {segment_by_sql}, "
+        f"order_by => ARRAY[{order_by_sql}], segment_size => %s)",
+        (segment_size,),
+    )
+    conn.commit()
+
+    _insert_codec_matrix_rows(conn, plain_table)
+
+    if load_path == "regular":
+        _insert_codec_matrix_rows(conn, deltax_table)
+        conn.commit()
+        _compress_non_default_partitions(conn, deltax_table)
+    elif load_path == "copy_text":
+        _copy_codec_matrix_rows_deltax(
+            conn,
+            deltax_table,
+            copy_format="deltax_compress",
+        )
+        conn.commit()
+    elif load_path == "copy_csv":
+        _copy_codec_matrix_rows_deltax(
+            conn,
+            deltax_table,
+            copy_format="deltax_compress_csv",
+        )
+        conn.commit()
+    elif load_path == "copy_text_options":
+        _copy_codec_matrix_rows_deltax(
+            conn,
+            deltax_table,
+            copy_format="deltax_compress",
+            copy_variant="options",
+        )
+        conn.commit()
+    elif load_path == "copy_csv_options":
+        _copy_codec_matrix_rows_deltax(
+            conn,
+            deltax_table,
+            copy_format="deltax_compress_csv",
+            copy_variant="options",
+        )
+        conn.commit()
+    else:
+        raise ValueError(f"unsupported codec matrix load path: {load_path}")
+
     _analyze_tables(conn, plain_table, deltax_table)
 
     return plain_table, deltax_table

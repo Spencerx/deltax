@@ -831,6 +831,396 @@ def partition_segment_fastpath_cases() -> Iterable[QueryCase]:
     )
 
 
+def codec_matrix_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "full_projection_ordered",
+        """
+        SELECT
+            id, ts, device_id, dict_text, unique_text, active, small_int,
+            int_val, large_int, repeated_int, float_val, observed_at,
+            always_text, pattern_text, nullable_text
+        FROM {table}
+        ORDER BY ts, id
+        """,
+        comparator="float_tolerant",
+    )
+    for column in (
+        "device_id",
+        "dict_text",
+        "unique_text",
+        "active",
+        "small_int",
+        "int_val",
+        "large_int",
+        "repeated_int",
+        "float_val",
+        "observed_at",
+        "always_text",
+        "pattern_text",
+        "nullable_text",
+    ):
+        yield QueryCase(
+            f"single_column_projection_{column}",
+            f"""
+            SELECT id, {column}
+            FROM {{table}}
+            ORDER BY id
+            """,
+            comparator="float_tolerant" if column == "float_val" else "ordered_exact",
+        )
+    yield QueryCase(
+        "reordered_projection_with_expressions",
+        """
+        SELECT
+            coalesce(nullable_text, 'missing') AS nullable_text_filled,
+            large_int::text AS large_int_text,
+            small_int::bigint + int_val::bigint AS combined_ints,
+            id,
+            ts::date AS ts_date,
+            length(unique_text) AS unique_text_len,
+            pattern_text IS NULL AS pattern_text_is_null
+        FROM {table}
+        WHERE id < 20 OR id >= 1000
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "dictionary_text_equality",
+        """
+        SELECT id, dict_text, nullable_text
+        FROM {table}
+        WHERE dict_text = 'alpha'
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "dictionary_text_including_null",
+        """
+        SELECT id, dict_text
+        FROM {table}
+        WHERE dict_text IS NULL OR dict_text IN ('beta', 'delta')
+        ORDER BY dict_text NULLS FIRST, id
+        """,
+    )
+    yield QueryCase(
+        "high_cardinality_text_equality",
+        """
+        SELECT id, unique_text
+        FROM {table}
+        WHERE unique_text IN ('token-0001-07919', 'token-0143-82417', 'token-0287-40053')
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "empty_string_vs_null_text",
+        """
+        SELECT id, unique_text, always_text, pattern_text, nullable_text
+        FROM {table}
+        WHERE unique_text = ''
+           OR always_text = ''
+           OR pattern_text = ''
+           OR nullable_text = ''
+           OR unique_text IS NULL
+           OR pattern_text IS NULL
+           OR nullable_text IS NULL
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "text_like_prefix_and_contains",
+        """
+        SELECT id, unique_text, nullable_text
+        FROM {table}
+        WHERE unique_text LIKE 'token-00%'
+           OR nullable_text LIKE 'nullable-repeat-%'
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "text_like_escaped_literals",
+        """
+        SELECT id, unique_text, pattern_text
+        FROM {table}
+        WHERE unique_text LIKE '%100!%!_done' ESCAPE '!'
+           OR pattern_text LIKE 'under!_score!_!%!_literal' ESCAPE '!'
+           OR pattern_text LIKE 'literal!%underscore!_' ESCAPE '!'
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "quoted_and_long_text_projection",
+        """
+        SELECT id, unique_text, length(unique_text), nullable_text
+        FROM {table}
+        WHERE unique_text LIKE 'text with,%'
+           OR unique_text LIKE 'long-%'
+           OR nullable_text = 'contains,comma'
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "boolean_null_semantics",
+        """
+        SELECT id, active
+        FROM {table}
+        WHERE active IS NOT TRUE
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "small_integer_predicates",
+        """
+        SELECT id, small_int
+        FROM {table}
+        WHERE small_int IS NULL
+           OR small_int BETWEEN -3 AND 3
+           OR small_int IN (-30, 30)
+        ORDER BY small_int NULLS FIRST, id
+        """,
+    )
+    yield QueryCase(
+        "integer_boundary_values",
+        """
+        SELECT id, small_int, int_val, large_int
+        FROM {table}
+        WHERE small_int IN (-32768, 32767)
+           OR int_val IN (-2147483648, 2147483647)
+           OR large_int IN (-9223372036854775807, 9223372036854775806)
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "integer_cast_and_coalesce_expressions",
+        """
+        SELECT
+            id,
+            coalesce(small_int::integer, -999999) AS small_int_filled,
+            coalesce(int_val, -999999) AS int_val_filled,
+            abs(repeated_int) AS repeated_abs
+        FROM {table}
+        WHERE coalesce(int_val, 0) BETWEEN -5 AND 5
+           OR coalesce(small_int::integer, 0) IN (-32768, 32767, 0)
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "large_integer_predicates",
+        """
+        SELECT id, large_int
+        FROM {table}
+        WHERE large_int IS NULL
+           OR large_int < -900000000
+           OR large_int > 900000000
+        ORDER BY large_int NULLS FIRST, id
+        """,
+    )
+    yield QueryCase(
+        "float_extreme_and_negative_zero_projection",
+        """
+        SELECT id, float_val, float_val = 0.0 AS equals_zero
+        FROM {table}
+        WHERE float_val IS NULL
+           OR float_val = 0.0
+           OR abs(float_val) >= 1000000000000.0
+           OR abs(float_val) <= 0.000000000001
+        ORDER BY id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "repeated_value_constant_codec",
+        """
+        SELECT repeated_int, count(*), min(id), max(id)
+        FROM {table}
+        GROUP BY repeated_int
+        ORDER BY repeated_int
+        """,
+    )
+    yield QueryCase(
+        "timestamp_predicates",
+        """
+        SELECT id, ts, observed_at
+        FROM {table}
+        WHERE ts >= '2025-01-15 01:00:00+00'
+          AND ts < '2025-01-15 03:00:00+00'
+          AND observed_at >= '2025-01-14 12:00:00+00'
+        ORDER BY observed_at, id
+        """,
+    )
+    yield QueryCase(
+        "timestamp_expression_filters",
+        """
+        SELECT id, ts, observed_at, date_trunc('hour', observed_at) AS observed_hour
+        FROM {table}
+        WHERE observed_at::date = DATE '2025-01-14'
+          AND extract(minute FROM observed_at)::integer IN (0, 7, 56, 59)
+        ORDER BY observed_at, id
+        """,
+    )
+    yield QueryCase(
+        "group_by_compressed_text_and_bool",
+        """
+        SELECT dict_text, active, count(*), count(unique_text), count(float_val)
+        FROM {table}
+        GROUP BY dict_text, active
+        ORDER BY dict_text NULLS LAST, active NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "group_by_null_pattern_columns",
+        """
+        SELECT
+            pattern_text,
+            nullable_text,
+            count(*),
+            count(pattern_text),
+            count(nullable_text),
+            min(id),
+            max(id)
+        FROM {table}
+        WHERE id < 60 OR id >= 1000
+        GROUP BY pattern_text, nullable_text
+        ORDER BY pattern_text NULLS FIRST, nullable_text NULLS FIRST
+        """,
+    )
+    yield QueryCase(
+        "integer_and_float_aggregates",
+        """
+        SELECT
+            count(*),
+            count(small_int),
+            min(small_int),
+            max(small_int),
+            min(int_val),
+            max(int_val),
+            sum(int_val::numeric),
+            sum(large_int::numeric),
+            round(avg(float_val)::numeric, 6),
+            min(float_val),
+            max(float_val)
+        FROM {table}
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "distinct_text_and_counts",
+        """
+        SELECT
+            count(DISTINCT dict_text),
+            count(DISTINCT unique_text),
+            count(DISTINCT always_text),
+            count(DISTINCT pattern_text),
+            count(DISTINCT nullable_text)
+        FROM {table}
+        """,
+    )
+    yield QueryCase(
+        "distinct_values_ordered",
+        """
+        SELECT DISTINCT dict_text, active
+        FROM {table}
+        ORDER BY dict_text NULLS FIRST, active NULLS FIRST
+        """,
+    )
+    yield QueryCase(
+        "window_by_dictionary_text",
+        """
+        SELECT id, dict_text, large_int, rn
+        FROM (
+            SELECT
+                id,
+                dict_text,
+                large_int,
+                row_number() OVER (
+                    PARTITION BY dict_text
+                    ORDER BY large_int DESC NULLS LAST, id
+                ) AS rn
+            FROM {table}
+            WHERE dict_text IS NOT NULL
+        ) ranked
+        WHERE rn <= 3
+        ORDER BY dict_text, rn, id
+        """,
+    )
+    yield QueryCase(
+        "union_all_filtered_codec_scans",
+        """
+        SELECT id, source
+        FROM (
+            SELECT id, 'small_boundary' AS source
+            FROM {table}
+            WHERE small_int IN (-32768, 32767)
+            UNION ALL
+            SELECT id, 'quoted_text' AS source
+            FROM {table}
+            WHERE unique_text LIKE 'text with,%'
+        ) unioned
+        ORDER BY source, id
+        """,
+    )
+    yield QueryCase(
+        "except_removes_null_pattern_rows",
+        """
+        SELECT id
+        FROM (
+            SELECT id
+            FROM {table}
+            WHERE id < 40
+            EXCEPT
+            SELECT id
+            FROM {table}
+            WHERE pattern_text IS NULL
+        ) remaining
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "intersect_text_and_numeric_filters",
+        """
+        SELECT id
+        FROM (
+            SELECT id
+            FROM {table}
+            WHERE unique_text LIKE 'token-01%'
+            INTERSECT
+            SELECT id
+            FROM {table}
+            WHERE int_val BETWEEN -20 AND 20
+        ) matched
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "filtered_grouped_aggregates",
+        """
+        SELECT
+            device_id,
+            dict_text,
+            count(*),
+            sum(small_int),
+            avg(float_val),
+            min(observed_at),
+            max(observed_at)
+        FROM {table}
+        WHERE active IS NOT FALSE
+          AND (unique_text LIKE 'token-01%' OR nullable_text = 'same-value')
+        GROUP BY device_id, dict_text
+        ORDER BY device_id NULLS LAST, dict_text NULLS LAST
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "topn_across_codec_columns",
+        """
+        SELECT id, ts, dict_text, large_int, unique_text, nullable_text
+        FROM {table}
+        WHERE large_int IS NOT NULL AND dict_text IS NOT NULL
+        ORDER BY large_int DESC, dict_text, id
+        LIMIT 17
+        """,
+    )
+
+
 def partition_segment_plan_shape_cases() -> Iterable[QueryCase]:
     yield QueryCase(
         "or_ranges_across_pruning_boundaries",
