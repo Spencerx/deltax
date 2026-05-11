@@ -1829,7 +1829,6 @@ pub(crate) fn build_companion_ddl(
         colstats_fqn
     );
 
-    // STORAGE EXTERNAL: skip TOAST pglz compression on _data — blobs are already zstd-compressed.
     let blobs_ddl = format!(
         "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4, PRIMARY KEY (_col_idx, _segment_id))",
         blobs_fqn

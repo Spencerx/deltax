@@ -2055,7 +2055,6 @@ fn flush_segment(
         let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
         spi_exec(&ddl.meta_ddl);
         spi_exec(&ddl.colstats_ddl);
-        // STORAGE EXTERNAL: skip TOAST pglz compression — blobs are already zstd-compressed.
         spi_exec(&format!(
             "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
             ddl.blobs_fqn
