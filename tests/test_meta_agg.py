@@ -493,3 +493,135 @@ def test_phase_d_null_count_distinct(db):
     # Spot-check: kind='B' has all-NULL tags → COUNT(DISTINCT tag) == 0.
     by_kind = {k: u for (k, u) in fast}
     assert by_kind["B"] == 0, by_kind
+
+
+def test_mixed_path_pipeline_detoast_covers_full_first_batch(db):
+    """Regression: the parallel-mixed aggregation path pipelines detoast
+    with worker execution — leader pre-detoasts batch 0, then workers run
+    on batch K while leader detoasts batch K+1. Both loops must use the
+    SAME `n_batches` value, otherwise pre-detoast covers only a fraction
+    of batch 0 and workers race on toast pointers that read as empty
+    blobs → SegTextColumn::None → group keys collapse to NULL → distinct
+    group values silently lost.
+
+    Trigger conditions:
+      * `pg_deltax.parallel_workers > 1` → `use_lazy = true`
+      * `all_segments.len() >= n_workers * 16` → pipeline mode engages
+      * high-cardinality text GROUP BY column whose compressed blob
+        exceeds the TOAST threshold so it's stored as a toast pointer
+        (without TOAST, lazy detoast is a no-op and the bug doesn't fire)
+
+    Cross-check: `SELECT count(*) FROM (... GROUP BY t)` must equal
+    `SELECT COUNT(DISTINCT t)` over the same input. The bug previously
+    made the former lower by ~half (one NULL group per pipeline chunk).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    # Need ≥ n_workers * 16 = 32 segments to engage pipeline mode at
+    # `pg_deltax.parallel_workers = 2`. segment_size=4000 × 10 segs/part
+    # × 4 partitions = 40 segments — comfortably over threshold.
+    n_partitions = 4
+    rows_per_partition = 40_000
+    segment_size = 4000
+
+    db.execute(
+        "CREATE TABLE pipe_events ("
+        "  ts TIMESTAMPTZ NOT NULL,"
+        "  user_id TEXT"
+        ")"
+    )
+    db.execute(
+        "SELECT deltax_create_table('pipe_events', 'ts', '1 day', %s)",
+        (n_partitions - 1,),
+    )
+    db.execute(
+        "SELECT deltax_enable_compression('pipe_events', "
+        "  order_by => ARRAY['ts'], segment_size => %s)",
+        (segment_size,),
+    )
+    db.commit()
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    window_us = 22 * 3600 * 1_000_000
+    spacing_us = max(1, window_us // max(1, rows_per_partition - 1))
+
+    for p in range(n_partitions):
+        part_start = today - timedelta(days=1) + timedelta(days=p) + timedelta(hours=1)
+        # user_id must be both unique per row AND high-entropy: an MD5 of
+        # `(partition, row)` gives 32 hex chars with ~no compressibility,
+        # so pg_deltax's Lz4Blocked-encoded segment blob (~4000 × ~32 B ≈
+        # 128 KB) doesn't shrink under PG's external-toast threshold (~2
+        # KB after PG's secondary lz4 pass). Without this the blob stays
+        # inline, lazy detoast is a no-op, and the bug doesn't fire.
+        db.execute(
+            "INSERT INTO pipe_events (ts, user_id) "
+            "SELECT %s::timestamptz + (i::bigint * %s::bigint * interval '1 microsecond'), "
+            "       md5(%s::text || ':' || i::text) "
+            "FROM generate_series(0, %s) i",
+            (part_start, spacing_us, p, rows_per_partition - 1),
+        )
+    db.commit()
+
+    for (name,) in db.execute(
+        "SELECT partition_name FROM deltax_partition_info('pipe_events') "
+        "ORDER BY range_start"
+    ).fetchall():
+        cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
+        if cnt > 0:
+            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+    db.commit()
+    db.rollback()
+    db.autocommit = True
+    db.execute("ANALYZE pipe_events")
+    db.autocommit = False
+
+    # Confirm we actually have enough segments to trigger the pipeline
+    # at n_workers=2. If seeding ever drops below the threshold the test
+    # silently stops exercising the bug — make it loud.
+    seg_count = 0
+    for (name,) in db.execute(
+        "SELECT partition_name FROM deltax_partition_info('pipe_events')"
+    ).fetchall():
+        meta_name = f"_deltax_compressed.{name}_meta"
+        if db.execute(
+            "SELECT to_regclass(%s) IS NOT NULL", (meta_name,)
+        ).fetchone()[0]:
+            seg_count += db.execute(f'SELECT count(*) FROM {meta_name}').fetchone()[0]
+    assert seg_count >= 32, (
+        f"test setup produces only {seg_count} segments; need >=32 to engage "
+        f"the mixed-path detoast pipeline at parallel_workers=2"
+    )
+
+    # Force n_workers=2 so the pipeline engages with as few rows as possible.
+    db.execute("SET pg_deltax.parallel_workers = 2")
+    try:
+        # CRITICAL: the GROUP BY must run as the *outer* upper-rel target,
+        # otherwise the upper-paths hook doesn't fire and PG falls back to
+        # HashAggregate → DeltaXAppend (which is correct but doesn't
+        # exercise the mixed-path bug). Wrapping the GROUP BY in `count(*)
+        # FROM (... GROUP BY)` triggers exactly that fallback. Materialize
+        # the GROUP BY result into a TEMP TABLE — the CREATE TABLE AS path
+        # routes the GROUP BY through DeltaXAgg, after which we can count
+        # rows from a plain heap scan.
+        db.execute("DROP TABLE IF EXISTS groupby_result")
+        db.execute(
+            "CREATE TEMP TABLE groupby_result AS "
+            "SELECT user_id, COUNT(*) AS c FROM pipe_events GROUP BY user_id"
+        )
+        groupby_count = db.execute(
+            "SELECT count(*) FROM groupby_result"
+        ).fetchone()[0]
+        # Reference: COUNT(DISTINCT) goes through process_cd_segments —
+        # a different code path that was correct even with the original
+        # bug — so it's a trustworthy ground truth.
+        distinct_count = db.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM pipe_events"
+        ).fetchone()[0]
+    finally:
+        db.execute("RESET pg_deltax.parallel_workers")
+
+    expected = n_partitions * rows_per_partition  # every user_id unique
+    assert groupby_count == distinct_count == expected, (
+        f"mixed-path GROUP BY lost rows: groupby={groupby_count} "
+        f"distinct={distinct_count} expected={expected}"
+    )
