@@ -9774,6 +9774,7 @@ mod tests {
             col_names: col_names.iter().map(|s| s.to_string()).collect(),
             col_types: col_names.iter().map(|_| pg_sys::Oid::from(23u32)).collect(),
             col_typmods: col_names.iter().map(|_| -1).collect(),
+            col_not_null: col_names.iter().map(|_| false).collect(),
             segment_by: Vec::new(),
             order_by: Vec::new(),
             time_column: "ts".to_string(),
