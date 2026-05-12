@@ -128,10 +128,10 @@ static CUSTOM_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     });
 
 // Thread-local to pass Top-N info from add_decompress_path to plan_custom_path.
-// Stored as (effective_limit, sort_ascending, multi_col_sort, sort_col_attno).
+// Stored as (effective_limit, sort_ascending, multi_col_sort, sort_col_attno, nulls_first).
 // sort_col_attno is 1-based PG attribute number of the ORDER BY column.
 thread_local! {
-    static TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32)> = const { std::cell::Cell::new((0, true, false, 0)) };
+    static TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32, bool)> = const { std::cell::Cell::new((0, true, false, 0, false)) };
 }
 
 /// Register every CustomScanMethods struct with PG's name-keyed registry.
@@ -163,6 +163,7 @@ pub unsafe fn add_decompress_path(
     sort_ascending: bool,
     multi_col_sort: bool,
     sort_col_attno: i32,
+    topn_nulls_first: bool,
 ) {
     unsafe {
         let cpath =
@@ -204,9 +205,9 @@ pub unsafe fn add_decompress_path(
 
         // Store Top-N info for plan_custom_path.
         if effective_limit > 0 {
-            TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno)));
+            TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno, topn_nulls_first)));
         } else {
-            TOPN_INFO.with(|cell| cell.set((0, true, false, 0)));
+            TOPN_INFO.with(|cell| cell.set((0, true, false, 0, false)));
         }
 
         // Clear existing paths — the partition is truncated so any SeqScan
@@ -461,14 +462,15 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
             }
         }
 
-        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag, sort_col_attno]
-        let (effective_limit, sort_ascending, multi_col_sort, sort_col_attno) = TOPN_INFO.with(|cell| cell.replace((0, true, false, 0)));
+        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag, sort_col_attno, nulls_first]
+        let (effective_limit, sort_ascending, multi_col_sort, sort_col_attno, nulls_first) = TOPN_INFO.with(|cell| cell.replace((0, true, false, 0, false)));
         if effective_limit > 0 {
             private_list = pg_sys::lappend_int(private_list, -2);
             private_list = pg_sys::lappend_int(private_list, effective_limit as i32);
             private_list = pg_sys::lappend_int(private_list, if sort_ascending { 1 } else { 0 });
             private_list = pg_sys::lappend_int(private_list, if multi_col_sort { 1 } else { 0 });
             private_list = pg_sys::lappend_int(private_list, sort_col_attno);
+            private_list = pg_sys::lappend_int(private_list, if nulls_first { 1 } else { 0 });
         }
 
         (*cscan).custom_private = private_list;
@@ -1324,7 +1326,7 @@ pub unsafe fn add_agg_partial_path(
         if !agg_specs_partial_emittable(agg_specs) {
             return;
         }
-        if !group_specs.is_empty() && !super::exec::can_use_compact_keys_path(group_specs) {
+        if !group_specs.is_empty() && !super::exec::can_use_compact_keys_path(group_specs, &[]) {
             return;
         }
         // Reject WHERE clauses that reference non-numeric columns. See
@@ -1485,7 +1487,7 @@ pub unsafe fn add_agg_path(
             && !topn_active
             && !agg_specs.iter().any(|s| s.agg_type == super::exec::AggType::CountDistinct)
             && parallel_compact_aggs_ok(agg_specs)
-            && (group_specs.is_empty() || super::exec::can_use_compact_keys_path(group_specs));
+            && (group_specs.is_empty() || super::exec::can_use_compact_keys_path(group_specs, &[]));
 
         // Phase C.2.f wiring: the predicate + `recommend_agg_workers` are in
         // place but we keep `parallel_workers = 0` here. Hooking the
@@ -2359,7 +2361,7 @@ unsafe fn extract_quals_from_baserestrictinfo(
 
 // Thread-local to pass Top-N info from add_deltax_append_path to plan_deltax_append_path.
 thread_local! {
-    static APPEND_TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32)> = const { std::cell::Cell::new((0, true, false, 0)) };
+    static APPEND_TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32, bool)> = const { std::cell::Cell::new((0, true, false, 0, false)) };
 }
 
 /// Add a DeltaXAppend custom path to the parent relation's pathlist.
@@ -2376,6 +2378,7 @@ pub unsafe fn add_deltax_append_path(
     sort_ascending: bool,
     multi_col_sort: bool,
     sort_col_attno: i32,
+    topn_nulls_first: bool,
 ) {
     unsafe {
         // Store Top-N info once — consumed by both the serial and partial
@@ -2383,9 +2386,9 @@ pub unsafe fn add_deltax_append_path(
         // hook level, but the thread-local is the mechanism plan_* uses
         // to reach the executor either way.
         if effective_limit > 0 {
-            APPEND_TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno)));
+            APPEND_TOPN_INFO.with(|cell| cell.set((effective_limit, sort_ascending, multi_col_sort, sort_col_attno, topn_nulls_first)));
         } else {
-            APPEND_TOPN_INFO.with(|cell| cell.set((0, true, false, 0)));
+            APPEND_TOPN_INFO.with(|cell| cell.set((0, true, false, 0, false)));
         }
 
         // Clear existing paths (removes Append paths). Must happen before we
@@ -2557,14 +2560,15 @@ pub unsafe extern "C-unwind" fn plan_deltax_append_path(
             }
         }
 
-        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag, sort_col_attno]
-        let (effective_limit, sort_ascending, multi_col_sort, sort_col_attno) = APPEND_TOPN_INFO.with(|cell| cell.replace((0, true, false, 0)));
+        // Append Top-N info: [-2, effective_limit, sort_ascending_flag, multi_col_sort_flag, sort_col_attno, nulls_first]
+        let (effective_limit, sort_ascending, multi_col_sort, sort_col_attno, nulls_first) = APPEND_TOPN_INFO.with(|cell| cell.replace((0, true, false, 0, false)));
         if effective_limit > 0 {
             private_list = pg_sys::lappend_int(private_list, -2);
             private_list = pg_sys::lappend_int(private_list, effective_limit as i32);
             private_list = pg_sys::lappend_int(private_list, if sort_ascending { 1 } else { 0 });
             private_list = pg_sys::lappend_int(private_list, if multi_col_sort { 1 } else { 0 });
             private_list = pg_sys::lappend_int(private_list, sort_col_attno);
+            private_list = pg_sys::lappend_int(private_list, if nulls_first { 1 } else { 0 });
         }
 
         (*cscan).custom_private = private_list;

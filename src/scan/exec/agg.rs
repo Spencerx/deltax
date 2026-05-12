@@ -2580,7 +2580,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         };
 
         // Compact keys: pack integer GROUP BY keys into u128
-        let use_compact_keys = has_group_by && can_use_compact_keys(&group_specs);
+        let use_compact_keys = has_group_by && can_use_compact_keys(&group_specs, &meta.col_not_null);
         let mut compact_group_map: CompactGroupMap = CompactGroupMap::with_hasher(BuildHasherDefault::default());
         let mut cd_sidecar = CountDistinctSideCar::new(&agg_specs);
 
@@ -9786,25 +9786,36 @@ unsafe fn compact_emit_partial(
 /// Phase C.2.f — public re-export for `path.rs::add_agg_path`. Diverging the
 /// path-level and exec-level eligibility checks would silently mismatch
 /// leader and worker, so add_agg_path calls into the canonical predicate.
-pub(crate) fn can_use_compact_keys_path(group_specs: &[GroupByColSpec]) -> bool {
-    can_use_compact_keys(group_specs)
+///
+/// Callers in the planner don't have segment metadata loaded, so they pass
+/// `&[]` for `col_not_null`. The canonical predicate then rejects every
+/// `Column` / `DateTrunc` / `Extract` / `AddConst` group key — leaving only
+/// `group_specs.is_empty()` as a viable parallel-agg shape at plan time.
+pub(crate) fn can_use_compact_keys_path(
+    group_specs: &[GroupByColSpec],
+    col_not_null: &[bool],
+) -> bool {
+    can_use_compact_keys(group_specs, col_not_null)
 }
 
 /// Check if all GROUP BY columns produce integer values and can be packed into u128.
-fn can_use_compact_keys(group_specs: &[GroupByColSpec]) -> bool {
+fn can_use_compact_keys(group_specs: &[GroupByColSpec], col_not_null: &[bool]) -> bool {
     if group_specs.is_empty() || group_specs.len() > 2 {
         return false; // u128 fits at most 2 x i64
     }
     group_specs.iter().all(|gs| {
         match &gs.expr {
             GroupByExpr::Column => {
+                if !col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false) {
+                    return false;
+                }
                 let t = gs.type_oid;
                 t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
                     || t == pg_sys::TIMESTAMPOID || t == pg_sys::TIMESTAMPTZOID
             }
-            GroupByExpr::DateTrunc { .. } => true, // returns i64
-            GroupByExpr::Extract { .. } => true,   // returns i64
-            GroupByExpr::AddConst { .. } => true,  // returns i64
+            GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {
+                col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false)
+            }
             GroupByExpr::RegexpReplace { .. } => false,
             GroupByExpr::CaseWhen(_) => false,
         }
@@ -12269,6 +12280,7 @@ mod tests {
             col_names: col_names.iter().map(|s| s.to_string()).collect(),
             col_types: col_names.iter().map(|_| pg_sys::Oid::from(23u32)).collect(),
             col_typmods: col_names.iter().map(|_| -1).collect(),
+            col_not_null: col_names.iter().map(|_| false).collect(),
             segment_by: Vec::new(),
             order_by: Vec::new(),
             time_column: "ts".to_string(),

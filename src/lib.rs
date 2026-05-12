@@ -3,6 +3,12 @@ use std::ffi::CString;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 
+// Pull the weak-stub static library into the test binary on Linux. The cdylib
+// (built via `cargo build --lib`) skips this dev-dependency entirely, so
+// Postgres keeps providing the real backend symbols when it loads the .so.
+#[cfg(test)]
+extern crate pg_deltax_test_stubs as _;
+
 mod bloom;
 mod catalog;
 mod compress;
@@ -152,6 +158,19 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
 ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
 ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
+
+CREATE OR REPLACE FUNCTION deltax_reject_compressed_partition_dml()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'cannot % compressed partition "%.%", decompress it first',
+        TG_OP,
+        TG_TABLE_SCHEMA,
+        TG_TABLE_NAME
+        USING ERRCODE = 'object_not_in_prerequisite_state';
+END;
+$$;
 "#,
     name = "create_catalog_tables",
 );
