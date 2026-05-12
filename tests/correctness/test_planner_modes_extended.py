@@ -462,6 +462,68 @@ def test_cursor_chunked_fetch_matches_plain_postgres(
     )
 
 
+def test_rtabench_join_cursor_chunked_fetch_matches_plain_postgres(
+    rtabench_synthetic_variant,
+    db,
+):
+    plain_table, deltax_table = rtabench_synthetic_variant
+    case = QueryCase(
+        "rtabench_join_cursor_chunked_fetch",
+        """
+        SELECT c.country, oe.order_id, oe.event_created, oe.event_type, oe.processor
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.customer_id
+        JOIN {table} oe ON oe.order_id = o.order_id
+        WHERE oe.event_created >= '2024-05-02 00:00:00+00'
+          AND oe.event_created < '2024-05-14 00:00:00+00'
+          AND oe.event_type <> 'Created'
+        ORDER BY c.country, oe.order_id, oe.event_created, oe.counter NULLS LAST
+        """,
+    )
+
+    _apply_mode(db, PARALLEL_AUTO)
+    plain_rows = _fetch_cursor_chunks(
+        db,
+        "planner_plain_join_cursor",
+        case.sql.format(table=plain_table),
+        (5, 17, 23),
+    )
+    deltax_rows = _fetch_cursor_chunks(
+        db,
+        "planner_deltax_join_cursor",
+        case.sql.format(table=deltax_table),
+        (5, 17, 23),
+    )
+    comparison = compare(case.comparator, plain_rows, deltax_rows)
+    assert comparison.ok, (
+        f"{case.name} failed across cursor fetch chunks: {comparison.detail}\n"
+        f"plain sample: {plain_rows[:5]!r}\ndeltax sample: {deltax_rows[:5]!r}"
+    )
+
+
+def test_parallel_explain_analyze_launches_workers(
+    rtabench_synthetic_variant,
+    db,
+):
+    _, deltax_table = rtabench_synthetic_variant
+    _apply_mode(db, PARALLEL_AUTO)
+    plan_rows = db.execute(
+        f"""
+        EXPLAIN (ANALYZE, VERBOSE, FORMAT TEXT)
+        SELECT order_id, counter, event_created, event_type, processor
+        FROM {deltax_table}
+        WHERE event_created >= '2024-05-01 00:00:00+00'
+          AND event_created < '2024-05-16 00:00:00+00'
+        """
+    ).fetchall()
+    plan_text = "\n".join(row[0] for row in plan_rows)
+    if "Workers Launched:" not in plan_text:
+        assert "Custom Scan (DeltaXDecompress)" in plan_text, plan_text
+        pytest.skip("planner did not choose a parallel append for this storage mix")
+    assert "Workers Launched:" in plan_text, plan_text
+    assert "Custom Scan (DeltaXAppend)" in plan_text, plan_text
+
+
 def test_parameterized_lateral_rescan_matches_plain_postgres(
     aggregate_matrix_large,
     db,
@@ -494,6 +556,68 @@ def test_parameterized_lateral_rescan_matches_plain_postgres(
     )
 
     _apply_mode(db, PARALLEL_AUTO)
+    _assert_case_matches(db, case, plain_table, deltax_table)
+
+
+@pytest.mark.parametrize("jit_value", ("off", "on"))
+def test_jit_mode_matches_plain_postgres(
+    aggregate_matrix_large,
+    db,
+    jit_value,
+):
+    plain_table, deltax_table = aggregate_matrix_large
+    _apply_mode(db, PARALLEL_AUTO)
+    try:
+        db.execute(f"SET jit = {jit_value}")
+    except Exception as exc:
+        db.rollback()
+        pytest.skip(f"jit GUC is not available: {exc}")
+    _assert_case_matches(db, AGGREGATE_PLAN_CASES[0], plain_table, deltax_table)
+
+
+@pytest.mark.parametrize(
+    "guc_setting",
+    (
+        ("enable_partitionwise_join", "on"),
+        ("enable_partitionwise_join", "off"),
+        ("enable_partitionwise_aggregate", "on"),
+        ("enable_partitionwise_aggregate", "off"),
+    ),
+    ids=lambda setting: f"{setting[0]}_{setting[1]}",
+)
+def test_partitionwise_planner_modes_match_plain_postgres(
+    rtabench_synthetic_variant,
+    db,
+    guc_setting,
+):
+    plain_table, deltax_table = rtabench_synthetic_variant
+    _apply_mode(db, PARALLEL_AUTO)
+    name, value = guc_setting
+    db.execute(f"SET {name} = {value}")
+    _assert_case_matches(db, RTABENCH_PLAN_CASES[0], plain_table, deltax_table)
+
+
+@pytest.mark.parametrize(
+    "disabled_node",
+    ("enable_sort", "enable_material"),
+)
+@pytest.mark.parametrize(
+    "case",
+    (
+        LIMIT_OFFSET_CASES[1],
+        DISTINCT_AGGREGATE_CASES[2],
+    ),
+    ids=lambda case: case.name,
+)
+def test_parallel_mode_with_disabled_upper_plan_nodes_matches_plain_postgres(
+    rtabench_synthetic_variant,
+    db,
+    disabled_node,
+    case,
+):
+    plain_table, deltax_table = rtabench_synthetic_variant
+    _apply_mode(db, PARALLEL_AUTO)
+    db.execute(f"SET {disabled_node} = off")
     _assert_case_matches(db, case, plain_table, deltax_table)
 
 

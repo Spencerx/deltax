@@ -238,3 +238,135 @@ def test_partition_edge_join_matches_plain_postgres(partition_segment_edges, db)
         plain_table=plain_table,
         deltax_table=deltax_table,
     )
+
+
+def test_partition_parent_only_has_no_rows(partition_segment_edges, db):
+    _, deltax_table = partition_segment_edges
+    parent_rows = db.execute(f"SELECT count(*) FROM ONLY {deltax_table}").fetchone()[0]
+    all_rows = db.execute(f"SELECT count(*) FROM {deltax_table}").fetchone()[0]
+    assert parent_rows == 0
+    assert all_rows > 0
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "UPDATE {partition} SET val = 999 WHERE id = 1",
+        "DELETE FROM {partition} WHERE id = 1",
+    ),
+    ids=("update", "delete"),
+)
+def test_partition_edge_compressed_partition_rejects_dml(partition_segment_edges, db, statement):
+    _, deltax_table = partition_segment_edges
+    partition_name = db.execute(
+        f"""
+        SELECT partition_name
+        FROM deltax_partition_info('{deltax_table}')
+        WHERE is_compressed
+        ORDER BY partition_name
+        LIMIT 1
+        """
+    ).fetchone()[0]
+
+    with pytest.raises(Exception, match="cannot .* compressed partition"):
+        db.execute(statement.format(partition=partition_name))
+    db.rollback()
+
+
+def test_partition_edges_match_plain_in_non_utc_session_timezone(partition_segment_edges, db):
+    plain_table, deltax_table = partition_segment_edges
+    db.execute("SET TIME ZONE 'Europe/Berlin'")
+    case = QueryCase(
+        "non_utc_session_timezone_half_open_boundary",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts >= '2025-01-15 01:00:00+01'::timestamptz
+          AND ts < '2025-01-16 01:00:00+01'::timestamptz
+        ORDER BY ts, id
+        """,
+    )
+    assert_query_case(
+        db,
+        case,
+        plain_table=plain_table,
+        deltax_table=deltax_table,
+    )
+
+
+def test_two_day_partition_interval_boundaries_match_plain_postgres(db):
+    db.execute("SET pg_deltax.mock_now = '2025-01-20 12:00:00+00'")
+    for table_name in ("two_day_edges_plain", "two_day_edges"):
+        db.execute(
+            f"""
+            CREATE TABLE {table_name} (
+                ts timestamptz NOT NULL,
+                id integer NOT NULL,
+                bucket text,
+                val integer
+            )
+            """
+        )
+    db.execute("SELECT deltax_create_table('two_day_edges', 'ts', '2 days'::interval, 3)")
+    db.execute(
+        "SELECT deltax_enable_compression("
+        "'two_day_edges', segment_by => ARRAY['bucket'], "
+        "order_by => ARRAY['ts', 'id'], segment_size => 3)"
+    )
+    db.commit()
+
+    insert_sql = """
+        INSERT INTO {table} (ts, id, bucket, val)
+        VALUES
+            ('2025-01-14 00:00:00+00', 1, 'start', 10),
+            ('2025-01-15 23:59:59.999999+00', 2, 'end_minus_epsilon', 20),
+            ('2025-01-16 00:00:00+00', 3, 'next_start', 30),
+            ('2025-01-17 12:00:00+00', 4, 'middle', 40),
+            ('2025-01-18 00:00:00+00', 5, 'second_next_start', 50)
+    """
+    db.execute(insert_sql.format(table="two_day_edges_plain"))
+    db.execute(insert_sql.format(table="two_day_edges"))
+    db.commit()
+
+    partitions = db.execute(
+        """
+        SELECT partition_name
+        FROM deltax_partition_info('two_day_edges')
+        WHERE range_start >= '2025-01-14 00:00:00+00'
+          AND range_start < '2025-01-18 00:00:00+00'
+        ORDER BY partition_name
+        """
+    ).fetchall()
+    for (partition_name,) in partitions:
+        db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("ANALYZE two_day_edges_plain")
+    db.execute("ANALYZE two_day_edges")
+
+    for case in (
+        QueryCase(
+            "two_day_first_partition",
+            """
+            SELECT id, ts, bucket, val
+            FROM {table}
+            WHERE ts >= '2025-01-14 00:00:00+00'
+              AND ts < '2025-01-16 00:00:00+00'
+            ORDER BY ts, id
+            """,
+        ),
+        QueryCase(
+            "two_day_cross_boundary",
+            """
+            SELECT id, ts, bucket, val
+            FROM {table}
+            WHERE ts >= '2025-01-15 23:59:59.999999+00'
+              AND ts <= '2025-01-18 00:00:00+00'
+            ORDER BY ts, id
+            """,
+        ),
+    ):
+        assert_query_case(
+            db,
+            case,
+            plain_table="two_day_edges_plain",
+            deltax_table="two_day_edges",
+        )

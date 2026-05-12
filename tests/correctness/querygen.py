@@ -46,6 +46,36 @@ def curated_smoke_cases() -> Iterable[QueryCase]:
         LIMIT 10
         """,
     )
+    yield QueryCase(
+        "limit_zero_empty_startup",
+        """
+        SELECT id, ts, device_id, kind, val, metric
+        FROM {table}
+        ORDER BY ts, id
+        LIMIT 0
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "empty_result_projection",
+        """
+        SELECT id, ts, device_id, kind, val, metric
+        FROM {table}
+        WHERE ts >= '2030-01-01 00:00:00+00'
+        ORDER BY ts, id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "full_row_projection",
+        """
+        SELECT *
+        FROM {table}
+        WHERE id BETWEEN 7 AND 23 OR device_id IS NULL
+        ORDER BY ts, id
+        """,
+        comparator="float_tolerant",
+    )
 
 
 def predicate_matrix_cases() -> Iterable[QueryCase]:
@@ -174,12 +204,89 @@ def predicate_matrix_cases() -> Iterable[QueryCase]:
         f"SELECT id, high_text FROM {{table}} WHERE high_text NOT LIKE 'token-%' {order}",
     )
     yield QueryCase(
+        "ilike_prefix",
+        f"SELECT id, high_text FROM {{table}} WHERE high_text ILIKE 'PREFIX-%' {order}",
+    )
+    yield QueryCase(
+        "similar_to_text",
+        f"SELECT id, high_text FROM {{table}} WHERE high_text SIMILAR TO '(prefix|middle)-%' {order}",
+    )
+    yield QueryCase(
+        "regex_match",
+        f"SELECT id, high_text FROM {{table}} WHERE high_text ~ '^(prefix|token)-0[0-9]{{{{2}}}}' {order}",
+    )
+    yield QueryCase(
+        "regex_not_match",
+        f"SELECT id, high_text FROM {{table}} WHERE high_text !~ 'contains$' {order}",
+    )
+    yield QueryCase(
         "boolean_true",
         f"SELECT id, active FROM {{table}} WHERE active = true {order}",
     )
     yield QueryCase(
+        "boolean_is_true",
+        f"SELECT id, active FROM {{table}} WHERE active IS TRUE {order}",
+    )
+    yield QueryCase(
+        "boolean_is_false",
+        f"SELECT id, active FROM {{table}} WHERE active IS FALSE {order}",
+    )
+    yield QueryCase(
+        "boolean_is_unknown",
+        f"SELECT id, active FROM {{table}} WHERE active IS UNKNOWN {order}",
+    )
+    yield QueryCase(
         "boolean_is_not_true",
         f"SELECT id, active FROM {{table}} WHERE active IS NOT TRUE {order}",
+    )
+    yield QueryCase(
+        "boolean_is_not_false",
+        f"SELECT id, active FROM {{table}} WHERE active IS NOT FALSE {order}",
+    )
+    yield QueryCase(
+        "scalar_array_any",
+        f"SELECT id, int_val FROM {{table}} WHERE int_val = ANY(ARRAY[-20, -5, 0, 5, 20]) {order}",
+    )
+    yield QueryCase(
+        "scalar_array_all_with_null",
+        f"SELECT id, int_val FROM {{table}} WHERE int_val <> ALL(ARRAY[-1, 0, NULL]::integer[]) {order}",
+    )
+    yield QueryCase(
+        "row_comparison_in",
+        """
+        SELECT id, int_val, device_id
+        FROM {table}
+        WHERE (int_val, device_id) IN ((-5, 1), (0, 2), (7, 3))
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "row_comparison_gt",
+        """
+        SELECT id, int_val, device_id
+        FROM {table}
+        WHERE (coalesce(int_val, -999), id) > (10, 40)
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "expression_vs_expression_predicate",
+        """
+        SELECT id, int_val, device_id, score
+        FROM {table}
+        WHERE coalesce(int_val, 0) + coalesce(device_id, 0) > floor(coalesce(score, 0.0))::integer
+        ORDER BY id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "date_trunc_expression_predicate",
+        """
+        SELECT id, ts
+        FROM {table}
+        WHERE date_trunc('hour', ts) < '2025-01-15 06:00:00+00'::timestamptz
+        ORDER BY id
+        """,
     )
     yield QueryCase(
         "nested_boolean_logic",
@@ -190,6 +297,19 @@ def predicate_matrix_cases() -> Iterable[QueryCase]:
             (low_text = 'red' AND int_val BETWEEN -10 AND 10)
             OR (device_id IS NULL AND NOT (active IS TRUE))
             OR (high_text LIKE 'prefix-%' AND score > 1.0)
+        )
+        ORDER BY id
+        """,
+    )
+    yield QueryCase(
+        "negated_large_predicate_tree",
+        """
+        SELECT id, device_id, low_text, int_val, active
+        FROM {table}
+        WHERE NOT (
+            (low_text = 'red' AND int_val BETWEEN -5 AND 5)
+            OR (device_id IS NULL AND active IS NOT TRUE)
+            OR (high_text LIKE 'middle-%' AND score < 0.0)
         )
         ORDER BY id
         """,
@@ -284,6 +404,85 @@ def ordering_topn_cases() -> Iterable[QueryCase]:
         FROM {table}
         ORDER BY ts ASC, id ASC
         LIMIT 12 OFFSET 9
+        """,
+    )
+    yield QueryCase(
+        "limit_zero",
+        """
+        SELECT id, ts, payload
+        FROM {table}
+        ORDER BY ts ASC, id ASC
+        LIMIT 0
+        """,
+    )
+    yield QueryCase(
+        "offset_beyond_rows",
+        """
+        SELECT id, ts, payload
+        FROM {table}
+        ORDER BY ts ASC, id ASC
+        LIMIT 15 OFFSET 10000
+        """,
+    )
+    yield QueryCase(
+        "limit_offset_no_rows",
+        """
+        SELECT id, sort_val, payload
+        FROM {table}
+        ORDER BY sort_val ASC NULLS LAST, id ASC
+        LIMIT 5 OFFSET 10000
+        """,
+    )
+    yield QueryCase(
+        "fetch_first_with_ties",
+        """
+        SELECT id, sort_val
+        FROM {table}
+        ORDER BY sort_val ASC NULLS LAST
+        FETCH FIRST 10 ROWS WITH TIES
+        """,
+        comparator="limit_ties",
+    )
+    yield QueryCase(
+        "order_by_expression",
+        """
+        SELECT id, sort_val, text_sort, payload
+        FROM {table}
+        ORDER BY coalesce(sort_val, 999), lower(coalesce(text_sort, 'zzzz')), id
+        LIMIT 24
+        """,
+    )
+    yield QueryCase(
+        "order_by_alias_and_ordinal",
+        """
+        SELECT sort_val AS s, id, payload
+        FROM {table}
+        ORDER BY s DESC NULLS LAST, 2 ASC
+        LIMIT 19
+        """,
+    )
+    yield QueryCase(
+        "topn_subquery_outer_reorder",
+        """
+        SELECT id, ts, payload
+        FROM (
+            SELECT id, ts, payload, sort_val
+            FROM {table}
+            ORDER BY ts DESC, id DESC
+            LIMIT 40
+        ) picked
+        ORDER BY sort_val NULLS LAST, id
+        LIMIT 15
+        """,
+    )
+    yield QueryCase(
+        "distinct_on_order_limit",
+        """
+        SELECT DISTINCT ON (device_id) device_id, id, ts, payload
+        FROM {table}
+        WHERE device_id IS NOT NULL
+        ORDER BY device_id, ts DESC, id DESC
+        LIMIT 10
         """,
     )
     yield QueryCase(
@@ -515,6 +714,68 @@ def aggregate_extended_cases() -> Iterable[QueryCase]:
             count(int_nullable) FILTER (WHERE filter_val <= 0),
             sum(int_not_null) FILTER (WHERE filter_val BETWEEN -3 AND 3)
         FROM {table}
+        """,
+    )
+    yield QueryCase(
+        "aggregate_filter_clauses_null_sensitive",
+        """
+        SELECT
+            count(*) FILTER (WHERE int_nullable IS NULL),
+            sum(int_not_null) FILTER (WHERE group_key IS NULL),
+            avg(float_val) FILTER (WHERE float_val IS NOT NULL AND int_nullable IS DISTINCT FROM 0),
+            min(ts) FILTER (WHERE all_null_input IS NULL)
+        FROM {table}
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "aggregate_over_expressions",
+        """
+        SELECT
+            sum((int_not_null * 2)::bigint),
+            avg(abs(float_val)),
+            max(coalesce(int_nullable, -999)),
+            min(date_trunc('hour', ts))
+        FROM {table}
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "aggregate_empty_result_without_group_by",
+        """
+        SELECT count(*), count(int_nullable), sum(int_nullable), avg(float_val), min(ts), max(ts)
+        FROM {table}
+        WHERE ts >= '2030-01-01 00:00:00+00'
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "aggregate_empty_result_with_group_by",
+        """
+        SELECT group_key, count(*), sum(int_nullable)
+        FROM {table}
+        WHERE ts >= '2030-01-01 00:00:00+00'
+        GROUP BY group_key
+        ORDER BY group_key NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "grouping_sets_rollup",
+        """
+        SELECT group_key, sub_key, count(*), sum(int_not_null), grouping(group_key, sub_key) AS grouping_id
+        FROM {table}
+        GROUP BY ROLLUP (group_key, sub_key)
+        ORDER BY grouping_id, group_key NULLS LAST, sub_key NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "ordered_array_aggregate_fallback",
+        """
+        SELECT group_key, array_agg(id ORDER BY ts DESC, id DESC)
+        FROM {table}
+        WHERE group_key IN (1, 2, 3)
+        GROUP BY group_key
+        ORDER BY group_key
         """,
     )
     yield QueryCase(
@@ -753,6 +1014,16 @@ def partition_segment_boundary_cases() -> Iterable[QueryCase]:
         SELECT id, ts, bucket, payload
         FROM {table}
         WHERE ts >= '2025-01-17 00:00:00+00'
+        ORDER BY ts, id
+        """,
+    )
+    yield QueryCase(
+        "session_timezone_boundary_projection",
+        """
+        SELECT id, ts, bucket, payload
+        FROM {table}
+        WHERE ts >= '2025-01-15 00:00:00 Europe/Berlin'::timestamptz
+          AND ts < '2025-01-16 00:00:00 Europe/Berlin'::timestamptz
         ORDER BY ts, id
         """,
     )
@@ -1219,6 +1490,27 @@ def codec_matrix_cases() -> Iterable[QueryCase]:
         LIMIT 17
         """,
     )
+    yield QueryCase(
+        "numeric_window_over_codec_columns",
+        """
+        SELECT id, device_id, small_int, int_val, running_sum
+        FROM (
+            SELECT
+                id,
+                device_id,
+                small_int,
+                int_val,
+                sum(coalesce(int_val, 0)) OVER (
+                    PARTITION BY device_id
+                    ORDER BY ts, id
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS running_sum
+            FROM {table}
+            WHERE device_id IS NOT NULL AND id < 80
+        ) ranked
+        ORDER BY device_id, id
+        """,
+    )
 
 
 def rtabench_synthetic_cases() -> Iterable[QueryCase]:
@@ -1325,6 +1617,20 @@ def rtabench_synthetic_cases() -> Iterable[QueryCase]:
             SELECT oe.order_id
             FROM {table} oe
             WHERE oe.event_type = 'Returned'
+        )
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "not_in_subquery_with_null_semantics",
+        """
+        SELECT o.order_id, o.customer_id
+        FROM orders o
+        WHERE o.order_id NOT IN (
+            SELECT oe.counter
+            FROM {table} oe
+            WHERE oe.event_type = 'Returned'
+               OR oe.counter IS NULL
         )
         ORDER BY o.order_id
         """,
@@ -1470,6 +1776,24 @@ def rtabench_synthetic_cases() -> Iterable[QueryCase]:
         """,
     )
     yield QueryCase(
+        "left_join_lateral_allows_no_match",
+        """
+        SELECT c.customer_id, o.order_id, latest.event_created, latest.event_type
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.customer_id
+        LEFT JOIN LATERAL (
+            SELECT oe.event_created, oe.event_type
+            FROM {table} oe
+            WHERE oe.order_id = o.order_id
+              AND oe.event_type = 'Impossible Event'
+            ORDER BY oe.event_created DESC, oe.counter DESC NULLS LAST
+            LIMIT 1
+        ) latest ON true
+        WHERE c.customer_id IN (1, 7, 13, 19)
+        ORDER BY c.customer_id, o.order_id
+        """,
+    )
+    yield QueryCase(
         "processor_backup_coalesce_grouping",
         """
         SELECT
@@ -1609,6 +1933,21 @@ def rtabench_synthetic_cases() -> Iterable[QueryCase]:
         """,
     )
     yield QueryCase(
+        "using_join_against_duplicate_keys",
+        """
+        SELECT order_id, event_type, marker
+        FROM (
+            VALUES
+                (10, 'Created'::text, 'first'::text),
+                (10, 'Created'::text, 'duplicate'::text),
+                (11, 'Packed'::text, 'second'::text),
+                (12, 'Delivered'::text, 'third'::text)
+        ) AS marker(order_id, event_type, marker)
+        JOIN {table} USING (order_id, event_type)
+        ORDER BY order_id, event_type, marker, event_created, counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
         "range_join_events_after_order_created",
         """
         SELECT o.order_id, count(*) AS events_after_created
@@ -1638,6 +1977,58 @@ def rtabench_synthetic_cases() -> Iterable[QueryCase]:
         WHERE base.order_id BETWEEN 60 AND 85
         GROUP BY base.order_id, base.event_type, follow.event_type
         ORDER BY base.order_id, base_type, follow_type
+        """,
+    )
+    yield QueryCase(
+        "fact_referenced_twice_with_dimension",
+        """
+        SELECT o.order_id, created.event_created AS created_at, delivered.event_created AS delivered_at, c.country
+        FROM orders o
+        JOIN customers c ON c.customer_id = o.customer_id
+        JOIN {table} created
+          ON created.order_id = o.order_id
+         AND created.event_type = 'Created'
+        LEFT JOIN {table} delivered
+          ON delivered.order_id = o.order_id
+         AND delivered.event_type = 'Delivered'
+        WHERE o.order_id BETWEEN 1 AND 50
+        ORDER BY o.order_id, delivered.event_created NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "except_joined_returned_orders",
+        """
+        SELECT order_id
+        FROM (
+            SELECT o.order_id
+            FROM orders o
+            JOIN {table} oe ON oe.order_id = o.order_id
+            WHERE oe.event_type = 'Delivered'
+            EXCEPT
+            SELECT o.order_id
+            FROM orders o
+            JOIN {table} oe ON oe.order_id = o.order_id
+            WHERE oe.event_type = 'Returned'
+        ) remaining
+        ORDER BY order_id
+        """,
+    )
+    yield QueryCase(
+        "intersect_joined_processor_orders",
+        """
+        SELECT order_id
+        FROM (
+            SELECT o.order_id
+            FROM orders o
+            JOIN {table} oe ON oe.order_id = o.order_id
+            WHERE oe.processor = 'proc-a'
+            INTERSECT
+            SELECT o.order_id
+            FROM orders o
+            JOIN {table} oe ON oe.order_id = o.order_id
+            WHERE oe.event_type = 'Delivered'
+        ) matched
+        ORDER BY order_id
         """,
     )
     yield QueryCase(
