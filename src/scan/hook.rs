@@ -1578,6 +1578,222 @@ unsafe fn collect_aggrefs_in_expr(
     }
 }
 
+/// Strip outer monotonic wrappers from a sort expression so the inner
+/// `MAX - MIN` shape can be recognized. Walks through:
+///
+/// - `*` with a positive numeric constant on one side (preserves order)
+/// - `FuncExpr(extract / date_part, [Const('epoch'|'milliseconds'|...), arg])`
+///   which is monotonic in `arg` for the supported field constants
+/// - `RelabelType` / `CoerceViaIO` casts
+///
+/// Returns the inner expression. For Q4's sort key
+/// `EXTRACT(EPOCH FROM (MAX - MIN)) * 1000` this returns the inner
+/// `MAX - MIN` OpExpr.
+unsafe fn strip_monotonic_topn_wrappers(node: *const pg_sys::Node) -> *const pg_sys::Node {
+    unsafe {
+        let mut cur = node;
+        loop {
+            if cur.is_null() {
+                return cur;
+            }
+            match (*cur).type_ {
+                pg_sys::NodeTag::T_OpExpr => {
+                    // Strip `*` by a positive constant — preserves ordering.
+                    let op = cur as *const pg_sys::OpExpr;
+                    let opname_ptr = pg_sys::get_opname((*op).opno);
+                    if opname_ptr.is_null() {
+                        return cur;
+                    }
+                    let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                        .to_str()
+                        .unwrap_or("");
+                    if opname != "*" {
+                        return cur;
+                    }
+                    let args = (*op).args;
+                    if args.is_null() || (*args).length != 2 {
+                        return cur;
+                    }
+                    let l = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                    let r = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                    if l.is_null() || r.is_null() {
+                        return cur;
+                    }
+                    let l_is_const = (*l).type_ == pg_sys::NodeTag::T_Const;
+                    let r_is_const = (*r).type_ == pg_sys::NodeTag::T_Const;
+                    if l_is_const && !r_is_const {
+                        // Bail on non-positive constants — they'd flip ordering.
+                        // Conservative: only positive numerics preserve direction.
+                        if !const_is_positive_numeric(l as *const pg_sys::Const) {
+                            return cur;
+                        }
+                        cur = r;
+                        continue;
+                    } else if r_is_const && !l_is_const {
+                        if !const_is_positive_numeric(r as *const pg_sys::Const) {
+                            return cur;
+                        }
+                        cur = l;
+                        continue;
+                    }
+                    return cur;
+                }
+                pg_sys::NodeTag::T_FuncExpr => {
+                    let f = cur as *const pg_sys::FuncExpr;
+                    let fname_ptr = pg_sys::get_func_name((*f).funcid);
+                    if fname_ptr.is_null() {
+                        return cur;
+                    }
+                    let fname = std::ffi::CStr::from_ptr(fname_ptr)
+                        .to_str()
+                        .unwrap_or("");
+                    // EXTRACT is rewritten by PG to either `extract` (PG16+) or
+                    // `date_part` (older). Both have signature `(text, ?)` —
+                    // first arg is the field-name Const, last arg is the
+                    // value expression. EXTRACT(EPOCH FROM interval) is
+                    // monotonic in interval microseconds.
+                    if fname != "extract" && fname != "date_part" {
+                        return cur;
+                    }
+                    let args = (*f).args;
+                    if args.is_null() || (*args).length < 2 {
+                        return cur;
+                    }
+                    let n = (*args).length as usize;
+                    cur = (*(*args).elements.add(n - 1)).ptr_value as *const pg_sys::Node;
+                    continue;
+                }
+                pg_sys::NodeTag::T_RelabelType => {
+                    let r = cur as *const pg_sys::RelabelType;
+                    cur = (*r).arg as *const pg_sys::Node;
+                    continue;
+                }
+                pg_sys::NodeTag::T_CoerceViaIO => {
+                    let c = cur as *const pg_sys::CoerceViaIO;
+                    cur = (*c).arg as *const pg_sys::Node;
+                    continue;
+                }
+                _ => return cur,
+            }
+        }
+    }
+}
+
+/// Returns true when the Const holds a positive numeric value (int2/int4/int8/
+/// float4/float8/numeric). Used by `strip_monotonic_topn_wrappers` to confirm
+/// that stripping a `*` doesn't flip sort direction.
+unsafe fn const_is_positive_numeric(c: *const pg_sys::Const) -> bool {
+    unsafe {
+        if (*c).constisnull {
+            return false;
+        }
+        match (*c).consttype {
+            pg_sys::INT2OID => ((*c).constvalue.value() as i16) > 0,
+            pg_sys::INT4OID => ((*c).constvalue.value() as i32) > 0,
+            pg_sys::INT8OID => ((*c).constvalue.value() as i64) > 0,
+            pg_sys::FLOAT4OID => f32::from_bits((*c).constvalue.value() as u32) > 0.0,
+            pg_sys::FLOAT8OID => f64::from_bits((*c).constvalue.value() as u64) > 0.0,
+            pg_sys::NUMERICOID => {
+                // PG numeric format encoding (numeric.c):
+                //   top 2 bits of n_header decode as:
+                //     00  NUMERIC_POS     (long format, positive)
+                //     01  NUMERIC_NEG     (long format, negative)
+                //     10  NUMERIC_SHORT   (compact format; sign in bit 0x2000)
+                //     11  NUMERIC_SPECIAL (NaN / ±inf)
+                // We accept anything that's not NEG / NaN / -inf. `'1000'::
+                // numeric` is the SHORT form on modern PG.
+                let varlena_ptr = (*c).constvalue.cast_mut_ptr::<pg_sys::varlena>();
+                if varlena_ptr.is_null() {
+                    return false;
+                }
+                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                let data = pgrx::vardata_any(detoasted) as *const u8;
+                let header = u16::from_le_bytes([*data, *data.add(1)]);
+                let was_toasted = detoasted != varlena_ptr;
+                if was_toasted {
+                    pg_sys::pfree(detoasted as *mut _);
+                }
+                let top2 = (header >> 14) & 0x3;
+                match top2 {
+                    0b00 => true,                                // long, positive
+                    0b01 => false,                                // long, negative
+                    0b10 => (header & 0x2000) == 0,               // short — bit 0x2000 = neg
+                    _ => false,                                   // NaN/±inf
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Try to recognize a derived MIN/MAX-difference sort key shape:
+/// `<monotonic-wrappers>(MAX(x) - MIN(x))`. Returns the (max, min) Aggref
+/// indices into the caller's `aggrefs` vec if recognized.
+///
+/// Designed for JSONBench Q4 — `ORDER BY EXTRACT(EPOCH FROM (MAX(t) - MIN(t)))
+/// * 1000 DESC`. The strip step handles the EXTRACT and `* 1000` wrappers;
+/// the inner shape is two Aggrefs subtracted.
+unsafe fn try_match_derived_minmax_topn(
+    sort_expr: *const pg_sys::Node,
+    aggrefs: &[*const pg_sys::Aggref],
+) -> Option<(usize, usize)> {
+    unsafe {
+        let inner = strip_monotonic_topn_wrappers(sort_expr);
+        if inner.is_null() || (*inner).type_ != pg_sys::NodeTag::T_OpExpr {
+            return None;
+        }
+        let op = inner as *const pg_sys::OpExpr;
+        let opname_ptr = pg_sys::get_opname((*op).opno);
+        if opname_ptr.is_null() {
+            return None;
+        }
+        let opname = std::ffi::CStr::from_ptr(opname_ptr)
+            .to_str()
+            .unwrap_or("");
+        if opname != "-" {
+            return None;
+        }
+        let args = (*op).args;
+        if args.is_null() || (*args).length != 2 {
+            return None;
+        }
+        let l_raw = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+        let r_raw = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+        if l_raw.is_null() || r_raw.is_null() {
+            return None;
+        }
+        let l = unwrap_relabel_node(l_raw);
+        let r = unwrap_relabel_node(r_raw);
+        if (*l).type_ != pg_sys::NodeTag::T_Aggref
+            || (*r).type_ != pg_sys::NodeTag::T_Aggref
+        {
+            return None;
+        }
+        let l_agg = l as *const pg_sys::Aggref;
+        let r_agg = r as *const pg_sys::Aggref;
+        let l_name_ptr = pg_sys::get_func_name((*l_agg).aggfnoid);
+        let r_name_ptr = pg_sys::get_func_name((*r_agg).aggfnoid);
+        if l_name_ptr.is_null() || r_name_ptr.is_null() {
+            return None;
+        }
+        let l_name = std::ffi::CStr::from_ptr(l_name_ptr)
+            .to_str()
+            .unwrap_or("");
+        let r_name = std::ffi::CStr::from_ptr(r_name_ptr)
+            .to_str()
+            .unwrap_or("");
+        if l_name != "max" || r_name != "min" {
+            return None;
+        }
+        // Find indices in caller's aggrefs vec by pointer identity (the
+        // sort tree references the same Aggref pointers PG stitched into
+        // the tlist, so pointer-equal match is exact).
+        let max_idx = aggrefs.iter().position(|&a| std::ptr::eq(a, l_agg))?;
+        let min_idx = aggrefs.iter().position(|&a| std::ptr::eq(a, r_agg))?;
+        Some((max_idx, min_idx))
+    }
+}
+
 /// Strip `int8 → float8` cast wrappers (`FuncExpr` with funcid for
 /// `float8(int8)` = 482, or `RelabelType`) so the underlying chain can be
 /// matched by `AggChainCtx`.
@@ -3747,19 +3963,95 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     }
                 }
                 if topn_sort_col < 0 {
-                    // No ORDER BY on aggregate found
+                    // Direct-aggregate sort didn't match. Try the derived
+                    // MIN/MAX-difference shape — `ORDER BY <wrappers>(MAX(x)
+                    // - MIN(x)) [ASC|DESC]` (JSONBench Q4). Both Aggrefs must
+                    //   already be in `aggrefs`; the recognizer matches by
+                    //   pointer identity.
                     let sort_clause = (*parse).sortClause;
-                    if sort_clause.is_null() || (*sort_clause).length == 0 {
-                        // Bare LIMIT N — pass as bare_limit (sort_col = -1)
-                        path::set_agg_topn_info(topn_limit, -1, true);
-                        // topn_active stays false — no pathkeys claimed
-                    } else {
-                        topn_limit = 0; // ORDER BY exists but doesn't match an aggregate — disable
+                    let mut derived_matched = false;
+                    if !sort_clause.is_null()
+                        && (*sort_clause).length == 1
+                    {
+                        let sc = pg_sys::list_nth(sort_clause, 0)
+                            as *const pg_sys::SortGroupClause;
+                        if !sc.is_null() {
+                            let tle_ref = (*sc).tleSortGroupRef;
+                            let mut sort_tle: *const pg_sys::TargetEntry = std::ptr::null();
+                            for i in 0..nentries {
+                                let te = pg_sys::list_nth(tlist, i)
+                                    as *const pg_sys::TargetEntry;
+                                if !te.is_null() && (*te).ressortgroupref == tle_ref {
+                                    sort_tle = te;
+                                    break;
+                                }
+                            }
+                            if !sort_tle.is_null() {
+                                let sort_expr = (*sort_tle).expr as *const pg_sys::Node;
+                                if let Some((max_idx, min_idx)) =
+                                    try_match_derived_minmax_topn(sort_expr, &aggrefs)
+                                {
+                                    // Check storage compatibility: both
+                                    // aggregates must be on i64-storage
+                                    // (MinInt/MaxInt) — the only kind whose
+                                    // values we can subtract directly.
+                                    let max_spec = &classified_aggs[max_idx];
+                                    let min_spec = &classified_aggs[min_idx];
+                                    let storage_ok =
+                                        matches!(max_spec.agg_type, AggType::Max)
+                                        && matches!(min_spec.agg_type, AggType::Min)
+                                        && matches!(
+                                            max_spec.col_type_oid,
+                                            pg_sys::INT2OID
+                                                | pg_sys::INT4OID
+                                                | pg_sys::INT8OID
+                                                | pg_sys::DATEOID
+                                                | pg_sys::TIMESTAMPOID
+                                                | pg_sys::TIMESTAMPTZOID
+                                        )
+                                        && max_spec.col_type_oid == min_spec.col_type_oid
+                                        && max_spec.col_idx == min_spec.col_idx;
+                                    if storage_ok {
+                                        let opname_ptr = pg_sys::get_opname((*sc).sortop);
+                                        if !opname_ptr.is_null() {
+                                            let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                                                .to_str()
+                                                .unwrap_or("");
+                                            topn_ascending = opname == "<";
+                                            path::set_agg_topn_info_derived_minmax(
+                                                topn_limit,
+                                                topn_ascending,
+                                                max_idx as i32,
+                                                min_idx as i32,
+                                            );
+                                            topn_active = true;
+                                            derived_matched = true;
+                                            // Skip the "no ORDER BY on aggregate"
+                                            // disable branch below.
+                                            topn_sort_col = path::TOPN_SORT_COL_DERIVED;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !derived_matched {
+                        // No ORDER BY on aggregate found
+                        if sort_clause.is_null() || (*sort_clause).length == 0 {
+                            // Bare LIMIT N — pass as bare_limit (sort_col = -1)
+                            path::set_agg_topn_info(topn_limit, -1, true);
+                            // topn_active stays false — no pathkeys claimed
+                        } else {
+                            topn_limit = 0; // ORDER BY exists but doesn't match an aggregate — disable
+                        }
                     }
                 }
             }
 
-            if topn_limit > 0 && topn_sort_col >= 0 {
+            if topn_limit > 0
+                && topn_sort_col >= 0
+                && topn_sort_col != path::TOPN_SORT_COL_DERIVED
+            {
                 path::set_agg_topn_info(topn_limit, topn_sort_col, topn_ascending);
                 topn_active = true;
             }

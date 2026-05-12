@@ -21,16 +21,59 @@ pub(super) fn take_agg_having_filters() -> Vec<super::exec::HavingFilter> {
     AGG_HAVING_FILTERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
+/// Top-N info for DeltaXAgg.
+///
+/// `sort_col`: index in the post-agg output tlist of a direct-aggregate sort
+/// key, or `-3` when the sort key is a derived expression over two
+/// aggregates (see `derived_minmax`).
+///
+/// `derived_minmax`: when `Some((max_agg_idx, min_agg_idx))`, the sort key is
+/// `storage[max] - storage[min]` (both i64-storage). This covers the
+/// JSONBench Q4 shape `ORDER BY EXTRACT(EPOCH FROM (MAX(t) - MIN(t))) * N`
+/// — monotonic in `max - min` regardless of the scaling/extract wrappers.
+#[derive(Copy, Clone)]
+pub(super) struct AggTopnInfo {
+    pub limit: i64,
+    pub sort_col: i32,
+    pub ascending: bool,
+    pub derived_minmax: Option<(i32, i32)>,
+}
+
+/// Sentinel for `sort_col` when the sort key is a derived MIN/MAX-difference
+/// expression instead of a single aggregate's output column.
+pub(super) const TOPN_SORT_COL_DERIVED: i32 = -3;
+
 thread_local! {
-    /// Top-N info for DeltaXAgg: (limit, sort_output_col, ascending).
+    /// Top-N info for DeltaXAgg.
     /// Set in hook (deltax_create_upper_paths), consumed in plan_agg_path.
-    static AGG_TOPN_INFO: std::cell::RefCell<Option<(i64, i32, bool)>> =
+    static AGG_TOPN_INFO: std::cell::RefCell<Option<AggTopnInfo>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Store top-N info for the next DeltaXAgg plan.
+/// Store top-N info for the next DeltaXAgg plan. Direct-aggregate form.
 pub(super) fn set_agg_topn_info(limit: i64, sort_col: i32, ascending: bool) {
-    AGG_TOPN_INFO.with(|cell| *cell.borrow_mut() = Some((limit, sort_col, ascending)));
+    AGG_TOPN_INFO.with(|cell| {
+        *cell.borrow_mut() = Some(AggTopnInfo {
+            limit, sort_col, ascending, derived_minmax: None,
+        });
+    });
+}
+
+/// Store top-N info with a derived MIN/MAX-difference sort key (Q4 shape).
+pub(super) fn set_agg_topn_info_derived_minmax(
+    limit: i64,
+    ascending: bool,
+    max_agg_idx: i32,
+    min_agg_idx: i32,
+) {
+    AGG_TOPN_INFO.with(|cell| {
+        *cell.borrow_mut() = Some(AggTopnInfo {
+            limit,
+            sort_col: TOPN_SORT_COL_DERIVED,
+            ascending,
+            derived_minmax: Some((max_agg_idx, min_agg_idx)),
+        });
+    });
 }
 
 /// Clear any stale top-N info (e.g. from a previous query whose DeltaXAgg path was not chosen).
@@ -39,14 +82,14 @@ pub(super) fn clear_agg_topn_info() {
 }
 
 /// Take (consume) the stored top-N info.
-fn take_agg_topn_info() -> Option<(i64, i32, bool)> {
+fn take_agg_topn_info() -> Option<AggTopnInfo> {
     AGG_TOPN_INFO.with(|cell| cell.borrow_mut().take())
 }
 
 /// Peek at the stored top-N info without consuming. Used by `add_agg_path`'s
 /// parallel-eligibility check (Phase C.2.f) — Top-N pushdown is excluded
 /// from the parallel path because workers can't prune top-N locally.
-fn peek_agg_topn_info() -> Option<(i64, i32, bool)> {
+fn peek_agg_topn_info() -> Option<AggTopnInfo> {
     AGG_TOPN_INFO.with(|cell| *cell.borrow())
 }
 
@@ -1437,7 +1480,7 @@ pub unsafe fn add_agg_path(
         // group keys, fixed-size accumulators, no DISTINCT / HAVING / Top-N
         // / LIMIT. Anything else stays serial / internal-rayon.
         let topn_info = peek_agg_topn_info();
-        let topn_active = topn_info.is_some_and(|(limit, _, _)| limit > 0);
+        let topn_active = topn_info.is_some_and(|info| info.limit > 0);
         let parallel_eligible = having_filters.is_empty()
             && !topn_active
             && !agg_specs.iter().any(|s| s.agg_type == super::exec::AggType::CountDistinct)
@@ -2226,12 +2269,20 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, 0);
         }
 
-        // Top-N info: [topn_limit, topn_sort_col, topn_ascending] or [0]
+        // Top-N info: [topn_limit, topn_sort_col, topn_ascending,
+        //              derived_max_idx, derived_min_idx] or [0].
+        // For backward compat: when derived_minmax is None we still emit the
+        // 3-int form (no trailing pair). When sort_col == TOPN_SORT_COL_DERIVED
+        // we emit the 5-int form with the slot indices.
         let topn = take_agg_topn_info();
-        if let Some((limit, sort_col, ascending)) = topn {
-            private_list = pg_sys::lappend_int(private_list, limit as i32);
-            private_list = pg_sys::lappend_int(private_list, sort_col);
-            private_list = pg_sys::lappend_int(private_list, if ascending { 1 } else { 0 });
+        if let Some(info) = topn {
+            private_list = pg_sys::lappend_int(private_list, info.limit as i32);
+            private_list = pg_sys::lappend_int(private_list, info.sort_col);
+            private_list = pg_sys::lappend_int(private_list, if info.ascending { 1 } else { 0 });
+            if let Some((max_idx, min_idx)) = info.derived_minmax {
+                private_list = pg_sys::lappend_int(private_list, max_idx);
+                private_list = pg_sys::lappend_int(private_list, min_idx);
+            }
         } else {
             private_list = pg_sys::lappend_int(private_list, 0);
         }

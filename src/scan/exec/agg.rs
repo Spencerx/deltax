@@ -869,6 +869,7 @@ unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> AggExecContex
             topn_limit,
             topn_sort_col,
             topn_ascending,
+            derived_minmax_topn: _,
             bare_limit: _,
             is_partial,
         } = plan;
@@ -1082,6 +1083,13 @@ pub(super) struct ParsedAggPlan {
     pub(super) topn_limit: i64,
     pub(super) topn_sort_col: usize,
     pub(super) topn_ascending: bool,
+    /// `Some((max_slot, min_slot))` when the sort key is a derived expression
+    /// `storage[max] - storage[min]` over two compact-storage slots — the
+    /// JSONBench-Q4 shape `ORDER BY EXTRACT(EPOCH FROM (MAX-MIN))*N`.
+    /// When set, `topn_sort_col` is the sentinel `usize::MAX` (the path layer
+    /// emits `TOPN_SORT_COL_DERIVED = -3`, which we map to `usize::MAX` here)
+    /// and the runtime uses `derived_minmax_topn` for sort-value computation.
+    pub(super) derived_minmax_topn: Option<(usize, usize)>,
     pub(super) bare_limit: i64,
     /// Phase C.2 activation: when true, this CustomScan is the partial-mode
     /// node below a Gather + Final Aggregate. exec_agg_scan emits per-group
@@ -1409,6 +1417,7 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
     let mut topn_sort_col: usize = 0;
     let mut topn_ascending: bool = true;
     let mut bare_limit: i64 = 0;
+    let mut derived_minmax_topn: Option<(usize, usize)> = None;
     if idx < list_len {
         let limit_val = pg_sys::list_nth_int(custom_private, idx);
         idx += 1;
@@ -1417,7 +1426,18 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
             idx += 1;
             topn_ascending = pg_sys::list_nth_int(custom_private, idx) != 0;
             idx += 1;
-            if sort_col_raw < 0 {
+            // -1 = bare LIMIT (no sort); -3 = derived MIN/MAX-difference
+            // sort (Q4 shape) — two additional ints follow with the
+            // (max_agg_idx, min_agg_idx) pair.
+            if sort_col_raw == -3 {
+                let max_idx = pg_sys::list_nth_int(custom_private, idx) as usize;
+                idx += 1;
+                let min_idx = pg_sys::list_nth_int(custom_private, idx) as usize;
+                idx += 1;
+                topn_limit = limit_val as i64;
+                topn_sort_col = usize::MAX; // unused — see derived_minmax_topn
+                derived_minmax_topn = Some((max_idx, min_idx));
+            } else if sort_col_raw < 0 {
                 bare_limit = limit_val as i64; // bare LIMIT, no sort
             } else {
                 topn_limit = limit_val as i64;
@@ -1447,6 +1467,7 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
         topn_limit,
         topn_sort_col,
         topn_ascending,
+        derived_minmax_topn,
         bare_limit,
         is_partial,
     }
@@ -2310,7 +2331,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let ParsedAggPlan {
             companion_oids, agg_specs, group_specs, output_map,
             having_filters, where_quals, topn_limit, topn_sort_col, topn_ascending,
-            bare_limit, is_partial: _,
+            derived_minmax_topn, bare_limit, is_partial: _,
         } = plan;
 
         // Build needed_cols: only columns referenced by aggregates and group-by
@@ -4018,7 +4039,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
         if can_parallel_mixed_flag {
             let t2 = Instant::now();
-            let topn_spec = if topn_limit > 0 && having_filters.is_empty() {
+            // For derived MIN/MAX-difference top-N, workers don't maintain a
+            // direct-sort heap — sort key is recovered at the leader from
+            // partial max/min, see the `derived_minmax_topn` branch below.
+            let topn_spec = if topn_limit > 0
+                && having_filters.is_empty()
+                && derived_minmax_topn.is_none()
+            {
                 let sort_slot = match output_map[topn_sort_col] {
                     OutputEntry::Agg(ai) => ai,
                     _ => unreachable!(),
@@ -4273,6 +4300,265 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             }
             total_detoast_us += pipeline_detoast_us;
             let agg_us = scan_wall_us.saturating_sub(decompress_us + pipeline_detoast_us);
+
+            // ----------------------------------------------------------
+            // Derived MIN/MAX-difference top-N (JSONBench Q4 shape):
+            // sort by `storage[max_slot] - storage[min_slot]`. Workers
+            // have produced partial MAX/MIN per group; one pass over all
+            // (worker, hash) pairs combines partials into per-key
+            // global MAX/MIN, applies a top-K heap on `max - min`, and
+            // then merges *only the K winners'* full accumulators.
+            // Skips the full 1.35M-group merge + finalize that the
+            // direct-aggregate paths below would otherwise do.
+            // ----------------------------------------------------------
+            if let Some((max_slot, min_slot)) = derived_minmax_topn {
+                let t_merge = Instant::now();
+                let limit = topn_limit as usize;
+                let ascending = topn_ascending;
+
+                // Step 1: single pass to combine per-worker partial
+                // MAX/MIN into per-key global (max, min).
+                let mut per_key: hashbrown::HashMap<
+                    u128,
+                    (i64, i64, bool),
+                    BuildHasherDefault<ahash::AHasher>,
+                > = hashbrown::HashMap::with_capacity_and_hasher(
+                    partial_results
+                        .iter()
+                        .map(|r| r.compact_map.len())
+                        .max()
+                        .unwrap_or(0),
+                    Default::default(),
+                );
+                for result in &partial_results {
+                    for (&hash_key, &wgidx) in &result.compact_map {
+                        let (max_val, max_has) = result
+                            .compact_storage
+                            .read_min_max_int(wgidx, max_slot);
+                        let (min_val, min_has) = result
+                            .compact_storage
+                            .read_min_max_int(wgidx, min_slot);
+                        let entry = per_key
+                            .entry(hash_key)
+                            .or_insert((i64::MIN, i64::MAX, false));
+                        if max_has && (!entry.2 || max_val > entry.0) {
+                            entry.0 = max_val;
+                            entry.2 = true;
+                        }
+                        if min_has && (entry.1 == i64::MAX || min_val < entry.1) {
+                            entry.1 = min_val;
+                        }
+                    }
+                }
+
+                // Step 2: top-K heap on `max - min`. Use i128 to avoid
+                // overflow on far-apart times. Skip keys whose either
+                // accumulator never saw a value (max_has=false ⇒ NULL).
+                let mut heap: std::collections::BinaryHeap<
+                    Reverse<(i128, u128)>,
+                > = std::collections::BinaryHeap::with_capacity(limit + 1);
+                let mut asc_heap: std::collections::BinaryHeap<(i128, u128)> =
+                    std::collections::BinaryHeap::with_capacity(limit + 1);
+                let pre_topn_groups = per_key.len();
+                for (&hash_key, &(max_val, min_val, seen)) in &per_key {
+                    if !seen {
+                        continue;
+                    }
+                    let derived = (max_val as i128).saturating_sub(min_val as i128);
+                    if ascending {
+                        asc_heap.push((derived, hash_key));
+                        if asc_heap.len() > limit {
+                            asc_heap.pop();
+                        }
+                    } else {
+                        heap.push(Reverse((derived, hash_key)));
+                        if heap.len() > limit {
+                            heap.pop();
+                        }
+                    }
+                }
+                let winners: Vec<u128> = if ascending {
+                    asc_heap.into_iter().map(|(_, h)| h).collect()
+                } else {
+                    heap.into_iter().map(|Reverse((_, h))| h).collect()
+                };
+                let topn_select_us = t_merge.elapsed().as_micros() as u64;
+
+                // Step 3: full-merge accumulators for the K winners and
+                // finalize. This is the existing speculative-path winner
+                // merge — duplicated here rather than factored out to
+                // keep this commit narrowly scoped.
+                let t_fin = Instant::now();
+                let storage = compact_storage.as_mut().unwrap();
+                let mut result_rows = Vec::with_capacity(winners.len());
+                let mut spec_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
+
+                for hash_key in winners {
+                    let global_idx = storage.alloc_group();
+                    spec_cd_sidecar.alloc_group();
+
+                    let mut key_source_worker: Option<usize> = None;
+                    for (wi, result) in partial_results.iter().enumerate() {
+                        if let Some(&worker_idx) = result.compact_map.get(&hash_key) {
+                            if key_source_worker.is_none() {
+                                key_source_worker = Some(wi);
+                            }
+                            for (slot_idx, _) in agg_specs.iter().enumerate() {
+                                let (_, kind) = storage.layout.slots[slot_idx];
+                                match kind {
+                                    CompactAccKind::Count => {
+                                        let wc = result.compact_storage.read_count(worker_idx, slot_idx);
+                                        *storage.count_mut(global_idx, slot_idx) += wc;
+                                    }
+                                    CompactAccKind::SumInt => {
+                                        let (ws, wc) = result.compact_storage.read_sum_int(worker_idx, slot_idx);
+                                        let (gs, gc) = storage.sum_int_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::SumIntNarrow => {
+                                        let (ws, wc) = result.compact_storage.read_sum_int_narrow(worker_idx, slot_idx);
+                                        let (gs, gc) = storage.sum_int_narrow_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::SumFloat => {
+                                        let (ws, wc) = result.compact_storage.read_sum_float(worker_idx, slot_idx);
+                                        let (gs, gc) = storage.sum_float_mut(global_idx, slot_idx);
+                                        *gs += ws;
+                                        *gc += wc;
+                                    }
+                                    CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                        let (w_off, w_len) = result.compact_storage.read_min_max_str(worker_idx, slot_idx);
+                                        if w_off != u32::MAX {
+                                            let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                            let (g_off, g_len) = storage.read_min_max_str(global_idx, slot_idx);
+                                            let should_update = if g_off == u32::MAX {
+                                                true
+                                            } else {
+                                                let g_str = storage.str_arena.get(g_off, g_len);
+                                                let cmp = collation_strcmp(w_str, g_str);
+                                                match kind {
+                                                    CompactAccKind::MinStr => cmp < 0,
+                                                    CompactAccKind::MaxStr => cmp > 0,
+                                                    _ => unreachable!(),
+                                                }
+                                            };
+                                            if should_update {
+                                                let w_str = result.compact_storage.str_arena.get(w_off, w_len);
+                                                let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                                storage.write_min_max_str(global_idx, slot_idx, new_off, new_len);
+                                            }
+                                        }
+                                    }
+                                    CompactAccKind::MinInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_min_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::MaxInt => {
+                                        let (w_val, w_has) = result.compact_storage.read_min_max_int(worker_idx, slot_idx);
+                                        if w_has { storage.update_max_int(global_idx, slot_idx, w_val); }
+                                    }
+                                    CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                                        spec_cd_sidecar.union_from(slot_idx, global_idx, &result.cd_sidecar, worker_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for e in &spec_cd_sidecar.entries {
+                        let count = e.count(global_idx);
+                        *storage.count_mut(global_idx, e.spec_idx) = count;
+                    }
+
+                    let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                        agg_results.push(compact_finalize(storage, global_idx, spec_idx, spec));
+                    }
+
+                    let source_wi = key_source_worker.unwrap();
+                    let source_gidx = *partial_results[source_wi].compact_map.get(&hash_key).unwrap();
+                    let mixed_ks = &partial_results[source_wi].mixed_keys;
+
+                    let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                    for entry in &output_map {
+                        match entry {
+                            OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                            OutputEntry::Group(gi) => {
+                                let kv = mixed_ks.get(source_gidx, *gi);
+                                match kv {
+                                    MixedKeyVal::Int(v) => {
+                                        if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                                            row.push((i128_to_numeric_datum(v as i128), false));
+                                        } else {
+                                            row.push((pg_sys::Datum::from(v as usize), false));
+                                        }
+                                    }
+                                    MixedKeyVal::Str(off, len) => {
+                                        let s = mixed_ks.arena.get(off, len);
+                                        let datum = string_to_datum(s, group_specs[*gi].type_oid);
+                                        row.push((datum, false));
+                                    }
+                                    MixedKeyVal::Null => {
+                                        row.push((pg_sys::Datum::from(0usize), true));
+                                    }
+                                }
+                            }
+                            OutputEntry::DerivedGroup { base_gi, delta } => {
+                                match mixed_ks.get(source_gidx, *base_gi) {
+                                    MixedKeyVal::Int(v) => row.push((pg_sys::Datum::from((v + delta) as usize), false)),
+                                    _ => row.push((pg_sys::Datum::from(0usize), true)),
+                                }
+                            }
+                            OutputEntry::Const(d, n) => row.push((*d, *n)),
+                        }
+                    }
+                    result_rows.push(row);
+                }
+                let finalize_us = t_fin.elapsed().as_micros() as u64;
+
+                let state = AggScanState {
+                    _agg_specs: agg_specs,
+                    _group_specs: group_specs,
+                    result_rows,
+                    result_idx: 0,
+                    _num_result_cols: num_result_cols,
+                    metadata_us,
+                    heap_scan_us,
+                    detoast_us: total_detoast_us,
+                    decompress_us,
+                    agg_us,
+                    total_segments,
+                    total_rows_processed,
+                    batch_quals_count: batch_quals.len(),
+                    where_quals_null: where_quals.is_null(),
+                    segments_metadata_resolved: 0,
+                    segments_decompressed: 0,
+                    regex_cache_size: 0,
+                    regex_cache_calls: 0,
+                    topn_limit: topn_limit as u64,
+                    topn_sort_col: -3, // derived sentinel — see explain.rs
+                    topn_ascending,
+                    pre_topn_groups: pre_topn_groups as u64,
+                    merge_us: 0,
+                    finalize_us,
+                    topn_select_us,
+                    n_workers: n_workers as u64,
+                    bare_limit: 0,
+                    wall_us: t_wall.elapsed().as_micros() as u64,
+                    buf_stats: super::segments::take_scan_buf_stats(),
+                    f8_preselected: 0,
+                    pscan: std::ptr::null_mut(),
+                    is_parallel_worker: false,
+                    exec_ctx: None,
+                };
+
+                let state_box = Box::new(state);
+                let state_ptr = Box::into_raw(state_box);
+                (*node).custom_ps = state_ptr as *mut pg_sys::List;
+                return;
+            }
 
             // ----------------------------------------------------------
             // Speculative top-N: merge-skip using pre-computed top-K
@@ -12012,6 +12298,7 @@ mod tests {
             topn_limit: 0,
             topn_sort_col: 0,
             topn_ascending: true,
+            derived_minmax_topn: None,
             bare_limit: 0,
             is_partial: false,
         }
