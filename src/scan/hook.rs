@@ -354,6 +354,14 @@ unsafe fn extract_order_by_attno(
         if members.is_null() {
             return None;
         }
+
+        // PG17 emitted an EquivalenceMember per partition child. PG18 only
+        // keeps the parent's Var — child rels have to walk back through
+        // `append_rel_list` to learn their parent relid before they can
+        // match. We accept either varno here so both versions work.
+        let rel_relid = (*rel).relid;
+        let parent_relid = parent_relid_from_appendrel(root, rel_relid);
+
         let nmembers = (*members).length;
         for i in 0..nmembers {
             let member = pg_sys::list_nth(members, i) as *const pg_sys::EquivalenceMember;
@@ -368,8 +376,35 @@ unsafe fn extract_order_by_attno(
                 continue;
             }
             let var = expr as *const pg_sys::Var;
-            if (*var).varno as u32 == (*rel).relid {
+            let varno = (*var).varno as u32;
+            if varno == rel_relid || Some(varno) == parent_relid {
                 return Some((*var).varattno);
+            }
+        }
+        None
+    }
+}
+
+/// Walks `root->append_rel_list` looking for an AppendRelInfo whose
+/// `child_relid` matches `rel_relid`, returning the corresponding parent
+/// relid. Returns `None` when `rel` is a top-level (non-child) rel.
+unsafe fn parent_relid_from_appendrel(
+    root: *mut pg_sys::PlannerInfo,
+    rel_relid: u32,
+) -> Option<u32> {
+    unsafe {
+        let list = (*root).append_rel_list;
+        if list.is_null() {
+            return None;
+        }
+        let len = (*list).length;
+        for i in 0..len {
+            let node = pg_sys::list_nth(list, i) as *const pg_sys::AppendRelInfo;
+            if node.is_null() {
+                continue;
+            }
+            if (*node).child_relid == rel_relid {
+                return Some((*node).parent_relid);
             }
         }
         None
