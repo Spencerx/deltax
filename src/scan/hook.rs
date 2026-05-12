@@ -330,9 +330,13 @@ unsafe fn check_time_pathkey(
     }
 }
 
-/// Extract the first ORDER BY column's attribute number from pathkeys.
-/// Returns the 1-based attno, or None if ORDER BY is not a simple column reference.
-unsafe fn extract_order_by_attno(root: *mut pg_sys::PlannerInfo) -> Option<i16> {
+/// Extract this relation's first ORDER BY column attribute number from pathkeys.
+/// Returns the 1-based attno, or None if ORDER BY is not a simple column
+/// reference on this relation.
+unsafe fn extract_order_by_attno(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+) -> Option<i16> {
     unsafe {
         let query_pathkeys = (*root).query_pathkeys;
         if query_pathkeys.is_null() || (*query_pathkeys).length == 0 {
@@ -364,7 +368,9 @@ unsafe fn extract_order_by_attno(root: *mut pg_sys::PlannerInfo) -> Option<i16> 
                 continue;
             }
             let var = expr as *const pg_sys::Var;
-            return Some((*var).varattno);
+            if (*var).varno as u32 == (*rel).relid {
+                return Some((*var).varattno);
+            }
         }
         None
     }
@@ -581,7 +587,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             // For Top-N, validate ORDER BY is a simple column reference.
             // Works for any column (time, text, numeric).
             let (append_topn_limit, append_sort_col_attno) = if effective_limit > 0 {
-                if let Some(attno) = extract_order_by_attno(root) {
+                if let Some(attno) = extract_order_by_attno(root, rel) {
                     (effective_limit, attno as i32)
                 } else {
                     (0, 0)
@@ -689,7 +695,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         // Top-N: enabled when ORDER BY is a simple column reference.
         // Works for any column (time, text, numeric).
         let (topn_effective_limit, topn_sort_col_attno) = if effective_limit > 0 {
-            if let Some(attno) = extract_order_by_attno(root) {
+            if let Some(attno) = extract_order_by_attno(root, rel) {
                 (effective_limit, attno as i32)
             } else {
                 (0, 0)

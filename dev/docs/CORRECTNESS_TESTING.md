@@ -350,6 +350,8 @@ Purpose:
 
 ### Session 9: Parallel and Planner Mode A/B
 
+Status: done.
+
 Datasets:
 
 - Reuse larger `segment_edges`, `aggregate_matrix`, and RTABench synthetic

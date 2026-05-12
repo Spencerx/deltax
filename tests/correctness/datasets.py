@@ -810,11 +810,14 @@ def create_aggregate_matrix_pair(
     segment_by: tuple[str, ...] = ("group_key",),
     order_by: tuple[str, ...] = ("ts", "id"),
     segment_size: int = 10,
+    row_count: int = 216,
 ) -> tuple[str, str]:
     """Create a numeric-heavy aggregate dataset and compress it."""
     plain_table = f"{deltax_table}_plain"
     segment_by_sql = ", ".join(f"'{column}'" for column in segment_by)
     order_by_sql = ", ".join(f"'{column}'" for column in order_by)
+    if row_count <= 0:
+        raise ValueError("row_count must be positive")
 
     conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
     for table_name in (plain_table, deltax_table):
@@ -864,7 +867,7 @@ def create_aggregate_matrix_pair(
             (i % 5) - 2 AS repeat_val,
             CASE WHEN i % 11 = 0 THEN NULL ELSE ((i % 41) - 20)::float8 / 7.0 END AS float_val,
             (i % 19) - 9 AS filter_val
-        FROM generate_series(0, 215) AS g(i)
+        FROM generate_series(0, {row_count - 1}) AS g(i)
     """
     conn.execute(insert_sql.format(table=plain_table))
     conn.execute(insert_sql.format(table=deltax_table))
@@ -1070,8 +1073,9 @@ def create_rtabench_synthetic_pair(
     direct_events = events
     tail_events: tuple[tuple, ...] = ()
     if mixed_uncompressed_tail:
-        direct_events = events[:-19]
-        tail_events = events[-19:]
+        tail_date = max(event[2].date() for event in events)
+        direct_events = tuple(event for event in events if event[2].date() != tail_date)
+        tail_events = tuple(event for event in events if event[2].date() == tail_date)
 
     if load_path == "copy_text":
         _copy_rtabench_events_deltax(
