@@ -330,9 +330,13 @@ unsafe fn check_time_pathkey(
     }
 }
 
-/// Extract the first ORDER BY column's attribute number from pathkeys.
-/// Returns the 1-based attno, or None if ORDER BY is not a simple column reference.
-unsafe fn extract_order_by_attno(root: *mut pg_sys::PlannerInfo) -> Option<i16> {
+/// Extract this relation's first ORDER BY column attribute number from pathkeys.
+/// Returns the 1-based attno, or None if ORDER BY is not a simple column
+/// reference on this relation.
+unsafe fn extract_order_by_attno(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+) -> Option<i16> {
     unsafe {
         let query_pathkeys = (*root).query_pathkeys;
         if query_pathkeys.is_null() || (*query_pathkeys).length == 0 {
@@ -350,6 +354,14 @@ unsafe fn extract_order_by_attno(root: *mut pg_sys::PlannerInfo) -> Option<i16> 
         if members.is_null() {
             return None;
         }
+
+        // PG17 emitted an EquivalenceMember per partition child. PG18 only
+        // keeps the parent's Var — child rels have to walk back through
+        // `append_rel_list` to learn their parent relid before they can
+        // match. We accept either varno here so both versions work.
+        let rel_relid = (*rel).relid;
+        let parent_relid = parent_relid_from_appendrel(root, rel_relid);
+
         let nmembers = (*members).length;
         for i in 0..nmembers {
             let member = pg_sys::list_nth(members, i) as *const pg_sys::EquivalenceMember;
@@ -364,7 +376,36 @@ unsafe fn extract_order_by_attno(root: *mut pg_sys::PlannerInfo) -> Option<i16> 
                 continue;
             }
             let var = expr as *const pg_sys::Var;
-            return Some((*var).varattno);
+            let varno = (*var).varno as u32;
+            if varno == rel_relid || Some(varno) == parent_relid {
+                return Some((*var).varattno);
+            }
+        }
+        None
+    }
+}
+
+/// Walks `root->append_rel_list` looking for an AppendRelInfo whose
+/// `child_relid` matches `rel_relid`, returning the corresponding parent
+/// relid. Returns `None` when `rel` is a top-level (non-child) rel.
+unsafe fn parent_relid_from_appendrel(
+    root: *mut pg_sys::PlannerInfo,
+    rel_relid: u32,
+) -> Option<u32> {
+    unsafe {
+        let list = (*root).append_rel_list;
+        if list.is_null() {
+            return None;
+        }
+        let len = (*list).length;
+        for i in 0..len {
+            let node = pg_sys::list_nth(list, i) as *const pg_sys::AppendRelInfo;
+            if node.is_null() {
+                continue;
+            }
+            if (*node).child_relid == rel_relid {
+                return Some((*node).parent_relid);
+            }
         }
         None
     }
@@ -372,24 +413,24 @@ unsafe fn extract_order_by_attno(root: *mut pg_sys::PlannerInfo) -> Option<i16> 
 
 /// Extract Top-N info (effective LIMIT + sort direction) from the parse tree.
 ///
-/// Returns `(effective_limit, sort_ascending, multi_col_sort)`:
+/// Returns `(effective_limit, sort_ascending, multi_col_sort, nulls_first)`:
 /// - effective_limit = 0 means Top-N is disabled
 /// - multi_col_sort = true when ORDER BY has multiple columns (first must be time)
 /// - Only enabled when LIMIT is a constant integer ≤ 10000 and ORDER BY matches time column
 unsafe fn extract_topn_info(
     root: *mut pg_sys::PlannerInfo,
     parse: *mut pg_sys::Query,
-) -> (i64, bool, bool) {
+) -> (i64, bool, bool, bool) {
     unsafe {
         if parse.is_null() {
-            return (0, true, false);
+            return (0, true, false, false);
         }
 
         // Scan-level top-N makes no sense for aggregate queries — the aggregate
         // needs all rows from the scan.  (The DeltaXAgg upper path has its own
         // top-N logic.)
         if (*parse).hasAggs || !(*parse).groupClause.is_null() {
-            return (0, true, false);
+            return (0, true, false, false);
         }
 
         // Extract LIMIT (constant integer only)
@@ -410,7 +451,7 @@ unsafe fn extract_topn_info(
         };
 
         if limit_count <= 0 {
-            return (0, true, false);
+            return (0, true, false, false);
         }
 
         // Extract OFFSET if present, add to limit
@@ -425,7 +466,7 @@ unsafe fn extract_topn_info(
                 }
             } else {
                 // Non-constant OFFSET — disable Top-N
-                return (0, true, false);
+                return (0, true, false, false);
             }
         } else {
             0
@@ -435,7 +476,7 @@ unsafe fn extract_topn_info(
 
         // Cap at 10000 — beyond that, overhead not worth it
         if effective_limit > 10000 {
-            return (0, true, false);
+            return (0, true, false, false);
         }
 
         // Check if ORDER BY has at least one pathkey and the first is the time column.
@@ -443,14 +484,14 @@ unsafe fn extract_topn_info(
         // skipping and threshold, PG's Sort node handles the full multi-column sort.
         let query_pathkeys = (*root).query_pathkeys;
         if query_pathkeys.is_null() || (*query_pathkeys).length < 1 {
-            return (0, true, false);
+            return (0, true, false, false);
         }
 
         let multi_col_sort = (*query_pathkeys).length > 1;
 
         let first_pk = pg_sys::list_nth(query_pathkeys, 0) as *mut pg_sys::PathKey;
         if first_pk.is_null() {
-            return (0, true, false);
+            return (0, true, false, false);
         }
 
         #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
@@ -464,10 +505,10 @@ unsafe fn extract_topn_info(
         let is_desc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_GT;
 
         if !is_asc && !is_desc {
-            return (0, true, false);
+            return (0, true, false, false);
         }
 
-        (effective_limit, is_asc, multi_col_sort)
+        (effective_limit, is_asc, multi_col_sort, (*first_pk).pk_nulls_first)
     }
 }
 
@@ -570,7 +611,8 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
 
         // Extract LIMIT/OFFSET from parse tree for Top-N optimization
         let parse = (*root).parse;
-        let (effective_limit, sort_ascending, multi_col_sort) = extract_topn_info(root, parse);
+        let (effective_limit, sort_ascending, multi_col_sort, topn_nulls_first) =
+            extract_topn_info(root, parse);
 
         // Check if this is the parent of a partitioned table (for DeltaXAppend)
         if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL
@@ -580,7 +622,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             // For Top-N, validate ORDER BY is a simple column reference.
             // Works for any column (time, text, numeric).
             let (append_topn_limit, append_sort_col_attno) = if effective_limit > 0 {
-                if let Some(attno) = extract_order_by_attno(root) {
+                if let Some(attno) = extract_order_by_attno(root, rel) {
                     (effective_limit, attno as i32)
                 } else {
                     (0, 0)
@@ -589,7 +631,17 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
                 (0, 0)
             };
             let append_multi_col = if append_topn_limit > 0 { multi_col_sort } else { false };
-            path::add_deltax_append_path(root, rel, &companion_oids, std::ptr::null_mut(), append_topn_limit, sort_ascending, append_multi_col, append_sort_col_attno);
+            path::add_deltax_append_path(
+                root,
+                rel,
+                &companion_oids,
+                std::ptr::null_mut(),
+                append_topn_limit,
+                sort_ascending,
+                append_multi_col,
+                append_sort_col_attno,
+                topn_nulls_first,
+            );
 
             // Partial-path variant for PG parallel query. Top-N pushdown is
             // suppressed because per-worker top-N would be incorrect without
@@ -678,7 +730,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         // Top-N: enabled when ORDER BY is a simple column reference.
         // Works for any column (time, text, numeric).
         let (topn_effective_limit, topn_sort_col_attno) = if effective_limit > 0 {
-            if let Some(attno) = extract_order_by_attno(root) {
+            if let Some(attno) = extract_order_by_attno(root, rel) {
                 (effective_limit, attno as i32)
             } else {
                 (0, 0)
@@ -689,7 +741,17 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
 
         // Add the custom decompress path
         let topn_multi_col = if topn_effective_limit > 0 { multi_col_sort } else { false };
-        path::add_decompress_path(root, rel, companion_oid, pathkeys, topn_effective_limit, sort_ascending, topn_multi_col, topn_sort_col_attno);
+        path::add_decompress_path(
+            root,
+            rel,
+            companion_oid,
+            pathkeys,
+            topn_effective_limit,
+            sort_ascending,
+            topn_multi_col,
+            topn_sort_col_attno,
+            topn_nulls_first,
+        );
     }
 }
 

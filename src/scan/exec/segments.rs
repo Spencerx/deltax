@@ -581,6 +581,7 @@ pub(super) struct MetadataInfo {
     pub(super) col_names: Vec<String>,
     pub(super) col_types: Vec<pg_sys::Oid>,
     pub(super) col_typmods: Vec<i32>,
+    pub(super) col_not_null: Vec<bool>,
     pub(super) segment_by: Vec<String>,
     pub(super) order_by: Vec<String>,
     pub(super) time_column: String,
@@ -651,7 +652,7 @@ pub(super) fn load_metadata(
     // Get column info from the parent table (pg_attribute gives us atttypmod)
     let col_result = client
         .select(
-            "SELECT a.attname::text, t.typname::text, a.atttypmod
+            "SELECT a.attname::text, t.typname::text, a.atttypmod, a.attnotnull
              FROM pg_attribute a
              JOIN pg_type t ON a.atttypid = t.oid
              JOIN pg_class c ON a.attrelid = c.oid
@@ -667,13 +668,16 @@ pub(super) fn load_metadata(
     let mut col_names = Vec::new();
     let mut col_type_names = Vec::new();
     let mut col_typmods = Vec::new();
+    let mut col_not_null = Vec::new();
     for row in col_result {
         let name: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
         let type_name: String = row.get_datum_by_ordinal(2).unwrap().value::<String>().unwrap().unwrap();
         let typmod: i32 = row.get_datum_by_ordinal(3).unwrap().value::<i32>().unwrap().unwrap_or(-1);
+        let not_null: bool = row.get_datum_by_ordinal(4).unwrap().value::<bool>().unwrap().unwrap_or(false);
         col_names.push(name);
         col_type_names.push(type_name);
         col_typmods.push(typmod);
+        col_not_null.push(not_null);
     }
 
     let col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
@@ -682,6 +686,7 @@ pub(super) fn load_metadata(
         col_names,
         col_types,
         col_typmods,
+        col_not_null,
         segment_by,
         order_by,
         time_column,
