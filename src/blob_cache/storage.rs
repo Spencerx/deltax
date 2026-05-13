@@ -130,7 +130,8 @@ struct BlobCacheCtl {
 }
 
 /// Per-shard metadata. The bucket array lives in DSA (lazily allocated
-/// on first use).
+/// on first use). LRU head/tail also live here and are maintained under
+/// the shard's exclusive LWLock by inserts and evictions.
 #[repr(C)]
 struct Shard {
     /// dsa_pointer to a `[u64; BUCKETS_PER_SHARD]` of bucket heads
@@ -145,11 +146,20 @@ struct Shard {
 
     /// Per-shard byte usage (sum of entry data_len for this shard).
     bytes_used: AtomicU64,
+
+    /// dsa_pointer to the most-recently-inserted entry (MRU end of the
+    /// LRU list), or 0 if the shard is empty. Mutated only under the
+    /// shard's exclusive LWLock.
+    lru_head: AtomicU64,
+
+    /// dsa_pointer to the oldest entry (LRU end), or 0 if empty.
+    /// Eviction walks backwards from here.
+    lru_tail: AtomicU64,
 }
 
 const _: () = {
     // Catch accidental size blowups at compile time.
-    assert!(std::mem::size_of::<Shard>() == 24);
+    assert!(std::mem::size_of::<Shard>() == 40);
 };
 
 /// Entry header. Lives in DSA memory, preceded by `data_len` bytes of
@@ -170,16 +180,26 @@ struct Entry {
     _pad3: u32,
 
     /// Snapshot of `BlobCacheCtl::last_used_counter` at last hit/insert.
-    /// Used for LRU eviction sampling.
+    /// Recorded for observability; eviction uses LRU list order, not
+    /// this value, so it's safe to update under SHARED lock.
     last_used: AtomicU64,
 
     /// dsa_pointer to next entry in the same bucket chain (0 = end).
     bucket_next: AtomicU64,
+
+    /// dsa_pointer to the next-newer entry in the shard's LRU list,
+    /// or 0 if this entry is at the head (MRU). Mutated only under
+    /// the shard's exclusive LWLock.
+    lru_prev: AtomicU64,
+
+    /// dsa_pointer to the next-older entry, or 0 if at the tail (LRU).
+    lru_next: AtomicU64,
 }
 
 const _: () = {
-    // 16 bytes key+pad, 16 data ptr/len/pad, 8 pin+pad, 8 last_used, 8 next.
-    assert!(std::mem::size_of::<Entry>() == 56);
+    // 16 bytes key+pad, 16 data ptr/len/pad, 8 pin+pad, 8 last_used,
+    // 8 bucket_next, 8 lru_prev, 8 lru_next.
+    assert!(std::mem::size_of::<Entry>() == 72);
 };
 
 // ---------------------------------------------------------------------------
@@ -333,13 +353,6 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
             return;
         }
 
-        let max_bytes = ctl.max_bytes.load(Ordering::Relaxed);
-        let cur = ctl.total_bytes.load(Ordering::Relaxed);
-        if cur.saturating_add(bytes.len() as u64) > max_bytes {
-            ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
         let h = hash_key(key);
         let shard_idx = ((h >> 8) as usize) & (n_shards - 1);
         let bucket_idx = (h as u32) & (BUCKETS_PER_SHARD - 1);
@@ -380,35 +393,81 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
             entry_dp = (*entry).bucket_next.load(Ordering::Acquire);
         }
 
-        // Allocate Entry + data payload.
+        // Capacity / allocation loop. Eviction can be triggered by two
+        // signals: (a) our soft accounting (`total_bytes + needed >
+        // max_bytes`) and (b) DSA itself returning InvalidDsaPointer for
+        // the actual allocation. (b) matters because DSA has per-page /
+        // per-allocation overhead that's not reflected in `total_bytes`,
+        // so the cap can be hit before our accounting catches it. We
+        // evict and retry until either both allocations succeed or
+        // there's nothing left to evict.
+        let max_bytes = ctl.max_bytes.load(Ordering::Relaxed);
+        let needed = bytes.len() as u64;
         let entry_size = std::mem::size_of::<Entry>();
-        let new_entry_dp = pg_sys::dsa_allocate_extended(
-            area,
-            entry_size,
-            (pg_sys::DSA_ALLOC_ZERO | pg_sys::DSA_ALLOC_NO_OOM) as i32,
-        );
-        if new_entry_dp == 0 {
-            pg_sys::LWLockRelease(lock);
-            ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+        let new_entry_dp: u64;
+        let data_dp: u64;
+        loop {
+            // Soft cap check first — fastest path.
+            let cur = ctl.total_bytes.load(Ordering::Relaxed);
+            if cur.saturating_add(needed) > max_bytes {
+                let to_free = cur.saturating_add(needed).saturating_sub(max_bytes);
+                let freed = evict_in_shard(ctl, area, shard, shard_idx, to_free);
+                if freed == 0 {
+                    // Nothing to evict (empty or all pinned). v1 bails;
+                    // neighbour-shard fallback is v2.
+                    pg_sys::LWLockRelease(lock);
+                    ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                continue;
+            }
 
-        let data_dp = pg_sys::dsa_allocate_extended(
-            area,
-            bytes.len(),
-            pg_sys::DSA_ALLOC_NO_OOM as i32,
-        );
-        if data_dp == 0 {
-            pg_sys::dsa_free(area, new_entry_dp);
-            pg_sys::LWLockRelease(lock);
-            ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
-            return;
+            // Try the actual allocations.
+            let entry_alloc = pg_sys::dsa_allocate_extended(
+                area,
+                entry_size,
+                (pg_sys::DSA_ALLOC_ZERO | pg_sys::DSA_ALLOC_NO_OOM) as i32,
+            );
+            if entry_alloc == 0 {
+                // DSA exhausted despite soft cap saying we're OK. Free
+                // some entries and retry. Target a chunk larger than
+                // the entry so we make real progress.
+                let freed = evict_in_shard(ctl, area, shard, shard_idx, (entry_size as u64).max(4096));
+                if freed == 0 {
+                    pg_sys::LWLockRelease(lock);
+                    ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                continue;
+            }
+
+            let data_alloc = pg_sys::dsa_allocate_extended(
+                area,
+                bytes.len(),
+                pg_sys::DSA_ALLOC_NO_OOM as i32,
+            );
+            if data_alloc == 0 {
+                pg_sys::dsa_free(area, entry_alloc);
+                let freed = evict_in_shard(ctl, area, shard, shard_idx, needed);
+                if freed == 0 {
+                    pg_sys::LWLockRelease(lock);
+                    ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                continue;
+            }
+
+            // Both allocations succeeded.
+            new_entry_dp = entry_alloc;
+            data_dp = data_alloc;
+            break;
         }
         let data_ptr = pg_sys::dsa_get_address(area, data_dp) as *mut u8;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, bytes.len());
 
         // Initialise the entry. dsa_allocate_extended with DSA_ALLOC_ZERO
-        // already zeroed the memory, so atomics start at 0.
+        // already zeroed the memory, so atomics start at 0 (including
+        // lru_prev / lru_next; lru_prepend overwrites them).
         let entry = entry_ptr_mut(new_entry_dp);
         (*entry).key = *key;
         (*entry).data_ptr.store(data_dp, Ordering::Release);
@@ -420,6 +479,9 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
         let prev_head = bucket_head(buckets_dp, bucket_idx);
         (*entry).bucket_next.store(prev_head, Ordering::Release);
         bucket_head_store(buckets_dp, bucket_idx, new_entry_dp);
+
+        // Prepend to LRU list (MRU end).
+        lru_prepend(shard, new_entry_dp, entry);
 
         shard.n_entries.fetch_add(1, Ordering::Relaxed);
         shard.bytes_used
@@ -748,5 +810,157 @@ unsafe fn bucket_head_store(buckets_dp: u64, idx: u32, value: u64) {
     unsafe {
         let buckets = pg_sys::dsa_get_address(dsa_area_ptr(), buckets_dp) as *mut AtomicU64;
         (*buckets.add(idx as usize)).store(value, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LRU list maintenance + eviction
+//
+// All four helpers below require the caller to hold the relevant shard's
+// exclusive LWLock. Concurrent readers (under SHARED) only read entry
+// fields they're known to be touching (bucket_next via Acquire, pin_count
+// via AcqRel), and they cannot see partial LRU mutations because the
+// shared/exclusive lock pair serialises us against any new bucket walks.
+// ---------------------------------------------------------------------------
+
+/// Push `new_entry_dp` onto the MRU end of the shard's LRU list.
+/// Caller holds the shard's exclusive lock.
+#[inline]
+unsafe fn lru_prepend(shard: &Shard, new_entry_dp: u64, new_entry: *mut Entry) {
+    unsafe {
+        let old_head = shard.lru_head.load(Ordering::Acquire);
+        (*new_entry).lru_prev.store(0, Ordering::Release);
+        (*new_entry).lru_next.store(old_head, Ordering::Release);
+        if old_head != 0 {
+            let old_head_ptr = entry_ptr(old_head);
+            (*old_head_ptr).lru_prev.store(new_entry_dp, Ordering::Release);
+        } else {
+            // List was empty — new entry is also the tail.
+            shard.lru_tail.store(new_entry_dp, Ordering::Release);
+        }
+        shard.lru_head.store(new_entry_dp, Ordering::Release);
+    }
+}
+
+/// Splice `target_dp` out of the shard's LRU list. Caller holds the
+/// shard's exclusive lock.
+#[inline]
+unsafe fn unlink_from_lru(shard: &Shard, target_dp: u64, target: *mut Entry) {
+    unsafe {
+        let prev_dp = (*target).lru_prev.load(Ordering::Acquire);
+        let next_dp = (*target).lru_next.load(Ordering::Acquire);
+
+        if prev_dp != 0 {
+            let prev = entry_ptr(prev_dp);
+            (*prev).lru_next.store(next_dp, Ordering::Release);
+        } else {
+            // Target was the head.
+            shard.lru_head.store(next_dp, Ordering::Release);
+        }
+
+        if next_dp != 0 {
+            let next = entry_ptr(next_dp);
+            (*next).lru_prev.store(prev_dp, Ordering::Release);
+        } else {
+            // Target was the tail.
+            shard.lru_tail.store(prev_dp, Ordering::Release);
+        }
+
+        // Defensive: clear the target's own links so a stale read can't
+        // walk back into the list. The entry's about to be dsa_free'd.
+        let _ = target_dp;
+        (*target).lru_prev.store(0, Ordering::Relaxed);
+        (*target).lru_next.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Remove `target_dp` from its bucket chain. Caller holds the shard's
+/// exclusive lock and has already computed `bucket_idx` from the entry's
+/// key.
+#[inline]
+unsafe fn unlink_from_bucket(buckets_dp: u64, bucket_idx: u32, target_dp: u64) {
+    unsafe {
+        let head = bucket_head(buckets_dp, bucket_idx);
+        if head == target_dp {
+            let target = entry_ptr(target_dp);
+            let next = (*target).bucket_next.load(Ordering::Acquire);
+            bucket_head_store(buckets_dp, bucket_idx, next);
+            return;
+        }
+        let mut cursor_dp = head;
+        while cursor_dp != 0 {
+            let cursor = entry_ptr(cursor_dp);
+            let next_dp = (*cursor).bucket_next.load(Ordering::Acquire);
+            if next_dp == target_dp {
+                let target = entry_ptr(target_dp);
+                let target_next = (*target).bucket_next.load(Ordering::Acquire);
+                (*cursor).bucket_next.store(target_next, Ordering::Release);
+                return;
+            }
+            cursor_dp = next_dp;
+        }
+        // Not found — invariant broken. We leak the entry rather than
+        // corrupt the chain further; counters will be slightly off.
+        debug_assert!(false, "evicted entry not found in bucket chain");
+    }
+}
+
+/// Evict unpinned entries from the tail of `shard`'s LRU list until at
+/// least `bytes_needed` worth of payload bytes have been freed or there
+/// are no more candidates. Caller holds the shard's exclusive lock.
+/// Returns the number of payload bytes actually freed.
+unsafe fn evict_in_shard(
+    ctl: &BlobCacheCtl,
+    area: *mut pg_sys::dsa_area,
+    shard: &Shard,
+    _shard_idx: usize,
+    bytes_needed: u64,
+) -> u64 {
+    unsafe {
+        let mut freed: u64 = 0;
+        let buckets_dp = shard.bucket_array.load(Ordering::Acquire);
+        let mut cur = shard.lru_tail.load(Ordering::Acquire);
+        while freed < bytes_needed && cur != 0 {
+            let entry = entry_ptr(cur);
+            // Capture predecessor before potential free.
+            let prev = (*entry).lru_prev.load(Ordering::Acquire);
+
+            if (*entry).pin_count.load(Ordering::Acquire) == 0 {
+                // Unlink from the bucket chain. The shard's bucket_array
+                // must exist if there are any entries; assert in debug.
+                debug_assert!(buckets_dp != 0);
+                let key = (*entry).key;
+                let h = hash_key(&key);
+                let bucket_idx = (h as u32) & (BUCKETS_PER_SHARD - 1);
+                unlink_from_bucket(buckets_dp, bucket_idx, cur);
+
+                // Unlink from LRU list.
+                unlink_from_lru(shard, cur, entry);
+
+                // Capture sizing + ptrs before freeing.
+                let dlen = (*entry).data_len as u64;
+                let dptr = (*entry).data_ptr.load(Ordering::Acquire);
+
+                // Free DSA allocations.
+                if dptr != 0 {
+                    pg_sys::dsa_free(area, dptr);
+                }
+                pg_sys::dsa_free(area, cur);
+
+                // Counters: per-shard first, then global. Relaxed is
+                // sufficient — the lock around us provides the only
+                // ordering guarantee we need.
+                shard.bytes_used.fetch_sub(dlen, Ordering::Relaxed);
+                shard.n_entries.fetch_sub(1, Ordering::Relaxed);
+                ctl.total_bytes.fetch_sub(dlen, Ordering::Relaxed);
+                ctl.n_entries.fetch_sub(1, Ordering::Relaxed);
+                ctl.evictions_total.fetch_add(1, Ordering::Relaxed);
+                freed = freed.saturating_add(dlen);
+            }
+            // Pinned entries are skipped — they stay in the LRU list and
+            // get re-evaluated on the next eviction round.
+            cur = prev;
+        }
+        freed
     }
 }

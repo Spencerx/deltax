@@ -105,13 +105,34 @@ Together those changes fit in `src/blob_cache/storage.rs`:
   `misses_total=1`, `hits_total=1` after the second scan, no
   crashes. Root causes were the two DSA gotchas documented in [DSA:
   what bit us, and the fix](#dsa-what-bit-us-and-the-fix).
+- `DSA_ALLOC_NO_OOM` flag on every `dsa_allocate_extended` call
+  (2026-05-13). Without it, DSA throws `ereport(ERROR)` on
+  out-of-space ("Failed on DSA request of size 56") and kills the
+  query. With it, insert just returns gracefully — letting eviction
+  or the insert-failure counter take over.
+- **Per-shard LRU eviction (2026-05-13).** Each `Shard` carries
+  `lru_head` / `lru_tail` dsa_pointers; each `Entry` has
+  `lru_prev` / `lru_next` pointers. Inserts prepend at the head;
+  evictions walk from the tail skipping pinned entries (`pin_count >
+  0`). Two eviction triggers: (a) `total_bytes + needed > max_bytes`
+  (soft cap), (b) `dsa_allocate_extended` returning 0 (DSA itself
+  is out of space — happens before soft cap because of DSA's
+  per-page overhead). On either trigger, `insert` evicts and retries
+  in a loop until both allocations succeed or there's nothing left
+  to evict locally. Verified end-to-end: 50 random-bytes tables
+  (~5 MB blobs total) against a 4 MB cache + 1 shard → 91 evictions,
+  0 insert failures.
 
 ### Remaining
 
-1. **Eviction.** Currently `insert` drops the new entry when
-   `total_bytes + new > max_bytes` (bumping `insert_failures_total`).
-   First iteration acceptable for JSONBench (1GB > working set).
-   Production needs LRU with neighbour-shard fallback and pin-skip.
+1. **Neighbour-shard eviction fallback (v2).** With the default
+   64 shards and a hash-distributed key, a target shard can be empty
+   when eviction is needed; `insert` then bumps
+   `insert_failures_total` (~38 out of 50 attempts in a stress test
+   on 4 MB / 64 shards). In practice, large caches with thousands of
+   entries per shard rarely hit this. When the rate justifies it,
+   try shards `±1, ±2, ...` with `LWLockConditionalAcquire` (avoids
+   deadlock without strict lock ordering).
 2. **`dshash` substitute already in place.** pgrx 0.17 doesn't
    expose `dshash_*` so the implementation uses a custom per-shard
    fixed-bucket hashmap (`BUCKETS_PER_SHARD = 256`, separate chaining
