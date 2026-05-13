@@ -357,7 +357,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
             let new_dp = pg_sys::dsa_allocate_extended(
                 area,
                 nbytes,
-                pg_sys::DSA_ALLOC_ZERO as i32,
+                (pg_sys::DSA_ALLOC_ZERO | pg_sys::DSA_ALLOC_NO_OOM) as i32,
             );
             if new_dp == 0 {
                 pg_sys::LWLockRelease(lock);
@@ -385,7 +385,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
         let new_entry_dp = pg_sys::dsa_allocate_extended(
             area,
             entry_size,
-            pg_sys::DSA_ALLOC_ZERO as i32,
+            (pg_sys::DSA_ALLOC_ZERO | pg_sys::DSA_ALLOC_NO_OOM) as i32,
         );
         if new_entry_dp == 0 {
             pg_sys::LWLockRelease(lock);
@@ -396,7 +396,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
         let data_dp = pg_sys::dsa_allocate_extended(
             area,
             bytes.len(),
-            0,
+            pg_sys::DSA_ALLOC_NO_OOM as i32,
         );
         if data_dp == 0 {
             pg_sys::dsa_free(area, new_entry_dp);
