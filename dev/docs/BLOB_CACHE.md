@@ -122,6 +122,17 @@ Together those changes fit in `src/blob_cache/storage.rs`:
   to evict locally. Verified end-to-end: 50 random-bytes tables
   (~5 MB blobs total) against a 4 MB cache + 1 shard → 91 evictions,
   0 insert failures.
+- **EXPLAIN ANALYZE shows per-query cache stats (2026-05-14).**
+  Both `DeltaXAgg` and `DeltaXDecompress` custom scan nodes now
+  emit a `DeltaX Blob Cache: hits=H misses=M bytes_served=B` line
+  whenever `H + M > 0`. The counters live on `ScanTiming` and on
+  `ScanTimingShmem` so parallel workers fold their per-process
+  counts into the leader's total via the existing
+  `flush_timing_to_shmem` path. `DetoastLazyStats` returned by
+  `detoast_lazy_blobs` and `detoast_lazy_blobs_selective` is now
+  consumed at every call site (10 in `decompress.rs`, 10 in
+  `agg.rs`). Example output on a warm 2nd scan of a 30k-row text
+  table: `DeltaX Blob Cache: hits=1 misses=0 bytes_served=1263144`.
 
 ### Remaining
 
@@ -138,13 +149,17 @@ Together those changes fit in `src/blob_cache/storage.rs`:
    fixed-bucket hashmap (`BUCKETS_PER_SHARD = 256`, separate chaining
    through `Entry::bucket_next`). Acceptable for the working set
    sizes we have; reconsider if buckets get long under churn.
-3. **ScanTiming/AggScanState wiring.** `DetoastLazyStats` returned
-   by the lazy-detoast helpers; call sites currently discard. Fold
-   into per-state timing and aggregate across workers via
-   `ScanTimingShmem`.
+3. **`to_vec()` elimination (Phase 5).** Cache-hit path currently
+   does `pin.as_slice().to_vec()` — a memcpy of the cached bytes
+   into a backend-heap `Vec<u8>`. Measurement on JSONBench Q4/Q5
+   showed ~1 ms/blob spent in this copy; eliminating it (borrow
+   directly from the pin) would roughly double the cache's warm
+   savings on detoast-dominated queries. Low-risk because pin
+   lifetime is already guaranteed by `cached_blob_pins`.
 4. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
    concurrent-insert races; parametrise `tests/test_parallel_scan.py`
-   over `blob_cache_mb`.
+   over `blob_cache_mb`. Needs a separate-container fixture since
+   `blob_cache_mb` is Postmaster-context.
 5. **Bench validation** on JSONBench + ClickBench EC2.
 
 ### Codebase findings that simplify the original plan

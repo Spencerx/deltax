@@ -2937,10 +2937,10 @@ pub(super) unsafe fn detoast_lazy_blobs_selective(
 /// Per-call counters returned by the lazy-detoast helpers. Callers fold
 /// these into their `ScanTiming` so the totals show up in EXPLAIN.
 #[derive(Copy, Clone, Default, Debug)]
-pub(super) struct DetoastLazyStats {
-    pub(super) cache_hits: u64,
-    pub(super) cache_misses: u64,
-    pub(super) cache_bytes_served: u64,
+pub(crate) struct DetoastLazyStats {
+    pub(crate) cache_hits: u64,
+    pub(crate) cache_misses: u64,
+    pub(crate) cache_bytes_served: u64,
 }
 
 /// Extract segment pruning filters from the plan qual (raw expression tree).
