@@ -3829,6 +3829,7 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
                 col_minmax: std::collections::HashMap::new(),
                 col_sums: std::collections::HashMap::new(),
                 toast_pointers: vec![Vec::new(); num_blob_cols],
+                cached_blob_pins: Vec::new(),
             });
         }
         state.segments_data = segments_data;

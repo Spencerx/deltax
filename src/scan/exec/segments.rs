@@ -638,6 +638,12 @@ pub(super) struct SegmentData {
     /// detoast_lazy_blobs() to materialize". Empty means already detoasted or
     /// not needed.
     pub(super) toast_pointers: Vec<Vec<u8>>,
+    /// Pins for blobs served from the shared blob cache. Holding these pins
+    /// guarantees the underlying DSA-backed bytes outlive every read of
+    /// `compressed_blobs` (including parallel-worker reads, since detoast
+    /// runs on the leader before worker dispatch and segments are owned by
+    /// the leader's `DecompressState`). Released automatically on drop.
+    pub(super) cached_blob_pins: Vec<crate::blob_cache::BlobCachePin>,
 }
 
 // SAFETY: SegmentData is shared across threads only via immutable references
@@ -1284,6 +1290,7 @@ pub(super) unsafe fn load_segments_heap(
                 col_minmax,
                 col_sums,
                 toast_pointers,
+                cached_blob_pins: Vec::new(),
             });
         }
 
@@ -2797,30 +2804,74 @@ pub(super) unsafe fn fetch_segment_blobs(
     t_start.elapsed().as_micros() as u64
 }
 
+/// Materialize a single blob slot from the cache (on hit) or via
+/// `pg_detoast_datum` (on miss). On miss, the freshly-detoasted bytes
+/// are also inserted into the cache best-effort.
+///
+/// Returns `(bytes_served_from_cache, hit)`. `hit` is true when the
+/// blob came from the cache; the caller can use this to bump per-query
+/// stats counters.
+unsafe fn detoast_blob_slot(seg: &mut SegmentData, bi: usize) -> (u64, bool) {
+    unsafe {
+        let key = crate::blob_cache::BlobCacheKey::new(
+            seg.companion_oid,
+            seg.segment_id,
+            bi,
+        );
+        if let Some(pin) = crate::blob_cache::get_pinned(&key) {
+            let slice = pin.as_slice();
+            let len = slice.len() as u64;
+            // The pipeline still expects `Vec<u8>` in `compressed_blobs`.
+            // The `to_vec()` is the targeted follow-up (BLOB_CACHE.md Phase 5);
+            // until then we copy out and keep the pin alive for the
+            // query's lifetime via `cached_blob_pins`.
+            seg.compressed_blobs[bi] = slice.to_vec();
+            seg.toast_pointers[bi].clear();
+            seg.cached_blob_pins.push(pin);
+            return (len, true);
+        }
+
+        let ptr = seg.toast_pointers[bi].as_ptr() as *mut pg_sys::varlena;
+        let detoasted = pg_sys::pg_detoast_datum(ptr);
+        let len = pgrx::varsize_any_exhdr(detoasted);
+        let data = pgrx::vardata_any(detoasted);
+        #[allow(clippy::unnecessary_cast)]
+        let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+        if detoasted != ptr {
+            pg_sys::pfree(detoasted as *mut _);
+        }
+        crate::blob_cache::insert(&key, &bytes);
+        seg.compressed_blobs[bi] = bytes;
+        seg.toast_pointers[bi].clear();
+        (0, false)
+    }
+}
+
 /// Materialize deferred TOAST pointers for a segment.
 ///
 /// For each blob index that has a non-empty toast_pointer, calls pg_detoast_datum
 /// on the stored pointer copy and replaces the empty compressed_blob with the
 /// detoasted data. Clears the toast_pointer after detoasting.
-pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) {
+///
+/// Returns the [`DetoastLazyStats`] aggregated over all blobs that were
+/// materialised on this call.
+pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) -> DetoastLazyStats {
+    let mut stats = DetoastLazyStats::default();
     unsafe {
         for bi in 0..seg.toast_pointers.len() {
             if seg.toast_pointers[bi].is_empty() {
                 continue;
             }
-            let ptr = seg.toast_pointers[bi].as_ptr() as *mut pg_sys::varlena;
-            let detoasted = pg_sys::pg_detoast_datum(ptr);
-            let len = pgrx::varsize_any_exhdr(detoasted);
-            let data = pgrx::vardata_any(detoasted);
-            #[allow(clippy::unnecessary_cast)]
-            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
-            if detoasted != ptr {
-                pg_sys::pfree(detoasted as *mut _);
+            let (bytes_from_cache, hit) = detoast_blob_slot(seg, bi);
+            if hit {
+                stats.cache_hits += 1;
+                stats.cache_bytes_served += bytes_from_cache;
+            } else {
+                stats.cache_misses += 1;
             }
-            seg.compressed_blobs[bi] = bytes;
-            seg.toast_pointers[bi].clear();
         }
     }
+    stats
 }
 
 /// Materialize deferred TOAST pointers for specific blob indices only.
@@ -2828,25 +2879,35 @@ pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) {
 /// Like `detoast_lazy_blobs` but only processes the given blob indices,
 /// leaving other blobs lazy. Used in top-N Phase 1 to detoast only
 /// filter + sort column blobs while deferring Phase 2 columns.
-pub(super) unsafe fn detoast_lazy_blobs_selective(seg: &mut SegmentData, blob_indices: &[usize]) {
+pub(super) unsafe fn detoast_lazy_blobs_selective(
+    seg: &mut SegmentData,
+    blob_indices: &[usize],
+) -> DetoastLazyStats {
+    let mut stats = DetoastLazyStats::default();
     unsafe {
         for &bi in blob_indices {
             if bi >= seg.toast_pointers.len() || seg.toast_pointers[bi].is_empty() {
                 continue;
             }
-            let ptr = seg.toast_pointers[bi].as_ptr() as *mut pg_sys::varlena;
-            let detoasted = pg_sys::pg_detoast_datum(ptr);
-            let len = pgrx::varsize_any_exhdr(detoasted);
-            let data = pgrx::vardata_any(detoasted);
-            #[allow(clippy::unnecessary_cast)]
-            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
-            if detoasted != ptr {
-                pg_sys::pfree(detoasted as *mut _);
+            let (bytes_from_cache, hit) = detoast_blob_slot(seg, bi);
+            if hit {
+                stats.cache_hits += 1;
+                stats.cache_bytes_served += bytes_from_cache;
+            } else {
+                stats.cache_misses += 1;
             }
-            seg.compressed_blobs[bi] = bytes;
-            seg.toast_pointers[bi].clear();
         }
     }
+    stats
+}
+
+/// Per-call counters returned by the lazy-detoast helpers. Callers fold
+/// these into their `ScanTiming` so the totals show up in EXPLAIN.
+#[derive(Copy, Clone, Default, Debug)]
+pub(super) struct DetoastLazyStats {
+    pub(super) cache_hits: u64,
+    pub(super) cache_misses: u64,
+    pub(super) cache_bytes_served: u64,
 }
 
 /// Extract segment pruning filters from the plan qual (raw expression tree).

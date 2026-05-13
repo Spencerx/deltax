@@ -1,9 +1,81 @@
 # Blob cache — shared-memory cache for detoasted compressed blobs
 
-> **Status: design proposal (2026-05).** Not started. This doc captures the
-> design, trade-offs, and implementation plan at the level of detail needed
-> to pick it up and ship without rediscovering things. Builds on the
-> findings in PARALLEL_AGG.md about where time goes on JSONBench warm runs.
+> **Status: Phase 1 scaffolding landed (2026-05-13).** Module structure,
+> public API, GUCs, integration point in `detoast_lazy_blobs`, and pin
+> lifetime are all in place; the storage backend
+> (`src/blob_cache/storage.rs`) is a stub that always misses. The actual
+> shmem-backed implementation (DSA + dshash + sharded LWLocks + LRU +
+> eviction) is the remaining ~1–1.5 weeks of focused work. See
+> [Implementation status](#implementation-status) below.
+
+## Implementation status
+
+### Done (2026-05-13)
+
+- GUCs `pg_deltax.blob_cache_mb` (default `1024`) and
+  `pg_deltax.blob_cache_shards` (default `64`) registered in `_PG_init`.
+  Context is `Postmaster` for both since the shmem reservation is
+  decided at startup.
+- Module `blob_cache` (`src/blob_cache/mod.rs`, `src/blob_cache/storage.rs`).
+  Public API in `mod.rs`: `BlobCacheKey`, `BlobCachePin` (Drop-based pin
+  release), `BlobCacheStats`, `get_pinned`, `insert`, `stats`,
+  `register_hooks`, `configured_bytes`, `configured_shards`. All
+  `unsafe` / raw PG-binding code is confined to `storage.rs`.
+- Integration site wired: `detoast_lazy_blobs` and
+  `detoast_lazy_blobs_selective` in `src/scan/exec/segments.rs` now try
+  the cache first, fall back to `pg_detoast_datum`, and insert on miss.
+  Both functions return a new `DetoastLazyStats` (cache_hits /
+  cache_misses / cache_bytes_served) for EXPLAIN aggregation.
+- `SegmentData` carries a `cached_blob_pins: Vec<BlobCachePin>`. Pins
+  live until `end_custom_scan` drops `DecompressState`, guaranteeing the
+  DSA bytes outlive every read of `compressed_blobs` (including
+  worker-thread reads, since detoast runs on the leader before
+  `std::thread::scope` dispatch).
+- Build green on PG 17 (default). `make clippy` clean on new code.
+  All 382 pgrx unit tests still pass.
+
+### Remaining
+
+1. **Storage backend in `src/blob_cache/storage.rs`** — the hard part.
+   - `shmem_request_hook` (PG 15+) / `RequestAddinShmemSpace` (PG 14)
+     in `_PG_init` reserving the control struct and an LWLock tranche
+     named `pg_deltax_blob_cache`.
+   - `shmem_startup_hook` that runs once: `ShmemInitStruct` the control
+     block, `dsa_create_in_place` the area (initial size
+     `min(blob_cache_mb, 256 MiB)`), `dshash_create` with a custom
+     hash over `BlobCacheKey`.
+   - Sharded LRU intrusive list whose `prev`/`next` pointers are
+     `dsa_pointer`s (since list nodes live in DSA memory).
+   - Size-class rounding (16/32/64/128/256/512KB, 1MB).
+   - Pin counting on `AtomicU16` inside each `BlobCacheEntry`.
+   - Eviction with neighbour-shard fallback when the local shard's tail
+     is fully pinned.
+2. **ScanTiming/AggScanState wiring.** `DetoastLazyStats` is already
+   returned by the lazy-detoast helpers; call sites currently discard.
+   Fold into the per-state timing struct and aggregate across parallel
+   workers via the existing `ScanTimingShmem` path.
+3. **`pg_deltax_blob_cache_stats()` SRF.** Small once `stats()` returns
+   real data.
+4. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
+   concurrent-insert races; parametrise `tests/test_parallel_scan.py`
+   over `blob_cache_mb`.
+5. **Bench validation** on JSONBench + ClickBench EC2.
+
+### Codebase findings that simplify the original plan
+
+- **`companion_oid` is already on `SegmentData`**, set in
+  `begin_deltax_append` before any detoast happens. The original
+  proposal threaded it through `detoast_lazy_blobs(seg, companion_oid)`;
+  in practice we just read `seg.companion_oid`. No signature change at
+  call sites.
+- **Workers do not call `detoast_lazy_blobs`** — detoast runs on the
+  leader before `std::thread::scope` worker dispatch (in
+  `load_next_segment` and the Top-N paths in
+  `src/scan/exec/decompress.rs`). Workers consume the already-populated
+  `seg.compressed_blobs`. So the cache lookup/insert and pin lifetime
+  live entirely on the leader; no cross-thread pin bookkeeping needed.
+- **No prior shmem hooks** in pg_deltax — we're the first user, so
+  registration is a plain installation rather than chaining.
 
 ## Why
 
@@ -361,13 +433,19 @@ positive on warm subset. Sanity check: no regression on cold runs.
 
 Each phase is a self-contained PR that compiles and passes tests.
 
-**Phase 1 (3-4 days): bootstrap + scaffolding**
-- `shmem_request_hook`, `shmem_startup_hook` registered.
-- Control struct, DSA + dshash created.
-- GUC `pg_deltax.blob_cache_mb` (default 0).
-- `blob_cache::{get_pinned, insert}` stubs that always miss (no
-  storage yet).
-- Tests: extension loads, GUC visible, no crash, no behaviour change.
+**Phase 1 (landed 2026-05-13): bootstrap + scaffolding**
+- ~~`shmem_request_hook`, `shmem_startup_hook` registered.~~
+  Deferred to the storage backend; `register_hooks` exists and is
+  called from `_PG_init` but is currently a no-op stub.
+- ~~Control struct, DSA + dshash created.~~ Deferred to storage backend.
+- GUCs `pg_deltax.blob_cache_mb` (default `1024`) and
+  `pg_deltax.blob_cache_shards` (default `64`) registered.
+- `blob_cache::{get_pinned, insert}` stubs that always miss — done.
+- `BlobCachePin` with Drop-based pin release — done; `SegmentData`
+  carries `cached_blob_pins`.
+- `detoast_lazy_blobs` / `detoast_lazy_blobs_selective` integrated
+  with cache (miss path is identical to old behaviour).
+- Build clean, clippy clean on new code, 382 unit tests pass.
 
 **Phase 2 (3-4 days): functional cache**
 - DSA allocation, size-class buckets, LRU per shard, pinning.
