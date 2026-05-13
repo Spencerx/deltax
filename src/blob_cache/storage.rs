@@ -52,9 +52,12 @@ use super::{BlobCacheKey, BlobCacheStats};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Initial in-place DSA chunk size. Small (1 MiB) — the DSA grows from
-/// here by allocating DSM segments up to the configured limit.
-const DSA_INITIAL_BYTES: usize = 1024 * 1024;
+// We reserve the full `blob_cache_mb` of named shmem up front and
+// create an in-place DSA inside it. This avoids DSM dynamic-growth
+// gymnastics (which need a fully-up DSM subsystem and proper
+// dsm_segment registration that's awkward from shmem_startup_hook).
+// Trade-off: the user's `blob_cache_mb` becomes a hard shmem
+// reservation at postmaster start.
 
 /// Maximum number of shards we provision space for. The actual number
 /// in use is taken from `configured_shards()`; unused slots are zeroed.
@@ -81,8 +84,10 @@ struct BlobCacheCtl {
     /// `1` afterwards. Other backends spin on this until it flips.
     initialized: AtomicU32,
 
-    /// DSA handle (dsm_handle is u32; widened to u64 for atomic ergonomics).
-    dsa_handle: AtomicU64,
+    /// `1` once `dsa_create_in_place` has succeeded in postmaster
+    /// and the in-place chunk is ready for backend `dsa_attach_in_place`.
+    /// Backends treat `0` as "DSA unavailable, fall back to no-cache".
+    dsa_ready: AtomicU32,
 
     /// LWLock tranche id assigned by `GetNamedLWLockTranche`.
     lwlock_tranche_id: AtomicI32,
@@ -109,6 +114,12 @@ struct BlobCacheCtl {
     misses_total: AtomicU64,
     evictions_total: AtomicU64,
     insert_failures_total: AtomicU64,
+
+    /// Our own LWLock storage. Each shard has one LWLock, padded to a
+    /// cache line by `LWLockPadded`. We allocate inline rather than via
+    /// `RequestNamedLWLockTranche` so we control initialization
+    /// explicitly via `LWLockInitialize` in shmem_startup_hook.
+    shard_locks: [pg_sys::LWLockPadded; MAX_SHARDS],
 
     shards: [Shard; MAX_SHARDS],
 }
@@ -320,7 +331,6 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
         let max_bytes = ctl.max_bytes.load(Ordering::Relaxed);
         let cur = ctl.total_bytes.load(Ordering::Relaxed);
         if cur.saturating_add(bytes.len() as u64) > max_bytes {
-            // No eviction yet — drop the insert.
             ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -449,19 +459,13 @@ pub(super) fn register_hooks() {
     RESERVATION_SHARDS.store(shards as u32, Ordering::Relaxed);
 
     if bytes == 0 {
-        // Cache disabled — skip shmem registration entirely so we don't
-        // reserve memory we'll never use.
         return;
     }
 
     unsafe {
         #[cfg(feature = "pg14")]
         {
-            // PG 14 has no shmem_request_hook; the request calls must
-            // happen during _PG_init while the postmaster is still
-            // setting up shmem.
             pg_sys::RequestAddinShmemSpace(reservation_total_bytes(shards));
-            pg_sys::RequestNamedLWLockTranche(SHMEM_NAME.as_ptr(), shards as i32);
         }
         #[cfg(not(feature = "pg14"))]
         {
@@ -487,7 +491,6 @@ unsafe extern "C-unwind" fn my_shmem_request_hook() {
             return;
         }
         pg_sys::RequestAddinShmemSpace(reservation_total_bytes(shards));
-        pg_sys::RequestNamedLWLockTranche(SHMEM_NAME.as_ptr(), shards as i32);
     }
 }
 
@@ -509,61 +512,48 @@ unsafe extern "C-unwind" fn my_shmem_startup_hook() {
             &mut found as *mut bool,
         );
         if block.is_null() {
-            // Postmaster will have already errored; nothing to do.
             return;
         }
         let ctl = block as *mut BlobCacheCtl;
-        let dsa_chunk = (block as *mut u8).add(std::mem::size_of::<BlobCacheCtl>());
 
         if !found {
-            // Zero-initialise then set the fields we care about. ShmemInitStruct
-            // hands back uninitialized memory the first time.
             std::ptr::write_bytes(ctl, 0, 1);
             (*ctl).n_shards.store(shards as u32, Ordering::Relaxed);
             (*ctl).max_bytes
                 .store(RESERVATION_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
 
-            // Get the tranche id (the LWLocks themselves are initialised
-            // by PG core because we called RequestNamedLWLockTranche).
-            // We only stash the tranche id in shmem — the LWLockPadded*
-            // pointer must be re-fetched in each backend so PG can
-            // register the tranche name in the backend-local lookup.
-            let pad = pg_sys::GetNamedLWLockTranche(SHMEM_NAME.as_ptr());
-            if !pad.is_null() {
-                let tranche_id = (*pad).lock.tranche as i32;
-                (*ctl).lwlock_tranche_id.store(tranche_id, Ordering::Relaxed);
+            // Allocate a private LWLock tranche id and register the
+            // tranche name. The locks themselves live inline in
+            // BlobCacheCtl::shard_locks (already zero-initialised by
+            // write_bytes above); we call LWLockInitialize on each one.
+            let tranche_id = pg_sys::LWLockNewTrancheId();
+            (*ctl).lwlock_tranche_id.store(tranche_id, Ordering::Relaxed);
+            pg_sys::LWLockRegisterTranche(tranche_id, SHMEM_NAME.as_ptr());
+            for i in 0..shards {
+                pg_sys::LWLockInitialize(
+                    &mut (*ctl).shard_locks[i].lock,
+                    tranche_id,
+                );
             }
 
-            // Create the DSA in place. The tranche id is the same as the
-            // shard LWLock tranche — DSA uses LWLocks internally and
-            // expects a tranche id we own.
-            //
-            // The returned `*dsa_area` is process-local: it points into
-            // the postmaster's heap. We deliberately do NOT stash it in
-            // `DSA_AREA_PTR` here — each backend must call
-            // `dsa_attach_in_place` itself to get its own handle.
-            let dsa_tranche_id = (*ctl).lwlock_tranche_id.load(Ordering::Relaxed);
+            // Create the DSA in place inside the named shmem block we
+            // just reserved. The chunk is sized to the full
+            // `blob_cache_mb` so the DSA never needs to grow. Backends
+            // attach via `dsa_attach_in_place(dsa_chunk, NULL)`.
+            let dsa_chunk = (block as *mut u8).add(std::mem::size_of::<BlobCacheCtl>());
+            let dsa_size = RESERVATION_BYTES.load(Ordering::Relaxed) as usize;
             let area = dsa_create_in_place_compat(
                 dsa_chunk as *mut std::ffi::c_void,
-                DSA_INITIAL_BYTES,
-                dsa_tranche_id,
+                dsa_size,
+                tranche_id,
             );
             if !area.is_null() {
                 pg_sys::dsa_pin(area);
-                pg_sys::dsa_set_size_limit(
-                    area,
-                    RESERVATION_BYTES.load(Ordering::Relaxed) as usize,
-                );
-                let handle = pg_sys::dsa_get_handle(area);
-                (*ctl).dsa_handle.store(handle as u64, Ordering::Release);
+                (*ctl).dsa_ready.store(1, Ordering::Release);
             }
             (*ctl).initialized.store(1, Ordering::Release);
         }
 
-        // CTL_PTR lives in shmem at the same address in all processes,
-        // so it's safe to inherit via OnceLock across fork. (Even if
-        // backends end up re-resolving it via ShmemInitStruct in
-        // `attach()`, the result is identical.)
         let _ = CTL_PTR.set(ctl as usize);
         CACHE_USABLE.store(true, Ordering::Release);
     }
@@ -603,12 +593,10 @@ fn attach() -> bool {
     if DSA_AREA_PTR.get().is_none() {
         unsafe {
             let ctl = ctl_ref();
-            // Wait briefly if another backend is still initialising.
             while ctl.initialized.load(Ordering::Acquire) == 0 {
                 std::hint::spin_loop();
             }
-            let handle = ctl.dsa_handle.load(Ordering::Acquire);
-            if handle == 0 {
+            if ctl.dsa_ready.load(Ordering::Acquire) == 0 {
                 return false;
             }
             let block = *CTL_PTR.get().unwrap() as *mut u8;
@@ -626,11 +614,16 @@ fn attach() -> bool {
     }
     if LWLOCK_BASE_PTR.get().is_none() {
         unsafe {
-            let pad = pg_sys::GetNamedLWLockTranche(SHMEM_NAME.as_ptr());
-            if pad.is_null() {
-                return false;
-            }
-            let _ = LWLOCK_BASE_PTR.set(pad as usize);
+            let ctl = ctl_ref();
+            // Each backend re-registers the tranche name so it shows
+            // up in error messages and pg_stat_activity. The id was
+            // assigned in postmaster's shmem_startup_hook.
+            let tranche_id = ctl.lwlock_tranche_id.load(Ordering::Relaxed);
+            pg_sys::LWLockRegisterTranche(tranche_id, SHMEM_NAME.as_ptr());
+            let base = (*CTL_PTR.get().unwrap() as *mut BlobCacheCtl) as *mut u8;
+            let off = std::mem::offset_of!(BlobCacheCtl, shard_locks);
+            let lock_array = base.add(off) as *mut pg_sys::LWLockPadded;
+            let _ = LWLOCK_BASE_PTR.set(lock_array as usize);
         }
     }
     true
@@ -640,15 +633,18 @@ fn attach() -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn reservation_total_bytes(n_shards: usize) -> usize {
-    let _ = n_shards; // currently fixed-size; kept for future variable layout.
-    std::mem::size_of::<BlobCacheCtl>() + DSA_INITIAL_BYTES
+fn reservation_total_bytes(_n_shards: usize) -> usize {
+    // Full in-place DSA chunk reserved up front so it never needs to
+    // grow at runtime. Sized to `blob_cache_mb` (captured at startup
+    // in RESERVATION_BYTES).
+    std::mem::size_of::<BlobCacheCtl>() + RESERVATION_BYTES.load(Ordering::Relaxed) as usize
 }
 
-/// Cross-version wrapper for `dsa_create_in_place`. PG 17+ replaced the
-/// 4-arg `dsa_create_in_place` with the 6-arg `dsa_create_in_place_ext`
-/// that additionally takes an initial and maximum segment size; passing
-/// `0` for both means "use PG's defaults".
+/// Cross-version wrapper for `dsa_create_in_place`. PG 17+ renamed it
+/// to `dsa_create_in_place_ext` and added init/max segment size knobs.
+/// Since we size the in-place chunk to the full cache and don't want
+/// growth, we pass `0,0` so PG uses sensible defaults if it ever does
+/// fall back to growth.
 unsafe fn dsa_create_in_place_compat(
     place: *mut std::ffi::c_void,
     size: usize,

@@ -1,14 +1,18 @@
 # Blob cache — shared-memory cache for detoasted compressed blobs
 
-> **Status: storage backend wired up, runtime debug pending (2026-05-13).**
-> Module structure, public API, GUCs, shmem registration, DSA creation,
-> sharded hashmap, pin counting, integration in three detoast sites,
-> and the `pg_deltax_blob_cache_stats()` SRF are all in place. Hooks
-> verified firing in postmaster (`register_hooks` + `shmem_startup_hook`
-> log at startup). Backend-side `attach()` currently fails for reasons
-> TBD — likely an issue with `dsa_attach_in_place` or a missed setup
-> step in the forked backend; needs a debug session with diagnostic
-> logs re-enabled. No eviction yet (insert drops when full).
+> **Status: lookup path working, insert crashes in `dsa_allocate_extended` (2026-05-13).**
+> Module structure, public API, GUCs, shmem registration, in-place DSA
+> creation (full `blob_cache_mb` reserved up front), per-backend
+> `dsa_attach_in_place`, inline-storage LWLocks initialised via
+> `LWLockInitialize`, sharded hashmap framework, pin counting, integration
+> in three detoast sites, and the `pg_deltax_blob_cache_stats()` SRF are
+> all in place. `get_pinned` traverses correctly and returns `None` for
+> misses without crashing. The first `insert` then segfaults inside
+> `dsa_allocate_extended` — postmaster's `dsa_create_in_place_ext`
+> returns a non-null area, backend's `dsa_attach_in_place` returns a
+> non-null area, the LWLock is acquired, but the actual DSA allocation
+> crashes. Next session: debug the DSA crash with gdb or by switching
+> to lazy DSM-backed `dsa_create` on first backend access.
 
 ## Implementation status
 
