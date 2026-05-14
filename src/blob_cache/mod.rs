@@ -179,3 +179,23 @@ fn pg_deltax_blob_cache_stats() -> TableIterator<
         s.insert_failures_total as i64,
     ))
 }
+
+/// Per-shard breakdown for diagnostics. Walks every shard's LRU list,
+/// counts entries with pin_count > 0 vs == 0, and reports the LRU
+/// tail pointer. Used to debug why evictions might not be firing.
+#[pg_extern]
+fn pg_deltax_blob_cache_shard_stats() -> TableIterator<
+    'static,
+    (
+        name!(shard_id, i32),
+        name!(n_entries, i64),
+        name!(bytes_used, i64),
+        name!(lru_walk_count, i64),
+        name!(pinned_count, i64),
+        name!(unpinned_count, i64),
+        name!(lru_head_dp, i64),
+        name!(lru_tail_dp, i64),
+    ),
+> {
+    TableIterator::new(storage::shard_diag().into_iter())
+}

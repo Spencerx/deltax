@@ -494,6 +494,53 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
     }
 }
 
+/// Per-shard diagnostic snapshot. Walks each shard's LRU list under
+/// shared lock and reports counts. Slow; only for debugging.
+pub(super) fn shard_diag() -> Vec<(i32, i64, i64, i64, i64, i64, i64, i64)> {
+    let mut out: Vec<(i32, i64, i64, i64, i64, i64, i64, i64)> = Vec::new();
+    if !CACHE_USABLE.load(Ordering::Acquire) || !attach() {
+        return out;
+    }
+    unsafe {
+        let ctl = ctl_ref();
+        let n_shards = ctl.n_shards.load(Ordering::Relaxed) as usize;
+        for i in 0..n_shards {
+            let shard = &ctl.shards[i];
+            let lock = shard_lwlock(i);
+            pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_SHARED);
+            let head_dp = shard.lru_head.load(Ordering::Acquire);
+            let tail_dp = shard.lru_tail.load(Ordering::Acquire);
+            let n_entries = shard.n_entries.load(Ordering::Relaxed) as i64;
+            let bytes_used = shard.bytes_used.load(Ordering::Relaxed) as i64;
+            let mut walk: i64 = 0;
+            let mut pinned: i64 = 0;
+            let mut unpinned: i64 = 0;
+            let mut cur = tail_dp;
+            // Safety stop: don't walk longer than n_entries (catches loops).
+            let max_walk = (n_entries.max(0) as u64).saturating_add(8) as i64;
+            while cur != 0 && walk < max_walk {
+                let entry = entry_ptr(cur);
+                if (*entry).pin_count.load(Ordering::Acquire) == 0 {
+                    unpinned += 1;
+                } else {
+                    pinned += 1;
+                }
+                walk += 1;
+                cur = (*entry).lru_prev.load(Ordering::Acquire);
+            }
+            pg_sys::LWLockRelease(lock);
+            // Only include shards with state to keep output small.
+            if n_entries > 0 || head_dp != 0 || tail_dp != 0 {
+                out.push((
+                    i as i32, n_entries, bytes_used, walk, pinned, unpinned,
+                    head_dp as i64, tail_dp as i64,
+                ));
+            }
+        }
+    }
+    out
+}
+
 pub(super) fn stats() -> BlobCacheStats {
     if !CACHE_USABLE.load(Ordering::Acquire) || !attach() {
         return BlobCacheStats {
