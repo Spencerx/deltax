@@ -186,7 +186,7 @@ def test_prepared_time_ranges_match_plain_postgres(partition_segment_edges, db):
     )
     db.execute(
         f"""
-        PREPARE deltax_partition_range(timestamptz, timestamptz) AS
+        PREPARE deltax.deltax_partition_range(timestamptz, timestamptz) AS
         SELECT id, ts, bucket, val, payload
         FROM {deltax_table}
         WHERE ts >= $1 AND ts < $2
@@ -199,7 +199,7 @@ def test_prepared_time_ranges_match_plain_postgres(partition_segment_edges, db):
             f"EXECUTE plain_partition_range('{lo}'::timestamptz, '{hi}'::timestamptz)"
         ).fetchall()
         deltax_rows = db.execute(
-            f"EXECUTE deltax_partition_range('{lo}'::timestamptz, '{hi}'::timestamptz)"
+            f"EXECUTE deltax.deltax_partition_range('{lo}'::timestamptz, '{hi}'::timestamptz)"
         ).fetchall()
         assert plain_rows == deltax_rows, range_name
 
@@ -261,7 +261,7 @@ def test_partition_edge_compressed_partition_rejects_dml(partition_segment_edges
     partition_name = db.execute(
         f"""
         SELECT partition_name
-        FROM deltax_partition_info('{deltax_table}')
+        FROM deltax.deltax_partition_info('{deltax_table}')
         WHERE is_compressed
         ORDER BY partition_name
         LIMIT 1
@@ -307,9 +307,9 @@ def test_two_day_partition_interval_boundaries_match_plain_postgres(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('two_day_edges', 'ts', '2 days'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('two_day_edges', 'ts', '2 days'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'two_day_edges', segment_by => ARRAY['bucket'], "
         "order_by => ARRAY['ts', 'id'], segment_size => 3)"
     )
@@ -331,14 +331,14 @@ def test_two_day_partition_interval_boundaries_match_plain_postgres(db):
     partitions = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('two_day_edges')
+        FROM deltax.deltax_partition_info('two_day_edges')
         WHERE range_start >= '2025-01-14 00:00:00+00'
           AND range_start < '2025-01-18 00:00:00+00'
         ORDER BY partition_name
         """
     ).fetchall()
     for (partition_name,) in partitions:
-        db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+        db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     db.execute("ANALYZE two_day_edges_plain")
     db.execute("ANALYZE two_day_edges")
 

@@ -215,7 +215,7 @@ pub fn ensure_future_partitions(
 
         // Check if partition already registered
         let exists = client.select(
-            "SELECT 1 FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
+            "SELECT 1 FROM deltax.deltax_partition WHERE schema_name = $1 AND table_name = $2",
             None,
             &[ht.schema_name.as_str().into(), part_name.as_str().into()],
         )?;
@@ -598,7 +598,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
     // Find partitions eligible for dropping: range_end < now() - drop_after
     let eligible = client
         .select(
-            "SELECT schema_name, table_name, is_compressed FROM deltax_partition
+            "SELECT schema_name, table_name, is_compressed FROM deltax.deltax_partition
              WHERE deltatable_id = $1 AND range_end < $2::timestamptz - $3::interval",
             None,
             &[ht.id.into(), now.into(), (*drop_after).into()],
@@ -659,7 +659,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
         // Remove from catalog
         client
             .update(
-                "DELETE FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
+                "DELETE FROM deltax.deltax_partition WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema.as_str().into(), name.as_str().into()],
             )

@@ -47,7 +47,7 @@ pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
             Spi::connect_mut(|client| {
                 // Skip if the extension hasn't been installed yet (catalog tables missing)
                 let has_catalog = client.select(
-                    "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'deltax_deltatable'",
+                    "SELECT 1 FROM pg_tables WHERE schemaname = 'deltax' AND tablename = 'deltax_deltatable'",
                     None,
                     &[],
                 ).map(|r| !r.is_empty()).unwrap_or(false);

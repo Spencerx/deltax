@@ -72,7 +72,7 @@ def test_codec_matrix_prepared_predicates_match_plain_postgres(codec_matrix, db,
     )
     db.execute(
         f"""
-        PREPARE deltax_codec_predicates(text, integer, bigint) AS
+        PREPARE deltax.deltax_codec_predicates(text, integer, bigint) AS
         SELECT id, dict_text, small_int, int_val, large_int, unique_text
         FROM {deltax_table}
         WHERE dict_text IS NOT DISTINCT FROM $1
@@ -87,6 +87,6 @@ def test_codec_matrix_prepared_predicates_match_plain_postgres(codec_matrix, db,
         f"EXECUTE plain_codec_predicates({dict_literal}, {small_int}, {large_int})"
     ).fetchall()
     deltax_rows = db.execute(
-        f"EXECUTE deltax_codec_predicates({dict_literal}, {small_int}, {large_int})"
+        f"EXECUTE deltax.deltax_codec_predicates({dict_literal}, {small_int}, {large_int})"
     ).fetchall()
     assert plain_rows == deltax_rows

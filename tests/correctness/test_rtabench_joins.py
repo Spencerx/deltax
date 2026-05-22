@@ -47,7 +47,7 @@ def test_rtabench_synthetic_compression_happened(rtabench_synthetic, db):
     compressed = db.execute(
         f"""
         SELECT count(*)
-        FROM deltax_compression_stats('{deltax_table}')
+        FROM deltax.deltax_compression_stats('{deltax_table}')
         WHERE is_compressed = true
           AND row_count > 0
         """
@@ -208,7 +208,7 @@ def test_rtabench_prepared_parameterized_join_matches_plain_postgres(rtabench_sy
     )
     db.execute(
         f"""
-        PREPARE deltax_rtabench_join(text, integer, integer, timestamptz, timestamptz) AS
+        PREPARE deltax.deltax_rtabench_join(text, integer, integer, timestamptz, timestamptz) AS
         SELECT o.customer_id, oe.event_type, count(*) AS events, max(oe.event_created) AS latest_event
         FROM orders o
         JOIN {deltax_table} oe ON oe.order_id = o.order_id
@@ -236,7 +236,7 @@ def test_rtabench_prepared_parameterized_join_matches_plain_postgres(rtabench_sy
         ).fetchall()
         deltax_rows = db.execute(
             f"""
-            EXECUTE deltax_rtabench_join(
+            EXECUTE deltax.deltax_rtabench_join(
                 '{event_type}',
                 {lo},
                 {hi},
