@@ -186,7 +186,7 @@ def test_prepared_time_ranges_match_plain_postgres(partition_segment_edges, db):
     )
     db.execute(
         f"""
-        PREPARE deltax.deltax_partition_range(timestamptz, timestamptz) AS
+        PREPARE deltax_partition_range(timestamptz, timestamptz) AS
         SELECT id, ts, bucket, val, payload
         FROM {deltax_table}
         WHERE ts >= $1 AND ts < $2
@@ -199,7 +199,7 @@ def test_prepared_time_ranges_match_plain_postgres(partition_segment_edges, db):
             f"EXECUTE plain_partition_range('{lo}'::timestamptz, '{hi}'::timestamptz)"
         ).fetchall()
         deltax_rows = db.execute(
-            f"EXECUTE deltax.deltax_partition_range('{lo}'::timestamptz, '{hi}'::timestamptz)"
+            f"EXECUTE deltax_partition_range('{lo}'::timestamptz, '{hi}'::timestamptz)"
         ).fetchall()
         assert plain_rows == deltax_rows, range_name
 

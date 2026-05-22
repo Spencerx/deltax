@@ -42,7 +42,7 @@ def test_tiny_events_prepared_statement_matches_plain_postgres(tiny_events, db):
     )
     db.execute(
         f"""
-        PREPARE deltax.deltax_tiny_range(timestamptz, timestamptz, integer) AS
+        PREPARE deltax_tiny_range(timestamptz, timestamptz, integer) AS
         SELECT id, ts, device_id, kind, val, metric
         FROM {deltax_table}
         WHERE ts >= $1
@@ -61,7 +61,7 @@ def test_tiny_events_prepared_statement_matches_plain_postgres(tiny_events, db):
             f"EXECUTE plain_tiny_range('{lo}'::timestamptz, '{hi}'::timestamptz, {device_id})"
         ).fetchall()
         deltax_rows = db.execute(
-            f"EXECUTE deltax.deltax_tiny_range('{lo}'::timestamptz, '{hi}'::timestamptz, {device_id})"
+            f"EXECUTE deltax_tiny_range('{lo}'::timestamptz, '{hi}'::timestamptz, {device_id})"
         ).fetchall()
         comparison = compare("float_tolerant", plain_rows, deltax_rows)
         assert comparison.ok, (lo, hi, device_id, comparison.detail)
