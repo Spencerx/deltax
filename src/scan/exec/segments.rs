@@ -1,10 +1,11 @@
+use pgrx::pg_guard;
 use pgrx::pg_sys;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use super::batch_qual::{BatchCompareOp, BatchQual, LikeStrategy, sql_like_match};
-use super::datum_utils::{pg_type_oid, tupdesc_get_attr};
+use super::datum_utils::tupdesc_get_attr;
 use crate::compress::{encode_f32_to_i64, encode_f64_to_i64};
 use crate::compression;
 
@@ -315,6 +316,170 @@ unsafe fn detoast_varlena_to_vec(varlena_ptr: *mut pg_sys::varlena) -> Vec<u8> {
             pg_sys::pfree(detoasted as *mut _);
         }
         bytes
+    }
+}
+
+/// Fast path for point lookups on a NOT NULL numeric column whose min/max
+/// stats live in `_colstats`: return candidate segments directly from the
+/// `(_col_idx, _min, _max)` btree without scanning the partition `_meta` heap.
+unsafe fn lookup_point_segments_by_minmax_index(
+    colstats_oid: pg_sys::Oid,
+    col_idx: i16,
+    value: i64,
+    num_blob_cols: usize,
+) -> Option<Vec<SegmentData>> {
+    unsafe {
+        let cs_rel = pg_sys::table_open(colstats_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        let mut minmax_idx_oid = pg_sys::InvalidOid;
+        let index_list = pg_sys::RelationGetIndexList(cs_rel);
+        if !index_list.is_null() {
+            let n = (*index_list).length;
+            for i in 0..n {
+                let idx_oid = (*(*index_list).elements.add(i as usize)).oid_value;
+                let idx_rel =
+                    pg_sys::index_open(idx_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let info = (*idx_rel).rd_index;
+                let is_target = if !info.is_null() {
+                    let is_primary = (*info).indisprimary;
+                    let nkeys = (*info).indnkeyatts as usize;
+                    if !is_primary && nkeys >= 3 {
+                        let indkey = (*info).indkey.values.as_ptr();
+                        *indkey.add(0) == 1 && *indkey.add(1) == 3 && *indkey.add(2) == 4
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                if is_target {
+                    minmax_idx_oid = idx_oid;
+                    break;
+                }
+            }
+            pg_sys::list_free(index_list);
+        }
+
+        if minmax_idx_oid == pg_sys::InvalidOid {
+            pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        }
+
+        let cs_tupdesc = (*cs_rel).rd_att;
+        let cs_natts = (*cs_tupdesc).natts as usize;
+        let mut sid_att: Option<usize> = None;
+        let mut max_att: Option<usize> = None;
+        let mut nonnull_att: Option<usize> = None;
+        for i in 0..cs_natts {
+            let att = &*tupdesc_get_attr(cs_tupdesc, i);
+            if att.attisdropped {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr()).to_string_lossy();
+            match name.as_ref() {
+                "_segment_id" => sid_att = Some(i),
+                "_max" => max_att = Some(i),
+                "_nonnull_count" => nonnull_att = Some(i),
+                _ => {}
+            }
+        }
+        let (Some(sid_att), Some(max_att), Some(nonnull_att)) = (sid_att, max_att, nonnull_att)
+        else {
+            pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        };
+
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let idx_rel =
+            pg_sys::index_open(minmax_idx_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let slot = pg_sys::table_slot_create(cs_rel, std::ptr::null_mut());
+
+        let mut skey = [pg_sys::ScanKeyData::default(); 2];
+        pg_sys::ScanKeyInit(
+            &mut skey[0],
+            1,
+            pg_sys::BTEqualStrategyNumber as u16,
+            pg_sys::F_INT2EQ.into(),
+            pg_sys::Datum::from(col_idx),
+        );
+        pg_sys::ScanKeyInit(
+            &mut skey[1],
+            2,
+            pg_sys::BTLessEqualStrategyNumber as u16,
+            pg_sys::F_INT8LE.into(),
+            pg_sys::Datum::from(value as usize),
+        );
+
+        #[cfg(feature = "pg17")]
+        let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, 2, 0);
+        #[cfg(feature = "pg18")]
+        let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
+        pg_sys::index_rescan(scan, skey.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
+
+        let mut segments = Vec::new();
+        loop {
+            if !pg_sys::index_getnext_slot(scan, pg_sys::ScanDirection::ForwardScanDirection, slot)
+            {
+                break;
+            }
+            pg_sys::slot_getallattrs(slot);
+            let tts_values = (*slot).tts_values;
+            let tts_isnull = (*slot).tts_isnull;
+            if *tts_isnull.add(sid_att) || *tts_isnull.add(max_att) || *tts_isnull.add(nonnull_att)
+            {
+                continue;
+            }
+            let max_v = (*tts_values.add(max_att)).value() as i64;
+            if max_v < value {
+                continue;
+            }
+            let segment_id = (*tts_values.add(sid_att)).value() as i32;
+            let row_count = (*tts_values.add(nonnull_att)).value() as i32;
+            let mut compressed_blobs: Vec<BlobBytes> = Vec::with_capacity(num_blob_cols);
+            compressed_blobs.resize_with(num_blob_cols, BlobBytes::default);
+            segments.push(SegmentData {
+                companion_oid: pg_sys::InvalidOid,
+                segment_id,
+                segment_values: Vec::new(),
+                compressed_blobs,
+                text_length_blobs: vec![Vec::new(); num_blob_cols],
+                row_count,
+                min_time: None,
+                max_time: None,
+                col_minmax: HashMap::new(),
+                col_sums: HashMap::new(),
+                toast_pointers: vec![Vec::new(); num_blob_cols],
+                cached_blob_pins: Vec::new(),
+            });
+        }
+
+        pg_sys::index_endscan(scan);
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        Some(segments)
+    }
+}
+
+unsafe fn reltuples_as_u64(rel_oid: pg_sys::Oid) -> Option<u64> {
+    unsafe {
+        let tuple = pg_sys::SearchSysCache1(
+            pg_sys::SysCacheIdentifier::RELOID as i32,
+            pg_sys::ObjectIdGetDatum(rel_oid),
+        );
+        if tuple.is_null() {
+            return None;
+        }
+        let rel_form = pg_sys::GETSTRUCT(tuple) as pg_sys::Form_pg_class;
+        let reltuples = (*rel_form).reltuples;
+        pg_sys::ReleaseSysCache(tuple);
+        if reltuples > 0.0 {
+            Some(reltuples.round() as u64)
+        } else {
+            None
+        }
     }
 }
 
@@ -781,6 +946,7 @@ unsafe impl Send for SegmentData {}
 unsafe impl Sync for SegmentData {}
 
 /// Metadata returned by the SPI metadata query.
+#[derive(Clone)]
 pub(super) struct MetadataInfo {
     pub(super) col_names: Vec<String>,
     pub(super) col_types: Vec<pg_sys::Oid>,
@@ -826,6 +992,69 @@ pub(super) struct MetadataInfo {
 // query duration). No worker writes to these fields.
 unsafe impl Send for MetadataInfo {}
 unsafe impl Sync for MetadataInfo {}
+
+thread_local! {
+    /// Backend-local cache: companion (`_meta`) table OID → MetadataInfo.
+    /// Populated lazily by `load_metadata_cached`. Cleared wholesale on any
+    /// relcache invalidation (see `metadata_relcache_callback`) — that
+    /// covers ALTER TABLE on the parent (which invalidates the Datums in
+    /// `missing_values`) plus partition compress/decompress.
+    static METADATA_CACHE: RefCell<HashMap<pg_sys::Oid, MetadataInfo>> =
+        RefCell::new(HashMap::new());
+    /// Tracks whether we've registered the relcache callback yet in this
+    /// backend. PG's `CacheRegisterRelcacheCallback` is one-shot — register
+    /// once on the first cache miss.
+    static METADATA_CB_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn metadata_relcache_callback(_arg: pg_sys::Datum, _relid: pg_sys::Oid) {
+    // Conservative: wipe the whole cache on any relcache invalidation.
+    // The cache is tiny (≤ #partitions per backend) so re-populating is cheap,
+    // and this avoids tracking dependencies between MetadataInfo entries and
+    // every catalog row they read (parent table pg_attribute, deltax catalog).
+    METADATA_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+fn ensure_metadata_callback_registered() {
+    METADATA_CB_REGISTERED.with(|c| {
+        if !c.get() {
+            unsafe {
+                pg_sys::CacheRegisterRelcacheCallback(
+                    Some(metadata_relcache_callback),
+                    pg_sys::Datum::from(0u32),
+                );
+            }
+            c.set(true);
+        }
+    });
+}
+
+/// Cached variant of `load_metadata` keyed on the companion (`_meta`) table
+/// OID. On miss, derives the companion name and runs the SPI queries; on
+/// hit, returns a clone of the cached `MetadataInfo` (which all 5 executor
+/// call sites consume by value).
+pub(super) fn load_metadata_cached(companion_oid: pg_sys::Oid) -> MetadataInfo {
+    if let Some(cached) = METADATA_CACHE.with(|c| c.borrow().get(&companion_oid).cloned()) {
+        return cached;
+    }
+    ensure_metadata_callback_registered();
+    let companion_name = unsafe {
+        let name_ptr = pg_sys::get_rel_name(companion_oid);
+        if name_ptr.is_null() {
+            pgrx::error!(
+                "pg_deltax: companion table not found for OID {}",
+                u32::from(companion_oid)
+            );
+        }
+        std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let meta = pgrx::Spi::connect(|client| load_metadata(client, &companion_name));
+    METADATA_CACHE.with(|c| c.borrow_mut().insert(companion_oid, meta.clone()));
+    meta
+}
 
 /// Load metadata (column names, types, segment_by) from catalog via SPI.
 /// `companion_name` is the meta table name (e.g. "<partition>_meta"). The `_meta`
@@ -902,78 +1131,21 @@ pub(super) fn load_metadata(
         .unwrap()
         .map(|j| j.0);
 
-    // Get column info from the parent table (pg_attribute gives us atttypmod).
-    // `atttypid` is fetched for cross-checking against the persisted
-    // descriptor; `attnum` is kept so the decompress path can call
-    // `pg_sys::getmissingattr` for columns added after compression.
-    let col_result = client
-        .select(
-            "SELECT a.attname::text, t.typname::text, a.atttypmod, a.attnotnull,
-                    a.attnum::int4, a.atttypid::int8
-             FROM pg_attribute a
-             JOIN pg_type t ON a.atttypid = t.oid
-             JOIN pg_class c ON a.attrelid = c.oid
-             JOIN pg_namespace n ON c.relnamespace = n.oid
-             WHERE n.nspname = $1 AND c.relname = $2
-               AND a.attnum > 0 AND NOT a.attisdropped
-             ORDER BY a.attnum",
-            None,
-            &[parent_schema.as_str().into(), parent_table.as_str().into()],
-        )
-        .expect("failed to get column info");
-
-    let mut col_names = Vec::new();
-    let mut col_type_names = Vec::new();
-    let mut col_typmods = Vec::new();
-    let mut col_not_null = Vec::new();
-    let mut col_attnums: Vec<i32> = Vec::new();
-    let mut col_atttypids: Vec<i64> = Vec::new();
-    for row in col_result {
-        let name: String = row
-            .get_datum_by_ordinal(1)
-            .unwrap()
-            .value::<String>()
-            .unwrap()
-            .unwrap();
-        let type_name: String = row
-            .get_datum_by_ordinal(2)
-            .unwrap()
-            .value::<String>()
-            .unwrap()
-            .unwrap();
-        let typmod: i32 = row
-            .get_datum_by_ordinal(3)
-            .unwrap()
-            .value::<i32>()
-            .unwrap()
-            .unwrap_or(-1);
-        let not_null: bool = row
-            .get_datum_by_ordinal(4)
-            .unwrap()
-            .value::<bool>()
-            .unwrap()
-            .unwrap_or(false);
-        let attnum: i32 = row
-            .get_datum_by_ordinal(5)
-            .unwrap()
-            .value::<i32>()
-            .unwrap()
-            .unwrap();
-        let atttypid: i64 = row
-            .get_datum_by_ordinal(6)
-            .unwrap()
-            .value::<i64>()
-            .unwrap()
-            .unwrap();
-        col_names.push(name);
-        col_type_names.push(type_name);
-        col_typmods.push(typmod);
-        col_not_null.push(not_null);
-        col_attnums.push(attnum);
-        col_atttypids.push(atttypid);
-    }
-
-    let mut col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
+    // Get column info via a direct relcache walk on the parent table —
+    // avoids the 4-table `pg_attribute ⋈ pg_type ⋈ pg_class ⋈ pg_namespace`
+    // SPI + name→OID translation that this used to do (~0.8 ms saved per
+    // miss on the fresh-connection path the bench measures). `attnum` is
+    // returned so the decompress path can call `pg_sys::getmissingattr` for
+    // columns added after compression (see SCHEMA_CHANGES.md).
+    let ParentColumnLayout {
+        names: mut col_names,
+        types: mut col_types,
+        typmods: mut col_typmods,
+        not_null: mut col_not_null,
+        attnums: mut col_attnums,
+    } = load_parent_columns(&parent_schema, &parent_table);
+    // Descriptor-compat: `compressed_columns.type_oid` was persisted as i64.
+    let col_atttypids: Vec<i64> = col_types.iter().map(|oid| u32::from(*oid) as i64).collect();
 
     // Resolve each physical column's `_col_idx` against the persisted
     // descriptor. None descriptor → legacy positional mapping (today's
@@ -1128,6 +1300,75 @@ pub(super) fn load_metadata(
     }
 }
 
+/// Parallel-vector view of one parent table's physical columns. Returned
+/// by `load_parent_columns` in attnum order, skipping dropped attributes.
+struct ParentColumnLayout {
+    names: Vec<String>,
+    types: Vec<pg_sys::Oid>,
+    typmods: Vec<i32>,
+    not_null: Vec<bool>,
+    attnums: Vec<i32>,
+}
+
+/// Walk the parent table's relcache `TupleDesc` and return its physical
+/// column layout. Replaces the 4-table `pg_attribute ⋈ pg_type ⋈ pg_class ⋈
+/// pg_namespace` SPI that the executor used to do here — saves ~0.8 ms per
+/// `load_metadata` miss on fresh-connection paths.
+///
+/// Errors out if the schema or relation can't be resolved (e.g. the parent
+/// has been dropped between planning and execution).
+fn load_parent_columns(parent_schema: &str, parent_table: &str) -> ParentColumnLayout {
+    let schema_cstr =
+        std::ffi::CString::new(parent_schema).expect("pg_deltax: parent schema name contained NUL");
+    let table_cstr =
+        std::ffi::CString::new(parent_table).expect("pg_deltax: parent table name contained NUL");
+    unsafe {
+        let ns_oid = pg_sys::get_namespace_oid(schema_cstr.as_ptr(), false);
+        let parent_oid = pg_sys::get_relname_relid(table_cstr.as_ptr(), ns_oid);
+        if parent_oid == pg_sys::InvalidOid {
+            pgrx::error!(
+                "pg_deltax: parent relation {}.{} not found",
+                parent_schema,
+                parent_table
+            );
+        }
+        // The parent is already locked by the surrounding query (planner +
+        // executor take their own lock); re-acquiring AccessShareLock here
+        // just bumps the local lock count.
+        let rel = pg_sys::table_open(parent_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let tupdesc = (*rel).rd_att;
+        let natts = (*tupdesc).natts as usize;
+
+        let mut col_names = Vec::with_capacity(natts);
+        let mut col_types = Vec::with_capacity(natts);
+        let mut col_typmods = Vec::with_capacity(natts);
+        let mut col_not_null = Vec::with_capacity(natts);
+        let mut col_attnums = Vec::with_capacity(natts);
+        for i in 0..natts {
+            let att = &*tupdesc_get_attr(tupdesc, i);
+            if att.attisdropped {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            col_names.push(name);
+            col_types.push(att.atttypid);
+            col_typmods.push(att.atttypmod);
+            col_not_null.push(att.attnotnull);
+            col_attnums.push(att.attnum as i32);
+        }
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        ParentColumnLayout {
+            names: col_names,
+            types: col_types,
+            typmods: col_typmods,
+            not_null: col_not_null,
+            attnums: col_attnums,
+        }
+    }
+}
+
 /// Parsed view of one entry in the `compressed_columns` JSONB descriptor.
 /// Field semantics match the JSON shape produced by
 /// `catalog::snapshot_compressed_columns`. See `dev/docs/SCHEMA_CHANGES.md`.
@@ -1272,6 +1513,7 @@ pub(super) unsafe fn load_segments_heap(
     batch_quals: &[BatchQual],
     needed_stats_cols: &[String],
     col_types: &[pg_sys::Oid],
+    col_not_null: &[bool],
     needed_minmax_cols: &[String],
     // Parallel to `col_names`. `Some(i)` = read this column from the
     // blob/colstats path at `_col_idx = i`. `None` = segment_by (live in
@@ -1291,6 +1533,229 @@ pub(super) unsafe fn load_segments_heap(
     unsafe {
         let mut buf_stats = ScanBufferStats::default();
         let (t0_hit, t0_read) = shared_buf_snapshot();
+
+        // ================================================================
+        // Phase -1: Partition-level minmax pruning. Uses the partition's
+        // `column_minmax` JSONB on `deltax.deltax_partition` (populated at
+        // compress time) to skip partitions whose [min, max] range doesn't
+        // cover any of the equality consts. Avoids the ~60µs per-partition
+        // colstats open + index probe for the bulk of partitions on wide
+        // scans that filter on a non-time, non-segment-by column (e.g.
+        // `WHERE order_id = 700` over 123 monthly partitions — 119 of them
+        // get ruled out here).
+        //
+        // We only consult column_minmax when batch_quals has eligible
+        // equality predicates. Bulk-loaded across the deltatable on first
+        // miss (one SPI for all partitions, cached backend-local).
+        if !batch_quals.is_empty() && segment_by.is_empty() {
+            let eligible_eq: Vec<(usize, i64)> = batch_quals
+                .iter()
+                .filter_map(|bq| {
+                    if bq.op != BatchCompareOp::Eq {
+                        return None;
+                    }
+                    let col_name = &col_names[bq.col_idx];
+                    let is_orderable = matches!(
+                        bq.type_oid,
+                        pg_sys::INT2OID
+                            | pg_sys::INT4OID
+                            | pg_sys::INT8OID
+                            | pg_sys::FLOAT4OID
+                            | pg_sys::FLOAT8OID
+                            | pg_sys::DATEOID
+                            | pg_sys::TIMESTAMPOID
+                            | pg_sys::TIMESTAMPTZOID
+                    );
+                    if !is_orderable
+                        || col_name == time_column
+                        || !col_not_null.get(bq.col_idx).copied().unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    let value = encode_datum_to_i64(bq.const_datum, bq.type_oid)?;
+                    Some((bq.col_idx, value))
+                })
+                .collect();
+
+            if !eligible_eq.is_empty()
+                && let Some(part_minmax) = crate::scan::cost::get_partition_column_minmax(meta_oid)
+            {
+                let can_match = eligible_eq.iter().all(|(col_idx, value)| {
+                    let col_name = &col_names[*col_idx];
+                    match part_minmax.get(col_name) {
+                        Some(&(pmin, pmax)) => *value >= pmin && *value <= pmax,
+                        None => true, // no entry → can't prune
+                    }
+                });
+                if !can_match {
+                    let total_segments = reltuples_as_u64(meta_oid).unwrap_or_else(|| {
+                        crate::scan::cost::get_segment_count(meta_oid).max(0) as u64
+                    });
+                    let (t1_hit, t1_read) = shared_buf_snapshot();
+                    buf_stats.meta_hit = t1_hit - t0_hit;
+                    buf_stats.meta_read = t1_read - t0_read;
+                    accumulate_scan_buf_stats(&buf_stats);
+                    return (Vec::new(), total_segments, total_segments, 0, 0, 0);
+                }
+            }
+        }
+
+        // ================================================================
+        // Phase 0: Colstats-index prefilter — done BEFORE opening meta so
+        // partitions whose colstats minmax rules out every segment can
+        // return without paying the meta-table open + tupdesc walk +
+        // attno HashMap construction. For queries like Q12/Q13 (no time
+        // predicate, equality on a non-segment-by column) this is what
+        // most partitions do — the prefilter immediately rules them out.
+        // ================================================================
+
+        // The authoritative `col_names[i] → _col_idx` mapping is the
+        // `blob_idx` parameter (built from the partition's
+        // `compressed_columns` descriptor in `load_metadata`). For legacy
+        // partitions with no descriptor, `load_metadata` populates `blob_idx`
+        // from the same positional rule we used to compute locally here, so
+        // behavior is unchanged for them. See `dev/docs/SCHEMA_CHANGES.md`.
+        debug_assert_eq!(col_names.len(), blob_idx.len());
+        let col_idx_map: &[Option<u16>] = blob_idx;
+        let num_blob_cols: usize = col_idx_map.iter().filter(|b| b.is_some()).count();
+
+        // Phase 0a: skip-meta fast path — `count(*)`-style scans (or any
+        // caller that passes `skip_blob_load=true` with a single point qual)
+        // can be answered entirely from the colstats minmax index.
+        let point_lookup_filter = if segment_by.is_empty()
+            && segment_by_filters.is_empty()
+            && time_min.is_none()
+            && time_max.is_none()
+            && !load_minmax
+            && needed_stats_cols.is_empty()
+            && needed_minmax_cols.is_empty()
+            && skip_blob_load
+            && batch_quals.len() == 1
+        {
+            let bq = &batch_quals[0];
+            let col_name = &col_names[bq.col_idx];
+            let is_orderable = matches!(
+                bq.type_oid,
+                pg_sys::INT2OID
+                    | pg_sys::INT4OID
+                    | pg_sys::INT8OID
+                    | pg_sys::FLOAT4OID
+                    | pg_sys::FLOAT8OID
+                    | pg_sys::DATEOID
+                    | pg_sys::TIMESTAMPOID
+                    | pg_sys::TIMESTAMPTZOID
+            );
+            if bq.op == BatchCompareOp::Eq
+                && is_orderable
+                && col_name != time_column
+                && !segment_by.contains(col_name)
+                && col_not_null.get(bq.col_idx).copied().unwrap_or(false)
+                && let Some(ci) = col_idx_map[bq.col_idx]
+                && let Some(value) = encode_datum_to_i64(bq.const_datum, bq.type_oid)
+            {
+                Some((ci as i16, value))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((filter_col_idx, filter_value)) = point_lookup_filter {
+            let colstats_oid = sibling_table_oid(meta_oid, "_colstats");
+            if colstats_oid != pg_sys::InvalidOid
+                && let Some(mut point_segments) = lookup_point_segments_by_minmax_index(
+                    colstats_oid,
+                    filter_col_idx,
+                    filter_value,
+                    num_blob_cols,
+                )
+            {
+                for seg in &mut point_segments {
+                    seg.companion_oid = meta_oid;
+                }
+                let total_segments = reltuples_as_u64(meta_oid).unwrap_or_else(|| {
+                    crate::scan::cost::get_segment_count(meta_oid).max(0) as u64
+                });
+                let kept = point_segments.len() as u64;
+                let skipped = total_segments.saturating_sub(kept);
+
+                let (t1_hit, t1_read) = shared_buf_snapshot();
+                buf_stats.meta_hit = t1_hit - t0_hit;
+                buf_stats.meta_read = t1_read - t0_read;
+                accumulate_scan_buf_stats(&buf_stats);
+
+                return (point_segments, skipped, skipped, 0, 0, 0);
+            }
+        }
+
+        // Phase 0b: general point-lookup prefilter. Probes the colstats
+        // `(_col_idx, _min, _max)` btree to get the candidate segment_ids
+        // whose min/max range covers each equality const. If this returns
+        // an empty set, the partition contributes zero rows and we can skip
+        // the meta open entirely.
+        let mut point_prefilter_cols: std::collections::HashSet<i16> =
+            std::collections::HashSet::new();
+        let point_prefilter = if segment_by.is_empty() {
+            let filters: Vec<(i16, i64)> = batch_quals
+                .iter()
+                .filter_map(|bq| {
+                    if bq.op != BatchCompareOp::Eq {
+                        return None;
+                    }
+                    let col_name = &col_names[bq.col_idx];
+                    let is_orderable = matches!(
+                        bq.type_oid,
+                        pg_sys::INT2OID
+                            | pg_sys::INT4OID
+                            | pg_sys::INT8OID
+                            | pg_sys::FLOAT4OID
+                            | pg_sys::FLOAT8OID
+                            | pg_sys::DATEOID
+                            | pg_sys::TIMESTAMPOID
+                            | pg_sys::TIMESTAMPTZOID
+                    );
+                    if !is_orderable
+                        || col_name == time_column
+                        || segment_by.contains(col_name)
+                        || !col_not_null.get(bq.col_idx).copied().unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    let ci = col_idx_map[bq.col_idx]?;
+                    let value = encode_datum_to_i64(bq.const_datum, bq.type_oid)?;
+                    Some((ci as i16, value))
+                })
+                .collect();
+
+            if filters.is_empty() {
+                None
+            } else {
+                let colstats_oid = sibling_table_oid(meta_oid, "_colstats");
+                if colstats_oid == pg_sys::InvalidOid {
+                    None
+                } else {
+                    let candidates = lookup_segments_by_minmax_index(colstats_oid, &filters);
+                    if candidates.is_some() {
+                        point_prefilter_cols.extend(filters.iter().map(|(ci, _)| *ci));
+                    }
+                    candidates
+                }
+            }
+        } else {
+            None
+        };
+
+        if point_prefilter.as_ref().is_some_and(|ids| ids.is_empty()) {
+            let total_segments = reltuples_as_u64(meta_oid)
+                .unwrap_or_else(|| crate::scan::cost::get_segment_count(meta_oid).max(0) as u64);
+            let (t1_hit, t1_read) = shared_buf_snapshot();
+            buf_stats.meta_hit = t1_hit - t0_hit;
+            buf_stats.meta_read = t1_read - t0_read;
+            accumulate_scan_buf_stats(&buf_stats);
+
+            return (Vec::new(), total_segments, total_segments, 0, 0, 0);
+        }
 
         // ================================================================
         // Phase 1: Scan meta table — no TOAST I/O
@@ -1405,15 +1870,6 @@ pub(super) unsafe fn load_segments_heap(
         let mut deform_us: u64 = 0;
         let mut values = vec![pg_sys::Datum::from(0); natts];
         let mut nulls = vec![true; natts];
-
-        // Authoritative `_col_idx` map comes from the persisted
-        // `compressed_columns` descriptor via `MetadataInfo.blob_idx`
-        // (legacy partitions fall back to the same positional rule this
-        // function used to compute locally — so behavior is bit-for-bit
-        // unchanged for them). See `dev/docs/SCHEMA_CHANGES.md`.
-        debug_assert_eq!(col_names.len(), blob_idx.len());
-        let col_idx_map: &[Option<u16>] = blob_idx;
-        let num_blob_cols: usize = col_idx_map.iter().filter(|b| b.is_some()).count();
 
         // Build bloom filter checks from batch quals (Eq and InList on numeric types)
         struct BloomCheck {
@@ -1533,6 +1989,13 @@ pub(super) unsafe fn load_segments_heap(
                 Some(attno) if !nulls[attno] => values[attno].value() as i32,
                 _ => 0,
             };
+            if let Some(ref candidate_ids) = point_prefilter
+                && !candidate_ids.contains(&segment_id)
+            {
+                segments_skipped += 1;
+                segments_minmax_skipped += 1;
+                continue;
+            }
 
             // Extract segment_by values
             let mut segment_values: Vec<Option<String>> = Vec::new();
@@ -1820,6 +2283,9 @@ pub(super) unsafe fn load_segments_heap(
                         Some(ci) => ci as i16,
                         None => continue,
                     };
+                    if point_prefilter_cols.contains(&ci) {
+                        continue;
+                    }
 
                     let const_i64 = match encode_datum_to_i64(bq.const_datum, bq.type_oid) {
                         Some(v) => v,

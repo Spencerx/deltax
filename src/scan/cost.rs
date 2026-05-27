@@ -3,6 +3,16 @@ use pgrx::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Per-column i64-encoded (min, max) for one compressed partition, or
+/// `None` when the partition predates the `column_minmax` catalog column.
+type PartitionMinmax = Option<HashMap<String, (i64, i64)>>;
+
+/// Planning-only fallback when we have the companion meta-table row count
+/// (one row per segment) but not the exact partition row count. This matches
+/// the historic fallback in `estimate_cost`; it only affects path costing,
+/// never executor-visible row counts.
+const ESTIMATED_ROWS_PER_SEGMENT: f64 = 10_000.0;
+
 thread_local! {
     /// Cache of companion_oid → (row_count, segment_count) from deltax.deltax_partition.
     /// Only populated on successful lookups; misses are not cached because
@@ -21,6 +31,15 @@ thread_local! {
     /// partition (no low-card text columns).
     static VALMAP_CACHE: RefCell<HashMap<pg_sys::Oid, HashMap<String, Vec<String>>>> =
         RefCell::new(HashMap::new());
+
+    /// Cache of companion_oid → per-column partition-level i64-encoded
+    /// (min, max). Populated bulk on miss from
+    /// `deltax.deltax_partition.column_minmax` for ALL partitions of the
+    /// containing deltatable. `None` value means the column_minmax JSONB is
+    /// NULL on disk (partition compressed before this catalog column shipped
+    /// — caller treats it as "can't prune").
+    static PARTITION_MINMAX_CACHE: RefCell<HashMap<pg_sys::Oid, PartitionMinmax>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Clear all cost-related caches. Called from `hook::invalidate_compressed_cache`.
@@ -28,6 +47,7 @@ pub(super) fn invalidate_caches() {
     PARTITION_STATS_CACHE.with(|cache| cache.borrow_mut().clear());
     NDISTINCT_CACHE.with(|cache| cache.borrow_mut().clear());
     VALMAP_CACHE.with(|cache| cache.borrow_mut().clear());
+    PARTITION_MINMAX_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Estimate the cost and row count for scanning a compressed partition.
@@ -35,6 +55,7 @@ pub(super) fn invalidate_caches() {
 ///
 /// When `workers > 0`, applies PG's parallel divisor to non-startup cost and
 /// row count so callers building a partial path see per-worker values.
+#[allow(dead_code)]
 pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid, workers: usize) -> (f64, f64, f64) {
     let (total_rows, segment_count) = get_partition_stats(companion_oid);
 
@@ -65,6 +86,51 @@ pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid, workers: usize) -> (f64,
     (startup, total, rows)
 }
 
+/// Planning-only cost estimate that avoids the `deltax.deltax_partition` SPI
+/// lookup. `row_hint` should be the compressed child partition's `pg_class`
+/// row estimate when the caller has it; otherwise we estimate rows from the
+/// companion meta table's reltuples (one tuple per segment).
+pub unsafe fn estimate_cost_from_pg_class(
+    companion_oid: pg_sys::Oid,
+    workers: usize,
+    row_hint: Option<f64>,
+) -> (f64, f64, f64) {
+    let rows = row_hint
+        .filter(|r| *r > 0.0)
+        .unwrap_or_else(|| estimate_companion_rows(companion_oid));
+    let segs = estimate_companion_segments(companion_oid).max(1.0);
+
+    let startup = 10.0;
+    let per_segment = 100.0;
+    let per_row = 0.1;
+    let total = startup + segs * per_segment + rows * per_row;
+
+    if workers > 0 {
+        let div = parallel_divisor(workers);
+        let non_startup = total - startup;
+        return (startup, startup + non_startup / div, rows / div);
+    }
+
+    (startup, total, rows)
+}
+
+/// Planning-only approximate row count from companion-table pg_class stats.
+/// The companion table has one heap row per compressed segment.
+pub(super) fn estimate_companion_rows(companion_oid: pg_sys::Oid) -> f64 {
+    let segments = estimate_companion_segments(companion_oid);
+    if segments > 0.0 {
+        segments * ESTIMATED_ROWS_PER_SEGMENT
+    } else {
+        ESTIMATED_ROWS_PER_SEGMENT
+    }
+}
+
+/// Planning-only approximate segment count from the companion meta table.
+pub(super) fn estimate_companion_segments(companion_oid: pg_sys::Oid) -> f64 {
+    let reltuples = unsafe { get_reltuples(companion_oid) };
+    if reltuples > 0.0 { reltuples } else { 1.0 }
+}
+
 /// Mirror PG's `get_parallel_divisor` in `costsize.c`: workers contribute
 /// fully, leader contribution decays at 0.3/worker, clamped to ≥ 0.
 pub(crate) fn parallel_divisor(workers: usize) -> f64 {
@@ -78,10 +144,12 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     if let Some(cached) =
         PARTITION_STATS_CACHE.with(|cache| cache.borrow().get(&companion_oid).copied())
     {
+        super::plan_profile::count("cost_partition_stats_hit");
         return cached;
     }
+    let _profile = super::plan_profile::scope("cost_partition_stats_miss");
 
-    let name = unsafe {
+    let companion_name = unsafe {
         let name_ptr = pg_sys::get_rel_name(companion_oid);
         if name_ptr.is_null() {
             return (0, 0);
@@ -91,23 +159,78 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
             .into_owned()
     };
     // Strip _meta suffix to get the partition name for catalog lookup
-    let partition_name = name.strip_suffix("_meta").unwrap_or(&name);
+    let partition_name = companion_name
+        .strip_suffix("_meta")
+        .unwrap_or(&companion_name);
 
-    let result = Spi::get_one_with_args::<i64>(
-        "SELECT row_count FROM deltax.deltax_partition WHERE table_name = $1 AND is_compressed = true",
-        &[partition_name.into()],
-    );
+    // Planning touches partition stats in several hooks. Loading the whole
+    // deltatable's compressed-partition stats on the first miss avoids one SPI
+    // round trip per partition on wide partitioned scans.
+    let bulk_load_start = std::time::Instant::now();
+    let loaded = Spi::connect(|client| {
+        let rows = client
+            .select(
+                "WITH target AS (
+                     SELECT deltatable_id
+                       FROM deltax.deltax_partition
+                      WHERE table_name = $1
+                      LIMIT 1
+                 )
+                 SELECT p.table_name, p.row_count, h.segment_size
+                   FROM deltax.deltax_partition p
+                   JOIN target t ON t.deltatable_id = p.deltatable_id
+                   JOIN deltax.deltax_deltatable h ON h.id = p.deltatable_id
+                  WHERE p.is_compressed",
+                None,
+                &[partition_name.into()],
+            )
+            .ok()?;
 
-    match result {
-        Ok(Some(row_count)) => {
-            let segments = (row_count / 100_000).max(1);
-            let stats = (row_count, segments);
-            PARTITION_STATS_CACHE.with(|cache| cache.borrow_mut().insert(companion_oid, stats));
-            stats
+        let compressed_ns_oid =
+            unsafe { pg_sys::get_namespace_oid(c"_deltax_compressed".as_ptr(), true) };
+        if compressed_ns_oid == pg_sys::InvalidOid {
+            return None;
         }
-        // Do not cache misses: companion lookups can race with partition creation.
-        _ => (0, 0),
+
+        let mut loaded_any = false;
+        for row in rows {
+            let table_name: Option<String> = row.get(1).ok().flatten();
+            let row_count: Option<i64> = row.get(2).ok().flatten();
+            let segment_size: Option<i32> = row.get(3).ok().flatten();
+            let (Some(table_name), Some(row_count), Some(segment_size)) =
+                (table_name, row_count, segment_size)
+            else {
+                continue;
+            };
+            let meta_name = format!("{}_meta", table_name);
+            let Ok(meta_cname) = std::ffi::CString::new(meta_name) else {
+                continue;
+            };
+            let oid = unsafe { pg_sys::get_relname_relid(meta_cname.as_ptr(), compressed_ns_oid) };
+            if oid == pg_sys::InvalidOid {
+                continue;
+            }
+            let seg_size = (segment_size as i64).max(1);
+            let segments = ((row_count + seg_size - 1) / seg_size).max(1);
+            PARTITION_STATS_CACHE.with(|cache| {
+                cache.borrow_mut().insert(oid, (row_count, segments));
+            });
+            loaded_any = true;
+        }
+        Some(loaded_any)
+    });
+    super::plan_profile::record("cost_partition_stats_bulk_load", bulk_load_start.elapsed());
+
+    if loaded == Some(true)
+        && let Some(cached) =
+            PARTITION_STATS_CACHE.with(|cache| cache.borrow().get(&companion_oid).copied())
+    {
+        super::plan_profile::count("cost_partition_stats_loaded_hit");
+        return cached;
     }
+
+    // Do not cache misses: companion lookups can race with partition creation.
+    (0, 0)
 }
 
 /// Get relpages from pg_class for a relation OID.
@@ -178,7 +301,7 @@ pub(super) fn estimate_agg_cost(
 
     let total_rows: f64 = companion_oids
         .iter()
-        .map(|&oid| get_row_count(oid).unwrap_or(0) as f64)
+        .map(|&oid| estimate_companion_rows(oid))
         .sum();
 
     let num_partitions = companion_oids.len() as f64;
@@ -216,7 +339,7 @@ pub(super) fn estimate_agg_cost(
 pub(super) fn recommend_agg_workers(companion_oids: &[pg_sys::Oid]) -> i32 {
     let total_segments: i64 = companion_oids
         .iter()
-        .map(|&oid| get_segment_count(oid))
+        .map(|&oid| estimate_companion_segments(oid).round() as i64)
         .sum();
     let pg_cap = unsafe { pg_sys::max_parallel_workers_per_gather };
     recommend_agg_workers_inner(total_segments, pg_cap)
@@ -254,6 +377,7 @@ pub(super) fn get_segment_count(companion_oid: pg_sys::Oid) -> i64 {
 pub(super) fn get_column_ndistinct(
     companion_oid: pg_sys::Oid,
 ) -> std::collections::HashMap<String, i64> {
+    let _profile = super::plan_profile::scope("cost_ndistinct");
     if let Some(cached) = NDISTINCT_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
     {
         return cached;
@@ -298,6 +422,7 @@ pub(super) fn get_column_ndistinct(
 pub(crate) fn get_column_valmap(
     companion_oid: pg_sys::Oid,
 ) -> std::collections::HashMap<String, Vec<String>> {
+    let _profile = super::plan_profile::scope("cost_valmap");
     if let Some(cached) = VALMAP_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned()) {
         return cached;
     }
@@ -330,6 +455,197 @@ pub(crate) fn get_column_valmap(
 
     VALMAP_CACHE.with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
     result_map
+}
+
+/// Get the partition-level `{col_name: (min, max)}` map populated at compress
+/// time on `deltax.deltax_partition.column_minmax`. `min` / `max` are the
+/// same i64 encoding colstats uses (so callers compare with
+/// `encode_datum_to_i64`).
+///
+/// On miss, bulk-loads the whole deltatable in one SPI round-trip (matches
+/// `get_partition_stats`'s pattern). Returns `None` for partitions whose
+/// `column_minmax` is NULL on disk (compressed before this column existed —
+/// caller treats it as "can't prune").
+pub(crate) fn get_partition_column_minmax(companion_oid: pg_sys::Oid) -> PartitionMinmax {
+    PARTITION_MINMAX_CACHE
+        .with(|cache| cache.borrow().get(&companion_oid).cloned())
+        .unwrap_or(None)
+}
+
+/// Bulk-load partition-level column minmax for the given companion OIDs into
+/// the backend-local cache. Called once per query from the executor's
+/// per-partition loop site (e.g. `begin_agg_scan`) so the per-partition
+/// pruning check inside `load_segments_heap` only does HashMap lookups.
+///
+/// A single SPI `WHERE table_name = ANY($1)` is issued for every OID not
+/// already cached — both 1-partition and 123-partition queries pay one SPI
+/// round-trip total, not one per partition.
+pub(crate) fn prewarm_partition_column_minmax(oids: &[pg_sys::Oid]) {
+    if oids.is_empty() {
+        return;
+    }
+    // Identify OIDs missing from the cache and recover their partition names.
+    let mut missing_oids: Vec<pg_sys::Oid> = Vec::new();
+    let mut missing_names: Vec<String> = Vec::new();
+    PARTITION_MINMAX_CACHE.with(|cache| {
+        let c = cache.borrow();
+        for &oid in oids {
+            if !c.contains_key(&oid) {
+                let companion_name = unsafe {
+                    let name_ptr = pg_sys::get_rel_name(oid);
+                    if name_ptr.is_null() {
+                        continue;
+                    }
+                    std::ffi::CStr::from_ptr(name_ptr)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let partition_name = companion_name
+                    .strip_suffix("_meta")
+                    .unwrap_or(&companion_name)
+                    .to_string();
+                missing_oids.push(oid);
+                missing_names.push(partition_name);
+            }
+        }
+    });
+    if missing_names.is_empty() {
+        return;
+    }
+
+    let _profile = super::plan_profile::scope("cost_partition_minmax_bulk_load");
+    let mut by_name: HashMap<String, PartitionMinmax> = HashMap::new();
+    let _ = Spi::connect(|client| -> Option<()> {
+        let rows = client
+            .select(
+                "SELECT table_name, column_minmax::text \
+                   FROM deltax.deltax_partition \
+                  WHERE table_name = ANY($1) AND is_compressed",
+                None,
+                &[missing_names.clone().into()],
+            )
+            .ok()?;
+        for row in rows {
+            let table_name: Option<String> = row.get(1).ok().flatten();
+            let json_text: Option<String> = row.get(2).ok().flatten();
+            let Some(table_name) = table_name else {
+                continue;
+            };
+            let parsed = json_text.as_deref().and_then(parse_minmax_json);
+            by_name.insert(table_name, parsed);
+        }
+        Some(())
+    });
+
+    PARTITION_MINMAX_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        for (oid, name) in missing_oids.into_iter().zip(missing_names) {
+            let parsed = by_name.remove(&name).unwrap_or(None);
+            c.insert(oid, parsed);
+        }
+    });
+}
+
+/// Parse a `{"col": [min,max], ...}` JSON map of i64 ranges (as emitted by
+/// `catalog::update_partition_column_minmax`). Returns `None` if the input
+/// isn't shaped like an object — callers treat that as "no info, can't prune".
+fn parse_minmax_json(text: &str) -> Option<HashMap<String, (i64, i64)>> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return None;
+    }
+    i += 1;
+
+    let mut out: HashMap<String, (i64, i64)> = HashMap::new();
+    loop {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'}' {
+            return Some(out);
+        }
+        // Key: "<col_name>"
+        if bytes[i] != b'"' {
+            return Some(out);
+        }
+        i += 1;
+        let key_start = i;
+        let mut key = String::new();
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'"' => key.push('"'),
+                    b'\\' => key.push('\\'),
+                    b'n' => key.push('\n'),
+                    b'r' => key.push('\r'),
+                    b't' => key.push('\t'),
+                    c => key.push(c as char),
+                }
+                i += 2;
+            } else {
+                key.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        if i >= bytes.len() {
+            return Some(out);
+        }
+        let _ = key_start; // satisfy lint when key escape path empty
+        i += 1; // skip closing quote
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            return Some(out);
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // Value: [<min>,<max>]
+        if i >= bytes.len() || bytes[i] != b'[' {
+            return Some(out);
+        }
+        i += 1;
+        let (min_v, ni) = parse_i64(bytes, i)?;
+        i = ni;
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        let (max_v, ni) = parse_i64(bytes, i)?;
+        i = ni;
+        while i < bytes.len() && bytes[i] != b']' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Some(out);
+        }
+        i += 1; // skip ']'
+        out.insert(key, (min_v, max_v));
+    }
+}
+
+fn parse_i64(bytes: &[u8], start: usize) -> Option<(i64, usize)> {
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let num_start = i;
+    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == num_start {
+        return None;
+    }
+    let s = std::str::from_utf8(&bytes[num_start..i]).ok()?;
+    s.parse::<i64>().ok().map(|v| (v, i))
 }
 
 /// Parse a `{"col": ["v0","v1",...], ...}` JSON object (as emitted by

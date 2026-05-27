@@ -440,7 +440,11 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 .map(|s| meta.col_names[s.col_idx as usize].clone())
                 .collect();
 
-            // Fast path: load metadata only (no blobs) — Phase 2 is skipped
+            // Fast path: load metadata only (no blobs) — Phase 2 is skipped.
+            // Bulk-prewarm partition-level minmax so the per-partition prune
+            // check inside `load_segments_heap` is a pure HashMap lookup.
+            crate::scan::cost::prewarm_partition_column_minmax(&plan.companion_oids);
+
             let no_blobs = vec![false; num_cols];
             let t1 = Instant::now();
             let mut all_segments: Vec<SegmentData> = Vec::new();
@@ -459,6 +463,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                     &fast_batch_quals,
                     &needed_stats_cols,
                     &meta.col_types,
+                    &meta.col_not_null,
                     &needed_minmax_cols,
                     &meta.blob_idx,
                     false,
@@ -727,6 +732,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         let mut total_cache_hits: u64 = 0;
         let mut total_cache_misses: u64 = 0;
         let mut total_cache_bytes_served: u64 = 0;
+        crate::scan::cost::prewarm_partition_column_minmax(&companion_oids);
         for &oid in &companion_oids {
             let (mut segs, _, _, _, _, dt_us) = load_segments_heap(
                 oid,
@@ -742,6 +748,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 &batch_quals,
                 &needed_minmax_cols,
                 &meta.col_types,
+                &meta.col_not_null,
                 &needed_minmax_cols,
                 &meta.blob_idx,
                 false,
