@@ -31,6 +31,7 @@ make logs-all                         # Show all logs from running container
 make logs-follow                      # Follow logs in real-time
 make cargo CMD="<cmd>"                # Run arbitrary cargo command in dev container
 make clean                            # Clean Docker volumes
+make release VERSION=0.2.1            # Bump version, commit, tag v0.2.1, push (triggers Release workflow)
 make bench-clickbench                 # Run Clickbench benchmark
 make bench-clickbench-keep            # Run Clickbench benchmark, keep container running
 make bench-rtabench                   # Run RTABench (plain PG vs pg_deltax) on a 250K-order subset

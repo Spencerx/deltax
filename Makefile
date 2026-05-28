@@ -18,7 +18,7 @@ VENV         = .venv
        bench-rtabench bench-rtabench-keep bench-rtabench-full bench-rtabench-clean \
        bench-rtabench-distclean \
        bench-timescaledb bench-compare bench-all \
-       run-sql run-sql-file logs logs-all logs-follow
+       run-sql run-sql-file logs logs-all logs-follow release
 
 # Build the dev toolchain image (rebuilds only when Dockerfile.dev changes)
 dev-image:
@@ -275,6 +275,54 @@ bench-compare: $(VENV)/.stamp
 	$(VENV)/bin/python tests/bench_compare.py
 
 bench-all: bench-clickbench bench-timescaledb bench-compare
+
+# Cut a release. Bumps the version in Cargo.toml + Cargo.lock, commits, tags
+# v$(VERSION), and pushes the branch + tag. The Release workflow reacts to the
+# v* tag and builds + publishes the .deb artifacts. Runs entirely on the host
+# (git + awk), so no Docker or host cargo toolchain is required.
+#   make release VERSION=0.2.1      # commits "Release v0.2.1", tags v0.2.1
+release:
+	@set -e; \
+	: $${VERSION:?VERSION required without leading 'v', e.g. make release VERSION=0.2.1}; \
+	case "$(VERSION)" in \
+	  v*) echo "ERROR: drop the leading 'v' — use VERSION=$(VERSION:v%=%)"; exit 1 ;; \
+	  [0-9]*) : ;; \
+	  *) echo "ERROR: VERSION must start with a digit (got '$(VERSION)')"; exit 1 ;; \
+	esac; \
+	tag="v$(VERSION)"; \
+	echo "==> Releasing $$tag"; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	  echo "ERROR: working tree is not clean — commit or stash first"; exit 1; \
+	fi; \
+	branch="$$(git rev-parse --abbrev-ref HEAD)"; \
+	if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then \
+	  echo "ERROR: branch '$$branch' has no upstream"; exit 1; \
+	fi; \
+	echo "--> fetching origin"; \
+	git fetch --quiet origin; \
+	if [ "$$(git rev-parse @)" != "$$(git rev-parse '@{u}')" ]; then \
+	  echo "ERROR: '$$branch' is not in sync with its upstream — pull/push first"; exit 1; \
+	fi; \
+	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
+	  echo "ERROR: tag $$tag already exists locally"; exit 1; \
+	fi; \
+	if git ls-remote --exit-code --tags origin "$$tag" >/dev/null 2>&1; then \
+	  echo "ERROR: tag $$tag already exists on origin"; exit 1; \
+	fi; \
+	echo "--> bumping version to $(VERSION)"; \
+	awk -v v="$(VERSION)" '!d && /^version = / {sub(/"[^"]*"/, "\"" v "\""); d=1} {print}' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml; \
+	awk -v v="$(VERSION)" '/^name = "pg_deltax"$$/ {h=1} h && /^version = / {sub(/"[^"]*"/, "\"" v "\""); h=0} {print}' Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock; \
+	got="$$(awk '/^version = / {gsub(/"/, "", $$3); print $$3; exit}' Cargo.toml)"; \
+	if [ "$$got" != "$(VERSION)" ]; then \
+	  echo "ERROR: version bump failed (Cargo.toml shows '$$got')"; git checkout -- Cargo.toml Cargo.lock; exit 1; \
+	fi; \
+	echo "--> committing, tagging, pushing"; \
+	git add Cargo.toml Cargo.lock; \
+	git commit -m "Release $$tag"; \
+	git tag -a "$$tag" -m "Release $$tag"; \
+	git push origin "$$branch"; \
+	git push origin "$$tag"; \
+	echo "==> Pushed $$tag — the Release workflow will build and publish artifacts."
 
 clean:
 	docker volume rm pg_deltax_target_pg17 pg_deltax_target_pg18 $(CARGO_VOL) 2>/dev/null || true
