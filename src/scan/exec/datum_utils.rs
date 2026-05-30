@@ -347,6 +347,138 @@ unsafe fn decode_compressed_datums(
 /// value is stored directly in the Datum with zero allocation.
 /// For pass-by-reference types (text, varchar, bpchar), a varlena is allocated
 /// in the current memory context (caller must set the right context).
+/// Weave decoded pass-by-value primitives into a full-length
+/// `Vec<(Datum, bool)>`, applying `f` per value and inserting null placeholders
+/// per the bitmap — in a single pass.
+///
+/// This fuses the value→Datum map with null reinsertion so pass-by-value
+/// columns avoid the intermediate `Vec<Datum>` allocation + extra copy pass
+/// that `decode_compressed_datums` + `reinsert_nulls_datum` would do. (Same
+/// optimization the parallel agg path already applies via
+/// `decompress_numeric_no_nulls`.)
+#[inline]
+fn weave_numeric_pairs<T: Copy>(
+    prims: Vec<T>,
+    null_bitmap: &[u8],
+    total_count: usize,
+    f: impl Fn(T) -> pg_sys::Datum,
+) -> Vec<(pg_sys::Datum, bool)> {
+    let mut out = Vec::with_capacity(total_count);
+    if null_bitmap.is_empty() {
+        for v in prims {
+            out.push((f(v), false));
+        }
+    } else {
+        let mut val_idx = 0usize;
+        for i in 0..total_count {
+            if is_null_at(null_bitmap, i) {
+                out.push((pg_sys::Datum::from(0usize), true));
+            } else {
+                out.push((f(prims[val_idx]), false));
+                val_idx += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Fused decode for pass-by-value codecs: decode directly into
+/// `Vec<(Datum, bool)>` with nulls woven in, skipping the intermediate
+/// `Vec<Datum>`. Returns `None` for pass-by-ref / dictionary codecs (text,
+/// jsonb), which keep the arena path in `decode_compressed_datums`. `dt` is
+/// the lowercased type name; transforms mirror `decode_compressed_datums`
+/// exactly.
+fn decode_numeric_blob_pairs(
+    cc: &CompressedColumnRef,
+    dt: &str,
+    non_null_count: usize,
+    total_count: usize,
+) -> Option<Vec<(pg_sys::Datum, bool)>> {
+    let nb = cc.null_bitmap;
+    let is_intlike = dt == "integer" || dt.contains("int4") || dt == "smallint";
+    let pairs = match cc.type_tag {
+        CompressionType::Gorilla => {
+            if dt.contains("timestamp") {
+                let ts = compression::gorilla::decode_timestamps(cc.data, non_null_count);
+                weave_numeric_pairs(ts, nb, total_count, |usec| {
+                    pg_sys::Datum::from((usec - PG_EPOCH_OFFSET_USEC) as usize)
+                })
+            } else if dt == "date" {
+                let ts = compression::gorilla::decode_timestamps(cc.data, non_null_count);
+                weave_numeric_pairs(ts, nb, total_count, |usec| {
+                    let unix_days = (usec / 86_400_000_000) as i32;
+                    pg_sys::Datum::from((unix_days - PG_EPOCH_OFFSET_DAYS) as usize)
+                })
+            } else if dt == "real" || dt.contains("float4") {
+                let fs = compression::gorilla::decode_floats_f32(cc.data, non_null_count);
+                weave_numeric_pairs(fs, nb, total_count, |v| {
+                    pg_sys::Datum::from(v.to_bits() as usize)
+                })
+            } else {
+                let fs = compression::gorilla::decode_floats(cc.data, non_null_count);
+                weave_numeric_pairs(fs, nb, total_count, |v| {
+                    pg_sys::Datum::from(v.to_bits() as usize)
+                })
+            }
+        }
+        CompressionType::DeltaVarint => {
+            if is_intlike {
+                let ints = compression::integer::decode_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    weave_numeric_pairs(ints, nb, total_count, |v| {
+                        pg_sys::Datum::from(v as i16 as usize)
+                    })
+                } else {
+                    weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+                }
+            } else {
+                let ints = compression::integer::decode_i64(cc.data, non_null_count);
+                weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+            }
+        }
+        CompressionType::Constant => {
+            if is_intlike {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    weave_numeric_pairs(ints, nb, total_count, |v| {
+                        pg_sys::Datum::from(v as i16 as usize)
+                    })
+                } else {
+                    weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+                }
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+            }
+        }
+        CompressionType::ForBitpacked => {
+            if is_intlike {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    weave_numeric_pairs(ints, nb, total_count, |v| {
+                        pg_sys::Datum::from(v as i16 as usize)
+                    })
+                } else {
+                    weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+                }
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
+                weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+            }
+        }
+        CompressionType::BooleanBitmap => {
+            let bools = compression::boolean::decode(cc.data, non_null_count);
+            weave_numeric_pairs(bools, nb, total_count, |b| pg_sys::Datum::from(b as usize))
+        }
+        // Pass-by-ref / dictionary codecs: keep the arena path.
+        CompressionType::Dictionary
+        | CompressionType::DictionaryLz4
+        | CompressionType::Lz4
+        | CompressionType::Lz4Blocked => return None,
+    };
+    Some(pairs)
+}
+
 pub(super) unsafe fn decompress_blob_to_datums(
     blob: &[u8],
     data_type: &str,
@@ -360,15 +492,15 @@ pub(super) unsafe fn decompress_blob_to_datums(
     let cc = CompressedColumnRef::from_bytes(blob);
     let total_count = cc.row_count as usize;
     let non_null_count = count_non_null(cc.null_bitmap, total_count);
-    let datums = unsafe {
-        decode_compressed_datums(
-            &cc,
-            &data_type.to_lowercase(),
-            type_oid,
-            typmod,
-            non_null_count,
-        )
-    };
+    let dt = data_type.to_lowercase();
+
+    // Fused pass-by-value path: decode straight into `(Datum, bool)` pairs.
+    if let Some(pairs) = decode_numeric_blob_pairs(&cc, &dt, non_null_count, total_count) {
+        return pairs;
+    }
+
+    // Pass-by-ref / dictionary codecs: decode to non-null datums, then reinsert.
+    let datums = unsafe { decode_compressed_datums(&cc, &dt, type_oid, typmod, non_null_count) };
     reinsert_nulls_datum(&datums, cc.null_bitmap, total_count)
 }
 
