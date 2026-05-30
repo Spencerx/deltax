@@ -254,44 +254,16 @@ unsafe fn decode_compressed_datums(
             }
         }
         CompressionType::Lz4 => {
+            // text/varchar/jsonb go straight from ranges to arena varlenas with
+            // no intermediate slice Vec and no UTF-8 validation; bpchar needs
+            // the input function (handled inside text_ranges_to_datums).
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            if type_oid == pg_sys::JSONBOID {
-                // Skip UTF-8 validation — stored bytes are jsonb varlena payload.
-                let byte_slices: Vec<&[u8]> = ranges
-                    .iter()
-                    .map(|&(off, len)| &buf[off..off + len])
-                    .collect();
-                unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
-            } else {
-                let slices: Vec<&str> = ranges
-                    .iter()
-                    .map(|&(off, len)| {
-                        std::str::from_utf8(&buf[off..off + len])
-                            .expect("invalid UTF-8 in LZ4 data")
-                    })
-                    .collect();
-                unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
-            }
+            unsafe { text_ranges_to_datums(&buf, &ranges, type_oid, typmod) }
         }
         CompressionType::Lz4Blocked => {
             let (buf, ranges) =
                 compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            if type_oid == pg_sys::JSONBOID {
-                let byte_slices: Vec<&[u8]> = ranges
-                    .iter()
-                    .map(|&(off, len)| &buf[off..off + len])
-                    .collect();
-                unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
-            } else {
-                let slices: Vec<&str> = ranges
-                    .iter()
-                    .map(|&(off, len)| {
-                        std::str::from_utf8(&buf[off..off + len])
-                            .expect("invalid UTF-8 in LZ4 data")
-                    })
-                    .collect();
-                unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
-            }
+            unsafe { text_ranges_to_datums(&buf, &ranges, type_oid, typmod) }
         }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
@@ -1393,24 +1365,9 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
         }
         CompressionType::Lz4 => {
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-
-            // Collect only selected slices for arena allocation
-            let matched_slices: Vec<&str> = slices
-                .iter()
-                .zip(nn_selection.iter())
-                .filter(|&(_, &sel)| sel)
-                .map(|(&s, _)| s)
-                .collect();
-            let matched_datums =
-                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
-
+            let matched_datums = unsafe {
+                matched_text_ranges_to_datums(&buf, &ranges, &nn_selection, type_oid, typmod)
+            };
             merge_with_placeholder(&matched_datums, &nn_selection)
         }
         CompressionType::Lz4Blocked => {
@@ -1420,19 +1377,9 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
                 non_null_count,
                 Some(&nn_selection),
             );
-
-            // Collect only selected slices for arena allocation
-            let matched_slices: Vec<&str> = ranges
-                .iter()
-                .zip(nn_selection.iter())
-                .filter(|&(_, &sel)| sel)
-                .map(|(&(off, len), _)| {
-                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            let matched_datums =
-                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
-
+            let matched_datums = unsafe {
+                matched_text_ranges_to_datums(&buf, &ranges, &nn_selection, type_oid, typmod)
+            };
             merge_with_placeholder(&matched_datums, &nn_selection)
         }
         _ => {
@@ -1702,6 +1649,111 @@ unsafe fn varlena_arena_alloc(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
         }
 
         datums
+    }
+}
+
+/// Arena-allocate one varlena per `(offset, len)` range over `buf`, returning
+/// the Datums — like [`varlena_arena_alloc`] but reading directly from the
+/// decompressed buffer via ranges, with no intermediate `Vec<&str>`/`Vec<&[u8]>`
+/// and no UTF-8 validation (PG text/jsonb store raw bytes and don't re-validate;
+/// the bytes were validated at ingest).
+unsafe fn ranges_to_varlena_datums(buf: &[u8], ranges: &[(usize, usize)]) -> Vec<pg_sys::Datum> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    unsafe {
+        const VARHDRSZ: usize = pg_sys::VARHDRSZ;
+        const MAXALIGN: usize = 8;
+
+        let total_size: usize = ranges
+            .iter()
+            .map(|&(_, len)| (VARHDRSZ + len + MAXALIGN - 1) & !(MAXALIGN - 1))
+            .sum();
+
+        let arena = pg_sys::palloc(total_size) as *mut u8;
+        let mut datums = Vec::with_capacity(ranges.len());
+        let mut arena_off = 0;
+        let base = buf.as_ptr();
+
+        for &(off, len) in ranges {
+            let varlena_ptr = arena.add(arena_off) as *mut pg_sys::varlena;
+            let total_len = (VARHDRSZ + len) as i32;
+            pgrx::set_varsize_4b(varlena_ptr, total_len);
+            std::ptr::copy_nonoverlapping(
+                base.add(off),
+                (varlena_ptr as *mut u8).add(VARHDRSZ),
+                len,
+            );
+            datums.push(pg_sys::Datum::from(varlena_ptr as usize));
+            arena_off += ((total_len as usize) + MAXALIGN - 1) & !(MAXALIGN - 1);
+        }
+
+        datums
+    }
+}
+
+/// Build text/varchar/jsonb/bpchar Datums from decompressed `(buf, ranges)`.
+///
+/// text/varchar/jsonb take the zero-validation arena path
+/// ([`ranges_to_varlena_datums`]). bpchar still needs the type input function
+/// for blank-padding, so it falls back to the per-string path (and is the only
+/// case that pays UTF-8 validation).
+unsafe fn text_ranges_to_datums(
+    buf: &[u8],
+    ranges: &[(usize, usize)],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+) -> Vec<pg_sys::Datum> {
+    unsafe {
+        if type_oid == pg_sys::BPCHAROID {
+            ranges
+                .iter()
+                .map(|&(off, len)| {
+                    let s = std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data");
+                    str_to_text_datum(s, type_oid, typmod)
+                })
+                .collect()
+        } else {
+            ranges_to_varlena_datums(buf, ranges)
+        }
+    }
+}
+
+/// Selection-aware variant of [`text_ranges_to_datums`]: build datums only for
+/// rows where `nn_selection[i]` is true (in order, for `merge_with_placeholder`).
+/// Skips UTF-8 validation for text/varchar (PG stores raw bytes); only bpchar
+/// pays the input function + validation. Avoids materializing a `Vec<&str>` over
+/// the whole column — important for the monolithic Lz4 path, which otherwise
+/// validates every row just to keep the (often few) matching ones.
+unsafe fn matched_text_ranges_to_datums(
+    buf: &[u8],
+    ranges: &[(usize, usize)],
+    nn_selection: &[bool],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+) -> Vec<pg_sys::Datum> {
+    unsafe {
+        if type_oid == pg_sys::BPCHAROID {
+            ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| {
+                    let s = std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data");
+                    str_to_text_datum(s, type_oid, typmod)
+                })
+                .collect()
+        } else {
+            let matched: Vec<&[u8]> = ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| &buf[off..off + len])
+                .collect();
+            varlena_arena_alloc(&matched)
+        }
     }
 }
 
