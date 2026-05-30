@@ -103,26 +103,31 @@ pub fn encode_i64(values: &[i64]) -> Vec<u8> {
 }
 
 pub fn decode_i64(data: &[u8], count: usize) -> Vec<i64> {
-    if count == 0 {
-        return Vec::new();
-    }
-
     let mut values = Vec::with_capacity(count);
+    decode_i64_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_i64`]: invokes `f` for each decoded value in
+/// order, with no intermediate `Vec`. Lets callers decode straight into their
+/// final layout (e.g. `(Datum, bool)` pairs) — one allocation, one pass.
+#[inline]
+pub fn decode_i64_each(data: &[u8], count: usize, mut f: impl FnMut(i64)) {
+    if count == 0 {
+        return;
+    }
 
     // First value
     let first = i64::from_le_bytes(data[0..8].try_into().unwrap());
-    values.push(first);
+    f(first);
 
     let mut offset = 8;
     let mut prev = first;
     for _ in 1..count {
         let zz = read_varint_at(data, &mut offset);
-        let delta = zigzag_decode(zz);
-        prev += delta;
-        values.push(prev);
+        prev += zigzag_decode(zz);
+        f(prev);
     }
-
-    values
 }
 
 // ---------------------------------------------------------------------------
@@ -148,24 +153,28 @@ pub fn encode_i32(values: &[i32]) -> Vec<u8> {
 }
 
 pub fn decode_i32(data: &[u8], count: usize) -> Vec<i32> {
+    let mut values = Vec::with_capacity(count);
+    decode_i32_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_i32`] — see [`decode_i64_each`].
+#[inline]
+pub fn decode_i32_each(data: &[u8], count: usize, mut f: impl FnMut(i32)) {
     if count == 0 {
-        return Vec::new();
+        return;
     }
 
-    let mut values = Vec::with_capacity(count);
     let first = i32::from_le_bytes(data[0..4].try_into().unwrap());
-    values.push(first);
+    f(first);
 
     let mut offset = 4;
     let mut prev = first as i64;
     for _ in 1..count {
         let zz = read_varint_at(data, &mut offset);
-        let delta = zigzag_decode(zz);
-        prev += delta;
-        values.push(prev as i32);
+        prev += zigzag_decode(zz);
+        f(prev as i32);
     }
-
-    values
 }
 
 #[cfg(test)]

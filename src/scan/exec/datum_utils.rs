@@ -396,44 +396,77 @@ fn decode_numeric_blob_pairs(
 ) -> Option<Vec<(pg_sys::Datum, bool)>> {
     let nb = cc.null_bitmap;
     let is_intlike = dt == "integer" || dt.contains("int4") || dt == "smallint";
+
+    // For Gorilla/DeltaVarint: on the no-null path decode straight into the
+    // output via the `_each` callback (one alloc, one pass — no intermediate
+    // `Vec<primitive>`); on the null path decode to a Vec and weave nulls.
+    // `$each`/`$vec` are the callback / Vec-returning decoders; `$tf` maps a
+    // decoded value to its Datum (transforms mirror `decode_compressed_datums`).
+    macro_rules! build {
+        ($each:path, $vec:path, $tf:expr) => {{
+            let tf = $tf;
+            if nb.is_empty() {
+                let mut out = Vec::with_capacity(total_count);
+                $each(cc.data, total_count, |v| out.push((tf(v), false)));
+                out
+            } else {
+                weave_numeric_pairs($vec(cc.data, non_null_count), nb, total_count, tf)
+            }
+        }};
+    }
+
     let pairs = match cc.type_tag {
         CompressionType::Gorilla => {
             if dt.contains("timestamp") {
-                let ts = compression::gorilla::decode_timestamps(cc.data, non_null_count);
-                weave_numeric_pairs(ts, nb, total_count, |usec| {
-                    pg_sys::Datum::from((usec - PG_EPOCH_OFFSET_USEC) as usize)
-                })
+                build!(
+                    compression::gorilla::decode_timestamps_each,
+                    compression::gorilla::decode_timestamps,
+                    |usec: i64| pg_sys::Datum::from((usec - PG_EPOCH_OFFSET_USEC) as usize)
+                )
             } else if dt == "date" {
-                let ts = compression::gorilla::decode_timestamps(cc.data, non_null_count);
-                weave_numeric_pairs(ts, nb, total_count, |usec| {
-                    let unix_days = (usec / 86_400_000_000) as i32;
-                    pg_sys::Datum::from((unix_days - PG_EPOCH_OFFSET_DAYS) as usize)
-                })
+                build!(
+                    compression::gorilla::decode_timestamps_each,
+                    compression::gorilla::decode_timestamps,
+                    |usec: i64| {
+                        let unix_days = (usec / 86_400_000_000) as i32;
+                        pg_sys::Datum::from((unix_days - PG_EPOCH_OFFSET_DAYS) as usize)
+                    }
+                )
             } else if dt == "real" || dt.contains("float4") {
-                let fs = compression::gorilla::decode_floats_f32(cc.data, non_null_count);
-                weave_numeric_pairs(fs, nb, total_count, |v| {
-                    pg_sys::Datum::from(v.to_bits() as usize)
-                })
+                build!(
+                    compression::gorilla::decode_floats_f32_each,
+                    compression::gorilla::decode_floats_f32,
+                    |v: f32| pg_sys::Datum::from(v.to_bits() as usize)
+                )
             } else {
-                let fs = compression::gorilla::decode_floats(cc.data, non_null_count);
-                weave_numeric_pairs(fs, nb, total_count, |v| {
-                    pg_sys::Datum::from(v.to_bits() as usize)
-                })
+                build!(
+                    compression::gorilla::decode_floats_each,
+                    compression::gorilla::decode_floats,
+                    |v: f64| pg_sys::Datum::from(v.to_bits() as usize)
+                )
             }
         }
         CompressionType::DeltaVarint => {
             if is_intlike {
-                let ints = compression::integer::decode_i32(cc.data, non_null_count);
                 if dt == "smallint" {
-                    weave_numeric_pairs(ints, nb, total_count, |v| {
-                        pg_sys::Datum::from(v as i16 as usize)
-                    })
+                    build!(
+                        compression::integer::decode_i32_each,
+                        compression::integer::decode_i32,
+                        |v: i32| pg_sys::Datum::from(v as i16 as usize)
+                    )
                 } else {
-                    weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+                    build!(
+                        compression::integer::decode_i32_each,
+                        compression::integer::decode_i32,
+                        |v: i32| pg_sys::Datum::from(v as usize)
+                    )
                 }
             } else {
-                let ints = compression::integer::decode_i64(cc.data, non_null_count);
-                weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+                build!(
+                    compression::integer::decode_i64_each,
+                    compression::integer::decode_i64,
+                    |v: i64| pg_sys::Datum::from(v as usize)
+                )
             }
         }
         CompressionType::Constant => {

@@ -209,15 +209,23 @@ pub fn encode_floats(values: &[f64]) -> Vec<u8> {
 }
 
 pub fn decode_floats(data: &[u8], count: usize) -> Vec<f64> {
+    let mut values = Vec::with_capacity(count);
+    decode_floats_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_floats`]: invokes `f` for each decoded value in
+/// order, with no intermediate `Vec`. Lets callers decode straight into their
+/// final layout (e.g. `(Datum, bool)` pairs) — one allocation, one pass.
+#[inline]
+pub fn decode_floats_each(data: &[u8], count: usize, mut f: impl FnMut(f64)) {
     if count == 0 {
-        return Vec::new();
+        return;
     }
 
     let mut reader = BitReader::new(data);
-    let mut values = Vec::with_capacity(count);
-
     let first_bits = reader.read_bits(64);
-    values.push(f64::from_bits(first_bits));
+    f(f64::from_bits(first_bits));
     let mut prev_bits = first_bits;
     let mut prev_leading: u8 = 0;
     let mut prev_trailing: u8 = 0;
@@ -225,14 +233,13 @@ pub fn decode_floats(data: &[u8], count: usize) -> Vec<f64> {
     for _ in 1..count {
         if !reader.read_bit() {
             // Same value
-            values.push(f64::from_bits(prev_bits));
+            f(f64::from_bits(prev_bits));
         } else if !reader.read_bit() {
             // Same window
             let meaningful = 64 - prev_leading - prev_trailing;
             let xor_meaningful = reader.read_bits(meaningful);
-            let xor = xor_meaningful << prev_trailing;
-            prev_bits ^= xor;
-            values.push(f64::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << prev_trailing;
+            f(f64::from_bits(prev_bits));
         } else {
             // New window
             let leading = reader.read_bits(6) as u8;
@@ -240,15 +247,12 @@ pub fn decode_floats(data: &[u8], count: usize) -> Vec<f64> {
             let meaningful = if meaningful == 0 { 64 } else { meaningful };
             let trailing = 64 - leading - meaningful;
             let xor_meaningful = reader.read_bits(meaningful);
-            let xor = xor_meaningful << trailing;
-            prev_bits ^= xor;
-            values.push(f64::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << trailing;
+            f(f64::from_bits(prev_bits));
             prev_leading = leading;
             prev_trailing = trailing;
         }
     }
-
-    values
 }
 
 // ---------------------------------------------------------------------------
@@ -299,43 +303,45 @@ pub fn encode_floats_f32(values: &[f32]) -> Vec<u8> {
 }
 
 pub fn decode_floats_f32(data: &[u8], count: usize) -> Vec<f32> {
+    let mut values = Vec::with_capacity(count);
+    decode_floats_f32_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_floats_f32`] — see [`decode_floats_each`].
+#[inline]
+pub fn decode_floats_f32_each(data: &[u8], count: usize, mut f: impl FnMut(f32)) {
     if count == 0 {
-        return Vec::new();
+        return;
     }
 
     let mut reader = BitReader::new(data);
-    let mut values = Vec::with_capacity(count);
-
     let first_bits = reader.read_bits(32) as u32;
-    values.push(f32::from_bits(first_bits));
+    f(f32::from_bits(first_bits));
     let mut prev_bits = first_bits;
     let mut prev_leading: u8 = 0;
     let mut prev_trailing: u8 = 0;
 
     for _ in 1..count {
         if !reader.read_bit() {
-            values.push(f32::from_bits(prev_bits));
+            f(f32::from_bits(prev_bits));
         } else if !reader.read_bit() {
             let meaningful = 32 - prev_leading - prev_trailing;
             let xor_meaningful = reader.read_bits(meaningful) as u32;
-            let xor = xor_meaningful << prev_trailing;
-            prev_bits ^= xor;
-            values.push(f32::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << prev_trailing;
+            f(f32::from_bits(prev_bits));
         } else {
             let leading = reader.read_bits(5) as u8;
             let meaningful = reader.read_bits(5) as u8;
             let meaningful = if meaningful == 0 { 32 } else { meaningful };
             let trailing = 32 - leading - meaningful;
             let xor_meaningful = reader.read_bits(meaningful) as u32;
-            let xor = xor_meaningful << trailing;
-            prev_bits ^= xor;
-            values.push(f32::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << trailing;
+            f(f32::from_bits(prev_bits));
             prev_leading = leading;
             prev_trailing = trailing;
         }
     }
-
-    values
 }
 
 // ---------------------------------------------------------------------------
@@ -395,24 +401,34 @@ pub fn encode_timestamps(values: &[i64]) -> Vec<u8> {
 }
 
 pub fn decode_timestamps(data: &[u8], count: usize) -> Vec<i64> {
+    let mut values = Vec::with_capacity(count);
+    decode_timestamps_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_timestamps`] — see [`decode_floats_each`]. Also
+/// tracks the running value in a local instead of re-reading `values.last()`
+/// every row.
+#[inline]
+pub fn decode_timestamps_each(data: &[u8], count: usize, mut f: impl FnMut(i64)) {
     if count == 0 {
-        return Vec::new();
+        return;
     }
 
     let mut reader = BitReader::new(data);
-    let mut values = Vec::with_capacity(count);
 
     // First value
     let first = reader.read_bits(64) as i64;
-    values.push(first);
+    f(first);
 
     if count == 1 {
-        return values;
+        return;
     }
 
     // First delta
     let mut prev_delta = reader.read_bits(64) as i64;
-    values.push(first + prev_delta);
+    let mut cur = first + prev_delta;
+    f(cur);
 
     for _ in 2..count {
         let dod = if !reader.read_bit() {
@@ -432,11 +448,9 @@ pub fn decode_timestamps(data: &[u8], count: usize) -> Vec<i64> {
         };
 
         prev_delta += dod;
-        let val = *values.last().unwrap() + prev_delta;
-        values.push(val);
+        cur += prev_delta;
+        f(cur);
     }
-
-    values
 }
 
 #[cfg(test)]
