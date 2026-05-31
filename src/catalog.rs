@@ -406,6 +406,24 @@ pub fn update_partition_column_ndistinct_from_map(
     Ok(())
 }
 
+/// Persist the serialized per-column HLL sketches for a partition into the
+/// `deltax.deltax_partition.column_hll` JSONB column. `json` is the
+/// `{col_name: <sketch>}` object produced by `compress::serialize_partition_hll`.
+/// `stats::write_table_stats` merges these across partitions for an accurate
+/// table-wide distinct count.
+pub fn update_partition_column_hll(
+    client: &mut SpiClient,
+    partition_id: i32,
+    json: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition SET column_hll = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
 /// Persist the per-column value lists used by the segment value-presence
 /// bitmap (see `compress::compute_segment_valbitmaps` and the read-side
 /// pruner in `scan::exec::segments`). Shape on disk is

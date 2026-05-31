@@ -1003,6 +1003,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     catalog::update_partition_column_ndistinct_from_map(client, part_info.id, &col_ndistinct)
         .expect("failed to update partition column_ndistinct");
 
+    // Persist the per-column HLL sketches so the table-wide distinct count can
+    // be computed by merging them across partitions (see write_table_stats).
+    if let Some(hll_json) = serialize_partition_hll(&nd_col_names, &partition_hll) {
+        catalog::update_partition_column_hll(client, part_info.id, &hll_json)
+            .expect("failed to update partition column_hll");
+    }
+
     // Persist the partition-level value→bit_idx maps for low-card text
     // columns. Empty map is fine — the read path treats a missing entry
     // for a column as "no bitmap available, fall back to bloom/batch
@@ -1786,6 +1793,47 @@ fn hash_for_hll<T: Hash>(val: &T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     val.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Merge per-segment HLL sketches into a partition-level accumulator (one
+/// sketch per non-segment-by column). The accumulator is lazily sized on the
+/// first call; subsequent calls union each column's sketch. Used by both load
+/// paths to build the per-partition sketch persisted as `column_hll`.
+pub(crate) fn accumulate_partition_hll(
+    acc: &mut Vec<CardinalityEstimator<u64>>,
+    sketches: &[CardinalityEstimator<u64>],
+) {
+    if acc.len() != sketches.len() {
+        *acc = (0..sketches.len())
+            .map(|_| CardinalityEstimator::<u64>::new())
+            .collect();
+    }
+    for (a, s) in acc.iter_mut().zip(sketches) {
+        a.merge(s);
+    }
+}
+
+/// Serialize a partition's per-column HLL sketches to a JSON object string
+/// `{col_name: <sketch>}` for storage in `deltax_partition.column_hll`.
+/// `stats::write_table_stats` deserializes and merges these across partitions
+/// to get an accurate table-wide distinct count for join/range estimation.
+pub(crate) fn serialize_partition_hll(
+    col_names: &[&str],
+    hll: &[CardinalityEstimator<u64>],
+) -> Option<String> {
+    if hll.is_empty() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for (name, sketch) in col_names.iter().zip(hll.iter()) {
+        if let Ok(v) = serde_json::to_value(sketch) {
+            map.insert((*name).to_string(), v);
+        }
+    }
+    if map.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Object(map).to_string())
 }
 
 /// Compute per-segment ndistinct using HyperLogLog estimators.

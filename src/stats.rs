@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use cardinality_estimator::CardinalityEstimator;
 use pgrx::pg_sys;
 use pgrx::spi::{self, SpiClient};
 
@@ -578,6 +579,25 @@ pub fn analyze_partition_from_catalog(
     )
 }
 
+/// Deserialize a partition's `column_hll` JSON (`{col_name: <sketch>}`) and
+/// union each column's sketch into the table-wide accumulator. Sketches that
+/// fail to parse are skipped (the caller falls back to the heuristic).
+fn merge_partition_hll_json(text: &str, acc: &mut HashMap<String, CardinalityEstimator<u64>>) {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    for (name, val) in obj {
+        if let Ok(sketch) = serde_json::from_value::<CardinalityEstimator<u64>>(val) {
+            match acc.get_mut(&name) {
+                Some(existing) => existing.merge(&sketch),
+                None => {
+                    acc.insert(name, sketch);
+                }
+            }
+        }
+    }
+}
+
 /// Merge per-partition distinct counts into a table-wide estimate. Columns
 /// whose per-partition value ranges are mostly disjoint (e.g. the time column,
 /// or order_id correlated with time) have additive distinct counts → SUM;
@@ -650,11 +670,14 @@ pub fn write_table_stats(
         return Ok(());
     }
 
-    // Gather per-partition (ndistinct, minmax) lists per column + total rows.
+    // Gather per-partition (ndistinct, minmax) lists per column + total rows,
+    // plus a merged table-wide HLL per column (accurate global distinct count,
+    // unlike the SUM/MAX heuristic over per-partition estimates).
     let mut total_rows: i64 = 0;
     let mut nd_by_col: HashMap<String, Vec<i64>> = HashMap::new();
     let mut mm_by_col: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
-    let query = "SELECT row_count, column_ndistinct::text, column_minmax::text \
+    let mut hll_by_col: HashMap<String, CardinalityEstimator<u64>> = HashMap::new();
+    let query = "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text \
                  FROM deltax.deltax_partition \
                  WHERE is_compressed = true AND deltatable_id = (\
                      SELECT id FROM deltax.deltax_deltatable \
@@ -687,6 +710,13 @@ pub fn write_table_stats(
                 mm_by_col.entry(name).or_default().push(mm);
             }
         }
+        if let Some(text) = row
+            .get_datum_by_ordinal(4)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            merge_partition_hll_json(&text, &mut hll_by_col);
+        }
     }
     if total_rows <= 0 {
         return Ok(());
@@ -705,7 +735,13 @@ pub fn write_table_stats(
         let nds = nd_by_col.get(&attr.attname).unwrap_or(&empty_nd);
         let mms = mm_by_col.get(&attr.attname).unwrap_or(&empty_mm);
 
-        let merged_nd = merge_ndistinct(nds, mms, total_rows);
+        // Prefer the merged table-wide HLL estimate (accurate global distinct);
+        // fall back to the SUM/MAX heuristic for partitions that predate
+        // `column_hll`.
+        let merged_nd = match hll_by_col.get(&attr.attname) {
+            Some(hll) => (hll.estimate() as i64).clamp(1, total_rows.max(1)),
+            None => merge_ndistinct(nds, mms, total_rows),
+        };
         let stadistinct = stadistinct_value(merged_nd, total_rows);
         // We don't aggregate per-partition nonnull counts at the table level;
         // NOT NULL columns are 0, the rest default to 0 (neutral — avoids the
@@ -752,6 +788,37 @@ mod tests {
         assert_eq!(stawidth_for_attlen(-1), 32);
         assert_eq!(stawidth_for_attlen(-2), 32);
         assert_eq!(stawidth_for_attlen(0), 32);
+    }
+
+    #[test]
+    fn partition_hll_serialize_merge_roundtrip_unions_distinct() {
+        // Two partitions with disjoint value sets; the merged estimate should
+        // approximate the union cardinality (~2000), not either half.
+        let mut a = CardinalityEstimator::<u64>::new();
+        for v in 0u64..1000 {
+            a.insert(&v);
+        }
+        let mut b = CardinalityEstimator::<u64>::new();
+        for v in 1000u64..2000 {
+            b.insert(&v);
+        }
+        let ja = crate::compress::serialize_partition_hll(&["k"], std::slice::from_ref(&a)).unwrap();
+        let jb = crate::compress::serialize_partition_hll(&["k"], std::slice::from_ref(&b)).unwrap();
+
+        let mut acc: HashMap<String, CardinalityEstimator<u64>> = HashMap::new();
+        merge_partition_hll_json(&ja, &mut acc);
+        merge_partition_hll_json(&jb, &mut acc);
+
+        let est = acc.get("k").unwrap().estimate() as i64;
+        assert!((1800..=2200).contains(&est), "union estimate off: {est}");
+    }
+
+    #[test]
+    fn merge_partition_hll_json_ignores_garbage() {
+        let mut acc: HashMap<String, CardinalityEstimator<u64>> = HashMap::new();
+        merge_partition_hll_json("not json", &mut acc);
+        merge_partition_hll_json("[1,2,3]", &mut acc); // not an object
+        assert!(acc.is_empty());
     }
 
     #[test]

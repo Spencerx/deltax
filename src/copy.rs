@@ -6,6 +6,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use cardinality_estimator::CardinalityEstimator;
 use pgrx::pg_sys;
 use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
 use pgrx::prelude::*;
@@ -638,6 +639,9 @@ struct PartitionBuffer {
     typed_cols: Vec<TypedColumn>,
     row_count: usize,
     next_segment_id: i32,
+    /// Partition-level HLL sketches (one per non-segment-by column), unioned
+    /// from each segment's sketches; serialized to `column_hll` at finalize.
+    partition_hll: Vec<CardinalityEstimator<u64>>,
     blob_buffer: Vec<(u16, i32, Vec<u8>)>,
     blob_buffer_size: usize,
     bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)>,
@@ -936,6 +940,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
             typed_cols: init_typed_columns(&columns, &kinds),
             row_count: 0,
             next_segment_id: 1,
+            partition_hll: Vec::new(),
             blob_buffer: Vec::new(),
             blob_buffer_size: 0,
             bloom_buffer: Vec::new(),
@@ -2172,6 +2177,9 @@ struct CompressedSegment {
     meta_values_csv: String, // pre-formatted VALUES clause for thin meta
     colstats_rows_csv: Vec<String>, // pre-formatted VALUES tuples, one per non-segment-by column
     total_compressed_size: i64,
+    /// Per-non-segment-by-column HLL sketches for this segment, unioned into
+    /// the partition-level sketch on the main thread.
+    hll_sketches: Vec<CardinalityEstimator<u64>>,
 }
 
 /// Sort, compress, and prepare metadata for a segment (pure Rust, no PG calls).
@@ -2191,7 +2199,7 @@ fn compress_segment(
     sort_typed_columns(&mut typed_cols, order_col_indices, row_count);
 
     // Ndistinct
-    let (ndistinct, _hll_sketches) = compute_segment_ndistinct(&typed_cols, columns);
+    let (ndistinct, hll_sketches) = compute_segment_ndistinct(&typed_cols, columns);
 
     // Segment_by values
     let seg_values: Vec<Option<String>> = columns
@@ -2339,6 +2347,7 @@ fn compress_segment(
         meta_values_csv: meta_vals.join(", "),
         colstats_rows_csv,
         total_compressed_size: total_size,
+        hll_sketches,
     }
 }
 
@@ -2367,7 +2376,8 @@ fn flush_segment(buf: &mut PartitionBuffer, state: &BackfillState) {
     let sort_ms = t_sort_start.elapsed().as_millis();
 
     // Compute ndistinct
-    let (ndistinct, _hll_sketches) = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
+    let (ndistinct, hll_sketches) = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
+    crate::compress::accumulate_partition_hll(&mut buf.partition_hll, &hll_sketches);
 
     // Segment_by values from the buffered data (extract from first row if present)
     let seg_values: Vec<Option<String>> = state
@@ -2795,6 +2805,9 @@ fn write_compressed_segment(
     buf.total_compressed_size += cs.total_compressed_size;
     buf.total_rows += cs.row_count as i64;
 
+    // Union this segment's HLL sketches into the partition-level accumulator.
+    crate::compress::accumulate_partition_hll(&mut buf.partition_hll, &cs.hll_sketches);
+
     // Track segment_id for next allocation
     if cs.seg_id >= buf.next_segment_id {
         buf.next_segment_id = cs.seg_id + 1;
@@ -2909,6 +2922,16 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             &nd_col_names,
         )
         .expect("failed to update partition column_ndistinct");
+        // Persist the partition-level HLL sketches (unioned across segments)
+        // so write_table_stats can merge them across partitions for an
+        // accurate table-wide distinct count.
+        let nd_col_refs: Vec<&str> = nd_col_names.iter().map(|s| s.as_str()).collect();
+        if let Some(hll_json) =
+            crate::compress::serialize_partition_hll(&nd_col_refs, &buf.partition_hll)
+        {
+            catalog::update_partition_column_hll(client, partition_id, &hll_json)
+                .expect("failed to update partition column_hll");
+        }
         catalog::update_partition_column_valmap(client, partition_id, &column_valmap)
             .expect("failed to update partition column_valmap");
         catalog::update_partition_column_minmax(client, partition_id, &ddl.colstats_fqn, columns)

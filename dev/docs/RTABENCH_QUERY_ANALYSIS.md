@@ -126,9 +126,12 @@ overlap `[1, large]`, so the min/max overlap heuristic can't see that the
 won only because `oe` was drastically *under*-estimated (accidental); accurate
 stats removed that accident.
 
-The fix is a **global HyperLogLog**: accumulate per-segment HLL sketches into
-a table-level sketch at load time (both the compress and COPY/backfill paths
-currently discard them), persist it, and read it in `write_table_stats` for an
-accurate parent `order_id` distinct (~10M) → `max(10M, 458K)=10M` → correct
-join card → nested loop. Requires a data reload to populate (HLL can't be
-rebuilt from the stored estimates). Tracked as a follow-up to this commit.
+The fix is a **global HyperLogLog** (implemented): per-segment HLL sketches
+(previously discarded in both the compress and COPY/backfill load paths) are
+now unioned into a per-partition sketch and persisted as
+`deltax_partition.column_hll`; `write_table_stats` merges them across
+partitions for an accurate parent distinct count. Local reload (250K orders):
+parent `order_id` n_distinct = 250,344 vs true 249,999 (0.1%). On the full
+EC2 dataset `order_id` ≈ 10M → `max(10M, 458K)=10M` → correct join card →
+nested loop. **Requires a data reload** (`make -C rtabench setup`) — HLL
+can't be rebuilt from the stored estimates.
