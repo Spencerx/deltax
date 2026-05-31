@@ -828,7 +828,7 @@ pub(super) unsafe extern "C-unwind" fn rescan_minmax_scan(node: *mut pg_sys::Cus
 ///
 /// Timestamps and dates are stored as Unix-epoch microseconds in the colstats table,
 /// but PG expects PG-epoch microseconds for timestamps and PG-epoch days for dates.
-fn decode_encoded_to_datum(encoded: i64, type_oid: pg_sys::Oid) -> pg_sys::Datum {
+pub(crate) fn decode_encoded_to_datum(encoded: i64, type_oid: pg_sys::Oid) -> pg_sys::Datum {
     match type_oid {
         pg_sys::FLOAT4OID => {
             let f = decode_i64_to_f32(encoded);

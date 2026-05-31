@@ -3896,11 +3896,10 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
 }
 
 /// Re-populate pg_class.reltuples + pg_statistic for an already-compressed
-/// partition from the `_colstats` catalog data. HLL sketches aren't
-/// available here (they only exist during compression), so
-/// `stats::analyze_partition_from_catalog` falls back to a SUM-capped
-/// per-segment ndistinct — less accurate but still strictly better than
-/// PG's defaults.
+/// partition. `stats::analyze_partition_from_catalog` reads the
+/// authoritative per-column distinct counts persisted at compression time
+/// in `deltax.deltax_partition.column_ndistinct` (merged-HLL), so a
+/// standalone refresh produces the same stats the compression path would.
 pub(crate) fn analyze_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let (schema, part_table) = crate::partition::resolve_relation(client, partition);
     analyze_partition_impl_split(client, &schema, &part_table)
@@ -4043,6 +4042,19 @@ fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
             n_ok += 1;
         }
     }
+
+    // Merge the per-partition stats onto the parent relation so the planner
+    // has table-wide distinct counts / histograms for join and range
+    // estimation (the partitions are scanned through a single DeltaXAppend).
+    if let Err(e) = crate::stats::write_table_stats(client, &schema, &table) {
+        pgrx::warning!(
+            "deltax_analyze_table: failed to write parent stats for {}.{}: {}",
+            schema,
+            table,
+            e
+        );
+    }
+
     format!(
         "deltax_analyze_table({}.{}): refreshed {} partition(s), {} failed",
         schema, table, n_ok, n_err,

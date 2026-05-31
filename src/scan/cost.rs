@@ -549,7 +549,7 @@ pub(crate) fn prewarm_partition_column_minmax(oids: &[pg_sys::Oid]) {
 /// Parse a `{"col": [min,max], ...}` JSON map of i64 ranges (as emitted by
 /// `catalog::update_partition_column_minmax`). Returns `None` if the input
 /// isn't shaped like an object — callers treat that as "no info, can't prune".
-fn parse_minmax_json(text: &str) -> Option<HashMap<String, (i64, i64)>> {
+pub(crate) fn parse_minmax_json(text: &str) -> Option<HashMap<String, (i64, i64)>> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -738,7 +738,7 @@ fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec
 /// `catalog::update_partition_column_ndistinct`) into the result map.
 /// Trivial hand-rolled parser — values are always integers, keys are
 /// always column names with limited escaping (backslash and quote).
-fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, i64>) {
+pub(crate) fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, i64>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     // Skip leading whitespace and opening brace
