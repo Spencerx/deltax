@@ -18,12 +18,11 @@ for file in "$DIR/queries"/*.sql; do
 
     query="$(cat "$file")"
     for i in $(seq 1 $TRIES); do
-
-        # `work_mem=8GB` keeps the 105M-row hash in a single batch (would
-        # otherwise spill to disk at 2 GB, doubling runtime).
+        # `work_mem=50MB` matches the TimescaleDB RTABench harness for an
+        # apples-to-apples comparison.
         sudo -u postgres psql test --no-psqlrc --tuples-only \
             --command "\timing on" \
-            --command "SET work_mem = '8GB'" \
+            --command "SET work_mem = '50MB'" \
             --command "$query" 2>&1 | grep -P 'Time|psql: error' | tail -n1
     done
 done

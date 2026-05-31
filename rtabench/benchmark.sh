@@ -148,7 +148,7 @@ sudo -u postgres psql -c "ALTER SYSTEM SET effective_cache_size = '24GB'"
 sudo -u postgres psql -c "ALTER SYSTEM SET max_worker_processes = 16"
 sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers = 16"
 sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers_per_gather = 8"
-sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '8GB'"
+sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '50MB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 sudo systemctl restart postgresql
 
