@@ -127,7 +127,10 @@ pub(super) fn decompress_numeric_no_nulls(
             // intermediate `Vec<primitive>`.
             if type_oid == pg_sys::TIMESTAMPOID || type_oid == pg_sys::TIMESTAMPTZOID {
                 compression::gorilla::decode_timestamps_each(cc.data, total_count, |usec| {
-                    out.push((pg_sys::Datum::from((usec - PG_EPOCH_OFFSET_USEC) as usize), false));
+                    out.push((
+                        pg_sys::Datum::from((usec - PG_EPOCH_OFFSET_USEC) as usize),
+                        false,
+                    ));
                 });
             } else if type_oid == pg_sys::DATEOID {
                 compression::gorilla::decode_timestamps_each(cc.data, total_count, |usec| {

@@ -622,10 +622,10 @@ mod tests {
             }
             for _ in 0..n {
                 match xorshift64(&mut s) % 4 {
-                    0 => {}                                   // repeat previous (xor==0)
+                    0 => {}                                               // repeat previous (xor==0)
                     1 => base += (xorshift64(&mut s) % 8) as f64 * 0.001, // tiny step
-                    2 => base = f64::from_bits(xorshift64(&mut s)), // arbitrary bits
-                    _ => base *= 1.0001,                       // small relative step
+                    2 => base = f64::from_bits(xorshift64(&mut s)),       // arbitrary bits
+                    _ => base *= 1.0001,                                  // small relative step
                 }
                 values.push(base);
             }

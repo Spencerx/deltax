@@ -253,10 +253,6 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// `per_segment` so each worker resolves `(seg_idx, local_dict_id)` →
     /// `global_id` without further coordination.
     pub(super) dict_distinct_remaps: &'a std::collections::HashMap<usize, DictDistinctRemap>,
-    /// When false, the dict-aware GROUP BY fast path is disabled (per-row
-    /// hashing + probing). Set from `pg_deltax.disable_dict_group_fast` on the
-    /// main thread; threaded through so worker threads don't read the GUC.
-    pub(super) dict_group_fast: bool,
 }
 
 // SAFETY: see equivalent impl on `ParallelCompactConfig` for the
@@ -937,8 +933,7 @@ pub(super) fn process_segments_mixed(
         // dict-entry -> group index so the per-row hash + map probe collapses to
         // once per *distinct* dict entry per segment; repeated values (the common
         // case for dict columns) become a Vec index lookup. Reset per segment.
-        let dict_fast: Option<&SegTextColumn> = if config.dict_group_fast
-            && n_int_keys == 0
+        let dict_fast: Option<&SegTextColumn> = if n_int_keys == 0
             && n_str_keys == 1
             && config.group_specs.len() == 1
             && config.preselected_keys.is_none()
@@ -3511,7 +3506,6 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             sidecar_only_cols,
             preselected_keys: preselected_keys.as_ref(),
             dict_distinct_remaps: &dict_distinct_remaps,
-            dict_group_fast: !crate::DISABLE_DICT_GROUP_FAST.get(),
         };
 
         let mut pipeline_detoast_us: u64 = 0;
