@@ -110,28 +110,45 @@ Implemented in `src/stats.rs`:
 **eliminated** (1.36 s); Q3 −49%, Q4 −24%, Q25 −45%, Q27 −52%, Q30 −21%.
 `clippy` clean, 547 unit tests pass.
 
-### 4.1 · Q17 — the one regression, needs a global HLL (follow-up)
+### 4.1 · Global HLL (Q17) + MCV (Q19) — done
 
-`top_selling_month_product` went 928 ms → 6.3 s. Forcing the nested loop
-runs it in **710 ms** (9× faster than the hash join the planner now picks),
-so it's a pure plan-choice problem, not spill (`work_mem=8GB` is *worse*).
+Two further estimator pieces, both shipped and validated on the full EC2
+dataset after a reload:
 
-Root cause: the `oe ⋈ order_items` join cardinality is overestimated (45M
-vs 6.3M actual). `card = rows1·rows2 / max(nd1, nd2)`, and **both** order_id
-n_distincts are too low: `order_items.order_id` = 458 808 (PG ANALYZE
-underestimate; true ~10M), and the merged parent `oe.order_id` = 19 767
-because `merge_ndistinct` took MAX — order_id's per-partition ranges all
-overlap `[1, large]`, so the min/max overlap heuristic can't see that the
-*values* are disjoint sets across time partitions (additive). Previously NL
-won only because `oe` was drastically *under*-estimated (accidental); accurate
-stats removed that accident.
+**Global HLL — fixes Q17.** `top_selling_month_product` regressed 928 ms →
+6.3 s once stats existed, because the `oe ⋈ order_items` join cardinality was
+overestimated (45M vs 6.3M). `card = rows1·rows2 / max(nd1, nd2)`, and the
+merged parent `oe.order_id` came out 19 767 — `merge_ndistinct` took MAX since
+order_id's per-partition ranges all overlap `[1, large]`, so a min/max
+heuristic can't see the values are disjoint sets across time partitions. Fix:
+the per-segment HLL sketches both load paths used to discard are now unioned
+into a per-partition sketch (`column_hll`) and merged table-wide in
+`write_table_stats`. Local reload: parent order_id n_distinct 250 344 vs true
+249 999 (0.1%); EC2 full: ~10M → correct join card. **Q17 6.3 s → 1.22 s.**
+(It picks a hash join, not the 0.7 s nested loop — `order_items.order_id`'s own
+ANALYZE n_distinct is 458 808, a PG underestimate — but 1.22 s is 5.7× faster
+than TimescaleDB, so not worth chasing.)
 
-The fix is a **global HyperLogLog** (implemented): per-segment HLL sketches
-(previously discarded in both the compress and COPY/backfill load paths) are
-now unioned into a per-partition sketch and persisted as
-`deltax_partition.column_hll`; `write_table_stats` merges them across
-partitions for an accurate parent distinct count. Local reload (250K orders):
-parent `order_id` n_distinct = 250,344 vs true 249,999 (0.1%). On the full
-EC2 dataset `order_id` ≈ 10M → `max(10M, 458K)=10M` → correct join card →
-nested loop. **Requires a data reload** (`make -C rtabench setup`) — HLL
-can't be rebuilt from the stored estimates.
+**MCV — fixes Q19.** The reload exposed a worse case: `out_of_stock_products`
+hit **871 seconds**. Its `NOT EXISTS (… event_type='Shipped')` filters a value
+that doesn't exist; with only stadistinct, PG estimated it at `1/9` of the
+table (~20M) instead of ~0, so the anti-join was estimated at ~1 row and put a
+224K-row result on the inner of a Materialize'd nested loop re-scanned once per
+product (9255×). Fix: write an MCV list (`stakind=1`) for low-cardinality
+columns from the persisted `column_valmap` (the column's complete distinct-value
+set). The slot-1 writer now carries a histogram *or* an MCV; frequencies are
+uniform summing to 1.0 (no exact counts), keeping present values at
+`1/ndistinct` while estimating absent values at ~0 (stadistinct = value count
+→ no "other" distinct). Written at the **child** level (equality filters on
+`order_events` are estimated per-child then summed) and the parent.
+`event_type='Shipped'` estimate **20M → 128**; **Q19 871 s → 0.70 s**.
+Reload-free — `column_valmap` is already persisted; just re-run
+`deltax_analyze_table`.
+
+### 4.2 · Final EC2 suite (181M events, reloaded, vs no-stats baseline)
+
+Suite **12.73 s → 11.99 s** (−6%); **2.4× faster than TimescaleDB** (29.3 s).
+Q19 871 s → 0.70 s, Q30 −21%, Q3 −48%, Q27 −52%, Q25 −42%, Q5 −28%, Q23 −15%.
+The only query slower than the (accidentally-NL) no-stats baseline is Q17
+(0.93 s → 1.22 s), still 5.7× faster than TimescaleDB. No disasters; every
+join query beats or ties TimescaleDB.
