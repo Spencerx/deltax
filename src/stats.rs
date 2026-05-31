@@ -49,6 +49,9 @@ pub fn write_partition_stats(
     // on the order-by / time column stop collapsing to a default
     // selectivity. Empty if the partition predates `column_minmax`.
     let col_minmax = load_column_minmax(client, part_rel_oid)?;
+    // Per-column distinct-value lists for low-cardinality columns, used to
+    // write an MCV (exact equality selectivity + ~0 for absent values).
+    let col_valmap = load_column_valmap(client, part_rel_oid)?;
 
     // Estimate average tuple width — feeds `pg_class.relpages`.
     let mut sum_widths: i64 = 0;
@@ -95,13 +98,35 @@ pub fn write_partition_stats(
         };
 
         let ndistinct = col_ndistinct.get(&col.name).copied().unwrap_or(0);
-        let stadistinct = stadistinct_value(ndistinct, row_count);
 
-        // Histogram slot from the persisted [min, max], when the type is
-        // one we can encode and the column isn't constant.
+        // Slot 1: a histogram for ordered types, else an MCV for a
+        // low-cardinality column. The valmap is the column's *complete*
+        // distinct-value set for the partition, so an MCV over it lets PG
+        // estimate equality on an absent value at ~0 (1/ndistinct gets that
+        // badly wrong — see Q19). Equality filters on `order_events` are
+        // estimated per-child then summed, so this child-level MCV is what the
+        // planner actually reads. When writing an MCV, stadistinct must equal
+        // the value count (the persisted ndistinct is a per-segment MAX that
+        // can under-count) so non-MCV values get 0.
         let histogram = col_minmax.get(&col.name).and_then(|&(lo, hi)| {
-            histogram_eligible(attr.atttypid, lo, hi).then(|| (attr.atttypid, vec![lo, hi]))
+            histogram_eligible(attr.atttypid, lo, hi).then(|| Slot1::Histogram {
+                type_oid: attr.atttypid,
+                bounds: vec![lo, hi],
+            })
         });
+        let (slot, eff_ndistinct) = match histogram {
+            Some(h) => (Some(h), ndistinct),
+            None => match col_valmap.get(&col.name) {
+                Some(vals) if vals.len() >= 2 => (
+                    Some(Slot1::Mcv {
+                        values: vals.clone(),
+                    }),
+                    vals.len() as i64,
+                ),
+                _ => (None, ndistinct),
+            },
+        };
+        let stadistinct = stadistinct_value(eff_ndistinct, row_count);
 
         upsert_pg_statistic_row(
             client,
@@ -110,7 +135,7 @@ pub fn write_partition_stats(
             stadistinct,
             stanullfrac,
             stawidth,
-            histogram,
+            slot,
             false,
         )?;
 
@@ -272,18 +297,22 @@ unsafe fn build_histogram_array(type_oid: pg_sys::Oid, bounds: &[i64]) -> pg_sys
     pg_sys::Datum::from(arr)
 }
 
-/// Look up the btree `<` operator for a type (strategy 1), used as `staop1`
-/// for the histogram slot. Returns `InvalidOid` if the type has no btree
-/// ordering (caller then skips the histogram).
-fn lookup_lt_operator(client: &mut SpiClient, type_oid: pg_sys::Oid) -> pg_sys::Oid {
+/// Look up the btree operator for a type and strategy number (1 = `<`,
+/// 3 = `=`), used as `staop` for the histogram / MCV slot. Returns
+/// `InvalidOid` if the type has no such btree operator.
+fn lookup_strategy_operator(
+    client: &mut SpiClient,
+    type_oid: pg_sys::Oid,
+    strategy: i32,
+) -> pg_sys::Oid {
     let t = u32::from(type_oid) as i64;
     client
         .select(
             "SELECT amopopr::int8 FROM pg_amop \
              WHERE amoplefttype = $1::oid AND amoprighttype = $1::oid \
-               AND amopstrategy = 1 AND amopmethod = 403 LIMIT 1",
+               AND amopstrategy = $2 AND amopmethod = 403 LIMIT 1",
             None,
-            &[t.into()],
+            &[t.into(), strategy.into()],
         )
         .ok()
         .and_then(|t| t.into_iter().next())
@@ -317,6 +346,50 @@ fn load_column_minmax(
     Ok(json_text
         .and_then(|t| crate::scan::cost::parse_minmax_json(&t))
         .unwrap_or_default())
+}
+
+/// Load the persisted per-column distinct-value lists (`column_valmap`) for a
+/// compressed partition. Only low-cardinality columns (≤ 32 distinct) have an
+/// entry. Empty map if the partition predates the column.
+fn load_column_valmap(
+    client: &mut SpiClient,
+    part_rel_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<String, Vec<String>>> {
+    let part_oid_int = u32::from(part_rel_oid) as i64;
+    let json_text: Option<String> = client
+        .select(
+            "SELECT column_valmap::text FROM deltax.deltax_partition \
+             WHERE table_name = (SELECT relname FROM pg_class WHERE oid = $1::oid) \
+               AND is_compressed = true",
+            None,
+            &[part_oid_int.into()],
+        )?
+        .next()
+        .and_then(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        });
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(text) = json_text
+        && let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        for (name, val) in obj {
+            if let serde_json::Value::Array(arr) = val {
+                let vals: Vec<String> = arr
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                if !vals.is_empty() {
+                    out.insert(name, vals);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Translate pg_attribute.attlen into a `stawidth`. Fixed-width types
@@ -377,6 +450,29 @@ fn update_reltuples(
 /// `(starelid, staattnum, stainherit)` but it's a system index not
 /// advertised for `ON CONFLICT`), so two-step is the conventional
 /// pattern — same thing `update_attstats` does in the backend.
+/// Slot-1 content for a `pg_statistic` row: either a histogram (range
+/// selectivity for ordered types) or an MCV list (equality selectivity for
+/// low-cardinality columns — and, crucially, ~0 for values that don't appear,
+/// which `1/ndistinct` gets badly wrong).
+enum Slot1 {
+    Histogram {
+        type_oid: pg_sys::Oid,
+        bounds: Vec<i64>,
+    },
+    Mcv {
+        values: Vec<String>,
+    },
+}
+
+/// Fully resolved slot-1 fields (operators + array Datums) ready for the tuple.
+struct Slot1Data {
+    stakind: i16,
+    staop: pg_sys::Oid,
+    stacoll: pg_sys::Oid,
+    stanumbers: Option<pg_sys::Datum>,
+    stavalues: pg_sys::Datum,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upsert_pg_statistic_row(
     client: &mut SpiClient,
@@ -385,7 +481,7 @@ fn upsert_pg_statistic_row(
     stadistinct: f32,
     stanullfrac: f32,
     stawidth: i32,
-    histogram: Option<(pg_sys::Oid, Vec<i64>)>,
+    slot: Option<Slot1>,
     stainherit: bool,
 ) -> spi::SpiResult<()> {
     let attrelid_int = u32::from(attrelid) as i64;
@@ -396,17 +492,31 @@ fn upsert_pg_statistic_row(
         &[attrelid_int.into(), attnum.into(), stainherit.into()],
     )?;
 
-    // Resolve the histogram slot (btree `<` operator + bounds array Datum)
-    // before forming the tuple; skip it if the type has no btree ordering
-    // or there aren't at least two distinct bounds.
-    let hist_slot: Option<(pg_sys::Oid, pg_sys::Datum)> = match histogram {
-        Some((type_oid, bounds)) if bounds.len() >= 2 => {
-            let ltopr = lookup_lt_operator(client, type_oid);
-            if ltopr == pg_sys::InvalidOid {
-                None
-            } else {
-                Some((ltopr, unsafe { build_histogram_array(type_oid, &bounds) }))
-            }
+    // Resolve slot 1 (operator + array Datums) before forming the tuple.
+    let slot1: Option<Slot1Data> = match slot {
+        Some(Slot1::Histogram { type_oid, bounds }) if bounds.len() >= 2 => {
+            let ltopr = lookup_strategy_operator(client, type_oid, 1); // btree `<`
+            (ltopr != pg_sys::InvalidOid).then(|| Slot1Data {
+                stakind: pg_sys::STATISTIC_KIND_HISTOGRAM as i16,
+                staop: ltopr,
+                stacoll: pg_sys::InvalidOid,
+                stanumbers: None,
+                stavalues: unsafe { build_histogram_array(type_oid, &bounds) },
+            })
+        }
+        Some(Slot1::Mcv { values }) if values.len() >= 2 => {
+            // MCV is written for text columns; resolve the text `=` operator.
+            let eqop = lookup_strategy_operator(client, pg_sys::TEXTOID, 3); // btree `=`
+            (eqop != pg_sys::InvalidOid).then(|| {
+                let (vals, numbers) = unsafe { build_mcv_arrays(&values) };
+                Slot1Data {
+                    stakind: pg_sys::STATISTIC_KIND_MCV as i16,
+                    staop: eqop,
+                    stacoll: pg_sys::DEFAULT_COLLATION_OID,
+                    stanumbers: Some(numbers),
+                    stavalues: vals,
+                }
+            })
         }
         _ => None,
     };
@@ -416,10 +526,62 @@ fn upsert_pg_statistic_row(
     unsafe { pg_sys::CommandCounterIncrement() };
     unsafe {
         form_and_insert_pg_statistic(
-            attrelid, attnum, stadistinct, stanullfrac, stawidth, hist_slot, stainherit,
+            attrelid, attnum, stadistinct, stanullfrac, stawidth, slot1, stainherit,
         )
     };
     Ok(())
+}
+
+/// Build the `stavalues` (text[]) and `stanumbers` (float4[]) array Datums for
+/// an MCV slot from a low-cardinality column's distinct values. We don't have
+/// exact per-value counts, so frequencies are uniform and sum to 1.0 — that
+/// keeps each present value at `1/ndistinct` (same as the ndistinct-only path)
+/// while making *absent* values estimate ~0 (the whole point: e.g. an
+/// `event_type='Shipped'` filter on a column that never contains 'Shipped').
+unsafe fn build_mcv_arrays(values: &[String]) -> (pg_sys::Datum, pg_sys::Datum) {
+    use pgrx::IntoDatum;
+    let n = values.len();
+
+    let mut val_datums: Vec<pg_sys::Datum> = values
+        .iter()
+        .map(|s| s.clone().into_datum().unwrap_or(pg_sys::Datum::from(0usize)))
+        .collect();
+    let mut freqs: Vec<f32> = vec![1.0f32 / n as f32; n];
+    // Make the frequencies sum to exactly 1.0 so PG estimates non-MCV values
+    // (which, with stadistinct == n, leave no "other" distinct values) at 0.
+    let drift: f32 = 1.0 - freqs.iter().sum::<f32>();
+    *freqs.last_mut().unwrap() += drift;
+    let mut freq_datums: Vec<pg_sys::Datum> = freqs
+        .iter()
+        .map(|x| pg_sys::Datum::from(x.to_bits() as usize))
+        .collect();
+
+    unsafe {
+        let (mut tl, mut tb, mut ta): (i16, bool, std::os::raw::c_char) = (0, false, 0);
+        pg_sys::get_typlenbyvalalign(pg_sys::TEXTOID, &mut tl, &mut tb, &mut ta);
+        let values_arr = pg_sys::construct_array(
+            val_datums.as_mut_ptr(),
+            n as i32,
+            pg_sys::TEXTOID,
+            tl as i32,
+            tb,
+            ta,
+        );
+        let (mut fl, mut fb, mut fa): (i16, bool, std::os::raw::c_char) = (0, false, 0);
+        pg_sys::get_typlenbyvalalign(pg_sys::FLOAT4OID, &mut fl, &mut fb, &mut fa);
+        let numbers_arr = pg_sys::construct_array(
+            freq_datums.as_mut_ptr(),
+            n as i32,
+            pg_sys::FLOAT4OID,
+            fl as i32,
+            fb,
+            fa,
+        );
+        (
+            pg_sys::Datum::from(values_arr),
+            pg_sys::Datum::from(numbers_arr),
+        )
+    }
 }
 
 /// Form a `pg_statistic` tuple in C and insert it. Slot 1 carries a
@@ -434,7 +596,7 @@ unsafe fn form_and_insert_pg_statistic(
     stadistinct: f32,
     stanullfrac: f32,
     stawidth: i32,
-    hist_slot: Option<(pg_sys::Oid, pg_sys::Datum)>,
+    slot1: Option<Slot1Data>,
     stainherit: bool,
 ) {
     use pgrx::IntoDatum;
@@ -472,29 +634,22 @@ unsafe fn form_and_insert_pg_statistic(
     put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stadistinct, f32_d(stadistinct));
 
     // Five (kind, op, coll, numbers, values) slots. Only slot 1 may carry a
-    // histogram; the rest are empty.
+    // histogram or MCV; the rest are empty.
     for slot in 0u32..5 {
-        let (kind, op, vals): (i16, pg_sys::Oid, Option<pg_sys::Datum>) = if slot == 0 {
-            match hist_slot {
-                Some((ltopr, arr)) => (
-                    pg_sys::STATISTIC_KIND_HISTOGRAM as i16,
-                    ltopr,
-                    Some(arr),
-                ),
-                None => (0, pg_sys::InvalidOid, None),
-            }
-        } else {
-            (0, pg_sys::InvalidOid, None)
+        let (kind, op, coll, numbers, vals): (
+            i16,
+            pg_sys::Oid,
+            pg_sys::Oid,
+            Option<pg_sys::Datum>,
+            Option<pg_sys::Datum>,
+        ) = match (slot, &slot1) {
+            (0, Some(s)) => (s.stakind, s.staop, s.stacoll, s.stanumbers, Some(s.stavalues)),
+            _ => (0, pg_sys::InvalidOid, pg_sys::InvalidOid, None, None),
         };
         put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stakind1 + slot, i16_d(kind));
         put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_staop1 + slot, oid_d(op));
-        put(
-            &mut values,
-            &mut nulls,
-            pg_sys::Anum_pg_statistic_stacoll1 + slot,
-            oid_d(pg_sys::InvalidOid),
-        );
-        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stanumbers1 + slot, None);
+        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stacoll1 + slot, oid_d(coll));
+        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stanumbers1 + slot, numbers);
         put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stavalues1 + slot, vals);
     }
 
@@ -598,6 +753,29 @@ fn merge_partition_hll_json(text: &str, acc: &mut HashMap<String, CardinalityEst
     }
 }
 
+/// Union a partition's `column_valmap` JSON (`{col_name: ["v0", "v1", ...]}`)
+/// into a table-wide per-column distinct-value set. Per-partition valmaps only
+/// list the values present in that partition, so the union across all
+/// partitions is the table's full value set for the (low-cardinality) column.
+fn union_valmap_json(
+    text: &str,
+    acc: &mut HashMap<String, std::collections::BTreeSet<String>>,
+) {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    for (name, val) in obj {
+        if let serde_json::Value::Array(arr) = val {
+            let set = acc.entry(name).or_default();
+            for v in arr {
+                if let serde_json::Value::String(s) = v {
+                    set.insert(s);
+                }
+            }
+        }
+    }
+}
+
 /// Merge per-partition distinct counts into a table-wide estimate. Columns
 /// whose per-partition value ranges are mostly disjoint (e.g. the time column,
 /// or order_id correlated with time) have additive distinct counts → SUM;
@@ -677,7 +855,12 @@ pub fn write_table_stats(
     let mut nd_by_col: HashMap<String, Vec<i64>> = HashMap::new();
     let mut mm_by_col: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
     let mut hll_by_col: HashMap<String, CardinalityEstimator<u64>> = HashMap::new();
-    let query = "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text \
+    // Table-wide distinct value lists for low-cardinality columns (the union
+    // of the per-partition valmaps), used to write an MCV list.
+    let mut vm_by_col: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let query =
+        "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text, \
+                column_valmap::text \
                  FROM deltax.deltax_partition \
                  WHERE is_compressed = true AND deltatable_id = (\
                      SELECT id FROM deltax.deltax_deltatable \
@@ -717,6 +900,13 @@ pub fn write_table_stats(
         {
             merge_partition_hll_json(&text, &mut hll_by_col);
         }
+        if let Some(text) = row
+            .get_datum_by_ordinal(5)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            union_valmap_json(&text, &mut vm_by_col);
+        }
     }
     if total_rows <= 0 {
         return Ok(());
@@ -742,14 +932,35 @@ pub fn write_table_stats(
             Some(hll) => (hll.estimate() as i64).clamp(1, total_rows.max(1)),
             None => merge_ndistinct(nds, mms, total_rows),
         };
-        let stadistinct = stadistinct_value(merged_nd, total_rows);
         // We don't aggregate per-partition nonnull counts at the table level;
         // NOT NULL columns are 0, the rest default to 0 (neutral — avoids the
         // all-null trap). Per-column nullfrac stays on the child stats.
         let stanullfrac = 0.0f32;
         let stawidth = stawidth_for_attlen(attr.attlen);
-        let histogram =
-            parent_histogram_bounds(attr.atttypid, mms).map(|b| (attr.atttypid, b));
+
+        // Slot 1: a histogram for ordered types (range selectivity), else an
+        // MCV list for a low-cardinality column whose full value set we know
+        // from the valmap union (equality selectivity, and ~0 for values that
+        // never appear — `1/ndistinct` gets those badly wrong; see Q19). When
+        // writing an MCV, stadistinct must equal the value count so non-MCV
+        // values estimate 0.
+        let histogram = parent_histogram_bounds(attr.atttypid, mms).map(|bounds| Slot1::Histogram {
+            type_oid: attr.atttypid,
+            bounds,
+        });
+        let (slot, eff_ndistinct) = match histogram {
+            Some(h) => (Some(h), merged_nd),
+            None => match vm_by_col.get(&attr.attname) {
+                Some(set) if set.len() >= 2 => (
+                    Some(Slot1::Mcv {
+                        values: set.iter().cloned().collect(),
+                    }),
+                    set.len() as i64,
+                ),
+                _ => (None, merged_nd),
+            },
+        };
+        let stadistinct = stadistinct_value(eff_ndistinct, total_rows);
 
         upsert_pg_statistic_row(
             client,
@@ -758,7 +969,7 @@ pub fn write_table_stats(
             stadistinct,
             stanullfrac,
             stawidth,
-            histogram,
+            slot,
             true,
         )?;
     }
