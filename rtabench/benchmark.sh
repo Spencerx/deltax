@@ -126,6 +126,14 @@ sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE customers, products,
 VACUUM_END=$(date +%s)
 echo "$((VACUUM_END - VACUUM_START))s"
 
+# Populate pg_statistic (histograms + parent-relation merged-HLL stats) for the
+# compressed order_events partitions. The COPY/backfill load path doesn't write
+# pg_statistic, so without this the planner has no distinct counts / histograms
+# for join + range estimation. Runs after the plain ANALYZE so it wins on the
+# partitioned parent's inheritance-tree stats.
+echo -n "deltax_analyze_table: "
+sudo -u postgres psql "$DB" -q -t -c "SELECT deltax.deltax_analyze_table('order_events')"
+
 # Capture data size = deltax(order_events) + plain(other 4 tables)
 DELTAX_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax.deltax_table_size('order_events')")
 PLAIN_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT coalesce(sum(pg_total_relation_size(c.oid))::bigint, 0) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname IN ('customers','products','orders','order_items')")
