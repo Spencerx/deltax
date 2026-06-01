@@ -1070,7 +1070,12 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
     Spi::connect_mut(|client| {
         let result = crate::compress::analyze_table_impl(client, &format!("{}.{}", schema, table));
         if result.starts_with("Failed") || result.starts_with("No compressed") {
-            pgrx::warning!("pg_deltax: post-backfill analyze for {}.{}: {}", schema, table, result);
+            pgrx::warning!(
+                "pg_deltax: post-backfill analyze for {}.{}: {}",
+                schema,
+                table,
+                result
+            );
         }
     });
 

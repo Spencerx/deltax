@@ -316,7 +316,11 @@ fn lookup_strategy_operator(
         )
         .ok()
         .and_then(|t| t.into_iter().next())
-        .and_then(|row| row.get_datum_by_ordinal(1).ok().and_then(|d| d.value::<i64>().ok().flatten()))
+        .and_then(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<i64>().ok().flatten())
+        })
         .map(|v| pg_sys::Oid::from(v as u32))
         .unwrap_or(pg_sys::InvalidOid)
 }
@@ -526,7 +530,13 @@ fn upsert_pg_statistic_row(
     unsafe { pg_sys::CommandCounterIncrement() };
     unsafe {
         form_and_insert_pg_statistic(
-            attrelid, attnum, stadistinct, stanullfrac, stawidth, slot1, stainherit,
+            attrelid,
+            attnum,
+            stadistinct,
+            stanullfrac,
+            stawidth,
+            slot1,
+            stainherit,
         )
     };
     Ok(())
@@ -544,7 +554,11 @@ unsafe fn build_mcv_arrays(values: &[String]) -> (pg_sys::Datum, pg_sys::Datum) 
 
     let mut val_datums: Vec<pg_sys::Datum> = values
         .iter()
-        .map(|s| s.clone().into_datum().unwrap_or(pg_sys::Datum::from(0usize)))
+        .map(|s| {
+            s.clone()
+                .into_datum()
+                .unwrap_or(pg_sys::Datum::from(0usize))
+        })
         .collect();
     let mut freqs: Vec<f32> = vec![1.0f32 / n as f32; n];
     // Make the frequencies sum to exactly 1.0 so PG estimates non-MCV values
@@ -605,16 +619,17 @@ unsafe fn form_and_insert_pg_statistic(
     let mut values: Vec<pg_sys::Datum> = vec![pg_sys::Datum::from(0usize); natts];
     let mut nulls: Vec<bool> = vec![true; natts];
 
-    let put = |values: &mut [pg_sys::Datum], nulls: &mut [bool], anum: u32, d: Option<pg_sys::Datum>| {
-        let i = (anum - 1) as usize;
-        match d {
-            Some(v) => {
-                values[i] = v;
-                nulls[i] = false;
+    let put =
+        |values: &mut [pg_sys::Datum], nulls: &mut [bool], anum: u32, d: Option<pg_sys::Datum>| {
+            let i = (anum - 1) as usize;
+            match d {
+                Some(v) => {
+                    values[i] = v;
+                    nulls[i] = false;
+                }
+                None => nulls[i] = true,
             }
-            None => nulls[i] = true,
-        }
-    };
+        };
     // `staopN` / `stacollN` are NOT NULL columns whose unused value is 0.
     // pgrx's `Oid::into_datum()` maps `InvalidOid` (0) to SQL NULL, which
     // would leave a NULL `stacoll1` — and PG then ignores the histogram
@@ -626,12 +641,42 @@ unsafe fn form_and_insert_pg_statistic(
     let f32_d = |v: f32| Some(pg_sys::Datum::from(v.to_bits() as usize));
     let i32_d = |v: i32| Some(pg_sys::Datum::from(v as u32 as usize));
 
-    put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_starelid, oid_d(attrelid));
-    put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_staattnum, attnum.into_datum());
-    put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stainherit, stainherit.into_datum());
-    put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stanullfrac, f32_d(stanullfrac));
-    put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stawidth, i32_d(stawidth));
-    put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stadistinct, f32_d(stadistinct));
+    put(
+        &mut values,
+        &mut nulls,
+        pg_sys::Anum_pg_statistic_starelid,
+        oid_d(attrelid),
+    );
+    put(
+        &mut values,
+        &mut nulls,
+        pg_sys::Anum_pg_statistic_staattnum,
+        attnum.into_datum(),
+    );
+    put(
+        &mut values,
+        &mut nulls,
+        pg_sys::Anum_pg_statistic_stainherit,
+        stainherit.into_datum(),
+    );
+    put(
+        &mut values,
+        &mut nulls,
+        pg_sys::Anum_pg_statistic_stanullfrac,
+        f32_d(stanullfrac),
+    );
+    put(
+        &mut values,
+        &mut nulls,
+        pg_sys::Anum_pg_statistic_stawidth,
+        i32_d(stawidth),
+    );
+    put(
+        &mut values,
+        &mut nulls,
+        pg_sys::Anum_pg_statistic_stadistinct,
+        f32_d(stadistinct),
+    );
 
     // Five (kind, op, coll, numbers, values) slots. Only slot 1 may carry a
     // histogram or MCV; the rest are empty.
@@ -643,14 +688,45 @@ unsafe fn form_and_insert_pg_statistic(
             Option<pg_sys::Datum>,
             Option<pg_sys::Datum>,
         ) = match (slot, &slot1) {
-            (0, Some(s)) => (s.stakind, s.staop, s.stacoll, s.stanumbers, Some(s.stavalues)),
+            (0, Some(s)) => (
+                s.stakind,
+                s.staop,
+                s.stacoll,
+                s.stanumbers,
+                Some(s.stavalues),
+            ),
             _ => (0, pg_sys::InvalidOid, pg_sys::InvalidOid, None, None),
         };
-        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stakind1 + slot, i16_d(kind));
-        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_staop1 + slot, oid_d(op));
-        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stacoll1 + slot, oid_d(coll));
-        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stanumbers1 + slot, numbers);
-        put(&mut values, &mut nulls, pg_sys::Anum_pg_statistic_stavalues1 + slot, vals);
+        put(
+            &mut values,
+            &mut nulls,
+            pg_sys::Anum_pg_statistic_stakind1 + slot,
+            i16_d(kind),
+        );
+        put(
+            &mut values,
+            &mut nulls,
+            pg_sys::Anum_pg_statistic_staop1 + slot,
+            oid_d(op),
+        );
+        put(
+            &mut values,
+            &mut nulls,
+            pg_sys::Anum_pg_statistic_stacoll1 + slot,
+            oid_d(coll),
+        );
+        put(
+            &mut values,
+            &mut nulls,
+            pg_sys::Anum_pg_statistic_stanumbers1 + slot,
+            numbers,
+        );
+        put(
+            &mut values,
+            &mut nulls,
+            pg_sys::Anum_pg_statistic_stavalues1 + slot,
+            vals,
+        );
     }
 
     unsafe {
@@ -658,8 +734,7 @@ unsafe fn form_and_insert_pg_statistic(
             pg_sys::StatisticRelationId,
             pg_sys::RowExclusiveLock as pg_sys::LOCKMODE,
         );
-        let tuple =
-            pg_sys::heap_form_tuple((*rel).rd_att, values.as_mut_ptr(), nulls.as_mut_ptr());
+        let tuple = pg_sys::heap_form_tuple((*rel).rd_att, values.as_mut_ptr(), nulls.as_mut_ptr());
         pg_sys::CatalogTupleInsert(rel, tuple);
         pg_sys::heap_freetuple(tuple);
         pg_sys::table_close(rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
@@ -757,10 +832,7 @@ fn merge_partition_hll_json(text: &str, acc: &mut HashMap<String, CardinalityEst
 /// into a table-wide per-column distinct-value set. Per-partition valmaps only
 /// list the values present in that partition, so the union across all
 /// partitions is the table's full value set for the (low-cardinality) column.
-fn union_valmap_json(
-    text: &str,
-    acc: &mut HashMap<String, std::collections::BTreeSet<String>>,
-) {
+fn union_valmap_json(text: &str, acc: &mut HashMap<String, std::collections::BTreeSet<String>>) {
     let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
@@ -827,11 +899,7 @@ fn parent_histogram_bounds(type_oid: pg_sys::Oid, ranges: &[(i64, i64)]) -> Opti
 /// so the planner reads JOIN selectivity (e.g. `oe.order_id = oi.order_id`)
 /// from the parent's stats — without them, join cardinality is badly
 /// mis-estimated and the planner picks hash joins where nested loops win.
-pub fn write_table_stats(
-    client: &mut SpiClient,
-    schema: &str,
-    table: &str,
-) -> spi::SpiResult<()> {
+pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> spi::SpiResult<()> {
     let parent_oid: pg_sys::Oid = {
         let fqn = format!("{}.{}", quote_ident(schema), quote_ident(table));
         let mut oid = pg_sys::InvalidOid;
@@ -858,8 +926,7 @@ pub fn write_table_stats(
     // Table-wide distinct value lists for low-cardinality columns (the union
     // of the per-partition valmaps), used to write an MCV list.
     let mut vm_by_col: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
-    let query =
-        "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text, \
+    let query = "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text, \
                 column_valmap::text \
                  FROM deltax.deltax_partition \
                  WHERE is_compressed = true AND deltatable_id = (\
@@ -957,10 +1024,11 @@ pub fn write_table_stats(
         // never appear — `1/ndistinct` gets those badly wrong; see Q19). When
         // writing an MCV, stadistinct must equal the value count so non-MCV
         // values estimate 0.
-        let histogram = parent_histogram_bounds(attr.atttypid, mms).map(|bounds| Slot1::Histogram {
-            type_oid: attr.atttypid,
-            bounds,
-        });
+        let histogram =
+            parent_histogram_bounds(attr.atttypid, mms).map(|bounds| Slot1::Histogram {
+                type_oid: attr.atttypid,
+                bounds,
+            });
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), merged_nd),
             // Only write an MCV when the valmap union covers EVERY distinct
@@ -1070,8 +1138,10 @@ mod tests {
         for v in 1000u64..2000 {
             b.insert(&v);
         }
-        let ja = crate::compress::serialize_partition_hll(&["k"], std::slice::from_ref(&a)).unwrap();
-        let jb = crate::compress::serialize_partition_hll(&["k"], std::slice::from_ref(&b)).unwrap();
+        let ja =
+            crate::compress::serialize_partition_hll(&["k"], std::slice::from_ref(&a)).unwrap();
+        let jb =
+            crate::compress::serialize_partition_hll(&["k"], std::slice::from_ref(&b)).unwrap();
 
         let mut acc: HashMap<String, CardinalityEstimator<u64>> = HashMap::new();
         merge_partition_hll_json(&ja, &mut acc);
@@ -1141,8 +1211,16 @@ mod tests {
         assert!(histogram_eligible(pg_sys::INT2OID, 1, 2));
         assert!(histogram_eligible(pg_sys::INT4OID, 100, 9000));
         assert!(histogram_eligible(pg_sys::INT8OID, -5, 5));
-        assert!(histogram_eligible(pg_sys::TIMESTAMPOID, 1_000_000, 2_000_000));
-        assert!(histogram_eligible(pg_sys::TIMESTAMPTZOID, 1_000_000, 2_000_000));
+        assert!(histogram_eligible(
+            pg_sys::TIMESTAMPOID,
+            1_000_000,
+            2_000_000
+        ));
+        assert!(histogram_eligible(
+            pg_sys::TIMESTAMPTZOID,
+            1_000_000,
+            2_000_000
+        ));
     }
 
     #[test]
