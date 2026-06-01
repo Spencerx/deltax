@@ -172,18 +172,44 @@ build that writes new stat kinds — like this one — on already-compressed dat
 plain `ANALYZE` (a plain ANALYZE on the partitioned parent samples the empty
 compressed heaps and would clobber the inheritance-tree stats).
 
-### 4.4 · Two parent-stats bugs (found via ClickBench/RTABench re-run)
+### 4.4 · Parent-stats bugs (found via ClickBench/RTABench re-run)
 
-The parent (table-level) stats are the trickiest because they merge across all
-partitions; two bugs caused a severe Q06/Q20 regression (Q06
-`order_events_without_backups` 55 ms → 17.6 s) before being fixed:
+The parent (table-level) stats merge across all partitions; two bugs there
+regressed Q20 (and looked like they fixed Q06, but didn't — see §4.5):
 
 - **Parent nullfrac must be aggregated, not assumed 0.** Hardcoding 0 made
   `backup_processor <> ''` (a ~98 %-NULL column) estimate ~100 % instead of
-  ~2 %, inflating the parent `DeltaXAppend` path cost so the planner fell back
-  to a per-partition `Append` + full Sort of 3.6 M rows for the Top-N. Now the
-  row-count-weighted average of the children's `stanullfrac`.
+  ~2 %. Now the row-count-weighted average of the children's `stanullfrac`.
 - **Only write a parent MCV when the valmap union is complete.** A partition
   with >32 distinct values contributes no valmap, so the union can be a strict
   subset; writing an MCV from it advertises a bogus tiny `n_distinct` for a
   high-cardinality column. Guard: `valmap-union size == merged-HLL n_distinct`.
+
+### 4.5 · The actual Q06 regression — DeltaXAppend gating (not a stats bug)
+
+Q06 `order_events_without_backups` (`backup_processor <> '' ORDER BY
+event_created LIMIT 10`) regressed 55 ms → 17.6 s, and it took two wrong
+guesses to find: it is **not** a stats problem — the stats are correct, and the
+plan flips between the fast parent `Custom Scan (DeltaXAppend)` (executor prunes
+all-empty segments, sorts a few K rows) and a slow per-partition `Append` +
+3.6 M-row `Sort`.
+
+Root cause in `scan::hook::collect_compressed_children`: it disables the
+DeltaXAppend path if any *non-compressed* child might hold data, using
+`pg_class.reltuples` as the proxy (`==0` ⇒ ANALYZE-proven-empty, skip; else
+bail). pg_deltax's own empty partitions — the default and the future partitions
+the background worker pre-creates — are **never analyzed** (`reltuples == −1`),
+so the proxy bailed on them and disabled DeltaXAppend for any query that
+doesn't prune them away via a time filter (Q06/Q19/Q20). Queries with a tight
+`event_created` range (Q17 etc.) prune those partitions, so they were unaffected
+— which is why it looked query-specific and intermittent (it only triggers once
+the worker has created the future partitions; an immediately-post-load run looks
+fine). It was *exposed* by §4.3 removing `order_events` from benchmark.sh's plain
+`ANALYZE` — that ANALYZE had been incidentally setting the empty partitions to
+`reltuples=0`.
+
+Fix: gate on the **physical heap size** (`RelationGetNumberOfBlocksInFork`)
+instead of `reltuples`. 0 blocks ⇒ no row ever inserted ⇒ safe to skip; >0 ⇒
+assume data and bail (conservative — a drained-but-unvacuumed partition stays on
+the safe side). Independent of ANALYZE, so it's stable. Q06 17.6 s → 54 ms.
+Final suite **11.7 s** (−8 % vs no-stats, 2.5× faster than TimescaleDB).
