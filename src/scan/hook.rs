@@ -4467,6 +4467,22 @@ unsafe fn extract_oids_from_custom_path(
 ///
 /// Returns `Some(companion_oids)` if we found at least one compressed child
 /// and no uncompressed data; `None` otherwise.
+/// True if the relation's main heap fork has zero blocks — i.e. it has never
+/// held a row (a freshly created / never-inserted partition). Unlike
+/// `pg_class.reltuples`, this is the physical truth and doesn't depend on
+/// ANALYZE having run. A drained-but-not-vacuumed partition keeps its blocks,
+/// so this is conservative (reports non-empty) — which is the safe direction
+/// for the DeltaXAppend correctness check.
+unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
+    unsafe {
+        let rel = pg_sys::table_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let nblocks =
+            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        nblocks == 0
+    }
+}
+
 unsafe fn collect_compressed_children(
     root: *mut pg_sys::PlannerInfo,
     parent_rti: pg_sys::Index,
@@ -4501,16 +4517,20 @@ unsafe fn collect_compressed_children(
             if companion_oid != pg_sys::InvalidOid {
                 companion_oids.push(companion_oid);
             } else {
-                // Not compressed — check if partition has data.
-                // reltuples == 0.0 means ANALYZE ran and found zero rows.
-                // reltuples < 0 means never analyzed — we must assume it
-                // could contain data and bail out.
+                // Not compressed — DeltaXAppend reads only compressed
+                // companions, so any uncompressed *data* would be silently
+                // dropped; bail in that case. `reltuples == 0` means ANALYZE
+                // proved it empty, but pg_deltax's empty partitions (the
+                // default, and worker pre-created future partitions) are
+                // never analyzed (`reltuples == -1`) — the stale proxy would
+                // bail on them and disable DeltaXAppend for any query that
+                // doesn't prune them away (no time filter). Fall back to the
+                // physical heap size: 0 blocks ⇒ no data possible ⇒ safe to
+                // skip; anything else ⇒ assume data and bail.
                 let reltuples = cost::get_reltuples(child_oid);
-                if reltuples != 0.0 {
-                    // Has data or unknown — cannot use DeltaXAppend
+                if reltuples != 0.0 && !relation_heap_is_empty(child_oid) {
                     return None;
                 }
-                // ANALYZE confirmed empty, safe to skip
             }
         }
 
