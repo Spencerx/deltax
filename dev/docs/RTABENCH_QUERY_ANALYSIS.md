@@ -152,3 +152,22 @@ Q19 871 s → 0.70 s, Q30 −21%, Q3 −48%, Q27 −52%, Q25 −42%, Q5 −28%, 
 The only query slower than the (accidentally-NL) no-stats baseline is Q17
 (0.93 s → 1.22 s), still 5.7× faster than TimescaleDB. No disasters; every
 join query beats or ties TimescaleDB.
+
+### 4.3 · Automatic stats population
+
+`pg_statistic` is now populated automatically on every load path, so no manual
+`deltax_analyze_table` is needed:
+
+- **Compress path** (background worker / `deltax_compress_partition`): writes
+  per-partition stats at compress time (already did); the worker now also
+  refreshes the parent-relation merged stats after each auto-compress cycle.
+- **Direct backfill** (`COPY … FORMAT deltax_compress_csv`): the per-partition
+  stats weren't written incrementally, so `handle_copy_from_inner` runs
+  `analyze_table_impl` once after all partitions are compressed (child + parent
+  in one pass).
+
+`deltax_analyze_table` remains as a manual refresh (e.g. after upgrading to a
+build that writes new stat kinds — like this one — on already-compressed data).
+`rtabench/benchmark.sh` no longer runs it, and excludes `order_events` from its
+plain `ANALYZE` (a plain ANALYZE on the partitioned parent samples the empty
+compressed heaps and would clobber the inheritance-tree stats).

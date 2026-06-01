@@ -1062,6 +1062,18 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
         finalize_partition(buf, &state.columns);
     }
 
+    // Populate planner statistics (per-partition histograms / MCV lists +
+    // parent-relation merged stats) now that every partition is compressed.
+    // The direct-backfill path doesn't write pg_statistic incrementally, so do
+    // it once here — otherwise the planner has no stats until someone runs
+    // deltax_analyze_table.
+    Spi::connect_mut(|client| {
+        let result = crate::compress::analyze_table_impl(client, &format!("{}.{}", schema, table));
+        if result.starts_with("Failed") || result.starts_with("No compressed") {
+            pgrx::warning!("pg_deltax: post-backfill analyze for {}.{}: {}", schema, table, result);
+        }
+    });
+
     crate::scan::invalidate_compressed_cache();
 
     let total_rows: i64 = part_buffers.iter().map(|b| b.total_rows).sum();

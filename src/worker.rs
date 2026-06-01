@@ -133,6 +133,20 @@ pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
                             ht.schema_name,
                             ht.table_name
                         );
+                        // Per-partition stats are written at compress time; the
+                        // parent-relation merged stats (join/range selectivity)
+                        // need re-merging across all partitions whenever new
+                        // ones are compressed.
+                        if let Err(e) =
+                            crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name)
+                        {
+                            log!(
+                                "pg_deltax: failed to refresh parent stats for {}.{}: {:?}",
+                                ht.schema_name,
+                                ht.table_name,
+                                e
+                            );
+                        }
                     }
 
                     // Auto-drop expired partitions (retention policy)

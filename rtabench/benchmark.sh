@@ -122,17 +122,14 @@ sudo -u postgres psql "$DB" -c "CREATE INDEX ON orders (customer_id)"
 # Vacuum
 echo -n "Vacuum time: "
 VACUUM_START=$(date +%s)
-sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE customers, products, orders, order_items, order_events"
+# order_events is intentionally excluded: pg_deltax populates its pg_statistic
+# (per-partition histograms / MCV lists + parent-relation merged-HLL stats)
+# automatically at load time via the direct-backfill path, and a plain ANALYZE
+# on the partitioned parent would clobber the inheritance-tree stats by
+# sampling the empty compressed heaps.
+sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE customers, products, orders, order_items"
 VACUUM_END=$(date +%s)
 echo "$((VACUUM_END - VACUUM_START))s"
-
-# Populate pg_statistic (histograms + parent-relation merged-HLL stats) for the
-# compressed order_events partitions. The COPY/backfill load path doesn't write
-# pg_statistic, so without this the planner has no distinct counts / histograms
-# for join + range estimation. Runs after the plain ANALYZE so it wins on the
-# partitioned parent's inheritance-tree stats.
-echo -n "deltax_analyze_table: "
-sudo -u postgres psql "$DB" -q -t -c "SELECT deltax.deltax_analyze_table('order_events')"
 
 # Capture data size = deltax(order_events) + plain(other 4 tables)
 DELTAX_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax.deltax_table_size('order_events')")

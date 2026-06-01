@@ -4045,7 +4045,7 @@ pub(crate) fn analyze_partition_impl_split(
     format!("Refreshed stats for {} ({} rows)", part_fqn, row_count)
 }
 
-fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
+pub(crate) fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
     let (schema, table) = crate::partition::resolve_relation(client, relation);
     let query = "SELECT schema_name, table_name FROM deltax.deltax_partition \
                  WHERE schema_name = $1 AND is_compressed = true AND deltatable_id = (\
