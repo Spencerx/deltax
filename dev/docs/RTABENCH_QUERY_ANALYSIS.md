@@ -171,3 +171,19 @@ build that writes new stat kinds — like this one — on already-compressed dat
 `rtabench/benchmark.sh` no longer runs it, and excludes `order_events` from its
 plain `ANALYZE` (a plain ANALYZE on the partitioned parent samples the empty
 compressed heaps and would clobber the inheritance-tree stats).
+
+### 4.4 · Two parent-stats bugs (found via ClickBench/RTABench re-run)
+
+The parent (table-level) stats are the trickiest because they merge across all
+partitions; two bugs caused a severe Q06/Q20 regression (Q06
+`order_events_without_backups` 55 ms → 17.6 s) before being fixed:
+
+- **Parent nullfrac must be aggregated, not assumed 0.** Hardcoding 0 made
+  `backup_processor <> ''` (a ~98 %-NULL column) estimate ~100 % instead of
+  ~2 %, inflating the parent `DeltaXAppend` path cost so the planner fell back
+  to a per-partition `Append` + full Sort of 3.6 M rows for the Top-N. Now the
+  row-count-weighted average of the children's `stanullfrac`.
+- **Only write a parent MCV when the valmap union is complete.** A partition
+  with >32 distinct values contributes no valmap, so the union can be a strict
+  subset; writing an MCV from it advertises a bogus tiny `n_distinct` for a
+  high-cardinality column. Guard: `valmap-union size == merged-HLL n_distinct`.
