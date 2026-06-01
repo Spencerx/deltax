@@ -919,6 +919,14 @@ pub fn write_table_stats(
     }
     let avg_tuple_width = sum_widths.max(32);
 
+    // Parent nullfrac per column = the row-count-weighted average of the
+    // children's nullfracs (written by write_partition_stats). A hardcoded 0
+    // badly over-estimates `<> const` / `IS NOT NULL` filters on a mostly-NULL
+    // column (e.g. backup_processor), which inflates the parent DeltaXAppend
+    // path cost and makes the planner fall back to a per-partition Append +
+    // full Sort for Top-N queries.
+    let nullfrac_by_attnum = load_parent_nullfrac(client, parent_oid).unwrap_or_default();
+
     for attr in &attrs {
         let empty_nd: Vec<i64> = Vec::new();
         let empty_mm: Vec<(i64, i64)> = Vec::new();
@@ -932,10 +940,15 @@ pub fn write_table_stats(
             Some(hll) => (hll.estimate() as i64).clamp(1, total_rows.max(1)),
             None => merge_ndistinct(nds, mms, total_rows),
         };
-        // We don't aggregate per-partition nonnull counts at the table level;
-        // NOT NULL columns are 0, the rest default to 0 (neutral — avoids the
-        // all-null trap). Per-column nullfrac stays on the child stats.
-        let stanullfrac = 0.0f32;
+        let stanullfrac = if attr.attnotnull {
+            0.0
+        } else {
+            nullfrac_by_attnum
+                .get(&attr.attnum)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0)
+        };
         let stawidth = stawidth_for_attlen(attr.attlen);
 
         // Slot 1: a histogram for ordered types (range selectivity), else an
@@ -950,8 +963,16 @@ pub fn write_table_stats(
         });
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), merged_nd),
+            // Only write an MCV when the valmap union covers EVERY distinct
+            // value (count matches the merged-HLL n_distinct). A partition with
+            // >32 distinct values contributes no valmap, so the union can be a
+            // strict subset — writing an MCV from it would both miss values
+            // (absent-value selectivity wrong) and, worse, advertise a tiny
+            // n_distinct for a high-cardinality column (e.g. backup_processor:
+            // union of 12 vs ~634 actual), which mis-plans Top-N / range
+            // queries.
             None => match vm_by_col.get(&attr.attname) {
-                Some(set) if set.len() >= 2 => (
+                Some(set) if set.len() >= 2 && set.len() as i64 == merged_nd => (
                     Some(Slot1::Mcv {
                         values: set.iter().cloned().collect(),
                     }),
@@ -977,6 +998,42 @@ pub fn write_table_stats(
     update_reltuples(client, parent_oid, total_rows, avg_tuple_width as i32)?;
     invalidate_relcache(parent_oid);
     Ok(())
+}
+
+/// Row-count-weighted average of the child partitions' `stanullfrac` per
+/// attribute, used as the parent's nullfrac. Children are analyzed before the
+/// table-level pass, so their `pg_statistic` rows already exist; partitions
+/// without stats simply don't contribute.
+fn load_parent_nullfrac(
+    client: &mut SpiClient,
+    parent_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<i16, f32>> {
+    let parent_int = u32::from(parent_oid) as i64;
+    let query = "SELECT s.staattnum::int2, \
+                        (SUM(s.stanullfrac::float8 * GREATEST(c.reltuples, 0)::float8) \
+                         / NULLIF(SUM(GREATEST(c.reltuples, 0)::float8), 0))::float4 \
+                 FROM pg_statistic s \
+                 JOIN pg_inherits i ON i.inhrelid = s.starelid \
+                 JOIN pg_class c ON c.oid = s.starelid \
+                 WHERE i.inhparent = $1::oid AND s.stainherit = false \
+                 GROUP BY s.staattnum";
+    let mut out: HashMap<i16, f32> = HashMap::new();
+    for row in client.select(query, None, &[parent_int.into()])? {
+        let attnum: i16 = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value::<i16>().ok().flatten())
+            .unwrap_or(0);
+        let nf: f32 = row
+            .get_datum_by_ordinal(2)
+            .ok()
+            .and_then(|d| d.value::<f32>().ok().flatten())
+            .unwrap_or(0.0);
+        if attnum > 0 {
+            out.insert(attnum, nf);
+        }
+    }
+    Ok(out)
 }
 
 /// Minimal SQL identifier quoting for building a `schema.table` regclass
