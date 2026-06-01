@@ -1003,6 +1003,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     catalog::update_partition_column_ndistinct_from_map(client, part_info.id, &col_ndistinct)
         .expect("failed to update partition column_ndistinct");
 
+    // Persist the per-column HLL sketches so the table-wide distinct count can
+    // be computed by merging them across partitions (see write_table_stats).
+    if let Some(hll_json) = serialize_partition_hll(&nd_col_names, &partition_hll) {
+        catalog::update_partition_column_hll(client, part_info.id, &hll_json)
+            .expect("failed to update partition column_hll");
+    }
+
     // Persist the partition-level value→bit_idx maps for low-card text
     // columns. Empty map is fine — the read path treats a missing entry
     // for a column as "no bitmap available, fall back to bloom/batch
@@ -1786,6 +1793,47 @@ fn hash_for_hll<T: Hash>(val: &T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     val.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Merge per-segment HLL sketches into a partition-level accumulator (one
+/// sketch per non-segment-by column). The accumulator is lazily sized on the
+/// first call; subsequent calls union each column's sketch. Used by both load
+/// paths to build the per-partition sketch persisted as `column_hll`.
+pub(crate) fn accumulate_partition_hll(
+    acc: &mut Vec<CardinalityEstimator<u64>>,
+    sketches: &[CardinalityEstimator<u64>],
+) {
+    if acc.len() != sketches.len() {
+        *acc = (0..sketches.len())
+            .map(|_| CardinalityEstimator::<u64>::new())
+            .collect();
+    }
+    for (a, s) in acc.iter_mut().zip(sketches) {
+        a.merge(s);
+    }
+}
+
+/// Serialize a partition's per-column HLL sketches to a JSON object string
+/// `{col_name: <sketch>}` for storage in `deltax_partition.column_hll`.
+/// `stats::write_table_stats` deserializes and merges these across partitions
+/// to get an accurate table-wide distinct count for join/range estimation.
+pub(crate) fn serialize_partition_hll(
+    col_names: &[&str],
+    hll: &[CardinalityEstimator<u64>],
+) -> Option<String> {
+    if hll.is_empty() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for (name, sketch) in col_names.iter().zip(hll.iter()) {
+        if let Ok(v) = serde_json::to_value(sketch) {
+            map.insert((*name).to_string(), v);
+        }
+    }
+    if map.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Object(map).to_string())
 }
 
 /// Compute per-segment ndistinct using HyperLogLog estimators.
@@ -3896,11 +3944,10 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
 }
 
 /// Re-populate pg_class.reltuples + pg_statistic for an already-compressed
-/// partition from the `_colstats` catalog data. HLL sketches aren't
-/// available here (they only exist during compression), so
-/// `stats::analyze_partition_from_catalog` falls back to a SUM-capped
-/// per-segment ndistinct — less accurate but still strictly better than
-/// PG's defaults.
+/// partition. `stats::analyze_partition_from_catalog` reads the
+/// authoritative per-column distinct counts persisted at compression time
+/// in `deltax.deltax_partition.column_ndistinct` (merged-HLL), so a
+/// standalone refresh produces the same stats the compression path would.
 pub(crate) fn analyze_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let (schema, part_table) = crate::partition::resolve_relation(client, partition);
     analyze_partition_impl_split(client, &schema, &part_table)
@@ -3998,7 +4045,7 @@ pub(crate) fn analyze_partition_impl_split(
     format!("Refreshed stats for {} ({} rows)", part_fqn, row_count)
 }
 
-fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
+pub(crate) fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
     let (schema, table) = crate::partition::resolve_relation(client, relation);
     let query = "SELECT schema_name, table_name FROM deltax.deltax_partition \
                  WHERE schema_name = $1 AND is_compressed = true AND deltatable_id = (\
@@ -4043,6 +4090,19 @@ fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
             n_ok += 1;
         }
     }
+
+    // Merge the per-partition stats onto the parent relation so the planner
+    // has table-wide distinct counts / histograms for join and range
+    // estimation (the partitions are scanned through a single DeltaXAppend).
+    if let Err(e) = crate::stats::write_table_stats(client, &schema, &table) {
+        pgrx::warning!(
+            "deltax_analyze_table: failed to write parent stats for {}.{}: {}",
+            schema,
+            table,
+            e
+        );
+    }
+
     format!(
         "deltax_analyze_table({}.{}): refreshed {} partition(s), {} failed",
         schema, table, n_ok, n_err,

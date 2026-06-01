@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS deltax.deltax_partition (
 
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_minmax JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_hll JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;

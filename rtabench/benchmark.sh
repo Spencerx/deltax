@@ -122,7 +122,12 @@ sudo -u postgres psql "$DB" -c "CREATE INDEX ON orders (customer_id)"
 # Vacuum
 echo -n "Vacuum time: "
 VACUUM_START=$(date +%s)
-sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE customers, products, orders, order_items, order_events"
+# order_events is intentionally excluded: pg_deltax populates its pg_statistic
+# (per-partition histograms / MCV lists + parent-relation merged-HLL stats)
+# automatically at load time via the direct-backfill path, and a plain ANALYZE
+# on the partitioned parent would clobber the inheritance-tree stats by
+# sampling the empty compressed heaps.
+sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE customers, products, orders, order_items"
 VACUUM_END=$(date +%s)
 echo "$((VACUUM_END - VACUUM_START))s"
 
@@ -148,7 +153,7 @@ sudo -u postgres psql -c "ALTER SYSTEM SET effective_cache_size = '24GB'"
 sudo -u postgres psql -c "ALTER SYSTEM SET max_worker_processes = 16"
 sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers = 16"
 sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers_per_gather = 8"
-sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '8GB'"
+sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '50MB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 sudo systemctl restart postgresql
 
