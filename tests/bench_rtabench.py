@@ -18,6 +18,7 @@ Makefile entry points:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import statistics
@@ -113,6 +114,88 @@ def run_phase(conn, queries: list[tuple[str, str]], *, label: str, transform=lam
         status = f"{median:.1f} ms" if median != float("inf") else f"ERROR: {last_error}"
         print(f"  [{label}] {qid}: {status}")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Row-estimate oracle (L4) — plain PG's ANALYZE is the ground-truth estimator.
+#
+# The fact-table scan estimate is where almost every planner disaster lived
+# (Q19's absent-value 20M, Q06's 100%-vs-2%, Q30's rows=8). We extract the
+# estimated rows the planner expects from the `order_events` scan in both
+# variants and compare:
+#   - plain PG (`order_events_plain`, properly ANALYZEd) → the oracle estimate
+#   - pg_deltax (`order_events`, synthesized pg_statistic) → estimate + actual
+#
+# A query fails the gate only when pg_deltax's scan estimate is BOTH far from
+# the actual row count AND far from plain PG's estimate of the same predicate.
+# The double condition keeps the gate from flaring on predicates that are
+# intrinsically hard to estimate (where plain PG is also off, so the two
+# estimates agree and we don't blame pg_deltax) while still catching a
+# deltax-specific blunder (where plain PG nails it and deltax is wild).
+# ---------------------------------------------------------------------------
+
+# Order-of-magnitude gate. The disasters were 50×–9000×; legitimate divergence
+# between two planners' estimates of the *same* filter is small. Override with
+# RTABENCH_EST_RATIO (0 disables the hard gate, leaving the report).
+EST_RATIO_THRESHOLD = float(os.environ.get("RTABENCH_EST_RATIO", "20"))
+
+# Custom Plan Provider names of the scan-shaped deltax nodes (they expose the
+# fact-table row estimate). The aggregate-pushdown nodes (DeltaXAgg / DeltaXCount
+# / DeltaXMinMax) emit grouped rows, not scan rows, so they're not comparable.
+_DELTAX_SCAN_PROVIDERS = {"DeltaXAppend", "DeltaXDecompress"}
+
+
+def _walk_plan(node):
+    """Yield every node in an EXPLAIN JSON plan tree (depth-first)."""
+    yield node
+    for child in node.get("Plans", []) or []:
+        yield from _walk_plan(child)
+
+
+def _misratio(a: float, b: float) -> float:
+    """Symmetric over/under-estimate ratio, floored at 1 row to avoid blowups
+    when one side is ~0 (PG clamps a 0-selectivity scan to 1)."""
+    hi, lo = max(a, b), max(min(a, b), 1.0)
+    return hi / lo
+
+
+def _explain_json(conn, sql: str, *, analyze: bool):
+    """Return the root Plan dict of an EXPLAIN (FORMAT JSON) run, or None on
+    error (query rolled back)."""
+    opt = "ANALYZE, TIMING OFF, FORMAT JSON" if analyze else "FORMAT JSON"
+    try:
+        res = conn.execute(f"EXPLAIN ({opt}) {sql}").fetchone()[0]
+    except Exception:
+        conn.rollback()
+        return None
+    root = json.loads(res) if isinstance(res, str) else res
+    return root[0]["Plan"]
+
+
+def _deltax_fact_scan(root) -> tuple | None:
+    """Find the dominant fact-table scan node in a pg_deltax plan and return
+    (est_rows, actual_rows) — per-loop, as PG reports them. None if the query
+    is fully pushed down (DeltaXAgg/Count/MinMax) with no comparable scan."""
+    candidates = [
+        n for n in _walk_plan(root)
+        if n.get("Custom Plan Provider") in _DELTAX_SCAN_PROVIDERS
+    ]
+    if not candidates:
+        return None
+    n = max(candidates, key=lambda x: x.get("Plan Rows", 0))
+    return float(n.get("Plan Rows", 0)), float(n.get("Actual Rows", 0))
+
+
+def _plain_fact_scan_estimate(root) -> float | None:
+    """Find the dominant `order_events_plain` scan node's estimated rows in a
+    plain-PG plan. None if the query doesn't scan the fact table."""
+    candidates = [
+        n for n in _walk_plan(root)
+        if n.get("Relation Name") == "order_events_plain"
+    ]
+    if not candidates:
+        return None
+    return float(max(candidates, key=lambda x: x.get("Plan Rows", 0)).get("Plan Rows", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +313,53 @@ def rtabench_db(pg_container):
 
 
 # ---------------------------------------------------------------------------
+# Estimate-oracle phase
+# ---------------------------------------------------------------------------
+
+def run_estimate_oracle(conn, queries) -> tuple[dict, list[str]]:
+    """For every query, extract the fact-table scan estimate from both
+    variants and the actual rows from the deltax run. Returns
+    (report_by_qid, violations).
+
+    report_by_qid[qid] = {est_dx, act_dx, est_plain, ratio_act, ratio_oracle}
+    A qid is a violation when est_dx is far from BOTH actual and the plain-PG
+    oracle (see module docstring)."""
+    report: dict[str, dict] = {}
+    violations: list[str] = []
+    for qid, sql_src in queries:
+        dx_root = _explain_json(conn, sql_src, analyze=True)
+        plain_root = _explain_json(conn, for_plain(sql_src), analyze=False)
+        if dx_root is None or plain_root is None:
+            report[qid] = {"note": "explain-error"}
+            continue
+
+        dx = _deltax_fact_scan(dx_root)
+        est_plain = _plain_fact_scan_estimate(plain_root)
+        if dx is None or est_plain is None:
+            # Pure aggregate pushdown, or no fact-table scan → nothing to gate.
+            report[qid] = {"note": "no-fact-scan"}
+            continue
+
+        est_dx, act_dx = dx
+        ratio_act = _misratio(est_dx, act_dx)
+        ratio_oracle = _misratio(est_dx, est_plain)
+        report[qid] = {
+            "est_dx": est_dx,
+            "act_dx": act_dx,
+            "est_plain": est_plain,
+            "ratio_act": ratio_act,
+            "ratio_oracle": ratio_oracle,
+        }
+        if (
+            EST_RATIO_THRESHOLD > 0
+            and ratio_act > EST_RATIO_THRESHOLD
+            and ratio_oracle > EST_RATIO_THRESHOLD
+        ):
+            violations.append(qid)
+    return report, violations
+
+
+# ---------------------------------------------------------------------------
 # The test
 # ---------------------------------------------------------------------------
 
@@ -286,6 +416,30 @@ class TestRtabench:
             f"{(plain_total/deltax_total if deltax_total else 0):>6.2f}x"
         )
 
+        # Phase E: row-estimate oracle (L4). plain PG's ANALYZE is the oracle;
+        # flag any query whose fact-scan estimate is far from both the actual
+        # rows and plain PG's estimate of the same predicate.
+        print("\n=== Phase E: Row-estimate oracle (fact-table scan) ===")
+        est_report, est_violations = run_estimate_oracle(conn, queries)
+        hdr = f"{'Query':<50}{'est_dx':>12}{'act_dx':>12}{'est_plain':>12}{'x_act':>9}{'x_oracle':>10}"
+        print(hdr)
+        for qid, _ in queries:
+            r = est_report[qid]
+            if "note" in r:
+                print(f"{qid:<50}{r['note']:>55}")
+                continue
+            flag = "  ⚠" if qid in est_violations else ""
+            print(
+                f"{qid:<50}{r['est_dx']:>12.0f}{r['act_dx']:>12.0f}{r['est_plain']:>12.0f}"
+                f"{r['ratio_act']:>8.1f}x{r['ratio_oracle']:>9.1f}x{flag}"
+            )
+        thr = EST_RATIO_THRESHOLD
+        print(
+            f"\n  estimate gate: threshold {thr:g}x"
+            f"{' (disabled)' if thr <= 0 else ''}, "
+            f"{len(est_violations)} violation(s)"
+        )
+
         # Save machine-readable result
         save_bench_results(
             "rtabench_pg_deltax",
@@ -294,6 +448,9 @@ class TestRtabench:
                 "plain_queries": {q: plain[q]["ms"] for q, _ in queries},
                 "deltax_queries": {q: deltax[q]["ms"] for q, _ in queries},
                 "mismatches": mismatches,
+                "estimate_oracle": est_report,
+                "estimate_violations": est_violations,
+                "estimate_threshold": thr,
                 "commit": _get_git_commit_short(),
             },
         )
@@ -301,4 +458,11 @@ class TestRtabench:
         assert not mismatches, (
             f"{len(mismatches)} query result mismatch(es) between plain PG "
             f"and pg_deltax: {mismatches}"
+        )
+        assert not est_violations, (
+            f"{len(est_violations)} query(ies) where pg_deltax's fact-scan row "
+            f"estimate is >{thr:g}x off from BOTH the actual rows and plain PG's "
+            f"estimate: {est_violations}. See the Phase E table above. This is the "
+            f"class of misestimate that flips join/scan plans (Q19/Q06/Q30). "
+            f"Override the gate with RTABENCH_EST_RATIO (0 to disable)."
         )

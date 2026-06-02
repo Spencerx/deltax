@@ -24,6 +24,8 @@ stats, not absent stats:
 | histogram neutralised | `stanullfrac=1.0` on the order-by col (its `_nonnull_count` read 0) | range selectivity `(1−nullfrac)` → 0 |
 | n_distinct = 264 (9 real) | standalone analyze SUMmed per-segment ndistinct | equality selectivity wrong |
 | MCV n_distinct = 12 (634 real) | MCV written from an incomplete valmap union | high-card col looked low-card → bad Top-N |
+| child n_distinct(order_id) 1.7K (250K real) | direct-backfill path derived per-column ndistinct from the per-segment range-overlap heuristic (`merge_ndistinct` → MAX) instead of the HLL; `order_id` is ordered physically by time, so all 154 segments span the full id range → MAX, not SUM | per-partition `order_id=N` est 2740 vs 18 (×150) on Q07/Q10/Q11/Q13 point lookups |
+| conjunction estimated *higher* than either conjunct | `build_deltax_append_path` gated `path.rows` on `rel->rows > 1`; a legitimately selective predicate drives `rel->rows` to ≤1 (PG's floor), which the guard mistook for the unpopulated-`reltuples` default and replaced with the *full unfiltered* companion sum | Q11 (`event_created` range AND `order_id=512`) est 641 667 vs actual 1 |
 
 The lesson: **any new stat we write needs a way to verify it matches reality
 before it ships**, because a benchmark only catches it if a query happens to
@@ -39,7 +41,7 @@ Per compressed partition (`stainherit=false`) and once on the parent
 |---|---|---|---|
 | `stanullfrac` | ✅ | child: `_colstats._nonnull_count`; parent: row-count-weighted avg of children | NOT NULL cols forced to 0 |
 | `stawidth` | ✅ | `pg_attribute.attlen` | varlena → flat 32 |
-| `stadistinct` | ✅ | child: merged-HLL / valmap count; parent: merged-HLL | |
+| `stadistinct` | ✅ | child: per-partition merged-HLL (both compress paths now persist the HLL-based scalar); parent: cross-partition merged-HLL | the range-overlap `merge_ndistinct` heuristic is a fallback only, for partitions predating `column_hll` |
 | MCV (`stakind=1`) | ✅ (partial) | `column_valmap` for low-card cols | **uniform** freqs (no real counts); only when valmap covers all distinct |
 | Histogram (`stakind=2`) | ✅ (partial) | per-partition `column_minmax` (parent: per-partition mins) | int/date/timestamp only; child is 2-point |
 | `reltuples` / `relpages` | ✅ | `deltax_partition.row_count` | |
@@ -106,7 +108,15 @@ reaches a benchmark. Five layers, cheapest first:
 serialize/merge round-trip, etc. Every new stat-computation helper gets one.
 Catches encoding/merge logic bugs. Fast, no PG.
 
-### L2 · Stat-value validation (the highest-leverage new investment)
+### L2 · Stat-value validation — **implemented** (`tests/test_pg_statistic.py`)
+Now asserts, against a synthetic table with a known distribution (controlled
+25%-null column, a 5-value low-card enum, a high-card column, an ordered column):
+`stanullfrac` ≈ truth (child + merged parent), the MCV slot's `stavalues` == the
+true distinct set with `staop`/`stacoll` non-null (read from raw `pg_statistic`,
+since `pg_stats` hides them), the histogram slot brackets the true min/max and is
+strictly ascending, and an absent-value equality estimates ~0. The original
+form below:
+
 A `#[pg_test]` (or python integration test) that:
 1. builds a small synthetic table with a **known** distribution (controlled
    null fraction, skewed low-card column with a value that never appears, an
@@ -132,14 +142,26 @@ estimated rows (`EXPLAIN`) to the actual count, asserting the ratio is bounded
 Run on a small dataset in integration tests; also worth a `make … query`-style
 spot check.
 
-### L4 · Plain-PG oracle (free, in the local RTABench harness)
-`make bench-rtabench` already loads the *same* data into both `order_events`
-(pg_deltax) and `order_events_plain` (plain PostgreSQL, properly ANALYZEd) and
-asserts **result-set equality**. Extend it to also compare **row estimates**:
-plain PG's ANALYZE is the oracle — for each query's scan/filter, assert
-pg_deltax's `EXPLAIN` estimate is within Nx of plain PG's. This would have
-flagged Q19 (plain ≈ 0 vs deltax 20M) and Q06 (plain 2% vs deltax 100%) on a
-sub-GB local run, no EC2 needed.
+### L4 · Plain-PG oracle — **implemented** (`tests/bench_rtabench.py`, Phase E)
+`make bench-rtabench` loads the *same* data into both `order_events` (pg_deltax)
+and `order_events_plain` (plain PostgreSQL, properly ANALYZEd) and already
+asserts **result-set equality**. Phase E now also extracts the fact-table scan
+estimate from each variant — the deltax `DeltaXAppend`/`DeltaXDecompress` custom
+scan vs plain PG's `order_events_plain` scan — plus the deltax run's *actual*
+rows, and **hard-fails** any query whose deltax estimate is off by >`N`× from
+**both** the actual count **and** plain PG's estimate. The double condition is
+what makes it non-flaky: a predicate that's intrinsically hard to estimate (e.g.
+Q06's `<> ''` on a mostly-NULL column — both planners over-estimate it the same
+way, ×9190 off actual) agrees between the two estimators and is *not* flagged,
+while a deltax-specific blunder (plain nails it, deltax is wild) is. Threshold
+`N` defaults to 20 via `RTABENCH_EST_RATIO` (0 disables; report still prints).
+Aggregate-pushdown queries (DeltaXAgg/Count/MinMax) emit grouped rows, not scan
+rows, so they're skipped.
+
+This gate paid for itself on first run: it surfaced the two bugs in the table
+above (child `order_id` n_distinct ×150 low; the conjunction-over-estimate guard)
+— both pre-existing, both invisible to the result-set check, both now fixed and
+guarded against regression.
 
 ### L5 · Disaster guard in the benchmark (cheap backstop)
 The bench harness should **fail loudly** instead of relying on a human noticing
@@ -148,9 +170,10 @@ query whose warm time regressed >3× vs the recorded baseline) or an
 estimate-vs-actual ratio check from `EXPLAIN ANALYZE`. Converts "the total
 looks a bit worse" into a named failing query.
 
-**Priority:** L2 (stat-value validation) and L4 (plain-PG oracle) give the most
-coverage for the least cost and should land alongside the next stats change
-(P1). L1 is ongoing; L3/L5 are incremental hardening.
+**Priority:** L2 (stat-value validation) and L4 (plain-PG oracle) have **landed**
+— they gave the most coverage for the least cost and immediately caught two real
+bugs. L1 is ongoing; L3 (standalone estimate-accuracy assertions) and L5 (a
+wall-clock regression backstop in the bench) remain as incremental hardening.
 
 ## Operational notes (carried over)
 - Stats auto-populate on load (COPY/backfill end + background-worker compaction);

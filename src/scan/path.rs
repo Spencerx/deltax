@@ -2687,14 +2687,18 @@ unsafe fn build_deltax_append_path(
             total_rows += rows;
         }
         // Prefer the filter-aware estimate PG already computed for the
-        // partitioned parent rel (it sums children's post-filter rows).
-        // `rel->rows = 1.0` is PG's fallback when nothing populated
-        // `pg_class.reltuples`; if we see that, trust our companion sum
-        // instead. When parallel (workers > 0), divide the PG estimate
-        // by the parallel divisor so per-worker row counts stay
-        // consistent with the serial path.
+        // partitioned parent rel (it sums children's post-filter rows). Only
+        // fall back to the unfiltered companion sum when PG never sized the
+        // parent — gate on `rel->tuples > 0`, NOT on `rel->rows > 1`. A
+        // highly selective predicate legitimately drives `rel->rows` down to
+        // ≤1 (PG's floor), and the old `rows > 1` guard mistook that for the
+        // "unpopulated reltuples" default and threw the good estimate away,
+        // replacing it with the *full* unfiltered row count — i.e. a
+        // conjunction estimated higher than either conjunct alone. When
+        // parallel (workers > 0), divide by the parallel divisor so
+        // per-worker counts stay consistent with the serial path.
         let rel_rows = (*rel).rows;
-        let path_rows = if rel_rows > 1.0 {
+        let path_rows = if (*rel).tuples > 0.0 {
             if workers > 0 {
                 let div = cost::parallel_divisor(workers as usize);
                 rel_rows / div

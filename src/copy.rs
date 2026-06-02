@@ -2932,13 +2932,38 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             &buf.partition_table,
         )
         .expect("failed to install compressed partition DML trigger");
-        catalog::update_partition_column_ndistinct(
-            client,
-            partition_id,
-            &ddl.colstats_fqn,
-            &nd_col_names,
-        )
-        .expect("failed to update partition column_ndistinct");
+        // Per-column distinct counts: prefer the value-based HLL estimate
+        // (one sketch per non-segment column, unioned across segments). The
+        // colstats-derived fallback merges per-segment `_ndistinct` by a
+        // range-overlap heuristic, which collapses to a single segment's
+        // count (MAX, not SUM) when segments share overlapping ranges of the
+        // sort key — e.g. `order_id` ordered physically by time, where all
+        // ~154 segments span the full order_id range. That undercounts
+        // `n_distinct(order_id)` ~150x (1.7K vs 250K), making per-partition
+        // equality selectivity (and thus the child `stadistinct`) wildly
+        // wrong while the parent — which already uses the HLL — stays right.
+        // The in-memory compress path computes this map the same way.
+        if !buf.partition_hll.is_empty() && buf.partition_hll.len() == nd_col_names.len() {
+            let col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
+                .iter()
+                .zip(buf.partition_hll.iter())
+                .map(|(name, hll)| (name.clone(), hll.estimate() as i64))
+                .collect();
+            catalog::update_partition_column_ndistinct_from_map(
+                client,
+                partition_id,
+                &col_ndistinct,
+            )
+            .expect("failed to update partition column_ndistinct");
+        } else {
+            catalog::update_partition_column_ndistinct(
+                client,
+                partition_id,
+                &ddl.colstats_fqn,
+                &nd_col_names,
+            )
+            .expect("failed to update partition column_ndistinct");
+        }
         // Persist the partition-level HLL sketches (unioned across segments)
         // so write_table_stats can merge them across partitions for an
         // accurate table-wide distinct count.
