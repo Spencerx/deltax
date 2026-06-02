@@ -26,6 +26,13 @@ stats, not absent stats:
 | MCV n_distinct = 12 (634 real) | MCV written from an incomplete valmap union | high-card col looked low-card → bad Top-N |
 | child n_distinct(order_id) 1.7K (250K real) | direct-backfill path derived per-column ndistinct from the per-segment range-overlap heuristic (`merge_ndistinct` → MAX) instead of the HLL; `order_id` is ordered physically by time, so all 154 segments span the full id range → MAX, not SUM | per-partition `order_id=N` est 2740 vs 18 (×150) on Q07/Q10/Q11/Q13 point lookups |
 | conjunction estimated *higher* than either conjunct | `build_deltax_append_path` gated `path.rows` on `rel->rows > 1`; a legitimately selective predicate drives `rel->rows` to ≤1 (PG's floor), which the guard mistook for the unpopulated-`reltuples` default and replaced with the *full unfiltered* companion sum | Q11 (`event_created` range AND `order_id=512`) est 641 667 vs actual 1 |
+| ClickBench Q32 9.5 s → 63 s | accurate `n_distinct` correctly flagged `WatchID` as ~unique, which tripped the **high-cardinality GROUP BY bail** in `hook.rs` — calibrated for high-card *text* keys (string-decompression cost) but firing on the *integer* `GROUP BY WatchID, ClientIP`. The bail disabled DeltaXAgg → PG fell back to an external-merge Sort + GroupAggregate (spilling 0.3 GB/worker; HashAgg was worse at 3.5 GB). Fix: gate the bail on text keys only — integer keys pack into compact u128 and aggregate RAM-resident, beating PG even at unique cardinality | ×6.6 on a no-WHERE near-unique integer GROUP BY |
+
+A second lesson, from the last two rows: **improving a stat can expose a latent
+gate that was calibrated against the old (wrong) value.** The HLL n_distinct fix
+was correct, yet it surfaced both the `rel->rows > 1` guard and the text-oriented
+GROUP BY bail. Always re-run *both* RTABench and ClickBench after a stats change —
+a win on one workload's estimates can flip a plan on the other.
 
 The lesson: **any new stat we write needs a way to verify it matches reality
 before it ships**, because a benchmark only catches it if a query happens to
