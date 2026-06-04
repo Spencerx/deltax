@@ -910,7 +910,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
     let segment_size = ht.segment_size as usize;
 
-    let (total_compressed_size, row_count, partition_hll, column_valmap) =
+    let (total_compressed_size, row_count, partition_hll, column_valmap, column_valcounts) =
         compress_partition_streaming(
             client,
             &part_fqn,
@@ -1016,6 +1016,12 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // filtering".
     catalog::update_partition_column_valmap(client, part_info.id, &column_valmap)
         .expect("failed to update partition column_valmap");
+
+    // Persist the summed per-value occurrence counts for those same low-card
+    // columns. `stats.rs` divides by the partition row count to write real
+    // `most_common_freqs` (skewed enums no longer get a flat 1/ndistinct).
+    catalog::update_partition_column_valcounts(client, part_info.id, &column_valcounts)
+        .expect("failed to update partition column_valcounts");
 
     // Aggregate per-segment colstats into a partition-level {col_name: [min,max]}
     // map. Read path uses this to skip partitions whose [min, max] range
@@ -1539,12 +1545,26 @@ pub(crate) struct ColstatsRow {
     pub(crate) ndistinct: i64,
 }
 
+/// Per-segment `(value, occurrence_count)` list for one low-cardinality text
+/// column, sorted by value. The values feed the valbitmap (presence) + the
+/// catalog `column_valmap`; the counts are summed across segments into
+/// `column_valcounts`, which lets `stats.rs` write *real* `most_common_freqs`
+/// instead of a uniform `1/ndistinct` (e.g. `event_type='Approved'` is 41%,
+/// not 11% — see PLANNER_STATS.md P1).
+pub(crate) type SegValueCounts = Vec<(String, u32)>;
+
+/// Partition-level summed per-value occurrence counts, keyed by user column
+/// name: `{col_name: [(value, count), ...]}`. Persisted as
+/// `deltax_partition.column_valcounts` and read by `stats.rs` to write real
+/// `pg_statistic.most_common_freqs`.
+pub(crate) type ColumnValcounts = std::collections::HashMap<String, Vec<(String, i64)>>;
+
 /// Return type for flush_segment_metadata: (compressed_size, column blobs,
 /// per-column bloom entries, colstats rows, per-text-column length sidecars,
-/// per-text-column value sets for valbitmap).
+/// per-text-column value+count lists for valbitmap/valcounts).
 /// Each bloom entry is (col_idx, num_hashes, bloom_bytes).
 /// Each text-length entry is (col_idx, length_blob).
-/// Each valbitmap entry is (col_idx, sorted_distinct_values) — only for text
+/// Each valbitmap entry is (col_idx, sorted (value, count) list) — only for text
 /// columns with ≤ `VALBITMAP_MAX_DISTINCT` distinct values in this segment.
 pub(crate) type FlushResult = (
     i64,
@@ -1552,7 +1572,7 @@ pub(crate) type FlushResult = (
     Vec<(u16, u8, Vec<u8>)>,
     Vec<ColstatsRow>,
     Vec<(u16, Vec<u8>)>,
-    Vec<(u16, Vec<String>)>,
+    Vec<(u16, SegValueCounts)>,
 );
 
 /// Cap on distinct values for the per-segment value-presence bitmap. Each
@@ -1736,28 +1756,30 @@ pub(crate) fn flush_segment_metadata(
 pub(crate) fn compute_segment_valbitmap_values(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
-) -> Vec<(u16, Vec<String>)> {
-    let mut entries: Vec<(u16, Vec<String>)> = Vec::new();
+) -> Vec<(u16, SegValueCounts)> {
+    let mut entries: Vec<(u16, SegValueCounts)> = Vec::new();
     let mut col_idx: u16 = 0;
     for (i, col) in columns.iter().enumerate() {
         if col.is_segment_by {
             continue;
         }
         if let TypedColumn::Text(vals) = &typed_cols[i] {
-            // Cap the set at VALBITMAP_MAX_DISTINCT + 1: as soon as we'd
-            // exceed the cap we know this column can't get a bitmap, so we
-            // bail and skip allocating the rest.
-            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            // Count occurrences per distinct value. As soon as the distinct
+            // count would exceed the cap we know this column can't get a
+            // bitmap, so we bail and skip counting the rest.
+            let mut counts: std::collections::BTreeMap<String, u32> =
+                std::collections::BTreeMap::new();
             let mut overflow = false;
             for v in vals.iter().flatten() {
-                if set.len() >= VALBITMAP_MAX_DISTINCT && !set.contains(v) {
+                if counts.len() >= VALBITMAP_MAX_DISTINCT && !counts.contains_key(v) {
                     overflow = true;
                     break;
                 }
-                set.insert(v.clone());
+                *counts.entry(v.clone()).or_insert(0) += 1;
             }
             if !overflow {
-                entries.push((col_idx, set.into_iter().collect()));
+                // BTreeMap iteration is already sorted by value.
+                entries.push((col_idx, counts.into_iter().collect()));
             }
         }
         col_idx += 1;
@@ -1987,7 +2009,7 @@ pub(crate) fn flush_with_splitting(
     bloom_buffer: &mut Vec<(u16, i32, u8, Vec<u8>)>,
     colstats_buffer: &mut Vec<ColstatsRow>,
     text_length_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
-    valbitmap_value_buffer: &mut Vec<(u16, i32, Vec<String>)>,
+    valbitmap_value_buffer: &mut Vec<(u16, i32, SegValueCounts)>,
     partition_hll: &mut [CardinalityEstimator<u64>],
 ) -> i64 {
     let mut total_size = 0i64;
@@ -2263,6 +2285,7 @@ fn compress_partition_streaming(
     i64,
     Vec<CardinalityEstimator<u64>>,
     std::collections::HashMap<String, Vec<String>>,
+    ColumnValcounts,
 ) {
     let batch_size = segment_size;
 
@@ -2343,7 +2366,7 @@ fn compress_partition_streaming(
     // (col_idx, segment_id, sorted distinct values). Encoded into per-segment
     // bitmaps after the streaming loop, once partition-level value lists are
     // finalized.
-    let mut valbitmap_value_buffer: Vec<(u16, i32, Vec<String>)> = Vec::new();
+    let mut valbitmap_value_buffer: Vec<(u16, i32, SegValueCounts)> = Vec::new();
 
     // Partition-level HLL sketches, one per non-segment-by column (matches
     // the order `compute_segment_ndistinct` returns). Each per-segment HLL
@@ -2679,7 +2702,7 @@ fn compress_partition_streaming(
     // encode each segment's bitmap against the finalized partition map and
     // bulk-insert into the valbitmap table. The partition map itself is
     // returned to the caller for catalog persistence.
-    let column_valmap =
+    let (column_valmap, column_valcounts) =
         finalize_and_insert_valbitmaps(client, ddl, columns, valbitmap_value_buffer);
 
     (
@@ -2687,59 +2710,64 @@ fn compress_partition_streaming(
         total_rows,
         partition_hll,
         column_valmap,
+        column_valcounts,
     )
 }
 
 /// Build partition-level value→bit_idx maps from per-segment value sets,
 /// encode each segment's bitmap, bulk-insert into the valbitmap table.
-/// Returns the partition-level value map keyed by user column name (for
-/// the catalog write).
+/// Returns the partition-level value map (column name → sorted distinct values,
+/// for `column_valmap`) plus the summed per-value occurrence counts (column
+/// name → (value, count) list, for `column_valcounts` → real MCV frequencies).
 fn finalize_and_insert_valbitmaps(
     client: &mut SpiClient,
     ddl: &CompanionDdl,
     columns: &[ColumnMeta],
-    value_buffer: Vec<(u16, i32, Vec<String>)>,
-) -> std::collections::HashMap<String, Vec<String>> {
-    use std::collections::{BTreeSet, HashMap};
+    value_buffer: Vec<(u16, i32, SegValueCounts)>,
+) -> (
+    std::collections::HashMap<String, Vec<String>>,
+    ColumnValcounts,
+) {
+    use std::collections::{BTreeMap, HashMap};
 
     if value_buffer.is_empty() {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     }
 
-    // Aggregate per-col_idx union. Stop accumulating into a column's set as
-    // soon as it crosses VALBITMAP_MAX_DISTINCT (we'll drop the bitmap for
-    // that column anyway).
-    let mut union_by_col: HashMap<u16, BTreeSet<String>> = HashMap::new();
+    // Aggregate per-col_idx: distinct value set (for the bitmap/valmap) and the
+    // summed occurrence counts (for valcounts). Stop accumulating into a column
+    // as soon as it crosses VALBITMAP_MAX_DISTINCT (we'll drop it anyway).
+    let mut count_by_col: HashMap<u16, BTreeMap<String, i64>> = HashMap::new();
     let mut overflow_cols: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for (col_idx, _seg_id, vals) in &value_buffer {
         if overflow_cols.contains(col_idx) {
             continue;
         }
-        let entry = union_by_col.entry(*col_idx).or_default();
-        for v in vals {
-            if entry.len() >= VALBITMAP_MAX_DISTINCT && !entry.contains(v) {
+        let entry = count_by_col.entry(*col_idx).or_default();
+        for (v, c) in vals {
+            if entry.len() >= VALBITMAP_MAX_DISTINCT && !entry.contains_key(v) {
                 overflow_cols.insert(*col_idx);
-                union_by_col.remove(col_idx);
+                count_by_col.remove(col_idx);
                 break;
             }
-            entry.insert(v.clone());
+            *entry.entry(v.clone()).or_insert(0) += *c as i64;
         }
     }
 
-    if union_by_col.is_empty() {
-        return HashMap::new();
+    if count_by_col.is_empty() {
+        return (HashMap::new(), HashMap::new());
     }
 
-    // Finalize per-column sorted value list + value→bit_idx index.
-    // Vec<(col_idx, sorted_values, value→bit_idx HashMap)>.
+    // Finalize per-column sorted value list + value→bit_idx index. The
+    // BTreeMap keys are already sorted, matching the prior sorted-set order.
     let mut finalized: HashMap<u16, (Vec<String>, HashMap<String, u8>)> = HashMap::new();
-    for (col_idx, set) in union_by_col {
-        let sorted: Vec<String> = set.into_iter().collect();
+    for (col_idx, counts) in &count_by_col {
+        let sorted: Vec<String> = counts.keys().cloned().collect();
         let mut idx: HashMap<String, u8> = HashMap::new();
         for (i, v) in sorted.iter().enumerate() {
             idx.insert(v.clone(), i as u8);
         }
-        finalized.insert(col_idx, (sorted, idx));
+        finalized.insert(*col_idx, (sorted, idx));
     }
 
     // Map non-segment-by col_idx → user column name for the catalog payload.
@@ -2770,7 +2798,7 @@ fn finalize_and_insert_valbitmaps(
         let n_bits = idx_map.len();
         let n_bytes = n_bits.div_ceil(8);
         let mut bits: Vec<u8> = vec![0; n_bytes];
-        for v in &vals {
+        for (v, _c) in &vals {
             if let Some(&bit_idx) = idx_map.get(v) {
                 bits[(bit_idx / 8) as usize] |= 1u8 << (bit_idx % 8);
             }
@@ -2799,15 +2827,22 @@ fn finalize_and_insert_valbitmaps(
         .update(&format!("ANALYZE {}", ddl.valbitmap_fqn), None, &[])
         .expect("failed to analyze valbitmap table");
 
-    // Build the catalog payload: column name → sorted value list.
-    let mut by_name: std::collections::HashMap<String, Vec<String>> =
+    // Build the catalog payloads keyed by user column name: the sorted value
+    // list (valmap) and the summed per-value counts (valcounts).
+    let mut valmap: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for (col_idx, (vals, _)) in finalized {
         if let Some(name) = col_idx_to_name.get(&col_idx) {
-            by_name.insert(name.clone(), vals);
+            valmap.insert(name.clone(), vals);
         }
     }
-    by_name
+    let mut valcounts: ColumnValcounts = std::collections::HashMap::new();
+    for (col_idx, counts) in count_by_col {
+        if let Some(name) = col_idx_to_name.get(&col_idx) {
+            valcounts.insert(name.clone(), counts.into_iter().collect());
+        }
+    }
+    (valmap, valcounts)
 }
 
 /// Compress a typed column directly, bypassing string parsing.

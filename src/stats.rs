@@ -52,6 +52,10 @@ pub fn write_partition_stats(
     // Per-column distinct-value lists for low-cardinality columns, used to
     // write an MCV (exact equality selectivity + ~0 for absent values).
     let col_valmap = load_column_valmap(client, part_rel_oid)?;
+    // Per-value occurrence counts for those same columns → real MCV
+    // frequencies. Empty for partitions predating `column_valcounts`, in which
+    // case `mcv_freqs` falls back to the old uniform split.
+    let col_valcounts = load_column_valcounts(client, part_rel_oid)?;
 
     // Estimate average tuple width — feeds `pg_class.relpages`.
     let mut sum_widths: i64 = 0;
@@ -117,12 +121,18 @@ pub fn write_partition_stats(
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), ndistinct),
             None => match col_valmap.get(&col.name) {
-                Some(vals) if vals.len() >= 2 => (
-                    Some(Slot1::Mcv {
-                        values: vals.clone(),
-                    }),
-                    vals.len() as i64,
-                ),
+                Some(vals) if vals.len() >= 2 => {
+                    let empty = HashMap::new();
+                    let counts = col_valcounts.get(&col.name).unwrap_or(&empty);
+                    let freqs = mcv_freqs(vals, counts, row_count);
+                    (
+                        Some(Slot1::Mcv {
+                            values: vals.clone(),
+                            freqs,
+                        }),
+                        vals.len() as i64,
+                    )
+                }
                 _ => (None, ndistinct),
             },
         };
@@ -396,6 +406,84 @@ fn load_column_valmap(
     Ok(out)
 }
 
+/// Load the persisted per-column per-value occurrence counts
+/// (`column_valcounts`) for a compressed partition. Shape on disk is
+/// `{col_name: {value: count}}`; returned as `{col_name: {value: count}}`.
+/// Same column set as `column_valmap` (≤ 32 distinct). Empty for partitions
+/// compressed by a build predating `column_valcounts` — callers then fall
+/// back to uniform MCV frequencies.
+fn load_column_valcounts(
+    client: &mut SpiClient,
+    part_rel_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<String, HashMap<String, i64>>> {
+    let part_oid_int = u32::from(part_rel_oid) as i64;
+    let json_text: Option<String> = client
+        .select(
+            "SELECT column_valcounts::text FROM deltax.deltax_partition \
+             WHERE table_name = (SELECT relname FROM pg_class WHERE oid = $1::oid) \
+               AND is_compressed = true",
+            None,
+            &[part_oid_int.into()],
+        )?
+        .next()
+        .and_then(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        });
+    Ok(json_text
+        .map(|t| parse_valcounts_json(&t))
+        .unwrap_or_default())
+}
+
+/// Parse a `{col_name: {value: count}}` JSON object into a per-column
+/// value→count map. Non-object values and non-integer counts are skipped.
+fn parse_valcounts_json(text: &str) -> HashMap<String, HashMap<String, i64>> {
+    let mut out: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(text) {
+        for (name, val) in obj {
+            if let serde_json::Value::Object(counts) = val {
+                let mut m: HashMap<String, i64> = HashMap::new();
+                for (v, c) in counts {
+                    if let Some(n) = c.as_i64() {
+                        m.insert(v, n);
+                    }
+                }
+                if !m.is_empty() {
+                    out.insert(name, m);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Map an MCV's value list to `most_common_freqs` using per-value counts.
+/// `freq = count / row_count` (PG's convention: a fraction of *all* rows, so
+/// the freqs sum to the non-null fraction — which is exactly what makes an
+/// absent value estimate ~0 in `var_eq_const`, since `1 - Σfreq - nullfrac`
+/// then collapses to 0). When `counts` is empty (a partition predating
+/// `column_valcounts`) we fall back to the old uniform `1/n` split. A value
+/// present in the valmap always has count ≥ 1; the tiny positive floor is
+/// defensive so PG never sees a 0/negative frequency for a listed value.
+fn mcv_freqs(values: &[String], counts: &HashMap<String, i64>, row_count: i64) -> Vec<f32> {
+    let n = values.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if counts.is_empty() || row_count <= 0 {
+        return vec![1.0f32 / n as f32; n];
+    }
+    values
+        .iter()
+        .map(|v| {
+            let c = counts.get(v).copied().unwrap_or(0).max(0);
+            let f = c as f64 / row_count as f64;
+            (f as f32).clamp(f32::MIN_POSITIVE, 1.0)
+        })
+        .collect()
+}
+
 /// Translate pg_attribute.attlen into a `stawidth`. Fixed-width types
 /// use attlen directly; varlena types (`attlen < 0`) get a conservative
 /// 32-byte default — pg_statistic's `stawidth` only feeds I/O and
@@ -465,6 +553,10 @@ enum Slot1 {
     },
     Mcv {
         values: Vec<String>,
+        /// `most_common_freqs`, parallel to `values`. Real per-value
+        /// frequencies (count / row_count); uniform `1/n` only for partitions
+        /// predating `column_valcounts`.
+        freqs: Vec<f32>,
     },
 }
 
@@ -508,11 +600,11 @@ fn upsert_pg_statistic_row(
                 stavalues: unsafe { build_histogram_array(type_oid, &bounds) },
             })
         }
-        Some(Slot1::Mcv { values }) if values.len() >= 2 => {
+        Some(Slot1::Mcv { values, freqs }) if values.len() >= 2 => {
             // MCV is written for text columns; resolve the text `=` operator.
             let eqop = lookup_strategy_operator(client, pg_sys::TEXTOID, 3); // btree `=`
             (eqop != pg_sys::InvalidOid).then(|| {
-                let (vals, numbers) = unsafe { build_mcv_arrays(&values) };
+                let (vals, numbers) = unsafe { build_mcv_arrays(&values, &freqs) };
                 Slot1Data {
                     stakind: pg_sys::STATISTIC_KIND_MCV as i16,
                     staop: eqop,
@@ -543,14 +635,15 @@ fn upsert_pg_statistic_row(
 }
 
 /// Build the `stavalues` (text[]) and `stanumbers` (float4[]) array Datums for
-/// an MCV slot from a low-cardinality column's distinct values. We don't have
-/// exact per-value counts, so frequencies are uniform and sum to 1.0 — that
-/// keeps each present value at `1/ndistinct` (same as the ndistinct-only path)
-/// while making *absent* values estimate ~0 (the whole point: e.g. an
-/// `event_type='Shipped'` filter on a column that never contains 'Shipped').
-unsafe fn build_mcv_arrays(values: &[String]) -> (pg_sys::Datum, pg_sys::Datum) {
+/// an MCV slot from a low-cardinality column's distinct values and their
+/// `most_common_freqs` (real per-value frequencies; see `mcv_freqs`). The
+/// freqs sum to the non-null fraction, so a *present* value estimates at its
+/// true frequency (e.g. `event_type='Approved'` ≈ 41%, not a flat `1/n`) while
+/// an *absent* value still estimates ~0 (`1 - Σfreq - nullfrac` → 0).
+unsafe fn build_mcv_arrays(values: &[String], freqs: &[f32]) -> (pg_sys::Datum, pg_sys::Datum) {
     use pgrx::IntoDatum;
     let n = values.len();
+    debug_assert_eq!(values.len(), freqs.len());
 
     let mut val_datums: Vec<pg_sys::Datum> = values
         .iter()
@@ -560,11 +653,6 @@ unsafe fn build_mcv_arrays(values: &[String]) -> (pg_sys::Datum, pg_sys::Datum) 
                 .unwrap_or(pg_sys::Datum::from(0usize))
         })
         .collect();
-    let mut freqs: Vec<f32> = vec![1.0f32 / n as f32; n];
-    // Make the frequencies sum to exactly 1.0 so PG estimates non-MCV values
-    // (which, with stadistinct == n, leave no "other" distinct values) at 0.
-    let drift: f32 = 1.0 - freqs.iter().sum::<f32>();
-    *freqs.last_mut().unwrap() += drift;
     let mut freq_datums: Vec<pg_sys::Datum> = freqs
         .iter()
         .map(|x| pg_sys::Datum::from(x.to_bits() as usize))
@@ -926,8 +1014,11 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
     // Table-wide distinct value lists for low-cardinality columns (the union
     // of the per-partition valmaps), used to write an MCV list.
     let mut vm_by_col: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    // Table-wide per-value counts (summed across partitions) for those same
+    // columns → real parent `most_common_freqs`.
+    let mut vc_by_col: HashMap<String, HashMap<String, i64>> = HashMap::new();
     let query = "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text, \
-                column_valmap::text \
+                column_valmap::text, column_valcounts::text \
                  FROM deltax.deltax_partition \
                  WHERE is_compressed = true AND deltatable_id = (\
                      SELECT id FROM deltax.deltax_deltatable \
@@ -973,6 +1064,18 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             .and_then(|d| d.value::<String>().ok().flatten())
         {
             union_valmap_json(&text, &mut vm_by_col);
+        }
+        if let Some(text) = row
+            .get_datum_by_ordinal(6)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            for (name, counts) in parse_valcounts_json(&text) {
+                let acc = vc_by_col.entry(name).or_default();
+                for (v, c) in counts {
+                    *acc.entry(v).or_insert(0) += c;
+                }
+            }
         }
     }
     if total_rows <= 0 {
@@ -1040,12 +1143,14 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             // union of 12 vs ~634 actual), which mis-plans Top-N / range
             // queries.
             None => match vm_by_col.get(&attr.attname) {
-                Some(set) if set.len() >= 2 && set.len() as i64 == merged_nd => (
-                    Some(Slot1::Mcv {
-                        values: set.iter().cloned().collect(),
-                    }),
-                    set.len() as i64,
-                ),
+                Some(set) if set.len() >= 2 && set.len() as i64 == merged_nd => {
+                    let values: Vec<String> = set.iter().cloned().collect();
+                    let empty = HashMap::new();
+                    let counts = vc_by_col.get(&attr.attname).unwrap_or(&empty);
+                    let freqs = mcv_freqs(&values, counts, total_rows);
+                    let n = values.len() as i64;
+                    (Some(Slot1::Mcv { values, freqs }), n)
+                }
                 _ => (None, merged_nd),
             },
         };
@@ -1240,6 +1345,68 @@ mod tests {
         // Types we don't emit histograms for (text, float for now) → skip.
         assert!(!histogram_eligible(pg_sys::TEXTOID, 0, 10));
         assert!(!histogram_eligible(pg_sys::FLOAT4OID, 0, 10));
+    }
+
+    #[test]
+    fn mcv_freqs_uses_real_per_value_counts() {
+        // Skewed enum: 'A' 80%, 'B' 20% over 100 rows → real freqs, not 1/2.
+        let values = vec!["A".to_string(), "B".to_string()];
+        let mut counts = HashMap::new();
+        counts.insert("A".to_string(), 80);
+        counts.insert("B".to_string(), 20);
+        let f = mcv_freqs(&values, &counts, 100);
+        assert!((f[0] - 0.8).abs() < 1e-6, "freq(A)={}", f[0]);
+        assert!((f[1] - 0.2).abs() < 1e-6, "freq(B)={}", f[1]);
+        // Complete coverage, no nulls → freqs sum to ~1.0.
+        assert!((f.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mcv_freqs_sums_below_one_with_nulls() {
+        // 60 non-null rows out of 100 → freqs sum to the non-null fraction
+        // (0.6), which is what makes an absent value estimate ~0 in PG's
+        // `1 - Σfreq - nullfrac`.
+        let values = vec!["A".to_string(), "B".to_string()];
+        let mut counts = HashMap::new();
+        counts.insert("A".to_string(), 40);
+        counts.insert("B".to_string(), 20);
+        let f = mcv_freqs(&values, &counts, 100);
+        assert!((f.iter().sum::<f32>() - 0.6).abs() < 1e-6, "sum={}", f.iter().sum::<f32>());
+    }
+
+    #[test]
+    fn mcv_freqs_falls_back_to_uniform_without_counts() {
+        // Partition predating column_valcounts → empty counts → uniform 1/n
+        // (the prior behaviour), so the change is a no-op for old data.
+        let values = vec!["A".to_string(), "B".to_string(), "C".to_string(), "D".to_string()];
+        let f = mcv_freqs(&values, &HashMap::new(), 100);
+        assert_eq!(f.len(), 4);
+        assert!(f.iter().all(|&x| (x - 0.25).abs() < 1e-6), "freqs={:?}", f);
+    }
+
+    #[test]
+    fn mcv_freqs_empty_and_zero_rowcount() {
+        assert!(mcv_freqs(&[], &HashMap::new(), 100).is_empty());
+        // row_count <= 0 → uniform fallback rather than a divide-by-zero.
+        let values = vec!["A".to_string(), "B".to_string()];
+        let f = mcv_freqs(&values, &HashMap::new(), 0);
+        assert!(f.iter().all(|&x| (x - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn parse_valcounts_json_parses_nested_object() {
+        let m = parse_valcounts_json(r#"{"kind":{"A":80,"B":20},"x":{"v":5}}"#);
+        assert_eq!(m["kind"]["A"], 80);
+        assert_eq!(m["kind"]["B"], 20);
+        assert_eq!(m["x"]["v"], 5);
+    }
+
+    #[test]
+    fn parse_valcounts_json_ignores_garbage() {
+        assert!(parse_valcounts_json("not json").is_empty());
+        assert!(parse_valcounts_json("[1,2,3]").is_empty()); // not an object
+        // Non-integer counts dropped; an all-garbage column yields no entry.
+        assert!(parse_valcounts_json(r#"{"k":{"a":"oops"}}"#).is_empty());
     }
 
     #[test]

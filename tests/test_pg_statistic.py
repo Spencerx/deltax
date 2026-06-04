@@ -15,6 +15,10 @@ def _seed(db, n_partitions=4, rows_per_partition=50_000, high_card=5000):
 
     - `uid`  — INT8, `high_card` distinct values (join key) → histogram slot.
     - `kind` — TEXT, 5 distinct values (low-cardinality enum) → MCV slot.
+    - `skew` — TEXT, 4 distinct values with a deliberately *skewed* frequency
+               (hot 50% / warm 30% / cool 15% / rare 5%) → MCV slot. Ground
+               truth for `most_common_freqs`: a regression to uniform `1/n`
+               would estimate every value at 25%, which these tests catch.
     - `val`  — FLOAT8, ~unique (measurement column) → stadistinct only.
     - `note` — TEXT, NULL in exactly 25% of rows (one non-null value) →
                ground truth for `stanullfrac`. A bug that hardcodes nullfrac
@@ -26,6 +30,7 @@ def _seed(db, n_partitions=4, rows_per_partition=50_000, high_card=5000):
         "  ts TIMESTAMPTZ NOT NULL,"
         "  uid BIGINT,"
         "  kind TEXT,"
+        "  skew TEXT,"
         "  val FLOAT8,"
         "  note TEXT"
         ")"
@@ -46,7 +51,7 @@ def _seed(db, n_partitions=4, rows_per_partition=50_000, high_card=5000):
     for p in range(n_partitions):
         part_start = today - timedelta(days=1) + timedelta(days=p) + timedelta(hours=1)
         db.execute(
-            "INSERT INTO events (ts, uid, kind, val, note) "
+            "INSERT INTO events (ts, uid, kind, skew, val, note) "
             "SELECT %s::timestamptz + (i::bigint * %s::bigint * interval '1 microsecond'), "
             "       (i %% %s)::bigint, "
             "       CASE WHEN i %% 5 = 0 THEN 'A' "
@@ -54,6 +59,13 @@ def _seed(db, n_partitions=4, rows_per_partition=50_000, high_card=5000):
             "            WHEN i %% 5 = 2 THEN 'C' "
             "            WHEN i %% 5 = 3 THEN 'D' "
             "            ELSE 'E' END, "
+            # Skewed: i%20 in 0..9 → 'hot' (50%), 10..15 → 'warm' (30%),
+            # 16..18 → 'cool' (15%), 19 → 'rare' (5%). Exact when
+            # rows_per_partition is a multiple of 20.
+            "       CASE WHEN i %% 20 < 10 THEN 'hot' "
+            "            WHEN i %% 20 < 16 THEN 'warm' "
+            "            WHEN i %% 20 < 19 THEN 'cool' "
+            "            ELSE 'rare' END, "
             "       random(), "
             "       CASE WHEN i %% 4 = 0 THEN NULL ELSE 'x' END "
             "FROM generate_series(0, %s) i",
@@ -458,4 +470,114 @@ def test_parent_histogram_is_multibucket_and_ascending(db):
     su = _pg_stats(db, "events", "uid", inherited=True)
     assert su is not None and 4500 <= su["n_distinct"] <= 5500, (
         f"parent n_distinct(uid)={su['n_distinct'] if su else None}, expected ~5000"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Real MCV frequencies (P1). The `skew` column is hot 50% / warm 30% /
+# cool 15% / rare 5%; a regression to the old uniform 1/n would put every
+# value at 25%, which both layers below catch.
+# ---------------------------------------------------------------------------
+
+TRUE_SKEW = {"hot": 0.50, "warm": 0.30, "cool": 0.15, "rare": 0.05}
+
+
+def test_mcv_freqs_match_skewed_distribution(db):
+    """L2: most_common_freqs must reflect the real per-value frequency, not a
+    uniform 1/n — on both the child partition and the merged parent."""
+    _seed(db, n_partitions=2, rows_per_partition=50_000, high_card=5000)
+
+    def assert_skew_freqs(s, where):
+        assert s is not None, f"no pg_stats row for skew ({where})"
+        vals, freqs = s["most_common_vals"], s["most_common_freqs"]
+        assert freqs is not None, f"no most_common_freqs ({where})"
+        assert set(vals) == set(TRUE_SKEW), f"MCV vals {vals} != {set(TRUE_SKEW)} ({where})"
+        by_val = dict(zip(vals, freqs))
+        for v, want in TRUE_SKEW.items():
+            assert abs(by_val[v] - want) < 0.02, (
+                f"freq({v})={by_val[v]:.3f}, expected ~{want} ({where}); "
+                f"uniform 1/n would be 0.25"
+            )
+
+    part = _first_compressed_partition(db)
+    assert_skew_freqs(_pg_stats(db, part, "skew", inherited=False), "child")
+
+    db.execute("SELECT deltax.deltax_analyze_table('events')")
+    db.commit()
+    assert_skew_freqs(_pg_stats(db, "events", "skew", inherited=True), "parent")
+
+
+def test_skewed_value_estimates_track_real_frequency(db):
+    """L3: the planner's row estimate for an equality on the skewed column must
+    track the value's real frequency — hot ~50% of rows, rare ~5%, absent ~0.
+    Uniform 1/n would estimate every present value at ~25%."""
+    import json
+
+    _seed(db, n_partitions=2, rows_per_partition=50_000, high_card=5000)
+    db.execute("SELECT deltax.deltax_analyze_table('events')")
+    db.commit()
+    total = db.execute("SELECT count(*) FROM events").fetchone()[0]
+
+    def scan_est(value):
+        plan = db.execute(
+            "EXPLAIN (FORMAT JSON) SELECT * FROM events WHERE skew = %s", (value,)
+        ).fetchone()[0]
+        root = json.loads(plan) if isinstance(plan, str) else plan
+
+        def rows(node):
+            out = [node.get("Plan Rows", 0)]
+            for child in node.get("Plans", []) or []:
+                out += rows(child)
+            return out
+
+        return max(rows(root[0]["Plan"]))
+
+    hot, rare, absent = scan_est("hot"), scan_est("rare"), scan_est("nope")
+
+    assert 0.40 * total <= hot <= 0.60 * total, (
+        f"hot estimate {hot} not ~50% of {total} (uniform 1/n → ~25%)"
+    )
+    assert 0.02 * total <= rare <= 0.10 * total, (
+        f"rare estimate {rare} not ~5% of {total} (uniform 1/n → ~25%)"
+    )
+    assert absent < 50, f"absent-value estimate {absent} should be ~0"
+    assert hot > rare > absent, (
+        f"estimates not monotone with frequency: hot={hot} rare={rare} absent={absent}"
+    )
+
+
+def test_in_range_estimate_is_substantial(db):
+    """L3: a range over the order-by column covering ~half the table's time
+    span must estimate a substantial fraction of rows — not collapse to a
+    handful. This is the Q30 trap (a range estimated rows=8 vs 4.2M) that a
+    missing or neutralised parent histogram caused."""
+    import json
+
+    _seed(db, n_partitions=4, rows_per_partition=40_000, high_card=5000)
+    db.execute("SELECT deltax.deltax_analyze_table('events')")
+    db.commit()
+
+    total = db.execute("SELECT count(*) FROM events").fetchone()[0]
+    _lo, _hi, mid = db.execute(
+        "SELECT min(ts), max(ts), min(ts) + (max(ts) - min(ts)) / 2 FROM events"
+    ).fetchone()
+
+    plan = db.execute(
+        "EXPLAIN (FORMAT JSON) SELECT * FROM events WHERE ts <= %s", (mid,)
+    ).fetchone()[0]
+    root = json.loads(plan) if isinstance(plan, str) else plan
+
+    def scan_rows(node):
+        out = [node.get("Plan Rows", 0)]
+        for child in node.get("Plans", []) or []:
+            out += scan_rows(child)
+        return out
+
+    est = max(scan_rows(root[0]["Plan"]))
+    # ~half the time span → ~half the rows. A rows=8 collapse (or default tiny
+    # selectivity) would fall far below this; a generous quarter-to-nearly-all
+    # band proves the histogram is doing real range selectivity.
+    assert 0.25 * total <= est <= 0.90 * total, (
+        f"range ts<=midpoint estimate {est} not ~half of {total} — parent "
+        f"histogram range selectivity may have collapsed (the Q30 rows=8 trap)"
     )
