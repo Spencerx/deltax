@@ -634,3 +634,119 @@ def test_groupby_estimate_clamped_to_filtered_input(db):
         f"GROUP BY uid estimate {est} not clamped to the filtered input — looks "
         f"like the raw n_distinct (5000), i.e. the clamp regressed"
     )
+
+
+# ---------------------------------------------------------------------------
+# segment_by columns. Stored as the partition's segment_values (not in the
+# blob/HLL), so they were previously skipped entirely → PG defaulted their
+# equality selectivity to 0.005. We now synthesize stats from the meta table's
+# exact (segment value, _row_count). Neither bench uses segment_by, so this
+# layer is the only guard.
+# ---------------------------------------------------------------------------
+
+def _seed_segmented(db, n_partitions=2, rows_per_partition=50_000):
+    """A deltax table segmented by a skewed low-card text column `region`
+    (us 50% / eu 30% / ap 15% / sa 5%), with a high-card `uid`."""
+    db.execute(
+        "CREATE TABLE seg_events (ts TIMESTAMPTZ NOT NULL, region TEXT, uid BIGINT)"
+    )
+    db.execute(
+        "SELECT deltax.deltax_create_table('seg_events', 'ts', '1 day', %s)",
+        (n_partitions - 1,),
+    )
+    db.execute(
+        "SELECT deltax.deltax_enable_compression('seg_events', "
+        "segment_by => ARRAY['region'], order_by => ARRAY['ts'])"
+    )
+    db.commit()
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    window_us = 22 * 3600 * 1_000_000
+    spacing_us = max(1, window_us // max(1, rows_per_partition - 1))
+    for p in range(n_partitions):
+        part_start = today - timedelta(days=1) + timedelta(days=p) + timedelta(hours=1)
+        db.execute(
+            "INSERT INTO seg_events (ts, region, uid) "
+            "SELECT %s::timestamptz + (i::bigint * %s::bigint * interval '1 microsecond'), "
+            "       CASE WHEN i %% 20 < 10 THEN 'us' "
+            "            WHEN i %% 20 < 16 THEN 'eu' "
+            "            WHEN i %% 20 < 19 THEN 'ap' "
+            "            ELSE 'sa' END, "
+            "       (i %% 5000)::bigint "
+            "FROM generate_series(0, %s) i",
+            (part_start, spacing_us, rows_per_partition - 1),
+        )
+    db.commit()
+    for (name,) in db.execute(
+        "SELECT partition_name FROM deltax.deltax_partition_info('seg_events') "
+        "ORDER BY range_start"
+    ).fetchall():
+        if db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0] > 0:
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
+    db.commit()
+
+
+REGION_FREQ = {"us": 0.50, "eu": 0.30, "ap": 0.15, "sa": 0.05}
+
+
+def test_segment_by_column_gets_stats(db):
+    """A segment_by column must get exact stadistinct + a real-frequency MCV
+    (child + parent), not be skipped (which left PG defaulting `region = X` to
+    0.005). The meta table gives exact per-value counts."""
+    _seed_segmented(db, n_partitions=2, rows_per_partition=50_000)
+
+    def assert_region(s, where):
+        assert s is not None, f"no pg_stats row for segment_by region ({where})"
+        assert set(s["most_common_vals"]) == set(REGION_FREQ), (
+            f"region MCV {s['most_common_vals']} != {set(REGION_FREQ)} ({where})"
+        )
+        by_val = dict(zip(s["most_common_vals"], s["most_common_freqs"]))
+        for v, want in REGION_FREQ.items():
+            assert abs(by_val[v] - want) < 0.02, (
+                f"region freq({v})={by_val[v]:.3f} expected ~{want} ({where})"
+            )
+
+    part = _first_compressed_partition(db)
+    # stadistinct ~4 on the child, with a real MCV (staop/stacoll non-null).
+    child = _pg_stats(db, part, "region", inherited=False)
+    assert child is not None and 3 <= child["n_distinct"] <= 5, (
+        f"child n_distinct(region)={child['n_distinct'] if child else None}, expected ~4"
+    )
+    assert_region(child, "child")
+    stakind1, staop1, stacoll1 = _slot1_ops(db, part, "region", inherited=False)
+    assert stakind1 == 1 and staop1 not in (None, 0) and stacoll1 not in (None, 0)
+
+    db.execute("SELECT deltax.deltax_analyze_table('seg_events')")
+    db.commit()
+    assert_region(_pg_stats(db, "seg_events", "region", inherited=True), "parent")
+
+
+def test_segment_by_equality_estimate_uses_mcv(db):
+    """`WHERE region = 'us'` (50% of rows) must estimate ~half the table via the
+    segment_by MCV — not the ~0.5% DEFAULT_EQ_SEL it got when segment_by columns
+    had no stats at all."""
+    import json
+
+    _seed_segmented(db, n_partitions=2, rows_per_partition=50_000)
+    db.execute("SELECT deltax.deltax_analyze_table('seg_events')")
+    db.commit()
+    total = db.execute("SELECT count(*) FROM seg_events").fetchone()[0]
+
+    plan = db.execute(
+        "EXPLAIN (FORMAT JSON) SELECT * FROM seg_events WHERE region = 'us'"
+    ).fetchone()[0]
+    root = json.loads(plan) if isinstance(plan, str) else plan
+
+    def find_scan_rows(node):
+        rows = [node.get("Plan Rows", 0)]
+        for child in node.get("Plans", []) or []:
+            rows += find_scan_rows(child)
+        return rows
+
+    est = max(find_scan_rows(root[0]["Plan"]))
+    # 'us' is 50%; DEFAULT_EQ_SEL would give ~0.5% (est ~ total*0.005). Require
+    # well above that to prove the MCV is in play.
+    assert est > 0.25 * total, (
+        f"region='us' estimate {est} not ~50% of {total} — segment_by MCV "
+        f"not used (looks like the 0.005 default)"
+    )

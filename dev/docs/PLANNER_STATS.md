@@ -165,6 +165,23 @@ deltax-specific estimate gaps that matter.
   Q33 4.4 s (`agg` over 23M URL groups). That's an execution-path track (text
   detoast for substring `LIKE`), orthogonal to planner stats.
 
+## Known-inaccurate stats (audit 2026-06-04)
+
+Stats we *write* (or skip) that are known to diverge from ground truth, ranked by
+wrong-value × real-usage impact. Several are invisible to the current RTABench /
+ClickBench suites (which use `order_by` only, no `segment_by`; and don't probe
+text width), so benchmarks will never catch them — they matter for real usage.
+
+| # | Stat | What's wrong | Real-usage impact | Status |
+|---|---|---|---|---|
+| 1 | ~~`segment_by` columns: no `pg_statistic` at all~~ | `WHERE segkey = X` fell back to `DEFAULT_EQ_SEL` (0.005) | The segment key is *the* dimension users filter/join on (tenant/device id). Was invisible to our benches (neither uses `segment_by`). | **fixed** — `augment_segment_by_stats` reads exact `(segment value, _row_count)` from the meta table → exact `stadistinct` for any type + a real-frequency MCV for text keys; guarded by `test_segment_by_*` |
+| 2 | **`stawidth` = flat 32 for every varlena/text col** (`stawidth_for_attlen`) | True avg width unknown; ClickBench `URL`/`Title` are ~50–70 B | Mis-sizes sort/hash work-mem + `relpages`/data-volume costs on wide-text aggregates. Real lengths live in the `text_lengths` sidecar. | open |
+| 3 | **No MCV for >32-distinct skewed columns** | valmap overflows at 32 → uniform `1/ndistinct` for every value | A 100-value enum with a 60%-hot value estimates it at 1%. Needs top-N hot counts on overflow (reload). | open (P1→P2) |
+| 4 | **No float histograms** (`FLOAT4/8` excluded) | `WHERE x > c` uses `DEFAULT_INEQ_SEL` (~0.33) | Range predicates on real-valued columns. | open (P5) |
+| 5 | **No correlation stat (kind 3)** | never written | Ordered/index-scan costing; marginal for custom scans. | open (P4) |
+| 6 | **Child histogram 2-point `[min,max]`** | within-partition range assumes uniform | Skewed-within-partition ranges; bounded by pruning + parent histogram. | open (P3) |
+| 7 | **Parent histogram assumes equal-sized partitions** | bounds = sorted partition mins + global max, treated equi-depth | Unequal partitions (variable ingest, backfill) skew range estimates. | open |
+
 ## Testing strategy
 
 The disasters above were ultimately caught by a full RTABench/ClickBench run —

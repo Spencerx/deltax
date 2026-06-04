@@ -910,7 +910,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
     let segment_size = ht.segment_size as usize;
 
-    let (total_compressed_size, row_count, partition_hll, column_valmap, column_valcounts) =
+    let (total_compressed_size, row_count, partition_hll, mut column_valmap, mut column_valcounts) =
         compress_partition_streaming(
             client,
             &part_fqn,
@@ -995,11 +995,22 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         .filter(|c| !c.is_segment_by)
         .map(|c| c.name.as_str())
         .collect();
-    let col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
+    let mut col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
         .iter()
         .zip(partition_hll.iter())
         .map(|(name, hll)| ((*name).to_string(), hll.estimate() as i64))
         .collect();
+    // Fold segment-by columns (absent from the HLL/valbitmap) into the stat
+    // maps from the meta table's exact (segment value, _row_count) so the
+    // child + parent pg_statistic machinery covers them.
+    augment_segment_by_stats(
+        client,
+        &ddl.meta_fqn,
+        &columns,
+        &mut col_ndistinct,
+        &mut column_valmap,
+        &mut column_valcounts,
+    );
     catalog::update_partition_column_ndistinct_from_map(client, part_info.id, &col_ndistinct)
         .expect("failed to update partition column_ndistinct");
 
@@ -3731,6 +3742,59 @@ pub(crate) fn supports_sum(data_type: &str) -> bool {
         || dt == "real"
         || dt == "float4"
         || is_text_data_type(&dt)
+}
+
+/// Fold segment-by columns into the partition's catalog stat maps so the child
+/// and parent `pg_statistic` machinery covers them. PG otherwise defaults
+/// `WHERE segkey = X` to 0.005, and the segment key is the column users filter
+/// and join on most. Segment-by values are stored as the partition's
+/// `segment_values` (not in the blob/HLL), but the meta table holds the exact
+/// `(segment value, _row_count)` per segment, so `SUM(_row_count) GROUP BY
+/// segval` is the exact per-value frequency. This populates `col_ndistinct` for
+/// every segment-by column; for text segment keys with no more than
+/// `VALBITMAP_MAX_DISTINCT` distinct values it also populates `valmap` and
+/// `valcounts`, yielding an MCV with real frequencies. Non-text keys get
+/// stadistinct only, since the MCV slot is text-only (see `stats::is_text_type`).
+pub(crate) fn augment_segment_by_stats(
+    client: &mut SpiClient,
+    meta_fqn: &str,
+    columns: &[ColumnMeta],
+    col_ndistinct: &mut std::collections::HashMap<String, i64>,
+    valmap: &mut std::collections::HashMap<String, Vec<String>>,
+    valcounts: &mut ColumnValcounts,
+) {
+    for col in columns {
+        if !col.is_segment_by {
+            continue;
+        }
+        let ident = col.name.replace('"', "\"\"");
+        let query = format!(
+            "SELECT \"{ident}\"::text AS v, SUM(_row_count)::int8 AS c \
+             FROM {meta_fqn} WHERE \"{ident}\" IS NOT NULL GROUP BY 1 ORDER BY 1"
+        );
+        let Ok(rows) = client.select(&query, None, &[]) else {
+            continue;
+        };
+        let mut pairs: Vec<(String, i64)> = Vec::new();
+        for row in rows {
+            let v: Option<String> = row.get(1).ok().flatten();
+            let c: i64 = row.get(2).ok().flatten().unwrap_or(0);
+            if let Some(v) = v {
+                pairs.push((v, c));
+            }
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        // Exact distinct count → accurate equality selectivity (1/ndistinct).
+        col_ndistinct.insert(col.name.clone(), pairs.len() as i64);
+        // Text, low-card → also an MCV with exact frequencies + absent-value ~0.
+        if is_text_data_type(&col.data_type.to_lowercase()) && pairs.len() <= VALBITMAP_MAX_DISTINCT
+        {
+            valmap.insert(col.name.clone(), pairs.iter().map(|(v, _)| v.clone()).collect());
+            valcounts.insert(col.name.clone(), pairs);
+        }
+    }
 }
 
 /// True for PostgreSQL text-family types.

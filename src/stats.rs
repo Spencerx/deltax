@@ -65,19 +65,22 @@ pub fn write_partition_stats(
     let avg_tuple_width = sum_widths.max(32);
 
     // Walk our pg_deltax columns, match to the partition's pg_attribute
-    // entry by name, emit one pg_statistic row each. Segment-by columns
-    // have null estimates from our HLL map (they're stored as the
-    // partition's segment_values, not in the blob), so we skip them
-    // here and let PG default them — there are usually only a handful.
+    // entry by name, emit one pg_statistic row each. Segment-by columns are
+    // stored as the partition's segment_values (not in the blob), so they have
+    // no `_colstats` entry; their stats come from the meta table, folded into
+    // `col_ndistinct` / `col_valmap` / `col_valcounts` at compress time (see
+    // `augment_segment_by_stats`). Without them PG defaults `WHERE segkey = X`
+    // to 0.005 — and the segment key is the column users filter/join on most.
+    // `nonseg_idx` tracks the colstats `_col_idx`, so it advances only for
+    // non-segment-by columns.
     let mut nonseg_idx: i32 = 0;
     for col in columns {
-        if col.is_segment_by {
-            continue;
-        }
         let attr = match attrs.iter().find(|a| a.attname == col.name) {
             Some(a) => a,
             None => {
-                nonseg_idx += 1;
+                if !col.is_segment_by {
+                    nonseg_idx += 1;
+                }
                 continue; // column was dropped post-compression
             }
         };
@@ -92,6 +95,18 @@ pub fn write_partition_stats(
         // selectivity `(1 - nullfrac)` and neutralised the histogram.
         let stanullfrac = if attr.attnotnull {
             0.0
+        } else if col.is_segment_by {
+            // Segment-by columns aren't in `_colstats`. The valcounts (when
+            // present, i.e. <=32 distinct) is the complete non-null value set
+            // for the partition, so it gives an exact nullfrac; for a high-card
+            // segment key we lack the null count and assume non-null.
+            match col_valcounts.get(&col.name) {
+                Some(counts) => {
+                    let nonnull: i64 = counts.values().sum();
+                    ((row_count - nonnull) as f32 / row_count as f32).clamp(0.0, 1.0)
+                }
+                None => 0.0,
+            }
         } else {
             let nonnull = nonnull_by_col_idx
                 .get(&nonseg_idx)
@@ -120,8 +135,11 @@ pub fn write_partition_stats(
         });
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), ndistinct),
+            // MCV only for text columns — `build_mcv_arrays` builds a text[]
+            // `stavalues` with the text `=` operator, so a non-text valmap entry
+            // (e.g. an integer segment key) must fall through to stadistinct.
             None => match col_valmap.get(&col.name) {
-                Some(vals) if vals.len() >= 2 => {
+                Some(vals) if vals.len() >= 2 && is_text_type(attr.atttypid) => {
                     let empty = HashMap::new();
                     let counts = col_valcounts.get(&col.name).unwrap_or(&empty);
                     let freqs = mcv_freqs(vals, counts, row_count);
@@ -149,7 +167,9 @@ pub fn write_partition_stats(
             false,
         )?;
 
-        nonseg_idx += 1;
+        if !col.is_segment_by {
+            nonseg_idx += 1;
+        }
     }
 
     update_reltuples(client, part_rel_oid, row_count, avg_tuple_width as i32)?;
@@ -261,6 +281,20 @@ fn histogram_eligible(type_oid: pg_sys::Oid, lo: i64, hi: i64) -> bool {
         pg_sys::DATEOID => (lo / 86_400_000_000) < (hi / 86_400_000_000),
         _ => lo < hi,
     }
+}
+
+/// Whether a column type takes a text MCV (`build_mcv_arrays` emits a `text[]`
+/// `stavalues` + the text `=` operator). Equality-selectivity types whose value
+/// set we capture as text: `text`/`varchar`/`bpchar`/`name`/`char`.
+fn is_text_type(type_oid: pg_sys::Oid) -> bool {
+    matches!(
+        type_oid,
+        pg_sys::TEXTOID
+            | pg_sys::VARCHAROID
+            | pg_sys::BPCHAROID
+            | pg_sys::NAMEOID
+            | pg_sys::CHAROID
+    )
 }
 
 /// Types whose order-preserving i64 colstats encoding we can decode back to
@@ -1143,7 +1177,11 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             // union of 12 vs ~634 actual), which mis-plans Top-N / range
             // queries.
             None => match vm_by_col.get(&attr.attname) {
-                Some(set) if set.len() >= 2 && set.len() as i64 == merged_nd => {
+                Some(set)
+                    if set.len() >= 2
+                        && set.len() as i64 == merged_nd
+                        && is_text_type(attr.atttypid) =>
+                {
                     let values: Vec<String> = set.iter().cloned().collect();
                     let empty = HashMap::new();
                     let counts = vc_by_col.get(&attr.attname).unwrap_or(&empty);

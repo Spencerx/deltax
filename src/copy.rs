@@ -2895,7 +2895,8 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
     // map, drop columns that overflowed VALBITMAP_MAX_DISTINCT, encode each
     // segment's bitmap, bulk-insert. Returns the column→values map for the
     // catalog write below.
-    let (column_valmap, column_valcounts) = finalize_and_insert_valbitmap(buf, columns, &ddl);
+    let (mut column_valmap, mut column_valcounts) =
+        finalize_and_insert_valbitmap(buf, columns, &ddl);
 
     spi_exec(&format!("ANALYZE {}", ddl.meta_fqn));
     spi_exec(&format!("ANALYZE {}", ddl.colstats_fqn));
@@ -2943,12 +2944,28 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         // equality selectivity (and thus the child `stadistinct`) wildly
         // wrong while the parent — which already uses the HLL — stays right.
         // The in-memory compress path computes this map the same way.
+        // Fold segment-by columns into the catalog stat maps from the meta
+        // table's exact (segment value, _row_count) — see
+        // compress::augment_segment_by_stats. Populates valmap/valcounts
+        // (persisted below) and a segment-key ndistinct map merged into the
+        // HLL-based map.
+        let mut seg_ndistinct: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        crate::compress::augment_segment_by_stats(
+            client,
+            &ddl.meta_fqn,
+            columns,
+            &mut seg_ndistinct,
+            &mut column_valmap,
+            &mut column_valcounts,
+        );
         if !buf.partition_hll.is_empty() && buf.partition_hll.len() == nd_col_names.len() {
-            let col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
+            let mut col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
                 .iter()
                 .zip(buf.partition_hll.iter())
                 .map(|(name, hll)| (name.clone(), hll.estimate() as i64))
                 .collect();
+            col_ndistinct.extend(seg_ndistinct);
             catalog::update_partition_column_ndistinct_from_map(
                 client,
                 partition_id,
