@@ -581,3 +581,56 @@ def test_in_range_estimate_is_substantial(db):
         f"range ts<=midpoint estimate {est} not ~half of {total} — parent "
         f"histogram range selectivity may have collapsed (the Q30 rows=8 trap)"
     )
+
+
+def test_groupby_estimate_clamped_to_filtered_input(db):
+    """A high-cardinality GROUP BY under a selective WHERE must estimate output
+    groups bounded by the post-filter input rows, not the grouping column's full
+    n_distinct. Guards the DeltaXAgg group-count clamp (hook.rs): before it,
+    `GROUP BY uid` (5000 distinct) after a filter leaving ~tens of rows estimated
+    ~5000 groups (clamped only to the full table); PG's own `estimate_num_groups`
+    clamps to the filtered input, and now so do we."""
+    import json
+
+    _seed(db, n_partitions=2, rows_per_partition=50_000, high_card=5000)
+    db.execute("SELECT deltax.deltax_analyze_table('events')")
+    db.commit()
+
+    # A narrow ts window (histogram-estimated) leaves ~tens of rows; uid is
+    # independent of the filter, so the surviving groups can't exceed those rows
+    # regardless of n_distinct(uid)=5000.
+    t0, t1 = db.execute(
+        "SELECT min(ts), min(ts) + interval '1 minute' FROM events"
+    ).fetchone()
+
+    plan = db.execute(
+        "EXPLAIN (FORMAT JSON) SELECT uid, count(*) FROM events "
+        "WHERE ts >= %s AND ts < %s GROUP BY uid",
+        (t0, t1),
+    ).fetchone()[0]
+    root = json.loads(plan) if isinstance(plan, str) else plan
+
+    def find_agg(node):
+        if node.get("Custom Plan Provider") == "DeltaXAgg" or node.get(
+            "Node Type"
+        ) in ("Aggregate", "GroupAggregate", "HashAggregate"):
+            return node
+        for c in node.get("Plans", []) or []:
+            r = find_agg(c)
+            if r:
+                return r
+        return None
+
+    agg = find_agg(root[0]["Plan"])
+    assert agg is not None, "no aggregate node in plan"
+    assert agg.get("Custom Plan Provider") == "DeltaXAgg", (
+        f"expected DeltaXAgg pushdown, got {agg.get('Node Type')} — the test no "
+        f"longer exercises the group-count clamp"
+    )
+    est = agg.get("Plan Rows", 0)
+    # n_distinct(uid)=5000; the filtered input is ~tens of rows, so the clamped
+    # group estimate must be far below 5000. Pre-fix it was ~5000.
+    assert est < 1000, (
+        f"GROUP BY uid estimate {est} not clamped to the filtered input — looks "
+        f"like the raw n_distinct (5000), i.e. the clamp regressed"
+    )

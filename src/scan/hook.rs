@@ -4004,7 +4004,18 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             }
                         }
                         if all_found {
-                            ndistinct_estimated_groups = Some(product.min(total_uncompressed_rows));
+                            // The group count can't exceed the rows that
+                            // actually reach the aggregate — PG's
+                            // `estimate_num_groups` clamps the same way. Clamping
+                            // only to the full table over-estimates the GROUP BY
+                            // output of a selective WHERE by orders of magnitude
+                            // (e.g. `GROUP BY SearchPhrase` after a selective URL
+                            // filter: n_distinct ~1.9M vs ~10 surviving groups).
+                            // `input_rel->rows` is the filter-aware estimate of
+                            // the rows feeding the agg (set by our baserel-size
+                            // override), so it's the right upper bound.
+                            let input_rows = (*input_rel).rows.max(1.0);
+                            ndistinct_estimated_groups = Some(product.min(input_rows));
                         }
                     }
                 }

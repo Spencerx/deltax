@@ -146,15 +146,20 @@ deltax-specific estimate gaps that matter.
   by plain PG (intrinsic predicate hardness — `<>''` on NULL, JSON-extract
   selectivity, generic GROUP-BY-output over-estimate); deltax even beats plain on
   Q00/Q15.
-- **ClickBench:** one genuinely deltax-specific gap exists — **DeltaXAgg clamps
-  its GROUP BY output estimate to the *full* table (`hook.rs`, `min(product,
-  total_uncompressed_rows)`), not the *post-filter* input rows** that PG's
-  `estimate_num_groups` uses (Q21: 1.95M est vs 10 actual; plain nails it). But
-  **validated cosmetic on the full 100M-row EC2 dataset**: DeltaXAgg/DeltaXAppend
-  absorb GROUP BY + ORDER BY + LIMIT internally (TopN pushdown), the only consumer
-  is a trivial `Limit`, and ClickBench has no join above the aggregate — so the
-  over-estimate flips no plan. The one-line fix (clamp to `(*input_rel).rows`) is
-  noted here for if a future query ever feeds a DeltaXAgg result into a join.
+- **ClickBench:** one genuinely deltax-specific gap was found — DeltaXAgg clamped
+  its GROUP BY output estimate to the *full* table, not the *post-filter* input
+  rows that PG's `estimate_num_groups` uses (Q21: 1.95M est vs 10 actual; plain
+  nails it). **Fixed** (`hook.rs`: clamp `ndistinct_estimated_groups` to
+  `(*input_rel).rows`): Q21's estimate dropped 1.95M → 10.6K on the full 100M-row
+  EC2 dataset, now matching plain PG (the residual ~10× is intrinsic
+  `LIKE '%google%'` selectivity, no longer deltax-specific); an unfiltered
+  `GROUP BY` (Q8) is correctly unchanged. The over-estimate was cosmetic on
+  today's benchmarks (DeltaXAgg/DeltaXAppend absorb GROUP BY + ORDER BY + LIMIT
+  via TopN pushdown, the only consumer is a trivial `Limit`, and ClickBench has no
+  join above the aggregate) — but accuracy matters for real usage where an
+  aggregate result feeds a join/CTE. Guarded by
+  `test_groupby_estimate_clamped_to_filtered_input` and validated through the
+  RTABench (L5 + oracle) and ClickBench correctness gates with no regression.
 - **Real ClickBench slowness is detoast-bound, not estimate-bound** — Q21 23.3 s
   (`detoast=22.6 s` for `URL LIKE '%google%'`), Q22 18.6 s (`Title` detoast),
   Q33 4.4 s (`agg` over 23M URL groups). That's an execution-path track (text
