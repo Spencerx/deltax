@@ -910,16 +910,22 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 
     let segment_size = ht.segment_size as usize;
 
-    let (total_compressed_size, row_count, partition_hll, mut column_valmap, mut column_valcounts) =
-        compress_partition_streaming(
-            client,
-            &part_fqn,
-            &ddl,
-            &columns,
-            &ht.order_by,
-            &ht.segment_by,
-            segment_size,
-        );
+    let (
+        total_compressed_size,
+        row_count,
+        partition_hll,
+        mut column_valmap,
+        mut column_valcounts,
+        partition_topvals,
+    ) = compress_partition_streaming(
+        client,
+        &part_fqn,
+        &ddl,
+        &columns,
+        &ht.order_by,
+        &ht.segment_by,
+        segment_size,
+    );
 
     // Empty partition — clean up tables and return
     if row_count == 0 {
@@ -1033,6 +1039,21 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // `most_common_freqs` (skewed enums no longer get a flat 1/ndistinct).
     catalog::update_partition_column_valcounts(client, part_info.id, &column_valcounts)
         .expect("failed to update partition column_valcounts");
+
+    // For high-cardinality text columns (not covered by the <=32 complete
+    // valmap), persist a partial MCV: the heavy hitters from the top-value
+    // summary that are notably more common than uniform. `stats.rs` writes
+    // these as an MCV while keeping the real HLL `stadistinct`, so PG estimates
+    // hot values from the MCV and the long tail from the remainder.
+    let column_mcv = select_partial_mcv(
+        &partition_topvals,
+        &nd_col_names,
+        &col_ndistinct,
+        &column_valmap,
+        row_count,
+    );
+    catalog::update_partition_column_mcv(client, part_info.id, &column_mcv)
+        .expect("failed to update partition column_mcv");
 
     // Aggregate per-segment colstats into a partition-level {col_name: [min,max]}
     // map. Read path uses this to skip partitions whose [min, max] range
@@ -1592,6 +1613,55 @@ pub(crate) type FlushResult = (
 /// exceeds this cap are dropped from valbitmap entirely (no entry written).
 pub(crate) const VALBITMAP_MAX_DISTINCT: usize = 32;
 
+/// Cap on distinct values tracked per text column for the partial-MCV
+/// (heavy-hitter) summary. Generous enough to hold every distinct value of a
+/// real categorical column exactly; for higher-cardinality columns we stop
+/// admitting new values once full — a genuinely hot value appears early so it
+/// is captured, and the significance filter at finalize drops the cold tail.
+pub(crate) const MCV_MAX_DISTINCT: usize = 2048;
+
+/// Per-non-segment-by-column exact value→count maps (text columns only) — the
+/// partition-level heavy-hitter summary feeding the partial MCV for skewed
+/// high-cardinality text columns. Same per-non-seg-col shape as `partition_hll`.
+pub(crate) type TopVals = Vec<std::collections::HashMap<String, i64>>;
+
+/// Fold one segment's text values into the partition-level top-value summary
+/// `acc` (indexed by non-segment-by column position, like `partition_hll`).
+/// Once a column's map reaches `MCV_MAX_DISTINCT` new values are dropped but
+/// existing counts keep accumulating. Cheap: O(1) per value.
+pub(crate) fn merge_segment_topvals(
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+    acc: &mut TopVals,
+) {
+    // Lazily size to one map per non-segment-by column (the COPY path starts
+    // with an empty Vec); num_nonseg is constant for a partition so this only
+    // fires once.
+    let num_nonseg = columns.iter().filter(|c| !c.is_segment_by).count();
+    if acc.len() != num_nonseg {
+        *acc = (0..num_nonseg).map(|_| std::collections::HashMap::new()).collect();
+    }
+    let mut nonseg = 0usize;
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
+        }
+        if nonseg < acc.len()
+            && let TypedColumn::Text(vals) = &typed_cols[i]
+        {
+            let m = &mut acc[nonseg];
+            for v in vals.iter().flatten() {
+                if let Some(c) = m.get_mut(v) {
+                    *c += 1;
+                } else if m.len() < MCV_MAX_DISTINCT {
+                    m.insert(v.clone(), 1);
+                }
+            }
+        }
+        nonseg += 1;
+    }
+}
+
 /// Compress accumulated typed column data and INSERT metadata into the meta table.
 /// Returns (compressed_size, column blobs, bloom entries, colstats rows) — blobs and colstats
 /// are NOT inserted, they are returned for column-major buffering by the caller.
@@ -1846,6 +1916,26 @@ pub(crate) fn accumulate_partition_hll(
     }
 }
 
+/// Merge a per-segment top-value summary into the partition-level accumulator
+/// (both indexed by non-segment-by column position). Used by the parallel COPY
+/// path, where segments are summarized off-thread and merged on the main thread.
+/// Capped at `MCV_MAX_DISTINCT` per column.
+pub(crate) fn merge_topvals_into(acc: &mut TopVals, seg: TopVals) {
+    if acc.len() != seg.len() {
+        *acc = seg;
+        return;
+    }
+    for (a, s) in acc.iter_mut().zip(seg) {
+        for (v, c) in s {
+            if let Some(x) = a.get_mut(&v) {
+                *x += c;
+            } else if a.len() < MCV_MAX_DISTINCT {
+                a.insert(v, c);
+            }
+        }
+    }
+}
+
 /// Serialize a partition's per-column HLL sketches to a JSON object string
 /// `{col_name: <sketch>}` for storage in `deltax_partition.column_hll`.
 /// `stats::write_table_stats` deserializes and merges these across partitions
@@ -2022,6 +2112,7 @@ pub(crate) fn flush_with_splitting(
     text_length_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
     valbitmap_value_buffer: &mut Vec<(u16, i32, SegValueCounts)>,
     partition_hll: &mut [CardinalityEstimator<u64>],
+    partition_topvals: &mut TopVals,
 ) -> i64 {
     let mut total_size = 0i64;
     let mut offset = 0;
@@ -2035,6 +2126,7 @@ pub(crate) fn flush_with_splitting(
             for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
                 dst.merge(src);
             }
+            merge_segment_topvals(typed_cols, columns, partition_topvals);
             let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
                 flush_segment_metadata(
                     client,
@@ -2070,6 +2162,7 @@ pub(crate) fn flush_with_splitting(
             for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
                 dst.merge(src);
             }
+            merge_segment_topvals(&chunk_cols, columns, partition_topvals);
             let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
                 flush_segment_metadata(
                     client,
@@ -2297,6 +2390,7 @@ fn compress_partition_streaming(
     Vec<CardinalityEstimator<u64>>,
     std::collections::HashMap<String, Vec<String>>,
     ColumnValcounts,
+    TopVals,
 ) {
     let batch_size = segment_size;
 
@@ -2387,6 +2481,10 @@ fn compress_partition_streaming(
     let mut partition_hll: Vec<CardinalityEstimator<u64>> = (0..num_nonseg_cols)
         .map(|_| CardinalityEstimator::<u64>::new())
         .collect();
+    // Partition-level heavy-hitter summary per non-seg col (text only) for the
+    // partial MCV; fed at each segment flush, like `partition_hll`.
+    let mut partition_topvals: TopVals =
+        (0..num_nonseg_cols).map(|_| std::collections::HashMap::new()).collect();
 
     loop {
         let result = client
@@ -2444,6 +2542,7 @@ fn compress_partition_streaming(
                             &mut text_length_buffer,
                             &mut valbitmap_value_buffer,
                             &mut partition_hll,
+                            &mut partition_topvals,
                         );
                         typed_cols = init_typed_columns(columns, &kinds);
                         rows_in_segment = 0;
@@ -2477,6 +2576,7 @@ fn compress_partition_streaming(
                 for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
                     dst.merge(src);
                 }
+                merge_segment_topvals(&typed_cols, columns, &mut partition_topvals);
                 let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
                     flush_segment_metadata(
                         client,
@@ -2548,6 +2648,7 @@ fn compress_partition_streaming(
             &mut text_length_buffer,
             &mut valbitmap_value_buffer,
             &mut partition_hll,
+            &mut partition_topvals,
         );
     }
 
@@ -2722,6 +2823,7 @@ fn compress_partition_streaming(
         partition_hll,
         column_valmap,
         column_valcounts,
+        partition_topvals,
     )
 }
 
@@ -3797,6 +3899,60 @@ pub(crate) fn augment_segment_by_stats(
     }
 }
 
+/// Select the partial MCV for high-cardinality text columns from the
+/// partition-level top-value summary. Skips columns already covered by the
+/// `<=32` complete valmap (those get an exact MCV). Keeps values notably more
+/// common than uniform — `freq > 1.25 / ndistinct`, PG's MCV admission
+/// heuristic — and, when at least one such heavy hitter exists, the top-N by
+/// count (>= 2, capped at PG's default statistics target of 100). Counts are
+/// exact for the monitored values; `stats.rs` pairs them with the real HLL
+/// `stadistinct` so the long tail is still estimated.
+pub(crate) fn select_partial_mcv(
+    topvals: &TopVals,
+    nd_col_names: &[&str],
+    col_ndistinct: &std::collections::HashMap<String, i64>,
+    valmap: &std::collections::HashMap<String, Vec<String>>,
+    row_count: i64,
+) -> ColumnValcounts {
+    const MAX_MCV: usize = 100;
+    let mut out: ColumnValcounts = std::collections::HashMap::new();
+    if row_count <= 0 {
+        return out;
+    }
+    for (i, &name) in nd_col_names.iter().enumerate() {
+        if valmap.contains_key(name) {
+            continue; // complete MCV already written from the valmap
+        }
+        let Some(map) = topvals.get(i) else { continue };
+        if map.len() < 2 {
+            continue;
+        }
+        let ndistinct = col_ndistinct
+            .get(name)
+            .copied()
+            .unwrap_or(map.len() as i64)
+            .max(1);
+        let threshold = 1.25 / ndistinct as f64;
+        let n_sig = map
+            .values()
+            .filter(|&&c| (c as f64 / row_count as f64) > threshold)
+            .count();
+        if n_sig == 0 {
+            continue; // near-uniform: no meaningful MCV
+        }
+        let mut sorted: Vec<(String, i64)> =
+            map.iter().map(|(v, &c)| (v.clone(), c)).collect();
+        // Highest count first; value as a stable tiebreak.
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Keep the heavy hitters; ensure at least 2 (the MCV slot needs >=2),
+        // capped at the statistics target.
+        let keep = n_sig.max(2).min(sorted.len()).min(MAX_MCV);
+        sorted.truncate(keep);
+        out.insert(name.to_string(), sorted);
+    }
+    out
+}
+
 /// True for PostgreSQL text-family types.
 pub(crate) fn is_text_data_type(dt: &str) -> bool {
     dt == "text"
@@ -4211,6 +4367,51 @@ pub(crate) fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_partial_mcv_keeps_heavy_hitters() {
+        use std::collections::HashMap;
+        // One high-card column "c": A=5000 (50%), B=3000 (30%), + 98 cold values
+        // at 20 each. ndistinct=100, row_count=10000.
+        let mut m: HashMap<String, i64> = HashMap::new();
+        m.insert("A".to_string(), 5000);
+        m.insert("B".to_string(), 3000);
+        for i in 0..98 {
+            m.insert(format!("cold{i}"), 20);
+        }
+        let topvals: TopVals = vec![m];
+        let nd: HashMap<String, i64> = [("c".to_string(), 100)].into_iter().collect();
+        let valmap: HashMap<String, Vec<String>> = HashMap::new();
+        let out = select_partial_mcv(&topvals, &["c"], &nd, &valmap, 10000);
+        let mcv = out.get("c").expect("expected a partial MCV for c");
+        // Only A and B clear the 1.25/ndistinct (=1.25%) admission threshold;
+        // cold values (0.2%) are dropped.
+        let kept: std::collections::HashSet<&str> =
+            mcv.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(kept, ["A", "B"].into_iter().collect());
+    }
+
+    #[test]
+    fn select_partial_mcv_skips_uniform_and_covered() {
+        use std::collections::HashMap;
+        // Near-uniform high-card column → no value clears the threshold → no MCV.
+        let mut uniform: HashMap<String, i64> = HashMap::new();
+        for i in 0..100 {
+            uniform.insert(format!("v{i}"), 100);
+        }
+        let topvals: TopVals = vec![uniform.clone()];
+        let nd: HashMap<String, i64> = [("c".to_string(), 100)].into_iter().collect();
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+        assert!(select_partial_mcv(&topvals, &["c"], &nd, &empty, 10000).is_empty());
+
+        // Columns already covered by the complete valmap are skipped.
+        let covered: HashMap<String, Vec<String>> =
+            [("c".to_string(), vec!["x".to_string()])].into_iter().collect();
+        let mut skewed: HashMap<String, i64> = HashMap::new();
+        skewed.insert("A".to_string(), 9000);
+        skewed.insert("B".to_string(), 1000);
+        assert!(select_partial_mcv(&vec![skewed], &["c"], &nd, &covered, 10000).is_empty());
+    }
 
     #[test]
     fn test_split_off_int64() {

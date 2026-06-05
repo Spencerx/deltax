@@ -57,6 +57,10 @@ pub fn write_partition_stats(
     // frequencies. Empty for partitions predating `column_valcounts`, in which
     // case `mcv_freqs` falls back to the old uniform split.
     let col_valcounts = load_column_valcounts(client, part_rel_oid)?;
+    // Partial MCV (heavy hitters) for high-cardinality text columns the <=32
+    // valmap doesn't cover; written with the real HLL stadistinct so the tail
+    // is still estimated.
+    let col_mcv = load_column_mcv(client, part_rel_oid)?;
 
     // Average tuple width (→ `pg_class.relpages`) is accumulated from the
     // accurate per-column widths inside the loop below.
@@ -143,8 +147,10 @@ pub fn write_partition_stats(
             // MCV only for text columns — `build_mcv_arrays` builds a text[]
             // `stavalues` with the text `=` operator, so a non-text valmap entry
             // (e.g. an integer segment key) must fall through to stadistinct.
-            None => match col_valmap.get(&col.name) {
-                Some(vals) if vals.len() >= 2 && is_text_type(attr.atttypid) => {
+            None if is_text_type(attr.atttypid) => {
+                if let Some(vals) = col_valmap.get(&col.name).filter(|v| v.len() >= 2) {
+                    // Complete MCV (<=32 distinct): stadistinct = value count, so
+                    // absent values estimate ~0.
                     let empty = HashMap::new();
                     let counts = col_valcounts.get(&col.name).unwrap_or(&empty);
                     let freqs = mcv_freqs(vals, counts, row_count);
@@ -155,9 +161,17 @@ pub fn write_partition_stats(
                         }),
                         vals.len() as i64,
                     )
+                } else if let Some(counts) = col_mcv.get(&col.name).filter(|m| m.len() >= 2) {
+                    // Partial MCV (high-card heavy hitters): keep the real HLL
+                    // `stadistinct` (eff_ndistinct = ndistinct) so PG estimates
+                    // the hot values from the MCV and the tail from the remainder.
+                    let (values, freqs) = ordered_mcv(counts, row_count, 100);
+                    (Some(Slot1::Mcv { values, freqs }), ndistinct)
+                } else {
+                    (None, ndistinct)
                 }
-                _ => (None, ndistinct),
-            },
+            }
+            None => (None, ndistinct),
         };
         let stadistinct = stadistinct_value(eff_ndistinct, row_count);
 
@@ -513,6 +527,51 @@ fn load_column_valcounts(
     Ok(json_text
         .map(|t| parse_valcounts_json(&t))
         .unwrap_or_default())
+}
+
+/// Load the persisted partial MCV (`column_mcv`) for a compressed partition —
+/// the heavy hitters of high-cardinality text columns (not covered by the
+/// `<=32` valmap). Same `{col: {value: count}}` shape as `column_valcounts`;
+/// `stats.rs` writes these as an MCV while keeping the real HLL `stadistinct`.
+fn load_column_mcv(
+    client: &mut SpiClient,
+    part_rel_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<String, HashMap<String, i64>>> {
+    let part_oid_int = u32::from(part_rel_oid) as i64;
+    let json_text: Option<String> = client
+        .select(
+            "SELECT column_mcv::text FROM deltax.deltax_partition \
+             WHERE table_name = (SELECT relname FROM pg_class WHERE oid = $1::oid) \
+               AND is_compressed = true",
+            None,
+            &[part_oid_int.into()],
+        )?
+        .next()
+        .and_then(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        });
+    Ok(json_text
+        .map(|t| parse_valcounts_json(&t))
+        .unwrap_or_default())
+}
+
+/// Order an MCV value→count map by descending count (PG's `most_common_*`
+/// convention), value as a stable tiebreak, capped at `cap` entries. Returns
+/// the parallel `(values, freqs)` with `freq = count / row_count`.
+fn ordered_mcv(
+    counts: &HashMap<String, i64>,
+    row_count: i64,
+    cap: usize,
+) -> (Vec<String>, Vec<f32>) {
+    let mut pairs: Vec<(&String, i64)> = counts.iter().map(|(v, &c)| (v, c)).collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    pairs.truncate(cap);
+    let values: Vec<String> = pairs.iter().map(|(v, _)| (*v).clone()).collect();
+    let map: HashMap<String, i64> = pairs.iter().map(|(v, c)| ((*v).clone(), *c)).collect();
+    let freqs = mcv_freqs(&values, &map, row_count);
+    (values, freqs)
 }
 
 /// Parse a `{col_name: {value: count}}` JSON object into a per-column
@@ -1096,8 +1155,11 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
     // Table-wide per-value counts (summed across partitions) for those same
     // columns → real parent `most_common_freqs`.
     let mut vc_by_col: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    // Table-wide partial-MCV counts (summed across partitions) for high-card
+    // text columns → parent partial MCV with real `stadistinct`.
+    let mut mcv_by_col: HashMap<String, HashMap<String, i64>> = HashMap::new();
     let query = "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text, \
-                column_valmap::text, column_valcounts::text \
+                column_valmap::text, column_valcounts::text, column_mcv::text \
                  FROM deltax.deltax_partition \
                  WHERE is_compressed = true AND deltatable_id = (\
                      SELECT id FROM deltax.deltax_deltatable \
@@ -1151,6 +1213,18 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
         {
             for (name, counts) in parse_valcounts_json(&text) {
                 let acc = vc_by_col.entry(name).or_default();
+                for (v, c) in counts {
+                    *acc.entry(v).or_insert(0) += c;
+                }
+            }
+        }
+        if let Some(text) = row
+            .get_datum_by_ordinal(7)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            for (name, counts) in parse_valcounts_json(&text) {
+                let acc = mcv_by_col.entry(name).or_default();
                 for (v, c) in counts {
                     *acc.entry(v).or_insert(0) += c;
                 }
@@ -1227,21 +1301,34 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             // n_distinct for a high-cardinality column (e.g. backup_processor:
             // union of 12 vs ~634 actual), which mis-plans Top-N / range
             // queries.
-            None => match vm_by_col.get(&attr.attname) {
-                Some(set)
-                    if set.len() >= 2
-                        && set.len() as i64 == merged_nd
-                        && is_text_type(attr.atttypid) =>
+            None if is_text_type(attr.atttypid) => {
+                if let Some(set) = vm_by_col
+                    .get(&attr.attname)
+                    .filter(|s| s.len() >= 2 && s.len() as i64 == merged_nd)
                 {
+                    // Complete MCV: the valmap union covers every distinct value
+                    // (count matches the merged-HLL n_distinct), so stadistinct =
+                    // value count and absent values estimate ~0.
                     let values: Vec<String> = set.iter().cloned().collect();
                     let empty = HashMap::new();
                     let counts = vc_by_col.get(&attr.attname).unwrap_or(&empty);
                     let freqs = mcv_freqs(&values, counts, total_rows);
                     let n = values.len() as i64;
                     (Some(Slot1::Mcv { values, freqs }), n)
+                } else if let Some(counts) = mcv_by_col
+                    .get(&attr.attname)
+                    .filter(|m| m.len() >= 2)
+                {
+                    // Partial MCV (high-card heavy hitters, merged across
+                    // partitions): keep the real merged HLL n_distinct so PG
+                    // estimates the tail from the remainder.
+                    let (values, freqs) = ordered_mcv(counts, total_rows, 100);
+                    (Some(Slot1::Mcv { values, freqs }), merged_nd)
+                } else {
+                    (None, merged_nd)
                 }
-                _ => (None, merged_nd),
-            },
+            }
+            None => (None, merged_nd),
         };
         let stadistinct = stadistinct_value(eff_ndistinct, total_rows);
 
@@ -1365,6 +1452,24 @@ mod tests {
             atttypid,
             attnotnull: false,
         }
+    }
+
+    #[test]
+    fn ordered_mcv_sorts_by_count_desc_and_caps() {
+        let mut counts = HashMap::new();
+        counts.insert("A".to_string(), 50);
+        counts.insert("B".to_string(), 30);
+        counts.insert("C".to_string(), 20);
+        // Descending by count, freq = count/row_count.
+        let (vals, freqs) = ordered_mcv(&counts, 100, 10);
+        assert_eq!(vals, vec!["A", "B", "C"]);
+        assert!((freqs[0] - 0.5).abs() < 1e-6);
+        assert!((freqs[1] - 0.3).abs() < 1e-6);
+        assert!((freqs[2] - 0.2).abs() < 1e-6);
+        // Cap keeps only the top-N.
+        let (vals2, freqs2) = ordered_mcv(&counts, 100, 2);
+        assert_eq!(vals2, vec!["A", "B"]);
+        assert_eq!(freqs2.len(), 2);
     }
 
     #[test]

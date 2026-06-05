@@ -642,6 +642,9 @@ struct PartitionBuffer {
     /// Partition-level HLL sketches (one per non-segment-by column), unioned
     /// from each segment's sketches; serialized to `column_hll` at finalize.
     partition_hll: Vec<CardinalityEstimator<u64>>,
+    /// Partition-level top-value summary (one map per non-segment-by column,
+    /// text only) feeding the partial MCV for high-cardinality text columns.
+    partition_topvals: crate::compress::TopVals,
     blob_buffer: Vec<(u16, i32, Vec<u8>)>,
     blob_buffer_size: usize,
     bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)>,
@@ -941,6 +944,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
             row_count: 0,
             next_segment_id: 1,
             partition_hll: Vec::new(),
+            partition_topvals: Vec::new(),
             blob_buffer: Vec::new(),
             blob_buffer_size: 0,
             bloom_buffer: Vec::new(),
@@ -2197,6 +2201,9 @@ struct CompressedSegment {
     /// Per-non-segment-by-column HLL sketches for this segment, unioned into
     /// the partition-level sketch on the main thread.
     hll_sketches: Vec<CardinalityEstimator<u64>>,
+    /// Per-non-segment-by-column top-value summary for this segment (text only),
+    /// merged into the partition-level summary on the main thread → partial MCV.
+    topvals: crate::compress::TopVals,
 }
 
 /// Sort, compress, and prepare metadata for a segment (pure Rust, no PG calls).
@@ -2217,6 +2224,9 @@ fn compress_segment(
 
     // Ndistinct
     let (ndistinct, hll_sketches) = compute_segment_ndistinct(&typed_cols, columns);
+    // Per-segment top-value summary (text columns) for the partial MCV.
+    let mut topvals: crate::compress::TopVals = Vec::new();
+    crate::compress::merge_segment_topvals(&typed_cols, columns, &mut topvals);
 
     // Segment_by values
     let seg_values: Vec<Option<String>> = columns
@@ -2365,6 +2375,7 @@ fn compress_segment(
         colstats_rows_csv,
         total_compressed_size: total_size,
         hll_sketches,
+        topvals,
     }
 }
 
@@ -2395,6 +2406,11 @@ fn flush_segment(buf: &mut PartitionBuffer, state: &BackfillState) {
     // Compute ndistinct
     let (ndistinct, hll_sketches) = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
     crate::compress::accumulate_partition_hll(&mut buf.partition_hll, &hll_sketches);
+    crate::compress::merge_segment_topvals(
+        &buf.typed_cols,
+        &state.columns,
+        &mut buf.partition_topvals,
+    );
 
     // Segment_by values from the buffered data (extract from first row if present)
     let seg_values: Vec<Option<String>> = state
@@ -2822,8 +2838,10 @@ fn write_compressed_segment(
     buf.total_compressed_size += cs.total_compressed_size;
     buf.total_rows += cs.row_count as i64;
 
-    // Union this segment's HLL sketches into the partition-level accumulator.
+    // Union this segment's HLL sketches + top-value summary into the
+    // partition-level accumulators.
     crate::compress::accumulate_partition_hll(&mut buf.partition_hll, &cs.hll_sketches);
+    crate::compress::merge_topvals_into(&mut buf.partition_topvals, cs.topvals);
 
     // Track segment_id for next allocation
     if cs.seg_id >= buf.next_segment_id {
@@ -2959,6 +2977,9 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             &mut column_valmap,
             &mut column_valcounts,
         );
+        // Partial MCV for high-cardinality text columns (built in the HLL
+        // branch, where the per-column ndistinct estimate is available).
+        let mut column_mcv: crate::compress::ColumnValcounts = std::collections::HashMap::new();
         if !buf.partition_hll.is_empty() && buf.partition_hll.len() == nd_col_names.len() {
             let mut col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
                 .iter()
@@ -2966,6 +2987,14 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
                 .map(|(name, hll)| (name.clone(), hll.estimate() as i64))
                 .collect();
             col_ndistinct.extend(seg_ndistinct);
+            let nd_refs: Vec<&str> = nd_col_names.iter().map(|s| s.as_str()).collect();
+            column_mcv = crate::compress::select_partial_mcv(
+                &buf.partition_topvals,
+                &nd_refs,
+                &col_ndistinct,
+                &column_valmap,
+                buf.total_rows,
+            );
             catalog::update_partition_column_ndistinct_from_map(
                 client,
                 partition_id,
@@ -2995,6 +3024,8 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             .expect("failed to update partition column_valmap");
         catalog::update_partition_column_valcounts(client, partition_id, &column_valcounts)
             .expect("failed to update partition column_valcounts");
+        catalog::update_partition_column_mcv(client, partition_id, &column_mcv)
+            .expect("failed to update partition column_mcv");
         catalog::update_partition_column_minmax(client, partition_id, &ddl.colstats_fqn, columns)
             .expect("failed to update partition column_minmax");
 

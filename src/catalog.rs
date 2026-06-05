@@ -496,6 +496,41 @@ pub fn update_partition_column_valcounts(
     Ok(())
 }
 
+/// Persist the partial MCV (heavy hitters) for high-cardinality text columns on
+/// `deltax.deltax_partition.column_mcv`. Same `{"col": {"val": count}}` shape as
+/// `column_valcounts`, but for columns the `<=32` valmap doesn't cover: `stats.rs`
+/// writes these as an MCV while keeping the real HLL `stadistinct`, so the long
+/// tail is still estimated (see `select_partial_mcv`).
+pub fn update_partition_column_mcv(
+    client: &mut SpiClient,
+    partition_id: i32,
+    col_mcv: &crate::compress::ColumnValcounts,
+) -> spi::SpiResult<()> {
+    let mut parts: Vec<String> = Vec::with_capacity(col_mcv.len());
+    let mut names: Vec<&String> = col_mcv.keys().collect();
+    names.sort();
+    for name in names {
+        let counts = &col_mcv[name];
+        let obj_body: Vec<String> = counts
+            .iter()
+            .map(|(v, c)| format!("\"{}\":{}", json_escape(v), c))
+            .collect();
+        parts.push(format!(
+            "\"{}\":{{{}}}",
+            json_escape(name),
+            obj_body.join(",")
+        ));
+    }
+    let json = format!("{{{}}}", parts.join(","));
+
+    client.update(
+        "UPDATE deltax.deltax_partition SET column_mcv = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
 /// Aggregate per-segment colstats min/max into a partition-level
 /// `{col_name: [min, max]}` JSONB and persist it on
 /// `deltax.deltax_partition.column_minmax`. The aggregation runs as a single
@@ -697,6 +732,14 @@ pub fn rename_column_in_deltatable(
                      value
                  ) FROM jsonb_each(column_valcounts))
              ELSE column_valcounts
+         END,
+         column_mcv = CASE
+             WHEN column_mcv ? $2 THEN
+                 (SELECT jsonb_object_agg(
+                     CASE WHEN key = $2 THEN $3 ELSE key END,
+                     value
+                 ) FROM jsonb_each(column_mcv))
+             ELSE column_mcv
          END
          WHERE deltatable_id = $1",
         None,

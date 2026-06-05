@@ -721,6 +721,93 @@ def test_segment_by_column_gets_stats(db):
     assert_region(_pg_stats(db, "seg_events", "region", inherited=True), "parent")
 
 
+def _seed_highcard(db, n_partitions=2, rows_per_partition=50_000):
+    """A deltax table with a high-cardinality (>32 distinct) text column `tag`
+    that is skewed: 'hot' 40%, 'warm' 20%, and 40% spread across ~200 'gNNN'
+    tail values. Exercises the partial-MCV path (the valmap is dropped above 32
+    distinct, so a heavy-hitter MCV + real n_distinct is the only stat)."""
+    db.execute("CREATE TABLE hc_events (ts TIMESTAMPTZ NOT NULL, tag TEXT)")
+    db.execute(
+        "SELECT deltax.deltax_create_table('hc_events', 'ts', '1 day', %s)",
+        (n_partitions - 1,),
+    )
+    db.execute("SELECT deltax.deltax_enable_compression('hc_events', order_by => ARRAY['ts'])")
+    db.commit()
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    window_us = 22 * 3600 * 1_000_000
+    spacing_us = max(1, window_us // max(1, rows_per_partition - 1))
+    for p in range(n_partitions):
+        part_start = today - timedelta(days=1) + timedelta(days=p) + timedelta(hours=1)
+        db.execute(
+            "INSERT INTO hc_events (ts, tag) "
+            "SELECT %s::timestamptz + (i::bigint * %s::bigint * interval '1 microsecond'), "
+            "       CASE WHEN i %% 10 < 4 THEN 'hot' "
+            "            WHEN i %% 10 < 6 THEN 'warm' "
+            "            ELSE 'g' || ((i / 10) %% 200)::text END "
+            "FROM generate_series(0, %s) i",
+            (part_start, spacing_us, rows_per_partition - 1),
+        )
+    db.commit()
+    for (name,) in db.execute(
+        "SELECT partition_name FROM deltax.deltax_partition_info('hc_events') "
+        "ORDER BY range_start"
+    ).fetchall():
+        if db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0] > 0:
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
+    db.commit()
+
+
+def test_high_cardinality_partial_mcv(db):
+    """A skewed >32-distinct text column gets a PARTIAL MCV: the heavy hitters
+    ('hot' 40%, 'warm' 20%) with real frequencies, while stadistinct stays the
+    true ~202 (not the MCV size) so the long tail is still estimated. Pre-fix
+    such a column got no MCV at all (uniform 1/ndistinct for every value)."""
+    _seed_highcard(db, n_partitions=2, rows_per_partition=50_000)
+
+    def assert_partial(s, where):
+        assert s is not None, f"no pg_stats row for tag ({where})"
+        # Real n_distinct retained (~202), NOT collapsed to the MCV size.
+        assert 150 <= abs(s["n_distinct"]) <= 260, (
+            f"n_distinct(tag)={s['n_distinct']} ({where}), expected ~202 — partial "
+            f"MCV must keep the real distinct count, not the MCV length"
+        )
+        by_val = dict(zip(s["most_common_vals"], s["most_common_freqs"]))
+        assert "hot" in by_val and "warm" in by_val, (
+            f"heavy hitters missing from MCV {s['most_common_vals']} ({where})"
+        )
+        assert abs(by_val["hot"] - 0.40) < 0.03, f"freq(hot)={by_val['hot']} ({where})"
+        assert abs(by_val["warm"] - 0.20) < 0.03, f"freq(warm)={by_val['warm']} ({where})"
+
+    part = _first_compressed_partition(db)
+    assert_partial(_pg_stats(db, part, "tag", inherited=False), "child")
+
+    db.execute("SELECT deltax.deltax_analyze_table('hc_events')")
+    db.commit()
+    assert_partial(_pg_stats(db, "hc_events", "tag", inherited=True), "parent")
+
+    # The hot value's equality estimate tracks its ~40% frequency, not the
+    # 1/ndistinct (~0.5%) it got with no MCV.
+    import json
+    total = db.execute("SELECT count(*) FROM hc_events").fetchone()[0]
+    plan = db.execute(
+        "EXPLAIN (FORMAT JSON) SELECT * FROM hc_events WHERE tag = 'hot'"
+    ).fetchone()[0]
+    root = json.loads(plan) if isinstance(plan, str) else plan
+
+    def scan_rows(node):
+        out = [node.get("Plan Rows", 0)]
+        for c in node.get("Plans", []) or []:
+            out += scan_rows(c)
+        return out
+
+    est = max(scan_rows(root[0]["Plan"]))
+    assert 0.25 * total <= est <= 0.55 * total, (
+        f"tag='hot' estimate {est} not ~40% of {total} — partial MCV not applied "
+        f"(1/ndistinct would be ~0.5%)"
+    )
+
+
 def test_text_stawidth_reflects_avg_length(db):
     """Text columns get stawidth ≈ avg char length + varlena header, not the
     flat 32 (audit #2). `kind` is 1 char → ~2; `skew` is 3–4 chars → ~5; fixed-
