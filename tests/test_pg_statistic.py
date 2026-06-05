@@ -689,6 +689,79 @@ def _seed_segmented(db, n_partitions=2, rows_per_partition=50_000):
 REGION_FREQ = {"us": 0.50, "eu": 0.30, "ap": 0.15, "sa": 0.05}
 
 
+def test_float_histogram_and_multibucket_child(db):
+    """#4: FLOAT8 columns get a histogram (range selectivity), not just
+    stadistinct. #6: the physically-sorted order-by column gets a multi-bucket
+    child histogram from per-segment mins, not a 2-point [min,max]."""
+    import json
+
+    _seed(db, n_partitions=2, rows_per_partition=50_000, high_card=5000)
+    part = _first_compressed_partition(db)
+
+    # #4 — val (FLOAT8, ~uniform 0..1) now has a histogram.
+    s = _pg_stats(db, part, "val", inherited=False)
+    assert s is not None and len(s["histogram_bounds"]) >= 2, (
+        f"FLOAT8 val has no histogram: {s['histogram_bounds'] if s else None}"
+    )
+    fb = [float(b) for b in s["histogram_bounds"]]
+    assert fb == sorted(fb) and fb[0] >= 0.0 and fb[-1] <= 1.0, f"val bounds {fb}"
+
+    # #6 — ts (the order-by column) → multi-bucket (segments are time-ordered).
+    sts = _pg_stats(db, part, "ts", inherited=False)
+    assert sts is not None and len(sts["histogram_bounds"]) >= 3, (
+        f"ts child histogram not multi-bucket: {sts['histogram_bounds'] if sts else None}"
+    )
+
+    # #4 — a range on the float estimates ~half, not the 0.33 inequality default.
+    total = db.execute("SELECT count(*) FROM events").fetchone()[0]
+    plan = db.execute(
+        "EXPLAIN (FORMAT JSON) SELECT * FROM events WHERE val < 0.5"
+    ).fetchone()[0]
+    root = json.loads(plan) if isinstance(plan, str) else plan
+
+    def scan_rows(node):
+        out = [node.get("Plan Rows", 0)]
+        for c in node.get("Plans", []) or []:
+            out += scan_rows(c)
+        return out
+
+    est = max(scan_rows(root[0]["Plan"]))
+    assert 0.3 * total <= est <= 0.7 * total, (
+        f"val<0.5 estimate {est} not ~half of {total} (float histogram missing)"
+    )
+
+
+def test_correlation_on_sorted_column(db):
+    """#5: the physically-sorted order-by column gets a correlation stat ~1.0
+    (segments are time-ordered); an unsorted column gets none. Marginal for
+    pg_deltax plans (custom scans, not btree index scans), but correct stats."""
+    _seed(db, n_partitions=2, rows_per_partition=50_000, high_card=5000)
+    part = _first_compressed_partition(db)
+
+    def corr(table, attname, inherited):
+        row = db.execute(
+            "SELECT correlation FROM pg_stats "
+            "WHERE tablename = %s AND attname = %s AND inherited = %s",
+            (table, attname, inherited),
+        ).fetchone()
+        return row[0] if row else None
+
+    # ts is the order-by column → near-perfect ascending correlation.
+    assert (corr(part, "ts", False) or 0) > 0.9, (
+        f"ts child correlation={corr(part, 'ts', False)}, expected ~1.0"
+    )
+    # uid = i%5000 is not physically sorted → no correlation slot.
+    assert corr(part, "uid", False) is None, (
+        f"uid should have no correlation, got {corr(part, 'uid', False)}"
+    )
+
+    db.execute("SELECT deltax.deltax_analyze_table('events')")
+    db.commit()
+    assert (corr("events", "ts", True) or 0) > 0.9, (
+        f"parent ts correlation={corr('events', 'ts', True)}, expected ~1.0"
+    )
+
+
 def test_segment_by_column_gets_stats(db):
     """A segment_by column must get exact stadistinct + a real-frequency MCV
     (child + parent), not be skipped (which left PG defaulting `region = X` to

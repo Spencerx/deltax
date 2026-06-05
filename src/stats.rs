@@ -50,6 +50,10 @@ pub fn write_partition_stats(
     // on the order-by / time column stop collapsing to a default
     // selectivity. Empty if the partition predates `column_minmax`.
     let col_minmax = load_column_minmax(client, part_rel_oid)?;
+    // Per-segment minimums per `_col_idx` → a multi-bucket child histogram (#6)
+    // instead of the 2-point `[min, max]`. Segments are ~equal-sized, so the
+    // mins are ~equi-depth bucket boundaries.
+    let col_seg_mins = load_colstats_segment_mins(client, colstats_fqn)?;
     // Per-column distinct-value lists for low-cardinality columns, used to
     // write an MCV (exact equality selectivity + ~0 for absent values).
     let col_valmap = load_column_valmap(client, part_rel_oid)?;
@@ -137,11 +141,27 @@ pub fn write_partition_stats(
         // the value count (the persisted ndistinct is a per-segment MAX that
         // can under-count) so non-MCV values get 0.
         let histogram = col_minmax.get(&col.name).and_then(|&(lo, hi)| {
-            histogram_eligible(attr.atttypid, lo, hi).then(|| Slot1::Histogram {
-                type_oid: attr.atttypid,
-                bounds: vec![lo, hi],
+            histogram_eligible(attr.atttypid, lo, hi).then(|| {
+                // Multi-bucket from this column's per-segment mins; fall back to
+                // the 2-point [min, max] if a single segment / no per-segment data.
+                let mins = col_seg_mins.get(&nonseg_idx).cloned().unwrap_or_else(|| vec![lo]);
+                let bounds = build_histogram_bounds(attr.atttypid, mins, hi, MAX_HISTOGRAM_BOUNDS)
+                    .unwrap_or_else(|| vec![lo, hi]);
+                Slot1::Histogram {
+                    type_oid: attr.atttypid,
+                    bounds,
+                }
             })
         });
+        // A multi-bucket histogram means the column's per-segment mins are
+        // monotonic — i.e. it's physically (~ascending) sorted — so write a
+        // correlation of ~1.0 (#5). 2-point histograms are unsorted → none.
+        let correlation = match &histogram {
+            Some(Slot1::Histogram { type_oid, bounds }) if bounds.len() > 2 => {
+                Some((*type_oid, 1.0f32))
+            }
+            _ => None,
+        };
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), ndistinct),
             // MCV only for text columns — `build_mcv_arrays` builds a text[]
@@ -183,6 +203,7 @@ pub fn write_partition_stats(
             stanullfrac,
             stawidth,
             slot,
+            correlation,
             false,
         )?;
 
@@ -241,6 +262,38 @@ fn load_colstats_aggregates(
             .unwrap_or(0);
         if idx >= 0 {
             out.insert(idx, (nonnull, len_sum));
+        }
+    }
+    Ok(out)
+}
+
+/// Load the per-segment `_min` values per `_col_idx` from a colstats table,
+/// sorted ascending. Each segment is ~equal-sized, so these are ~equi-depth
+/// histogram bucket boundaries — the basis for a multi-bucket child histogram
+/// (#6) and the per-segment parent histogram (#7), versus the old 2-point
+/// `[min, max]`.
+fn load_colstats_segment_mins(
+    client: &mut SpiClient,
+    colstats_fqn: &str,
+) -> spi::SpiResult<HashMap<i32, Vec<i64>>> {
+    let query = format!(
+        "SELECT _col_idx::int4, _min::int8 FROM {} \
+         WHERE _min IS NOT NULL ORDER BY _col_idx, _min",
+        colstats_fqn
+    );
+    let mut out: HashMap<i32, Vec<i64>> = HashMap::new();
+    for row in client.select(&query, None, &[])? {
+        let idx: i32 = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value::<i32>().ok().flatten())
+            .unwrap_or(-1);
+        let min: Option<i64> = row
+            .get_datum_by_ordinal(2)
+            .ok()
+            .and_then(|d| d.value::<i64>().ok().flatten());
+        if idx >= 0 && let Some(m) = min {
+            out.entry(idx).or_default().push(m);
         }
     }
     Ok(out)
@@ -357,13 +410,17 @@ fn is_text_type(type_oid: pg_sys::Oid) -> bool {
 }
 
 /// Types whose order-preserving i64 colstats encoding we can decode back to
-/// a native Datum for a histogram. FLOAT/TEXT/NUMERIC fall through.
+/// a native Datum for a histogram. FLOAT4/8 use the order-preserving float
+/// encoding (`encode_f*_to_i64` / `decode_encoded_to_datum`). TEXT/NUMERIC
+/// fall through.
 fn histogram_type_eligible(type_oid: pg_sys::Oid) -> bool {
     matches!(
         type_oid,
         pg_sys::INT2OID
             | pg_sys::INT4OID
             | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
             | pg_sys::TIMESTAMPOID
             | pg_sys::TIMESTAMPTZOID
             | pg_sys::DATEOID
@@ -698,13 +755,15 @@ enum Slot1 {
     },
 }
 
-/// Fully resolved slot-1 fields (operators + array Datums) ready for the tuple.
+/// Fully resolved fields for one `pg_statistic` slot (operators + array Datums)
+/// ready for the tuple. `stavalues` is optional — a correlation slot carries
+/// only `stanumbers` (the coefficient), no values array.
 struct Slot1Data {
     stakind: i16,
     staop: pg_sys::Oid,
     stacoll: pg_sys::Oid,
     stanumbers: Option<pg_sys::Datum>,
-    stavalues: pg_sys::Datum,
+    stavalues: Option<pg_sys::Datum>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,6 +775,7 @@ fn upsert_pg_statistic_row(
     stanullfrac: f32,
     stawidth: i32,
     slot: Option<Slot1>,
+    correlation: Option<(pg_sys::Oid, f32)>,
     stainherit: bool,
 ) -> spi::SpiResult<()> {
     let attrelid_int = u32::from(attrelid) as i64;
@@ -726,34 +786,52 @@ fn upsert_pg_statistic_row(
         &[attrelid_int.into(), attnum.into(), stainherit.into()],
     )?;
 
-    // Resolve slot 1 (operator + array Datums) before forming the tuple.
-    let slot1: Option<Slot1Data> = match slot {
+    // Resolve the slots (operators + array Datums) before forming the tuple.
+    // Slot 1: a histogram or MCV. Slot 2 (optional): correlation.
+    let mut slots: Vec<Slot1Data> = Vec::new();
+    match slot {
         Some(Slot1::Histogram { type_oid, bounds }) if bounds.len() >= 2 => {
             let ltopr = lookup_strategy_operator(client, type_oid, 1); // btree `<`
-            (ltopr != pg_sys::InvalidOid).then(|| Slot1Data {
-                stakind: pg_sys::STATISTIC_KIND_HISTOGRAM as i16,
-                staop: ltopr,
-                stacoll: pg_sys::InvalidOid,
-                stanumbers: None,
-                stavalues: unsafe { build_histogram_array(type_oid, &bounds) },
-            })
+            if ltopr != pg_sys::InvalidOid {
+                slots.push(Slot1Data {
+                    stakind: pg_sys::STATISTIC_KIND_HISTOGRAM as i16,
+                    staop: ltopr,
+                    stacoll: pg_sys::InvalidOid,
+                    stanumbers: None,
+                    stavalues: Some(unsafe { build_histogram_array(type_oid, &bounds) }),
+                });
+            }
         }
         Some(Slot1::Mcv { values, freqs }) if values.len() >= 2 => {
             // MCV is written for text columns; resolve the text `=` operator.
             let eqop = lookup_strategy_operator(client, pg_sys::TEXTOID, 3); // btree `=`
-            (eqop != pg_sys::InvalidOid).then(|| {
+            if eqop != pg_sys::InvalidOid {
                 let (vals, numbers) = unsafe { build_mcv_arrays(&values, &freqs) };
-                Slot1Data {
+                slots.push(Slot1Data {
                     stakind: pg_sys::STATISTIC_KIND_MCV as i16,
                     staop: eqop,
                     stacoll: pg_sys::DEFAULT_COLLATION_OID,
                     stanumbers: Some(numbers),
-                    stavalues: vals,
-                }
-            })
+                    stavalues: Some(vals),
+                });
+            }
         }
-        _ => None,
-    };
+        _ => {}
+    }
+    // Correlation (kind 3) for a physically-sorted column. `staop` is the type's
+    // btree `<`; `stanumbers` is the single coefficient; no `stavalues`.
+    if let Some((type_oid, corr)) = correlation {
+        let ltopr = lookup_strategy_operator(client, type_oid, 1);
+        if ltopr != pg_sys::InvalidOid {
+            slots.push(Slot1Data {
+                stakind: pg_sys::STATISTIC_KIND_CORRELATION as i16,
+                staop: ltopr,
+                stacoll: pg_sys::InvalidOid,
+                stanumbers: Some(unsafe { build_float4_array(&[corr]) }),
+                stavalues: None,
+            });
+        }
+    }
 
     // The catalog DELETE above must be visible to the heap insert's unique
     // index check.
@@ -765,11 +843,32 @@ fn upsert_pg_statistic_row(
             stadistinct,
             stanullfrac,
             stawidth,
-            slot1,
+            slots,
             stainherit,
         )
     };
     Ok(())
+}
+
+/// Build a `float4[]` Datum (used for a correlation slot's single coefficient).
+unsafe fn build_float4_array(vals: &[f32]) -> pg_sys::Datum {
+    let mut datums: Vec<pg_sys::Datum> = vals
+        .iter()
+        .map(|x| pg_sys::Datum::from(x.to_bits() as usize))
+        .collect();
+    unsafe {
+        let (mut fl, mut fb, mut fa): (i16, bool, std::os::raw::c_char) = (0, false, 0);
+        pg_sys::get_typlenbyvalalign(pg_sys::FLOAT4OID, &mut fl, &mut fb, &mut fa);
+        let arr = pg_sys::construct_array(
+            datums.as_mut_ptr(),
+            vals.len() as i32,
+            pg_sys::FLOAT4OID,
+            fl as i32,
+            fb,
+            fa,
+        );
+        pg_sys::Datum::from(arr)
+    }
 }
 
 /// Build the `stavalues` (text[]) and `stanumbers` (float4[]) array Datums for
@@ -836,7 +935,7 @@ unsafe fn form_and_insert_pg_statistic(
     stadistinct: f32,
     stanullfrac: f32,
     stawidth: i32,
-    slot1: Option<Slot1Data>,
+    slots: Vec<Slot1Data>,
     stainherit: bool,
 ) {
     use pgrx::IntoDatum;
@@ -904,8 +1003,8 @@ unsafe fn form_and_insert_pg_statistic(
         f32_d(stadistinct),
     );
 
-    // Five (kind, op, coll, numbers, values) slots. Only slot 1 may carry a
-    // histogram or MCV; the rest are empty.
+    // Five (kind, op, coll, numbers, values) slots, filled in order from
+    // `slots` (slot 1 = histogram/MCV, slot 2 = correlation, …); the rest empty.
     for slot in 0u32..5 {
         let (kind, op, coll, numbers, vals): (
             i16,
@@ -913,15 +1012,9 @@ unsafe fn form_and_insert_pg_statistic(
             pg_sys::Oid,
             Option<pg_sys::Datum>,
             Option<pg_sys::Datum>,
-        ) = match (slot, &slot1) {
-            (0, Some(s)) => (
-                s.stakind,
-                s.staop,
-                s.stacoll,
-                s.stanumbers,
-                Some(s.stavalues),
-            ),
-            _ => (0, pg_sys::InvalidOid, pg_sys::InvalidOid, None, None),
+        ) = match slots.get(slot as usize) {
+            Some(s) => (s.stakind, s.staop, s.stacoll, s.stanumbers, s.stavalues),
+            None => (0, pg_sys::InvalidOid, pg_sys::InvalidOid, None, None),
         };
         put(
             &mut values,
@@ -1101,6 +1194,74 @@ fn merge_ndistinct(nds: &[i64], ranges: &[(i64, i64)], total_rows: i64) -> i64 {
 /// the sorted per-partition minimums plus the global maximum. For roughly
 /// equal-sized partitions this is an equi-depth histogram over the order-by
 /// column; for columns with a constant range it collapses to `[min, max]`.
+/// Maximum histogram bounds we emit (PG's default `statistics_target` of 100
+/// buckets → 101 boundaries).
+const MAX_HISTOGRAM_BOUNDS: usize = 101;
+
+/// Build multi-bucket histogram bounds from per-segment (or per-partition)
+/// minimums plus the column max. Because segments are ~equal-sized, the
+/// minimums are ~equi-depth bucket boundaries (this is what makes the parent
+/// histogram robust to unequal partition sizes — #7). Sorted, deduped (DATE at
+/// day granularity), and downsampled to at most `max_bounds`. `None` for fewer
+/// than 2 distinct bounds.
+fn build_histogram_bounds(
+    type_oid: pg_sys::Oid,
+    mut mins: Vec<i64>,
+    global_max: i64,
+    max_bounds: usize,
+) -> Option<Vec<i64>> {
+    if !histogram_type_eligible(type_oid) || mins.is_empty() {
+        return None;
+    }
+    mins.sort_unstable();
+    let lo = mins[0];
+    let largest_min = *mins.last().unwrap();
+    let range = (global_max as i128) - (lo as i128);
+    if range <= 0 {
+        return None; // constant (or inverted) — no histogram
+    }
+    // Per-segment mins only partition the value range when the column is
+    // (nearly) physically sorted — then the segment mins span most of [min, max].
+    // For an unsorted column the mins cluster near the column minimum and would
+    // make a skewed histogram, so fall back to the uniform 2-point [min, max].
+    let well_distributed = ((largest_min as i128) - (lo as i128)) * 2 >= range;
+    if !well_distributed {
+        return build_two_point(type_oid, lo, global_max);
+    }
+    mins.push(global_max);
+    mins.sort_unstable();
+    if type_oid == pg_sys::DATEOID {
+        mins.dedup_by_key(|b| *b / 86_400_000_000);
+    } else {
+        mins.dedup();
+    }
+    if mins.len() < 2 {
+        return None;
+    }
+    Some(downsample_bounds(mins, max_bounds))
+}
+
+/// The 2-point `[min, max]` histogram (uniform assumption), gated on the same
+/// eligibility/constant checks as `histogram_eligible`.
+fn build_two_point(type_oid: pg_sys::Oid, lo: i64, hi: i64) -> Option<Vec<i64>> {
+    histogram_eligible(type_oid, lo, hi).then(|| vec![lo, hi])
+}
+
+/// Pick at most `max_bounds` evenly-spaced values from an already-sorted list,
+/// always keeping the first and last (so the histogram still spans [min, max]).
+fn downsample_bounds(bounds: Vec<i64>, max_bounds: usize) -> Vec<i64> {
+    let n = bounds.len();
+    if n <= max_bounds || max_bounds < 2 {
+        return bounds;
+    }
+    let mut out = Vec::with_capacity(max_bounds);
+    for i in 0..max_bounds {
+        out.push(bounds[i * (n - 1) / (max_bounds - 1)]);
+    }
+    out.dedup();
+    out
+}
+
 fn parent_histogram_bounds(type_oid: pg_sys::Oid, ranges: &[(i64, i64)]) -> Option<Vec<i64>> {
     if !histogram_type_eligible(type_oid) || ranges.is_empty() {
         return None;
@@ -1243,6 +1404,10 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
     // NULL column; a flat-32 stawidth mis-sizes sort/hash work-mem on wide text.
     let nullfrac_by_attnum = load_parent_nullfrac(client, parent_oid).unwrap_or_default();
     let stawidth_by_attnum = load_parent_stawidth(client, parent_oid).unwrap_or_default();
+    // Per-segment mins across all partitions → a fine, ~equi-depth parent
+    // histogram (#7); falls back to per-partition mins when unavailable.
+    let seg_mins_by_name =
+        load_parent_segment_mins(client, schema, table, &attrs).unwrap_or_default();
     let parent_stawidth = |attr: &AttrInfo| -> i32 {
         stawidth_by_attnum
             .get(&attr.attnum)
@@ -1286,11 +1451,32 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
         // never appear — `1/ndistinct` gets those badly wrong; see Q19). When
         // writing an MCV, stadistinct must equal the value count so non-MCV
         // values estimate 0.
-        let histogram =
-            parent_histogram_bounds(attr.atttypid, mms).map(|bounds| Slot1::Histogram {
-                type_oid: attr.atttypid,
-                bounds,
-            });
+        // Prefer a fine per-segment histogram (pooled across partitions);
+        // fall back to per-partition mins. Both gated on histogram eligibility
+        // via the bound builders.
+        let histogram = match seg_mins_by_name.get(&attr.attname) {
+            Some(mins) if !mins.is_empty() => {
+                let global_max = mms.iter().map(|r| r.1).max().unwrap_or(i64::MIN);
+                build_histogram_bounds(
+                    attr.atttypid,
+                    mins.clone(),
+                    global_max,
+                    MAX_HISTOGRAM_BOUNDS,
+                )
+            }
+            _ => parent_histogram_bounds(attr.atttypid, mms),
+        }
+        .map(|bounds| Slot1::Histogram {
+            type_oid: attr.atttypid,
+            bounds,
+        });
+        // Multi-bucket histogram → physically-sorted column → correlation ~1.0.
+        let correlation = match &histogram {
+            Some(Slot1::Histogram { type_oid, bounds }) if bounds.len() > 2 => {
+                Some((*type_oid, 1.0f32))
+            }
+            _ => None,
+        };
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), merged_nd),
             // Only write an MCV when the valmap union covers EVERY distinct
@@ -1340,6 +1526,7 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             stanullfrac,
             stawidth,
             slot,
+            correlation,
             true,
         )?;
     }
@@ -1380,6 +1567,80 @@ fn load_parent_nullfrac(
             .unwrap_or(0.0);
         if attnum > 0 {
             out.insert(attnum, nf);
+        }
+    }
+    Ok(out)
+}
+
+/// Gather per-segment `_min` values per column NAME across all compressed
+/// partitions of the deltatable, for a fine, ~equi-depth parent histogram (#7).
+/// Segments are ~equal-sized, so pooling every partition's segment mins gives
+/// boundaries weighted by partition size automatically — fixing the old
+/// per-partition-mins histogram that assumed equal partitions. The colstats
+/// `_col_idx` is the non-segment-by column position, mapped here to the column
+/// name via pg_attribute order minus the deltatable's `segment_by`.
+fn load_parent_segment_mins(
+    client: &mut SpiClient,
+    schema: &str,
+    table: &str,
+    attrs: &[AttrInfo],
+) -> spi::SpiResult<HashMap<String, Vec<i64>>> {
+    // Segment-by columns (not in colstats) — skipped when numbering _col_idx.
+    let mut segment_by: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in client.select(
+        "SELECT unnest(segment_by)::text FROM deltax.deltax_deltatable \
+         WHERE schema_name = $1 AND table_name = $2",
+        None,
+        &[schema.into(), table.into()],
+    )? {
+        if let Some(s) = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            segment_by.insert(s);
+        }
+    }
+    // _col_idx (non-seg position, attnum order) → column name.
+    let mut idx_to_name: HashMap<i32, String> = HashMap::new();
+    let mut idx: i32 = 0;
+    for a in attrs {
+        if segment_by.contains(&a.attname) {
+            continue;
+        }
+        idx_to_name.insert(idx, a.attname.clone());
+        idx += 1;
+    }
+
+    let mut out: HashMap<String, Vec<i64>> = HashMap::new();
+    let parts: Vec<String> = client
+        .select(
+            "SELECT table_name FROM deltax.deltax_partition \
+             WHERE is_compressed = true AND deltatable_id = (\
+                 SELECT id FROM deltax.deltax_deltatable \
+                 WHERE schema_name = $1 AND table_name = $2)",
+            None,
+            &[schema.into(), table.into()],
+        )?
+        .filter_map(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        })
+        .collect();
+    for part in parts {
+        let colstats_fqn = format!(
+            "\"_deltax_compressed\".\"{}_colstats\"",
+            part.replace('"', "\"\"")
+        );
+        let per_idx = match load_colstats_segment_mins(client, &colstats_fqn) {
+            Ok(m) => m,
+            Err(_) => continue, // partition predating colstats / transient
+        };
+        for (i, mins) in per_idx {
+            if let Some(name) = idx_to_name.get(&i) {
+                out.entry(name.clone()).or_default().extend(mins);
+            }
         }
     }
     Ok(out)
@@ -1562,6 +1823,51 @@ mod tests {
     }
 
     #[test]
+    fn build_histogram_bounds_from_segment_mins() {
+        // Per-segment mins + global max → sorted multi-bucket bounds.
+        let b = build_histogram_bounds(pg_sys::INT4OID, vec![0, 100, 200], 299, 101).unwrap();
+        assert_eq!(b, vec![0, 100, 200, 299]);
+        // Single segment → 2-point [min, max].
+        let b = build_histogram_bounds(pg_sys::INT4OID, vec![0], 99, 101).unwrap();
+        assert_eq!(b, vec![0, 99]);
+        // Constant → fewer than 2 distinct bounds → None.
+        assert!(build_histogram_bounds(pg_sys::INT4OID, vec![5], 5, 101).is_none());
+        // Floats are eligible (#4).
+        assert!(build_histogram_bounds(pg_sys::FLOAT8OID, vec![0, 50], 100, 101).is_some());
+        // Text never.
+        assert!(build_histogram_bounds(pg_sys::TEXTOID, vec![0, 5], 9, 101).is_none());
+        // Clustered mins (unsorted column: all near the min) → collapse to the
+        // 2-point [min, max] rather than a skewed multi-bucket histogram.
+        assert_eq!(
+            build_histogram_bounds(pg_sys::INT8OID, vec![0, 1, 2], 1000, 101).unwrap(),
+            vec![0, 1000]
+        );
+    }
+
+    #[test]
+    fn downsample_bounds_keeps_endpoints_and_caps() {
+        // 11 sorted values capped at 5 → 5 evenly-spaced, first & last kept.
+        let out = downsample_bounds((0..11).collect(), 5);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], 0);
+        assert_eq!(*out.last().unwrap(), 10);
+        assert!(out.windows(2).all(|w| w[0] < w[1]), "ascending: {out:?}");
+        // Below the cap → unchanged.
+        assert_eq!(downsample_bounds(vec![1, 2, 3], 100), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn build_histogram_bounds_downsamples_many_segments() {
+        // 1000 segment mins + max → capped at MAX_HISTOGRAM_BOUNDS, spanning ends.
+        let mins: Vec<i64> = (0..1000).collect();
+        let b = build_histogram_bounds(pg_sys::INT8OID, mins, 1000, MAX_HISTOGRAM_BOUNDS).unwrap();
+        assert!(b.len() <= MAX_HISTOGRAM_BOUNDS, "len {}", b.len());
+        assert_eq!(b[0], 0);
+        assert_eq!(*b.last().unwrap(), 1000);
+        assert!(b.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
     fn parent_histogram_bounds_collapses_constant_range_to_two_points() {
         let ranges = [(0, 27), (0, 27), (0, 27)];
         let b = parent_histogram_bounds(pg_sys::INT4OID, &ranges).unwrap();
@@ -1607,9 +1913,17 @@ mod tests {
         // Constant column (lo == hi) and inverted bounds → skip.
         assert!(!histogram_eligible(pg_sys::INT4OID, 7, 7));
         assert!(!histogram_eligible(pg_sys::INT4OID, 9, 1));
-        // Types we don't emit histograms for (text, float for now) → skip.
+        // Text has no histogram-decodable encoding → skip.
         assert!(!histogram_eligible(pg_sys::TEXTOID, 0, 10));
-        assert!(!histogram_eligible(pg_sys::FLOAT4OID, 0, 10));
+    }
+
+    #[test]
+    fn histogram_eligible_accepts_floats() {
+        // FLOAT4/8 use the order-preserving i64 encoding (#4).
+        assert!(histogram_eligible(pg_sys::FLOAT4OID, 0, 10));
+        assert!(histogram_eligible(pg_sys::FLOAT8OID, -5, 5));
+        // Constant still rejected.
+        assert!(!histogram_eligible(pg_sys::FLOAT8OID, 3, 3));
     }
 
     #[test]
