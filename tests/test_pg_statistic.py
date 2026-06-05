@@ -721,6 +721,34 @@ def test_segment_by_column_gets_stats(db):
     assert_region(_pg_stats(db, "seg_events", "region", inherited=True), "parent")
 
 
+def test_text_stawidth_reflects_avg_length(db):
+    """Text columns get stawidth ≈ avg char length + varlena header, not the
+    flat 32 (audit #2). `kind` is 1 char → ~2; `skew` is 3–4 chars → ~5; fixed-
+    width `uid` stays 8. Checked on child + merged parent."""
+    _seed(db, n_partitions=2, rows_per_partition=50_000, high_card=5000)
+    part = _first_compressed_partition(db)
+
+    _, _, w_kind = _stats_for(db, part, "kind")
+    assert 1 <= w_kind <= 6, f"stawidth(kind)={w_kind}, expected ~2 (was flat 32)"
+    _, _, w_skew = _stats_for(db, part, "skew")
+    assert 3 <= w_skew <= 8, f"stawidth(skew)={w_skew}, expected ~5 (was flat 32)"
+    _, _, w_uid = _stats_for(db, part, "uid")
+    assert w_uid == 8, f"stawidth(uid)={w_uid}, expected 8 (fixed-width unchanged)"
+
+    db.execute("SELECT deltax.deltax_analyze_table('events')")
+    db.commit()
+    pw = db.execute(
+        "SELECT s.stawidth FROM pg_statistic s "
+        "JOIN pg_attribute a ON a.attrelid = s.starelid AND a.attnum = s.staattnum "
+        "WHERE s.starelid = 'events'::regclass AND a.attname = 'kind' "
+        "  AND s.stainherit = true"
+    ).fetchone()
+    assert pw is not None and 1 <= pw[0] <= 6, (
+        f"parent stawidth(kind)={pw[0] if pw else None}, expected ~2 (row-count-"
+        f"weighted child avg, not flat 32)"
+    )
+
+
 def test_segment_by_equality_estimate_uses_mcv(db):
     """`WHERE region = 'us'` (50% of rows) must estimate ~half the table via the
     segment_by MCV — not the ~0.5% DEFAULT_EQ_SEL it got when segment_by columns

@@ -34,9 +34,10 @@ pub fn write_partition_stats(
         return Ok(());
     }
 
-    // Single SPI pass over the colstats table to get per-column
-    // SUM(nonnull). One row per non-segment-by column, in _col_idx order.
-    let nonnull_by_col_idx = load_nonnull_counts(client, colstats_fqn)?;
+    // Single SPI pass over the colstats table: per-column SUM(nonnull) (→
+    // nullfrac) and SUM(_sum) (→ avg length → stawidth for text). One row per
+    // non-segment-by column, keyed by `_col_idx`.
+    let colstats_agg = load_colstats_aggregates(client, colstats_fqn)?;
 
     // Fetch `(attname, attnum, attlen, atttypid)` for every non-dropped
     // column of the partition so we can map our `ColumnMeta` back to PG's
@@ -57,12 +58,9 @@ pub fn write_partition_stats(
     // case `mcv_freqs` falls back to the old uniform split.
     let col_valcounts = load_column_valcounts(client, part_rel_oid)?;
 
-    // Estimate average tuple width — feeds `pg_class.relpages`.
+    // Average tuple width (→ `pg_class.relpages`) is accumulated from the
+    // accurate per-column widths inside the loop below.
     let mut sum_widths: i64 = 0;
-    for a in &attrs {
-        sum_widths += stawidth_for_attlen(a.attlen) as i64;
-    }
-    let avg_tuple_width = sum_widths.max(32);
 
     // Walk our pg_deltax columns, match to the partition's pg_attribute
     // entry by name, emit one pg_statistic row each. Segment-by columns are
@@ -84,7 +82,15 @@ pub fn write_partition_stats(
                 continue; // column was dropped post-compression
             }
         };
-        let stawidth = stawidth_for_attlen(attr.attlen);
+        // Accurate width for text (avg length + varlena header) instead of the
+        // flat 32; segment-by columns aren't in colstats so they use attlen/32.
+        let agg = if col.is_segment_by {
+            None
+        } else {
+            colstats_agg.get(&nonseg_idx)
+        };
+        let stawidth = column_stawidth(attr, agg);
+        sum_widths += stawidth as i64;
 
         // NOT NULL columns have no nulls by definition. For nullable
         // columns, derive nullfrac from the colstats nonnull sum — but a
@@ -108,9 +114,8 @@ pub fn write_partition_stats(
                 None => 0.0,
             }
         } else {
-            let nonnull = nonnull_by_col_idx
-                .get(&nonseg_idx)
-                .copied()
+            let nonnull = agg
+                .map(|&(n, _)| n)
                 .filter(|&n| n > 0)
                 .unwrap_or(row_count);
             ((row_count - nonnull) as f32 / row_count as f32).clamp(0.0, 1.0)
@@ -172,6 +177,7 @@ pub fn write_partition_stats(
         }
     }
 
+    let avg_tuple_width = sum_widths.max(32);
     update_reltuples(client, part_rel_oid, row_count, avg_tuple_width as i32)?;
 
     // Make the new stats visible to other backends at commit time.
@@ -180,13 +186,22 @@ pub fn write_partition_stats(
     Ok(())
 }
 
-/// Load `SUM(_nonnull_count)` per `_col_idx` in a single pass.
-fn load_nonnull_counts(
+/// Per-`_col_idx` colstats aggregates: `(nonnull_count, length_sum)`. For text
+/// columns `_sum` holds `SUM(length(value))` over non-null rows (see
+/// `compress::compute_typed_sum`), so `length_sum / nonnull` is the average
+/// character length — the basis for an accurate `stawidth` instead of the flat
+/// 32. For non-text columns `_sum` is the numeric sum (ignored for width).
+fn load_colstats_aggregates(
     client: &mut SpiClient,
     colstats_fqn: &str,
-) -> spi::SpiResult<HashMap<i32, i64>> {
+) -> spi::SpiResult<HashMap<i32, (i64, i64)>> {
+    // `SUM(_sum)` is cast to float8, not int8: for a numeric column `_sum` is
+    // the value sum, which can exceed i64 and would raise NumericValueOutOfRange
+    // on an int8 cast. We only consult it for text (length sum, always small and
+    // exactly representable in f64), so the float path is lossless where it
+    // matters and merely approximate (and unused) for numeric columns.
     let query = format!(
-        "SELECT _col_idx::int4, SUM(_nonnull_count)::int8 \
+        "SELECT _col_idx::int4, SUM(_nonnull_count)::int8, SUM(_sum)::float8 \
          FROM {} GROUP BY _col_idx",
         colstats_fqn
     );
@@ -202,11 +217,41 @@ fn load_nonnull_counts(
             .ok()
             .and_then(|d| d.value::<i64>().ok().flatten())
             .unwrap_or(0);
+        // Read as f64 (see query comment) and saturate to i64; for text the
+        // length sum is exact, for numeric it's unused.
+        let len_sum: i64 = row
+            .get_datum_by_ordinal(3)
+            .ok()
+            .and_then(|d| d.value::<f64>().ok().flatten())
+            .map(|f| f.max(0.0) as i64)
+            .unwrap_or(0);
         if idx >= 0 {
-            out.insert(idx, nonnull);
+            out.insert(idx, (nonnull, len_sum));
         }
     }
     Ok(out)
+}
+
+/// `stawidth` for one column. Fixed-width types use `attlen`. Text/varchar use
+/// the average character length from colstats (`len_sum / nonnull`) plus the
+/// varlena header (1 byte short, 4 bytes long) — far better than the flat 32,
+/// which over-reports short codes and under-reports wide text (URL/Title) and so
+/// mis-sizes sort/hash work-mem + `relpages`. Other varlena (jsonb/bytea, no
+/// `_sum`) and missing data fall back to the 32-byte default.
+fn column_stawidth(attr: &AttrInfo, agg: Option<&(i64, i64)>) -> i32 {
+    if attr.attlen > 0 {
+        return attr.attlen as i32;
+    }
+    if is_text_type(attr.atttypid)
+        && let Some(&(nonnull, len_sum)) = agg
+        && nonnull > 0
+        && len_sum > 0
+    {
+        let avg = (len_sum as f64 / nonnull as f64).round() as i32;
+        let header = if avg < 127 { 1 } else { 4 };
+        return (avg + header).max(1);
+    }
+    stawidth_for_attlen(attr.attlen)
 }
 
 struct AttrInfo {
@@ -1117,19 +1162,25 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
     }
 
     let attrs = load_pg_attribute(client, parent_oid)?;
-    let mut sum_widths: i64 = 0;
-    for a in &attrs {
-        sum_widths += stawidth_for_attlen(a.attlen) as i64;
-    }
-    let avg_tuple_width = sum_widths.max(32);
 
-    // Parent nullfrac per column = the row-count-weighted average of the
-    // children's nullfracs (written by write_partition_stats). A hardcoded 0
-    // badly over-estimates `<> const` / `IS NOT NULL` filters on a mostly-NULL
-    // column (e.g. backup_processor), which inflates the parent DeltaXAppend
-    // path cost and makes the planner fall back to a per-partition Append +
-    // full Sort for Top-N queries.
+    // Parent nullfrac/stawidth per column = the row-count-weighted average of
+    // the children's values (written by write_partition_stats). A hardcoded
+    // nullfrac 0 badly over-estimates `<> const` / `IS NOT NULL` on a mostly-
+    // NULL column; a flat-32 stawidth mis-sizes sort/hash work-mem on wide text.
     let nullfrac_by_attnum = load_parent_nullfrac(client, parent_oid).unwrap_or_default();
+    let stawidth_by_attnum = load_parent_stawidth(client, parent_oid).unwrap_or_default();
+    let parent_stawidth = |attr: &AttrInfo| -> i32 {
+        stawidth_by_attnum
+            .get(&attr.attnum)
+            .copied()
+            .filter(|&w| w > 0)
+            .unwrap_or_else(|| stawidth_for_attlen(attr.attlen))
+    };
+    let avg_tuple_width = attrs
+        .iter()
+        .map(|a| parent_stawidth(a) as i64)
+        .sum::<i64>()
+        .max(32);
 
     for attr in &attrs {
         let empty_nd: Vec<i64> = Vec::new();
@@ -1153,7 +1204,7 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0)
         };
-        let stawidth = stawidth_for_attlen(attr.attlen);
+        let stawidth = parent_stawidth(attr);
 
         // Slot 1: a histogram for ordered types (range selectivity), else an
         // MCV list for a low-cardinality column whose full value set we know
@@ -1247,6 +1298,43 @@ fn load_parent_nullfrac(
     Ok(out)
 }
 
+/// Row-count-weighted average of the child partitions' `stawidth` per
+/// attribute, used as the parent's width. Mirrors `load_parent_nullfrac`:
+/// children are analyzed before the table-level pass, so their accurate
+/// (text avg-length-based) widths already exist. Rounded to an int; attributes
+/// without child stats simply don't contribute (caller falls back to attlen/32).
+fn load_parent_stawidth(
+    client: &mut SpiClient,
+    parent_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<i16, i32>> {
+    let parent_int = u32::from(parent_oid) as i64;
+    let query = "SELECT s.staattnum::int2, \
+                        round(SUM(s.stawidth::float8 * GREATEST(c.reltuples, 0)::float8) \
+                         / NULLIF(SUM(GREATEST(c.reltuples, 0)::float8), 0))::int4 \
+                 FROM pg_statistic s \
+                 JOIN pg_inherits i ON i.inhrelid = s.starelid \
+                 JOIN pg_class c ON c.oid = s.starelid \
+                 WHERE i.inhparent = $1::oid AND s.stainherit = false \
+                 GROUP BY s.staattnum";
+    let mut out: HashMap<i16, i32> = HashMap::new();
+    for row in client.select(query, None, &[parent_int.into()])? {
+        let attnum: i16 = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value::<i16>().ok().flatten())
+            .unwrap_or(0);
+        let w: i32 = row
+            .get_datum_by_ordinal(2)
+            .ok()
+            .and_then(|d| d.value::<i32>().ok().flatten())
+            .unwrap_or(0);
+        if attnum > 0 && w > 0 {
+            out.insert(attnum, w);
+        }
+    }
+    Ok(out)
+}
+
 /// Minimal SQL identifier quoting for building a `schema.table` regclass
 /// literal. Doubles embedded quotes; always wraps in double quotes.
 fn quote_ident(ident: &str) -> String {
@@ -1267,6 +1355,40 @@ mod tests {
         assert_eq!(stawidth_for_attlen(-1), 32);
         assert_eq!(stawidth_for_attlen(-2), 32);
         assert_eq!(stawidth_for_attlen(0), 32);
+    }
+
+    fn attr(attlen: i16, atttypid: pg_sys::Oid) -> AttrInfo {
+        AttrInfo {
+            attname: "c".to_string(),
+            attnum: 1,
+            attlen,
+            atttypid,
+            attnotnull: false,
+        }
+    }
+
+    #[test]
+    fn column_stawidth_uses_avg_length_for_text() {
+        // Fixed-width types ignore colstats and use attlen.
+        assert_eq!(column_stawidth(&attr(8, pg_sys::INT8OID), Some(&(100, 999))), 8);
+
+        // Text: avg length (len_sum / nonnull) + varlena header. 6000/100 = 60
+        // chars, < 127 → +1 short header = 61 (vs the flat 32).
+        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 6000))), 61);
+        // Wide text: 200 chars avg → +4 long header = 204.
+        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(10, 2000))), 204);
+        // Short codes get a small width, not 32.
+        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 300))), 4);
+    }
+
+    #[test]
+    fn column_stawidth_falls_back_to_32() {
+        // Text with no colstats aggregate, or zero rows → 32 default.
+        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), None), 32);
+        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(0, 0))), 32);
+        // Non-text varlena (jsonb has no length `_sum`) → 32, never the numeric
+        // `_sum` misread as a length.
+        assert_eq!(column_stawidth(&attr(-1, pg_sys::JSONBOID), Some(&(100, 999999))), 32);
     }
 
     #[test]
