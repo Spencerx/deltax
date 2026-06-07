@@ -1639,7 +1639,9 @@ pub(crate) fn merge_segment_topvals(
     // fires once.
     let num_nonseg = columns.iter().filter(|c| !c.is_segment_by).count();
     if acc.len() != num_nonseg {
-        *acc = (0..num_nonseg).map(|_| std::collections::HashMap::new()).collect();
+        *acc = (0..num_nonseg)
+            .map(|_| std::collections::HashMap::new())
+            .collect();
     }
     let mut nonseg = 0usize;
     for (i, col) in columns.iter().enumerate() {
@@ -2483,8 +2485,9 @@ fn compress_partition_streaming(
         .collect();
     // Partition-level heavy-hitter summary per non-seg col (text only) for the
     // partial MCV; fed at each segment flush, like `partition_hll`.
-    let mut partition_topvals: TopVals =
-        (0..num_nonseg_cols).map(|_| std::collections::HashMap::new()).collect();
+    let mut partition_topvals: TopVals = (0..num_nonseg_cols)
+        .map(|_| std::collections::HashMap::new())
+        .collect();
 
     loop {
         let result = client
@@ -3893,7 +3896,10 @@ pub(crate) fn augment_segment_by_stats(
         // Text, low-card → also an MCV with exact frequencies + absent-value ~0.
         if is_text_data_type(&col.data_type.to_lowercase()) && pairs.len() <= VALBITMAP_MAX_DISTINCT
         {
-            valmap.insert(col.name.clone(), pairs.iter().map(|(v, _)| v.clone()).collect());
+            valmap.insert(
+                col.name.clone(),
+                pairs.iter().map(|(v, _)| v.clone()).collect(),
+            );
             valcounts.insert(col.name.clone(), pairs);
         }
     }
@@ -3940,8 +3946,7 @@ pub(crate) fn select_partial_mcv(
         if n_sig == 0 {
             continue; // near-uniform: no meaningful MCV
         }
-        let mut sorted: Vec<(String, i64)> =
-            map.iter().map(|(v, &c)| (v.clone(), c)).collect();
+        let mut sorted: Vec<(String, i64)> = map.iter().map(|(v, &c)| (v.clone(), c)).collect();
         // Highest count first; value as a stable tiebreak.
         sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         // Keep the heavy hitters; ensure at least 2 (the MCV slot needs >=2),
@@ -4386,8 +4391,7 @@ mod tests {
         let mcv = out.get("c").expect("expected a partial MCV for c");
         // Only A and B clear the 1.25/ndistinct (=1.25%) admission threshold;
         // cold values (0.2%) are dropped.
-        let kept: std::collections::HashSet<&str> =
-            mcv.iter().map(|(v, _)| v.as_str()).collect();
+        let kept: std::collections::HashSet<&str> = mcv.iter().map(|(v, _)| v.as_str()).collect();
         assert_eq!(kept, ["A", "B"].into_iter().collect());
     }
 
@@ -4405,8 +4409,9 @@ mod tests {
         assert!(select_partial_mcv(&topvals, &["c"], &nd, &empty, 10000).is_empty());
 
         // Columns already covered by the complete valmap are skipped.
-        let covered: HashMap<String, Vec<String>> =
-            [("c".to_string(), vec!["x".to_string()])].into_iter().collect();
+        let covered: HashMap<String, Vec<String>> = [("c".to_string(), vec!["x".to_string()])]
+            .into_iter()
+            .collect();
         let mut skewed: HashMap<String, i64> = HashMap::new();
         skewed.insert("A".to_string(), 9000);
         skewed.insert("B".to_string(), 1000);

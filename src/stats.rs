@@ -122,10 +122,7 @@ pub fn write_partition_stats(
                 None => 0.0,
             }
         } else {
-            let nonnull = agg
-                .map(|&(n, _)| n)
-                .filter(|&n| n > 0)
-                .unwrap_or(row_count);
+            let nonnull = agg.map(|&(n, _)| n).filter(|&n| n > 0).unwrap_or(row_count);
             ((row_count - nonnull) as f32 / row_count as f32).clamp(0.0, 1.0)
         };
 
@@ -144,7 +141,10 @@ pub fn write_partition_stats(
             histogram_eligible(attr.atttypid, lo, hi).then(|| {
                 // Multi-bucket from this column's per-segment mins; fall back to
                 // the 2-point [min, max] if a single segment / no per-segment data.
-                let mins = col_seg_mins.get(&nonseg_idx).cloned().unwrap_or_else(|| vec![lo]);
+                let mins = col_seg_mins
+                    .get(&nonseg_idx)
+                    .cloned()
+                    .unwrap_or_else(|| vec![lo]);
                 let bounds = build_histogram_bounds(attr.atttypid, mins, hi, MAX_HISTOGRAM_BOUNDS)
                     .unwrap_or_else(|| vec![lo, hi]);
                 Slot1::Histogram {
@@ -292,7 +292,9 @@ fn load_colstats_segment_mins(
             .get_datum_by_ordinal(2)
             .ok()
             .and_then(|d| d.value::<i64>().ok().flatten());
-        if idx >= 0 && let Some(m) = min {
+        if idx >= 0
+            && let Some(m) = min
+        {
             out.entry(idx).or_default().push(m);
         }
     }
@@ -1501,9 +1503,7 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
                     let freqs = mcv_freqs(&values, counts, total_rows);
                     let n = values.len() as i64;
                     (Some(Slot1::Mcv { values, freqs }), n)
-                } else if let Some(counts) = mcv_by_col
-                    .get(&attr.attname)
-                    .filter(|m| m.len() >= 2)
+                } else if let Some(counts) = mcv_by_col.get(&attr.attname).filter(|m| m.len() >= 2)
                 {
                     // Partial MCV (high-card heavy hitters, merged across
                     // partitions): keep the real merged HLL n_distinct so PG
@@ -1736,25 +1736,43 @@ mod tests {
     #[test]
     fn column_stawidth_uses_avg_length_for_text() {
         // Fixed-width types ignore colstats and use attlen.
-        assert_eq!(column_stawidth(&attr(8, pg_sys::INT8OID), Some(&(100, 999))), 8);
+        assert_eq!(
+            column_stawidth(&attr(8, pg_sys::INT8OID), Some(&(100, 999))),
+            8
+        );
 
         // Text: avg length (len_sum / nonnull) + varlena header. 6000/100 = 60
         // chars, < 127 → +1 short header = 61 (vs the flat 32).
-        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 6000))), 61);
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 6000))),
+            61
+        );
         // Wide text: 200 chars avg → +4 long header = 204.
-        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(10, 2000))), 204);
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(10, 2000))),
+            204
+        );
         // Short codes get a small width, not 32.
-        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 300))), 4);
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 300))),
+            4
+        );
     }
 
     #[test]
     fn column_stawidth_falls_back_to_32() {
         // Text with no colstats aggregate, or zero rows → 32 default.
         assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), None), 32);
-        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(0, 0))), 32);
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(0, 0))),
+            32
+        );
         // Non-text varlena (jsonb has no length `_sum`) → 32, never the numeric
         // `_sum` misread as a length.
-        assert_eq!(column_stawidth(&attr(-1, pg_sys::JSONBOID), Some(&(100, 999999))), 32);
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::JSONBOID), Some(&(100, 999999))),
+            32
+        );
     }
 
     #[test]
@@ -1950,14 +1968,23 @@ mod tests {
         counts.insert("A".to_string(), 40);
         counts.insert("B".to_string(), 20);
         let f = mcv_freqs(&values, &counts, 100);
-        assert!((f.iter().sum::<f32>() - 0.6).abs() < 1e-6, "sum={}", f.iter().sum::<f32>());
+        assert!(
+            (f.iter().sum::<f32>() - 0.6).abs() < 1e-6,
+            "sum={}",
+            f.iter().sum::<f32>()
+        );
     }
 
     #[test]
     fn mcv_freqs_falls_back_to_uniform_without_counts() {
         // Partition predating column_valcounts → empty counts → uniform 1/n
         // (the prior behaviour), so the change is a no-op for old data.
-        let values = vec!["A".to_string(), "B".to_string(), "C".to_string(), "D".to_string()];
+        let values = vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ];
         let f = mcv_freqs(&values, &HashMap::new(), 100);
         assert_eq!(f.len(), 4);
         assert!(f.iter().all(|&x| (x - 0.25).abs() < 1e-6), "freqs={:?}", f);
