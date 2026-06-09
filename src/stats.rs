@@ -34,9 +34,10 @@ pub fn write_partition_stats(
         return Ok(());
     }
 
-    // Single SPI pass over the colstats table to get per-column
-    // SUM(nonnull). One row per non-segment-by column, in _col_idx order.
-    let nonnull_by_col_idx = load_nonnull_counts(client, colstats_fqn)?;
+    // Single SPI pass over the colstats table: per-column SUM(nonnull) (→
+    // nullfrac) and SUM(_sum) (→ avg length → stawidth for text). One row per
+    // non-segment-by column, keyed by `_col_idx`.
+    let colstats_agg = load_colstats_aggregates(client, colstats_fqn)?;
 
     // Fetch `(attname, attnum, attlen, atttypid)` for every non-dropped
     // column of the partition so we can map our `ColumnMeta` back to PG's
@@ -49,35 +50,55 @@ pub fn write_partition_stats(
     // on the order-by / time column stop collapsing to a default
     // selectivity. Empty if the partition predates `column_minmax`.
     let col_minmax = load_column_minmax(client, part_rel_oid)?;
+    // Per-segment minimums per `_col_idx` → a multi-bucket child histogram (#6)
+    // instead of the 2-point `[min, max]`. Segments are ~equal-sized, so the
+    // mins are ~equi-depth bucket boundaries.
+    let col_seg_mins = load_colstats_segment_mins(client, colstats_fqn)?;
     // Per-column distinct-value lists for low-cardinality columns, used to
     // write an MCV (exact equality selectivity + ~0 for absent values).
     let col_valmap = load_column_valmap(client, part_rel_oid)?;
+    // Per-value occurrence counts for those same columns → real MCV
+    // frequencies. Empty for partitions predating `column_valcounts`, in which
+    // case `mcv_freqs` falls back to the old uniform split.
+    let col_valcounts = load_column_valcounts(client, part_rel_oid)?;
+    // Partial MCV (heavy hitters) for high-cardinality text columns the <=32
+    // valmap doesn't cover; written with the real HLL stadistinct so the tail
+    // is still estimated.
+    let col_mcv = load_column_mcv(client, part_rel_oid)?;
 
-    // Estimate average tuple width — feeds `pg_class.relpages`.
+    // Average tuple width (→ `pg_class.relpages`) is accumulated from the
+    // accurate per-column widths inside the loop below.
     let mut sum_widths: i64 = 0;
-    for a in &attrs {
-        sum_widths += stawidth_for_attlen(a.attlen) as i64;
-    }
-    let avg_tuple_width = sum_widths.max(32);
 
     // Walk our pg_deltax columns, match to the partition's pg_attribute
-    // entry by name, emit one pg_statistic row each. Segment-by columns
-    // have null estimates from our HLL map (they're stored as the
-    // partition's segment_values, not in the blob), so we skip them
-    // here and let PG default them — there are usually only a handful.
+    // entry by name, emit one pg_statistic row each. Segment-by columns are
+    // stored as the partition's segment_values (not in the blob), so they have
+    // no `_colstats` entry; their stats come from the meta table, folded into
+    // `col_ndistinct` / `col_valmap` / `col_valcounts` at compress time (see
+    // `augment_segment_by_stats`). Without them PG defaults `WHERE segkey = X`
+    // to 0.005 — and the segment key is the column users filter/join on most.
+    // `nonseg_idx` tracks the colstats `_col_idx`, so it advances only for
+    // non-segment-by columns.
     let mut nonseg_idx: i32 = 0;
     for col in columns {
-        if col.is_segment_by {
-            continue;
-        }
         let attr = match attrs.iter().find(|a| a.attname == col.name) {
             Some(a) => a,
             None => {
-                nonseg_idx += 1;
+                if !col.is_segment_by {
+                    nonseg_idx += 1;
+                }
                 continue; // column was dropped post-compression
             }
         };
-        let stawidth = stawidth_for_attlen(attr.attlen);
+        // Accurate width for text (avg length + varlena header) instead of the
+        // flat 32; segment-by columns aren't in colstats so they use attlen/32.
+        let agg = if col.is_segment_by {
+            None
+        } else {
+            colstats_agg.get(&nonseg_idx)
+        };
+        let stawidth = column_stawidth(attr, agg);
+        sum_widths += stawidth as i64;
 
         // NOT NULL columns have no nulls by definition. For nullable
         // columns, derive nullfrac from the colstats nonnull sum — but a
@@ -88,12 +109,20 @@ pub fn write_partition_stats(
         // selectivity `(1 - nullfrac)` and neutralised the histogram.
         let stanullfrac = if attr.attnotnull {
             0.0
+        } else if col.is_segment_by {
+            // Segment-by columns aren't in `_colstats`. The valcounts (when
+            // present, i.e. <=32 distinct) is the complete non-null value set
+            // for the partition, so it gives an exact nullfrac; for a high-card
+            // segment key we lack the null count and assume non-null.
+            match col_valcounts.get(&col.name) {
+                Some(counts) => {
+                    let nonnull: i64 = counts.values().sum();
+                    ((row_count - nonnull) as f32 / row_count as f32).clamp(0.0, 1.0)
+                }
+                None => 0.0,
+            }
         } else {
-            let nonnull = nonnull_by_col_idx
-                .get(&nonseg_idx)
-                .copied()
-                .filter(|&n| n > 0)
-                .unwrap_or(row_count);
+            let nonnull = agg.map(|&(n, _)| n).filter(|&n| n > 0).unwrap_or(row_count);
             ((row_count - nonnull) as f32 / row_count as f32).clamp(0.0, 1.0)
         };
 
@@ -109,22 +138,60 @@ pub fn write_partition_stats(
         // the value count (the persisted ndistinct is a per-segment MAX that
         // can under-count) so non-MCV values get 0.
         let histogram = col_minmax.get(&col.name).and_then(|&(lo, hi)| {
-            histogram_eligible(attr.atttypid, lo, hi).then(|| Slot1::Histogram {
-                type_oid: attr.atttypid,
-                bounds: vec![lo, hi],
+            histogram_eligible(attr.atttypid, lo, hi).then(|| {
+                // Multi-bucket from this column's per-segment mins; fall back to
+                // the 2-point [min, max] if a single segment / no per-segment data.
+                let mins = col_seg_mins
+                    .get(&nonseg_idx)
+                    .cloned()
+                    .unwrap_or_else(|| vec![lo]);
+                let bounds = build_histogram_bounds(attr.atttypid, mins, hi, MAX_HISTOGRAM_BOUNDS)
+                    .unwrap_or_else(|| vec![lo, hi]);
+                Slot1::Histogram {
+                    type_oid: attr.atttypid,
+                    bounds,
+                }
             })
         });
+        // A multi-bucket histogram means the column's per-segment mins are
+        // monotonic — i.e. it's physically (~ascending) sorted — so write a
+        // correlation of ~1.0 (#5). 2-point histograms are unsorted → none.
+        let correlation = match &histogram {
+            Some(Slot1::Histogram { type_oid, bounds }) if bounds.len() > 2 => {
+                Some((*type_oid, 1.0f32))
+            }
+            _ => None,
+        };
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), ndistinct),
-            None => match col_valmap.get(&col.name) {
-                Some(vals) if vals.len() >= 2 => (
-                    Some(Slot1::Mcv {
-                        values: vals.clone(),
-                    }),
-                    vals.len() as i64,
-                ),
-                _ => (None, ndistinct),
-            },
+            // MCV only for text columns — `build_mcv_arrays` builds a text[]
+            // `stavalues` with the text `=` operator, so a non-text valmap entry
+            // (e.g. an integer segment key) must fall through to stadistinct.
+            None if is_text_type(attr.atttypid) => {
+                if let Some(vals) = col_valmap.get(&col.name).filter(|v| v.len() >= 2) {
+                    // Complete MCV (<=32 distinct): stadistinct = value count, so
+                    // absent values estimate ~0.
+                    let empty = HashMap::new();
+                    let counts = col_valcounts.get(&col.name).unwrap_or(&empty);
+                    let freqs = mcv_freqs(vals, counts, row_count);
+                    (
+                        Some(Slot1::Mcv {
+                            values: vals.clone(),
+                            freqs,
+                        }),
+                        vals.len() as i64,
+                    )
+                } else if let Some(counts) = col_mcv.get(&col.name).filter(|m| m.len() >= 2) {
+                    // Partial MCV (high-card heavy hitters): keep the real HLL
+                    // `stadistinct` (eff_ndistinct = ndistinct) so PG estimates
+                    // the hot values from the MCV and the tail from the remainder.
+                    let (values, freqs) = ordered_mcv(counts, row_count, 100);
+                    (Some(Slot1::Mcv { values, freqs }), ndistinct)
+                } else {
+                    (None, ndistinct)
+                }
+            }
+            None => (None, ndistinct),
         };
         let stadistinct = stadistinct_value(eff_ndistinct, row_count);
 
@@ -136,12 +203,16 @@ pub fn write_partition_stats(
             stanullfrac,
             stawidth,
             slot,
+            correlation,
             false,
         )?;
 
-        nonseg_idx += 1;
+        if !col.is_segment_by {
+            nonseg_idx += 1;
+        }
     }
 
+    let avg_tuple_width = sum_widths.max(32);
     update_reltuples(client, part_rel_oid, row_count, avg_tuple_width as i32)?;
 
     // Make the new stats visible to other backends at commit time.
@@ -150,13 +221,22 @@ pub fn write_partition_stats(
     Ok(())
 }
 
-/// Load `SUM(_nonnull_count)` per `_col_idx` in a single pass.
-fn load_nonnull_counts(
+/// Per-`_col_idx` colstats aggregates: `(nonnull_count, length_sum)`. For text
+/// columns `_sum` holds `SUM(length(value))` over non-null rows (see
+/// `compress::compute_typed_sum`), so `length_sum / nonnull` is the average
+/// character length — the basis for an accurate `stawidth` instead of the flat
+/// 32. For non-text columns `_sum` is the numeric sum (ignored for width).
+fn load_colstats_aggregates(
     client: &mut SpiClient,
     colstats_fqn: &str,
-) -> spi::SpiResult<HashMap<i32, i64>> {
+) -> spi::SpiResult<HashMap<i32, (i64, i64)>> {
+    // `SUM(_sum)` is cast to float8, not int8: for a numeric column `_sum` is
+    // the value sum, which can exceed i64 and would raise NumericValueOutOfRange
+    // on an int8 cast. We only consult it for text (length sum, always small and
+    // exactly representable in f64), so the float path is lossless where it
+    // matters and merely approximate (and unused) for numeric columns.
     let query = format!(
-        "SELECT _col_idx::int4, SUM(_nonnull_count)::int8 \
+        "SELECT _col_idx::int4, SUM(_nonnull_count)::int8, SUM(_sum)::float8 \
          FROM {} GROUP BY _col_idx",
         colstats_fqn
     );
@@ -172,11 +252,75 @@ fn load_nonnull_counts(
             .ok()
             .and_then(|d| d.value::<i64>().ok().flatten())
             .unwrap_or(0);
+        // Read as f64 (see query comment) and saturate to i64; for text the
+        // length sum is exact, for numeric it's unused.
+        let len_sum: i64 = row
+            .get_datum_by_ordinal(3)
+            .ok()
+            .and_then(|d| d.value::<f64>().ok().flatten())
+            .map(|f| f.max(0.0) as i64)
+            .unwrap_or(0);
         if idx >= 0 {
-            out.insert(idx, nonnull);
+            out.insert(idx, (nonnull, len_sum));
         }
     }
     Ok(out)
+}
+
+/// Load the per-segment `_min` values per `_col_idx` from a colstats table,
+/// sorted ascending. Each segment is ~equal-sized, so these are ~equi-depth
+/// histogram bucket boundaries — the basis for a multi-bucket child histogram
+/// (#6) and the per-segment parent histogram (#7), versus the old 2-point
+/// `[min, max]`.
+fn load_colstats_segment_mins(
+    client: &mut SpiClient,
+    colstats_fqn: &str,
+) -> spi::SpiResult<HashMap<i32, Vec<i64>>> {
+    let query = format!(
+        "SELECT _col_idx::int4, _min::int8 FROM {} \
+         WHERE _min IS NOT NULL ORDER BY _col_idx, _min",
+        colstats_fqn
+    );
+    let mut out: HashMap<i32, Vec<i64>> = HashMap::new();
+    for row in client.select(&query, None, &[])? {
+        let idx: i32 = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value::<i32>().ok().flatten())
+            .unwrap_or(-1);
+        let min: Option<i64> = row
+            .get_datum_by_ordinal(2)
+            .ok()
+            .and_then(|d| d.value::<i64>().ok().flatten());
+        if idx >= 0
+            && let Some(m) = min
+        {
+            out.entry(idx).or_default().push(m);
+        }
+    }
+    Ok(out)
+}
+
+/// `stawidth` for one column. Fixed-width types use `attlen`. Text/varchar use
+/// the average character length from colstats (`len_sum / nonnull`) plus the
+/// varlena header (1 byte short, 4 bytes long) — far better than the flat 32,
+/// which over-reports short codes and under-reports wide text (URL/Title) and so
+/// mis-sizes sort/hash work-mem + `relpages`. Other varlena (jsonb/bytea, no
+/// `_sum`) and missing data fall back to the 32-byte default.
+fn column_stawidth(attr: &AttrInfo, agg: Option<&(i64, i64)>) -> i32 {
+    if attr.attlen > 0 {
+        return attr.attlen as i32;
+    }
+    if is_text_type(attr.atttypid)
+        && let Some(&(nonnull, len_sum)) = agg
+        && nonnull > 0
+        && len_sum > 0
+    {
+        let avg = (len_sum as f64 / nonnull as f64).round() as i32;
+        let header = if avg < 127 { 1 } else { 4 };
+        return (avg + header).max(1);
+    }
+    stawidth_for_attlen(attr.attlen)
 }
 
 struct AttrInfo {
@@ -253,14 +397,32 @@ fn histogram_eligible(type_oid: pg_sys::Oid, lo: i64, hi: i64) -> bool {
     }
 }
 
+/// Whether a column type takes a text MCV (`build_mcv_arrays` emits a `text[]`
+/// `stavalues` + the text `=` operator). Equality-selectivity types whose value
+/// set we capture as text: `text`/`varchar`/`bpchar`/`name`/`char`.
+fn is_text_type(type_oid: pg_sys::Oid) -> bool {
+    matches!(
+        type_oid,
+        pg_sys::TEXTOID
+            | pg_sys::VARCHAROID
+            | pg_sys::BPCHAROID
+            | pg_sys::NAMEOID
+            | pg_sys::CHAROID
+    )
+}
+
 /// Types whose order-preserving i64 colstats encoding we can decode back to
-/// a native Datum for a histogram. FLOAT/TEXT/NUMERIC fall through.
+/// a native Datum for a histogram. FLOAT4/8 use the order-preserving float
+/// encoding (`encode_f*_to_i64` / `decode_encoded_to_datum`). TEXT/NUMERIC
+/// fall through.
 fn histogram_type_eligible(type_oid: pg_sys::Oid) -> bool {
     matches!(
         type_oid,
         pg_sys::INT2OID
             | pg_sys::INT4OID
             | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
             | pg_sys::TIMESTAMPOID
             | pg_sys::TIMESTAMPTZOID
             | pg_sys::DATEOID
@@ -396,6 +558,129 @@ fn load_column_valmap(
     Ok(out)
 }
 
+/// Load the persisted per-column per-value occurrence counts
+/// (`column_valcounts`) for a compressed partition. Shape on disk is
+/// `{col_name: {value: count}}`; returned as `{col_name: {value: count}}`.
+/// Same column set as `column_valmap` (≤ 32 distinct). Empty for partitions
+/// compressed by a build predating `column_valcounts` — callers then fall
+/// back to uniform MCV frequencies.
+fn load_column_valcounts(
+    client: &mut SpiClient,
+    part_rel_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<String, HashMap<String, i64>>> {
+    let part_oid_int = u32::from(part_rel_oid) as i64;
+    let json_text: Option<String> = client
+        .select(
+            "SELECT column_valcounts::text FROM deltax.deltax_partition \
+             WHERE table_name = (SELECT relname FROM pg_class WHERE oid = $1::oid) \
+               AND is_compressed = true",
+            None,
+            &[part_oid_int.into()],
+        )?
+        .next()
+        .and_then(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        });
+    Ok(json_text
+        .map(|t| parse_valcounts_json(&t))
+        .unwrap_or_default())
+}
+
+/// Load the persisted partial MCV (`column_mcv`) for a compressed partition —
+/// the heavy hitters of high-cardinality text columns (not covered by the
+/// `<=32` valmap). Same `{col: {value: count}}` shape as `column_valcounts`;
+/// `stats.rs` writes these as an MCV while keeping the real HLL `stadistinct`.
+fn load_column_mcv(
+    client: &mut SpiClient,
+    part_rel_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<String, HashMap<String, i64>>> {
+    let part_oid_int = u32::from(part_rel_oid) as i64;
+    let json_text: Option<String> = client
+        .select(
+            "SELECT column_mcv::text FROM deltax.deltax_partition \
+             WHERE table_name = (SELECT relname FROM pg_class WHERE oid = $1::oid) \
+               AND is_compressed = true",
+            None,
+            &[part_oid_int.into()],
+        )?
+        .next()
+        .and_then(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        });
+    Ok(json_text
+        .map(|t| parse_valcounts_json(&t))
+        .unwrap_or_default())
+}
+
+/// Order an MCV value→count map by descending count (PG's `most_common_*`
+/// convention), value as a stable tiebreak, capped at `cap` entries. Returns
+/// the parallel `(values, freqs)` with `freq = count / row_count`.
+fn ordered_mcv(
+    counts: &HashMap<String, i64>,
+    row_count: i64,
+    cap: usize,
+) -> (Vec<String>, Vec<f32>) {
+    let mut pairs: Vec<(&String, i64)> = counts.iter().map(|(v, &c)| (v, c)).collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    pairs.truncate(cap);
+    let values: Vec<String> = pairs.iter().map(|(v, _)| (*v).clone()).collect();
+    let map: HashMap<String, i64> = pairs.iter().map(|(v, c)| ((*v).clone(), *c)).collect();
+    let freqs = mcv_freqs(&values, &map, row_count);
+    (values, freqs)
+}
+
+/// Parse a `{col_name: {value: count}}` JSON object into a per-column
+/// value→count map. Non-object values and non-integer counts are skipped.
+fn parse_valcounts_json(text: &str) -> HashMap<String, HashMap<String, i64>> {
+    let mut out: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(text) {
+        for (name, val) in obj {
+            if let serde_json::Value::Object(counts) = val {
+                let mut m: HashMap<String, i64> = HashMap::new();
+                for (v, c) in counts {
+                    if let Some(n) = c.as_i64() {
+                        m.insert(v, n);
+                    }
+                }
+                if !m.is_empty() {
+                    out.insert(name, m);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Map an MCV's value list to `most_common_freqs` using per-value counts.
+/// `freq = count / row_count` (PG's convention: a fraction of *all* rows, so
+/// the freqs sum to the non-null fraction — which is exactly what makes an
+/// absent value estimate ~0 in `var_eq_const`, since `1 - Σfreq - nullfrac`
+/// then collapses to 0). When `counts` is empty (a partition predating
+/// `column_valcounts`) we fall back to the old uniform `1/n` split. A value
+/// present in the valmap always has count ≥ 1; the tiny positive floor is
+/// defensive so PG never sees a 0/negative frequency for a listed value.
+fn mcv_freqs(values: &[String], counts: &HashMap<String, i64>, row_count: i64) -> Vec<f32> {
+    let n = values.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if counts.is_empty() || row_count <= 0 {
+        return vec![1.0f32 / n as f32; n];
+    }
+    values
+        .iter()
+        .map(|v| {
+            let c = counts.get(v).copied().unwrap_or(0).max(0);
+            let f = c as f64 / row_count as f64;
+            (f as f32).clamp(f32::MIN_POSITIVE, 1.0)
+        })
+        .collect()
+}
+
 /// Translate pg_attribute.attlen into a `stawidth`. Fixed-width types
 /// use attlen directly; varlena types (`attlen < 0`) get a conservative
 /// 32-byte default — pg_statistic's `stawidth` only feeds I/O and
@@ -465,16 +750,22 @@ enum Slot1 {
     },
     Mcv {
         values: Vec<String>,
+        /// `most_common_freqs`, parallel to `values`. Real per-value
+        /// frequencies (count / row_count); uniform `1/n` only for partitions
+        /// predating `column_valcounts`.
+        freqs: Vec<f32>,
     },
 }
 
-/// Fully resolved slot-1 fields (operators + array Datums) ready for the tuple.
+/// Fully resolved fields for one `pg_statistic` slot (operators + array Datums)
+/// ready for the tuple. `stavalues` is optional — a correlation slot carries
+/// only `stanumbers` (the coefficient), no values array.
 struct Slot1Data {
     stakind: i16,
     staop: pg_sys::Oid,
     stacoll: pg_sys::Oid,
     stanumbers: Option<pg_sys::Datum>,
-    stavalues: pg_sys::Datum,
+    stavalues: Option<pg_sys::Datum>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -486,6 +777,7 @@ fn upsert_pg_statistic_row(
     stanullfrac: f32,
     stawidth: i32,
     slot: Option<Slot1>,
+    correlation: Option<(pg_sys::Oid, f32)>,
     stainherit: bool,
 ) -> spi::SpiResult<()> {
     let attrelid_int = u32::from(attrelid) as i64;
@@ -496,34 +788,52 @@ fn upsert_pg_statistic_row(
         &[attrelid_int.into(), attnum.into(), stainherit.into()],
     )?;
 
-    // Resolve slot 1 (operator + array Datums) before forming the tuple.
-    let slot1: Option<Slot1Data> = match slot {
+    // Resolve the slots (operators + array Datums) before forming the tuple.
+    // Slot 1: a histogram or MCV. Slot 2 (optional): correlation.
+    let mut slots: Vec<Slot1Data> = Vec::new();
+    match slot {
         Some(Slot1::Histogram { type_oid, bounds }) if bounds.len() >= 2 => {
             let ltopr = lookup_strategy_operator(client, type_oid, 1); // btree `<`
-            (ltopr != pg_sys::InvalidOid).then(|| Slot1Data {
-                stakind: pg_sys::STATISTIC_KIND_HISTOGRAM as i16,
-                staop: ltopr,
-                stacoll: pg_sys::InvalidOid,
-                stanumbers: None,
-                stavalues: unsafe { build_histogram_array(type_oid, &bounds) },
-            })
+            if ltopr != pg_sys::InvalidOid {
+                slots.push(Slot1Data {
+                    stakind: pg_sys::STATISTIC_KIND_HISTOGRAM as i16,
+                    staop: ltopr,
+                    stacoll: pg_sys::InvalidOid,
+                    stanumbers: None,
+                    stavalues: Some(unsafe { build_histogram_array(type_oid, &bounds) }),
+                });
+            }
         }
-        Some(Slot1::Mcv { values }) if values.len() >= 2 => {
+        Some(Slot1::Mcv { values, freqs }) if values.len() >= 2 => {
             // MCV is written for text columns; resolve the text `=` operator.
             let eqop = lookup_strategy_operator(client, pg_sys::TEXTOID, 3); // btree `=`
-            (eqop != pg_sys::InvalidOid).then(|| {
-                let (vals, numbers) = unsafe { build_mcv_arrays(&values) };
-                Slot1Data {
+            if eqop != pg_sys::InvalidOid {
+                let (vals, numbers) = unsafe { build_mcv_arrays(&values, &freqs) };
+                slots.push(Slot1Data {
                     stakind: pg_sys::STATISTIC_KIND_MCV as i16,
                     staop: eqop,
                     stacoll: pg_sys::DEFAULT_COLLATION_OID,
                     stanumbers: Some(numbers),
-                    stavalues: vals,
-                }
-            })
+                    stavalues: Some(vals),
+                });
+            }
         }
-        _ => None,
-    };
+        _ => {}
+    }
+    // Correlation (kind 3) for a physically-sorted column. `staop` is the type's
+    // btree `<`; `stanumbers` is the single coefficient; no `stavalues`.
+    if let Some((type_oid, corr)) = correlation {
+        let ltopr = lookup_strategy_operator(client, type_oid, 1);
+        if ltopr != pg_sys::InvalidOid {
+            slots.push(Slot1Data {
+                stakind: pg_sys::STATISTIC_KIND_CORRELATION as i16,
+                staop: ltopr,
+                stacoll: pg_sys::InvalidOid,
+                stanumbers: Some(unsafe { build_float4_array(&[corr]) }),
+                stavalues: None,
+            });
+        }
+    }
 
     // The catalog DELETE above must be visible to the heap insert's unique
     // index check.
@@ -535,22 +845,44 @@ fn upsert_pg_statistic_row(
             stadistinct,
             stanullfrac,
             stawidth,
-            slot1,
+            slots,
             stainherit,
         )
     };
     Ok(())
 }
 
+/// Build a `float4[]` Datum (used for a correlation slot's single coefficient).
+unsafe fn build_float4_array(vals: &[f32]) -> pg_sys::Datum {
+    let mut datums: Vec<pg_sys::Datum> = vals
+        .iter()
+        .map(|x| pg_sys::Datum::from(x.to_bits() as usize))
+        .collect();
+    unsafe {
+        let (mut fl, mut fb, mut fa): (i16, bool, std::os::raw::c_char) = (0, false, 0);
+        pg_sys::get_typlenbyvalalign(pg_sys::FLOAT4OID, &mut fl, &mut fb, &mut fa);
+        let arr = pg_sys::construct_array(
+            datums.as_mut_ptr(),
+            vals.len() as i32,
+            pg_sys::FLOAT4OID,
+            fl as i32,
+            fb,
+            fa,
+        );
+        pg_sys::Datum::from(arr)
+    }
+}
+
 /// Build the `stavalues` (text[]) and `stanumbers` (float4[]) array Datums for
-/// an MCV slot from a low-cardinality column's distinct values. We don't have
-/// exact per-value counts, so frequencies are uniform and sum to 1.0 — that
-/// keeps each present value at `1/ndistinct` (same as the ndistinct-only path)
-/// while making *absent* values estimate ~0 (the whole point: e.g. an
-/// `event_type='Shipped'` filter on a column that never contains 'Shipped').
-unsafe fn build_mcv_arrays(values: &[String]) -> (pg_sys::Datum, pg_sys::Datum) {
+/// an MCV slot from a low-cardinality column's distinct values and their
+/// `most_common_freqs` (real per-value frequencies; see `mcv_freqs`). The
+/// freqs sum to the non-null fraction, so a *present* value estimates at its
+/// true frequency (e.g. `event_type='Approved'` ≈ 41%, not a flat `1/n`) while
+/// an *absent* value still estimates ~0 (`1 - Σfreq - nullfrac` → 0).
+unsafe fn build_mcv_arrays(values: &[String], freqs: &[f32]) -> (pg_sys::Datum, pg_sys::Datum) {
     use pgrx::IntoDatum;
     let n = values.len();
+    debug_assert_eq!(values.len(), freqs.len());
 
     let mut val_datums: Vec<pg_sys::Datum> = values
         .iter()
@@ -560,11 +892,6 @@ unsafe fn build_mcv_arrays(values: &[String]) -> (pg_sys::Datum, pg_sys::Datum) 
                 .unwrap_or(pg_sys::Datum::from(0usize))
         })
         .collect();
-    let mut freqs: Vec<f32> = vec![1.0f32 / n as f32; n];
-    // Make the frequencies sum to exactly 1.0 so PG estimates non-MCV values
-    // (which, with stadistinct == n, leave no "other" distinct values) at 0.
-    let drift: f32 = 1.0 - freqs.iter().sum::<f32>();
-    *freqs.last_mut().unwrap() += drift;
     let mut freq_datums: Vec<pg_sys::Datum> = freqs
         .iter()
         .map(|x| pg_sys::Datum::from(x.to_bits() as usize))
@@ -610,7 +937,7 @@ unsafe fn form_and_insert_pg_statistic(
     stadistinct: f32,
     stanullfrac: f32,
     stawidth: i32,
-    slot1: Option<Slot1Data>,
+    slots: Vec<Slot1Data>,
     stainherit: bool,
 ) {
     use pgrx::IntoDatum;
@@ -678,8 +1005,8 @@ unsafe fn form_and_insert_pg_statistic(
         f32_d(stadistinct),
     );
 
-    // Five (kind, op, coll, numbers, values) slots. Only slot 1 may carry a
-    // histogram or MCV; the rest are empty.
+    // Five (kind, op, coll, numbers, values) slots, filled in order from
+    // `slots` (slot 1 = histogram/MCV, slot 2 = correlation, …); the rest empty.
     for slot in 0u32..5 {
         let (kind, op, coll, numbers, vals): (
             i16,
@@ -687,15 +1014,9 @@ unsafe fn form_and_insert_pg_statistic(
             pg_sys::Oid,
             Option<pg_sys::Datum>,
             Option<pg_sys::Datum>,
-        ) = match (slot, &slot1) {
-            (0, Some(s)) => (
-                s.stakind,
-                s.staop,
-                s.stacoll,
-                s.stanumbers,
-                Some(s.stavalues),
-            ),
-            _ => (0, pg_sys::InvalidOid, pg_sys::InvalidOid, None, None),
+        ) = match slots.get(slot as usize) {
+            Some(s) => (s.stakind, s.staop, s.stacoll, s.stanumbers, s.stavalues),
+            None => (0, pg_sys::InvalidOid, pg_sys::InvalidOid, None, None),
         };
         put(
             &mut values,
@@ -875,6 +1196,74 @@ fn merge_ndistinct(nds: &[i64], ranges: &[(i64, i64)], total_rows: i64) -> i64 {
 /// the sorted per-partition minimums plus the global maximum. For roughly
 /// equal-sized partitions this is an equi-depth histogram over the order-by
 /// column; for columns with a constant range it collapses to `[min, max]`.
+/// Maximum histogram bounds we emit (PG's default `statistics_target` of 100
+/// buckets → 101 boundaries).
+const MAX_HISTOGRAM_BOUNDS: usize = 101;
+
+/// Build multi-bucket histogram bounds from per-segment (or per-partition)
+/// minimums plus the column max. Because segments are ~equal-sized, the
+/// minimums are ~equi-depth bucket boundaries (this is what makes the parent
+/// histogram robust to unequal partition sizes — #7). Sorted, deduped (DATE at
+/// day granularity), and downsampled to at most `max_bounds`. `None` for fewer
+/// than 2 distinct bounds.
+fn build_histogram_bounds(
+    type_oid: pg_sys::Oid,
+    mut mins: Vec<i64>,
+    global_max: i64,
+    max_bounds: usize,
+) -> Option<Vec<i64>> {
+    if !histogram_type_eligible(type_oid) || mins.is_empty() {
+        return None;
+    }
+    mins.sort_unstable();
+    let lo = mins[0];
+    let largest_min = *mins.last().unwrap();
+    let range = (global_max as i128) - (lo as i128);
+    if range <= 0 {
+        return None; // constant (or inverted) — no histogram
+    }
+    // Per-segment mins only partition the value range when the column is
+    // (nearly) physically sorted — then the segment mins span most of [min, max].
+    // For an unsorted column the mins cluster near the column minimum and would
+    // make a skewed histogram, so fall back to the uniform 2-point [min, max].
+    let well_distributed = ((largest_min as i128) - (lo as i128)) * 2 >= range;
+    if !well_distributed {
+        return build_two_point(type_oid, lo, global_max);
+    }
+    mins.push(global_max);
+    mins.sort_unstable();
+    if type_oid == pg_sys::DATEOID {
+        mins.dedup_by_key(|b| *b / 86_400_000_000);
+    } else {
+        mins.dedup();
+    }
+    if mins.len() < 2 {
+        return None;
+    }
+    Some(downsample_bounds(mins, max_bounds))
+}
+
+/// The 2-point `[min, max]` histogram (uniform assumption), gated on the same
+/// eligibility/constant checks as `histogram_eligible`.
+fn build_two_point(type_oid: pg_sys::Oid, lo: i64, hi: i64) -> Option<Vec<i64>> {
+    histogram_eligible(type_oid, lo, hi).then(|| vec![lo, hi])
+}
+
+/// Pick at most `max_bounds` evenly-spaced values from an already-sorted list,
+/// always keeping the first and last (so the histogram still spans [min, max]).
+fn downsample_bounds(bounds: Vec<i64>, max_bounds: usize) -> Vec<i64> {
+    let n = bounds.len();
+    if n <= max_bounds || max_bounds < 2 {
+        return bounds;
+    }
+    let mut out = Vec::with_capacity(max_bounds);
+    for i in 0..max_bounds {
+        out.push(bounds[i * (n - 1) / (max_bounds - 1)]);
+    }
+    out.dedup();
+    out
+}
+
 fn parent_histogram_bounds(type_oid: pg_sys::Oid, ranges: &[(i64, i64)]) -> Option<Vec<i64>> {
     if !histogram_type_eligible(type_oid) || ranges.is_empty() {
         return None;
@@ -926,8 +1315,14 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
     // Table-wide distinct value lists for low-cardinality columns (the union
     // of the per-partition valmaps), used to write an MCV list.
     let mut vm_by_col: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    // Table-wide per-value counts (summed across partitions) for those same
+    // columns → real parent `most_common_freqs`.
+    let mut vc_by_col: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    // Table-wide partial-MCV counts (summed across partitions) for high-card
+    // text columns → parent partial MCV with real `stadistinct`.
+    let mut mcv_by_col: HashMap<String, HashMap<String, i64>> = HashMap::new();
     let query = "SELECT row_count, column_ndistinct::text, column_minmax::text, column_hll::text, \
-                column_valmap::text \
+                column_valmap::text, column_valcounts::text, column_mcv::text \
                  FROM deltax.deltax_partition \
                  WHERE is_compressed = true AND deltatable_id = (\
                      SELECT id FROM deltax.deltax_deltatable \
@@ -974,25 +1369,59 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
         {
             union_valmap_json(&text, &mut vm_by_col);
         }
+        if let Some(text) = row
+            .get_datum_by_ordinal(6)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            for (name, counts) in parse_valcounts_json(&text) {
+                let acc = vc_by_col.entry(name).or_default();
+                for (v, c) in counts {
+                    *acc.entry(v).or_insert(0) += c;
+                }
+            }
+        }
+        if let Some(text) = row
+            .get_datum_by_ordinal(7)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            for (name, counts) in parse_valcounts_json(&text) {
+                let acc = mcv_by_col.entry(name).or_default();
+                for (v, c) in counts {
+                    *acc.entry(v).or_insert(0) += c;
+                }
+            }
+        }
     }
     if total_rows <= 0 {
         return Ok(());
     }
 
     let attrs = load_pg_attribute(client, parent_oid)?;
-    let mut sum_widths: i64 = 0;
-    for a in &attrs {
-        sum_widths += stawidth_for_attlen(a.attlen) as i64;
-    }
-    let avg_tuple_width = sum_widths.max(32);
 
-    // Parent nullfrac per column = the row-count-weighted average of the
-    // children's nullfracs (written by write_partition_stats). A hardcoded 0
-    // badly over-estimates `<> const` / `IS NOT NULL` filters on a mostly-NULL
-    // column (e.g. backup_processor), which inflates the parent DeltaXAppend
-    // path cost and makes the planner fall back to a per-partition Append +
-    // full Sort for Top-N queries.
+    // Parent nullfrac/stawidth per column = the row-count-weighted average of
+    // the children's values (written by write_partition_stats). A hardcoded
+    // nullfrac 0 badly over-estimates `<> const` / `IS NOT NULL` on a mostly-
+    // NULL column; a flat-32 stawidth mis-sizes sort/hash work-mem on wide text.
     let nullfrac_by_attnum = load_parent_nullfrac(client, parent_oid).unwrap_or_default();
+    let stawidth_by_attnum = load_parent_stawidth(client, parent_oid).unwrap_or_default();
+    // Per-segment mins across all partitions → a fine, ~equi-depth parent
+    // histogram (#7); falls back to per-partition mins when unavailable.
+    let seg_mins_by_name =
+        load_parent_segment_mins(client, schema, table, &attrs).unwrap_or_default();
+    let parent_stawidth = |attr: &AttrInfo| -> i32 {
+        stawidth_by_attnum
+            .get(&attr.attnum)
+            .copied()
+            .filter(|&w| w > 0)
+            .unwrap_or_else(|| stawidth_for_attlen(attr.attlen))
+    };
+    let avg_tuple_width = attrs
+        .iter()
+        .map(|a| parent_stawidth(a) as i64)
+        .sum::<i64>()
+        .max(32);
 
     for attr in &attrs {
         let empty_nd: Vec<i64> = Vec::new();
@@ -1016,7 +1445,7 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0)
         };
-        let stawidth = stawidth_for_attlen(attr.attlen);
+        let stawidth = parent_stawidth(attr);
 
         // Slot 1: a histogram for ordered types (range selectivity), else an
         // MCV list for a low-cardinality column whose full value set we know
@@ -1024,11 +1453,32 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
         // never appear — `1/ndistinct` gets those badly wrong; see Q19). When
         // writing an MCV, stadistinct must equal the value count so non-MCV
         // values estimate 0.
-        let histogram =
-            parent_histogram_bounds(attr.atttypid, mms).map(|bounds| Slot1::Histogram {
-                type_oid: attr.atttypid,
-                bounds,
-            });
+        // Prefer a fine per-segment histogram (pooled across partitions);
+        // fall back to per-partition mins. Both gated on histogram eligibility
+        // via the bound builders.
+        let histogram = match seg_mins_by_name.get(&attr.attname) {
+            Some(mins) if !mins.is_empty() => {
+                let global_max = mms.iter().map(|r| r.1).max().unwrap_or(i64::MIN);
+                build_histogram_bounds(
+                    attr.atttypid,
+                    mins.clone(),
+                    global_max,
+                    MAX_HISTOGRAM_BOUNDS,
+                )
+            }
+            _ => parent_histogram_bounds(attr.atttypid, mms),
+        }
+        .map(|bounds| Slot1::Histogram {
+            type_oid: attr.atttypid,
+            bounds,
+        });
+        // Multi-bucket histogram → physically-sorted column → correlation ~1.0.
+        let correlation = match &histogram {
+            Some(Slot1::Histogram { type_oid, bounds }) if bounds.len() > 2 => {
+                Some((*type_oid, 1.0f32))
+            }
+            _ => None,
+        };
         let (slot, eff_ndistinct) = match histogram {
             Some(h) => (Some(h), merged_nd),
             // Only write an MCV when the valmap union covers EVERY distinct
@@ -1039,15 +1489,32 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             // n_distinct for a high-cardinality column (e.g. backup_processor:
             // union of 12 vs ~634 actual), which mis-plans Top-N / range
             // queries.
-            None => match vm_by_col.get(&attr.attname) {
-                Some(set) if set.len() >= 2 && set.len() as i64 == merged_nd => (
-                    Some(Slot1::Mcv {
-                        values: set.iter().cloned().collect(),
-                    }),
-                    set.len() as i64,
-                ),
-                _ => (None, merged_nd),
-            },
+            None if is_text_type(attr.atttypid) => {
+                if let Some(set) = vm_by_col
+                    .get(&attr.attname)
+                    .filter(|s| s.len() >= 2 && s.len() as i64 == merged_nd)
+                {
+                    // Complete MCV: the valmap union covers every distinct value
+                    // (count matches the merged-HLL n_distinct), so stadistinct =
+                    // value count and absent values estimate ~0.
+                    let values: Vec<String> = set.iter().cloned().collect();
+                    let empty = HashMap::new();
+                    let counts = vc_by_col.get(&attr.attname).unwrap_or(&empty);
+                    let freqs = mcv_freqs(&values, counts, total_rows);
+                    let n = values.len() as i64;
+                    (Some(Slot1::Mcv { values, freqs }), n)
+                } else if let Some(counts) = mcv_by_col.get(&attr.attname).filter(|m| m.len() >= 2)
+                {
+                    // Partial MCV (high-card heavy hitters, merged across
+                    // partitions): keep the real merged HLL n_distinct so PG
+                    // estimates the tail from the remainder.
+                    let (values, freqs) = ordered_mcv(counts, total_rows, 100);
+                    (Some(Slot1::Mcv { values, freqs }), merged_nd)
+                } else {
+                    (None, merged_nd)
+                }
+            }
+            None => (None, merged_nd),
         };
         let stadistinct = stadistinct_value(eff_ndistinct, total_rows);
 
@@ -1059,6 +1526,7 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             stanullfrac,
             stawidth,
             slot,
+            correlation,
             true,
         )?;
     }
@@ -1104,6 +1572,117 @@ fn load_parent_nullfrac(
     Ok(out)
 }
 
+/// Gather per-segment `_min` values per column NAME across all compressed
+/// partitions of the deltatable, for a fine, ~equi-depth parent histogram (#7).
+/// Segments are ~equal-sized, so pooling every partition's segment mins gives
+/// boundaries weighted by partition size automatically — fixing the old
+/// per-partition-mins histogram that assumed equal partitions. The colstats
+/// `_col_idx` is the non-segment-by column position, mapped here to the column
+/// name via pg_attribute order minus the deltatable's `segment_by`.
+fn load_parent_segment_mins(
+    client: &mut SpiClient,
+    schema: &str,
+    table: &str,
+    attrs: &[AttrInfo],
+) -> spi::SpiResult<HashMap<String, Vec<i64>>> {
+    // Segment-by columns (not in colstats) — skipped when numbering _col_idx.
+    let mut segment_by: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in client.select(
+        "SELECT unnest(segment_by)::text FROM deltax.deltax_deltatable \
+         WHERE schema_name = $1 AND table_name = $2",
+        None,
+        &[schema.into(), table.into()],
+    )? {
+        if let Some(s) = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value::<String>().ok().flatten())
+        {
+            segment_by.insert(s);
+        }
+    }
+    // _col_idx (non-seg position, attnum order) → column name.
+    let mut idx_to_name: HashMap<i32, String> = HashMap::new();
+    let mut idx: i32 = 0;
+    for a in attrs {
+        if segment_by.contains(&a.attname) {
+            continue;
+        }
+        idx_to_name.insert(idx, a.attname.clone());
+        idx += 1;
+    }
+
+    let mut out: HashMap<String, Vec<i64>> = HashMap::new();
+    let parts: Vec<String> = client
+        .select(
+            "SELECT table_name FROM deltax.deltax_partition \
+             WHERE is_compressed = true AND deltatable_id = (\
+                 SELECT id FROM deltax.deltax_deltatable \
+                 WHERE schema_name = $1 AND table_name = $2)",
+            None,
+            &[schema.into(), table.into()],
+        )?
+        .filter_map(|row| {
+            row.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        })
+        .collect();
+    for part in parts {
+        let colstats_fqn = format!(
+            "\"_deltax_compressed\".\"{}_colstats\"",
+            part.replace('"', "\"\"")
+        );
+        let per_idx = match load_colstats_segment_mins(client, &colstats_fqn) {
+            Ok(m) => m,
+            Err(_) => continue, // partition predating colstats / transient
+        };
+        for (i, mins) in per_idx {
+            if let Some(name) = idx_to_name.get(&i) {
+                out.entry(name.clone()).or_default().extend(mins);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Row-count-weighted average of the child partitions' `stawidth` per
+/// attribute, used as the parent's width. Mirrors `load_parent_nullfrac`:
+/// children are analyzed before the table-level pass, so their accurate
+/// (text avg-length-based) widths already exist. Rounded to an int; attributes
+/// without child stats simply don't contribute (caller falls back to attlen/32).
+fn load_parent_stawidth(
+    client: &mut SpiClient,
+    parent_oid: pg_sys::Oid,
+) -> spi::SpiResult<HashMap<i16, i32>> {
+    let parent_int = u32::from(parent_oid) as i64;
+    let query = "SELECT s.staattnum::int2, \
+                        round(SUM(s.stawidth::float8 * GREATEST(c.reltuples, 0)::float8) \
+                         / NULLIF(SUM(GREATEST(c.reltuples, 0)::float8), 0))::int4 \
+                 FROM pg_statistic s \
+                 JOIN pg_inherits i ON i.inhrelid = s.starelid \
+                 JOIN pg_class c ON c.oid = s.starelid \
+                 WHERE i.inhparent = $1::oid AND s.stainherit = false \
+                 GROUP BY s.staattnum";
+    let mut out: HashMap<i16, i32> = HashMap::new();
+    for row in client.select(query, None, &[parent_int.into()])? {
+        let attnum: i16 = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value::<i16>().ok().flatten())
+            .unwrap_or(0);
+        let w: i32 = row
+            .get_datum_by_ordinal(2)
+            .ok()
+            .and_then(|d| d.value::<i32>().ok().flatten())
+            .unwrap_or(0);
+        if attnum > 0 && w > 0 {
+            out.insert(attnum, w);
+        }
+    }
+    Ok(out)
+}
+
 /// Minimal SQL identifier quoting for building a `schema.table` regclass
 /// literal. Doubles embedded quotes; always wraps in double quotes.
 fn quote_ident(ident: &str) -> String {
@@ -1124,6 +1703,76 @@ mod tests {
         assert_eq!(stawidth_for_attlen(-1), 32);
         assert_eq!(stawidth_for_attlen(-2), 32);
         assert_eq!(stawidth_for_attlen(0), 32);
+    }
+
+    fn attr(attlen: i16, atttypid: pg_sys::Oid) -> AttrInfo {
+        AttrInfo {
+            attname: "c".to_string(),
+            attnum: 1,
+            attlen,
+            atttypid,
+            attnotnull: false,
+        }
+    }
+
+    #[test]
+    fn ordered_mcv_sorts_by_count_desc_and_caps() {
+        let mut counts = HashMap::new();
+        counts.insert("A".to_string(), 50);
+        counts.insert("B".to_string(), 30);
+        counts.insert("C".to_string(), 20);
+        // Descending by count, freq = count/row_count.
+        let (vals, freqs) = ordered_mcv(&counts, 100, 10);
+        assert_eq!(vals, vec!["A", "B", "C"]);
+        assert!((freqs[0] - 0.5).abs() < 1e-6);
+        assert!((freqs[1] - 0.3).abs() < 1e-6);
+        assert!((freqs[2] - 0.2).abs() < 1e-6);
+        // Cap keeps only the top-N.
+        let (vals2, freqs2) = ordered_mcv(&counts, 100, 2);
+        assert_eq!(vals2, vec!["A", "B"]);
+        assert_eq!(freqs2.len(), 2);
+    }
+
+    #[test]
+    fn column_stawidth_uses_avg_length_for_text() {
+        // Fixed-width types ignore colstats and use attlen.
+        assert_eq!(
+            column_stawidth(&attr(8, pg_sys::INT8OID), Some(&(100, 999))),
+            8
+        );
+
+        // Text: avg length (len_sum / nonnull) + varlena header. 6000/100 = 60
+        // chars, < 127 → +1 short header = 61 (vs the flat 32).
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 6000))),
+            61
+        );
+        // Wide text: 200 chars avg → +4 long header = 204.
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(10, 2000))),
+            204
+        );
+        // Short codes get a small width, not 32.
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(100, 300))),
+            4
+        );
+    }
+
+    #[test]
+    fn column_stawidth_falls_back_to_32() {
+        // Text with no colstats aggregate, or zero rows → 32 default.
+        assert_eq!(column_stawidth(&attr(-1, pg_sys::TEXTOID), None), 32);
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::TEXTOID), Some(&(0, 0))),
+            32
+        );
+        // Non-text varlena (jsonb has no length `_sum`) → 32, never the numeric
+        // `_sum` misread as a length.
+        assert_eq!(
+            column_stawidth(&attr(-1, pg_sys::JSONBOID), Some(&(100, 999999))),
+            32
+        );
     }
 
     #[test]
@@ -1192,6 +1841,51 @@ mod tests {
     }
 
     #[test]
+    fn build_histogram_bounds_from_segment_mins() {
+        // Per-segment mins + global max → sorted multi-bucket bounds.
+        let b = build_histogram_bounds(pg_sys::INT4OID, vec![0, 100, 200], 299, 101).unwrap();
+        assert_eq!(b, vec![0, 100, 200, 299]);
+        // Single segment → 2-point [min, max].
+        let b = build_histogram_bounds(pg_sys::INT4OID, vec![0], 99, 101).unwrap();
+        assert_eq!(b, vec![0, 99]);
+        // Constant → fewer than 2 distinct bounds → None.
+        assert!(build_histogram_bounds(pg_sys::INT4OID, vec![5], 5, 101).is_none());
+        // Floats are eligible (#4).
+        assert!(build_histogram_bounds(pg_sys::FLOAT8OID, vec![0, 50], 100, 101).is_some());
+        // Text never.
+        assert!(build_histogram_bounds(pg_sys::TEXTOID, vec![0, 5], 9, 101).is_none());
+        // Clustered mins (unsorted column: all near the min) → collapse to the
+        // 2-point [min, max] rather than a skewed multi-bucket histogram.
+        assert_eq!(
+            build_histogram_bounds(pg_sys::INT8OID, vec![0, 1, 2], 1000, 101).unwrap(),
+            vec![0, 1000]
+        );
+    }
+
+    #[test]
+    fn downsample_bounds_keeps_endpoints_and_caps() {
+        // 11 sorted values capped at 5 → 5 evenly-spaced, first & last kept.
+        let out = downsample_bounds((0..11).collect(), 5);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], 0);
+        assert_eq!(*out.last().unwrap(), 10);
+        assert!(out.windows(2).all(|w| w[0] < w[1]), "ascending: {out:?}");
+        // Below the cap → unchanged.
+        assert_eq!(downsample_bounds(vec![1, 2, 3], 100), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn build_histogram_bounds_downsamples_many_segments() {
+        // 1000 segment mins + max → capped at MAX_HISTOGRAM_BOUNDS, spanning ends.
+        let mins: Vec<i64> = (0..1000).collect();
+        let b = build_histogram_bounds(pg_sys::INT8OID, mins, 1000, MAX_HISTOGRAM_BOUNDS).unwrap();
+        assert!(b.len() <= MAX_HISTOGRAM_BOUNDS, "len {}", b.len());
+        assert_eq!(b[0], 0);
+        assert_eq!(*b.last().unwrap(), 1000);
+        assert!(b.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
     fn parent_histogram_bounds_collapses_constant_range_to_two_points() {
         let ranges = [(0, 27), (0, 27), (0, 27)];
         let b = parent_histogram_bounds(pg_sys::INT4OID, &ranges).unwrap();
@@ -1237,9 +1931,88 @@ mod tests {
         // Constant column (lo == hi) and inverted bounds → skip.
         assert!(!histogram_eligible(pg_sys::INT4OID, 7, 7));
         assert!(!histogram_eligible(pg_sys::INT4OID, 9, 1));
-        // Types we don't emit histograms for (text, float for now) → skip.
+        // Text has no histogram-decodable encoding → skip.
         assert!(!histogram_eligible(pg_sys::TEXTOID, 0, 10));
-        assert!(!histogram_eligible(pg_sys::FLOAT4OID, 0, 10));
+    }
+
+    #[test]
+    fn histogram_eligible_accepts_floats() {
+        // FLOAT4/8 use the order-preserving i64 encoding (#4).
+        assert!(histogram_eligible(pg_sys::FLOAT4OID, 0, 10));
+        assert!(histogram_eligible(pg_sys::FLOAT8OID, -5, 5));
+        // Constant still rejected.
+        assert!(!histogram_eligible(pg_sys::FLOAT8OID, 3, 3));
+    }
+
+    #[test]
+    fn mcv_freqs_uses_real_per_value_counts() {
+        // Skewed enum: 'A' 80%, 'B' 20% over 100 rows → real freqs, not 1/2.
+        let values = vec!["A".to_string(), "B".to_string()];
+        let mut counts = HashMap::new();
+        counts.insert("A".to_string(), 80);
+        counts.insert("B".to_string(), 20);
+        let f = mcv_freqs(&values, &counts, 100);
+        assert!((f[0] - 0.8).abs() < 1e-6, "freq(A)={}", f[0]);
+        assert!((f[1] - 0.2).abs() < 1e-6, "freq(B)={}", f[1]);
+        // Complete coverage, no nulls → freqs sum to ~1.0.
+        assert!((f.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mcv_freqs_sums_below_one_with_nulls() {
+        // 60 non-null rows out of 100 → freqs sum to the non-null fraction
+        // (0.6), which is what makes an absent value estimate ~0 in PG's
+        // `1 - Σfreq - nullfrac`.
+        let values = vec!["A".to_string(), "B".to_string()];
+        let mut counts = HashMap::new();
+        counts.insert("A".to_string(), 40);
+        counts.insert("B".to_string(), 20);
+        let f = mcv_freqs(&values, &counts, 100);
+        assert!(
+            (f.iter().sum::<f32>() - 0.6).abs() < 1e-6,
+            "sum={}",
+            f.iter().sum::<f32>()
+        );
+    }
+
+    #[test]
+    fn mcv_freqs_falls_back_to_uniform_without_counts() {
+        // Partition predating column_valcounts → empty counts → uniform 1/n
+        // (the prior behaviour), so the change is a no-op for old data.
+        let values = vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ];
+        let f = mcv_freqs(&values, &HashMap::new(), 100);
+        assert_eq!(f.len(), 4);
+        assert!(f.iter().all(|&x| (x - 0.25).abs() < 1e-6), "freqs={:?}", f);
+    }
+
+    #[test]
+    fn mcv_freqs_empty_and_zero_rowcount() {
+        assert!(mcv_freqs(&[], &HashMap::new(), 100).is_empty());
+        // row_count <= 0 → uniform fallback rather than a divide-by-zero.
+        let values = vec!["A".to_string(), "B".to_string()];
+        let f = mcv_freqs(&values, &HashMap::new(), 0);
+        assert!(f.iter().all(|&x| (x - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn parse_valcounts_json_parses_nested_object() {
+        let m = parse_valcounts_json(r#"{"kind":{"A":80,"B":20},"x":{"v":5}}"#);
+        assert_eq!(m["kind"]["A"], 80);
+        assert_eq!(m["kind"]["B"], 20);
+        assert_eq!(m["x"]["v"], 5);
+    }
+
+    #[test]
+    fn parse_valcounts_json_ignores_garbage() {
+        assert!(parse_valcounts_json("not json").is_empty());
+        assert!(parse_valcounts_json("[1,2,3]").is_empty()); // not an object
+        // Non-integer counts dropped; an all-garbage column yields no entry.
+        assert!(parse_valcounts_json(r#"{"k":{"a":"oops"}}"#).is_empty());
     }
 
     #[test]

@@ -3922,11 +3922,31 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 }
 
                 if !merged_ndistinct.is_empty() {
-                    // Bail out for high-cardinality GROUP BY (only without WHERE)
+                    // Bail out for high-cardinality *text* GROUP BY (only without
+                    // WHERE). The cost we're avoiding is AggScan's per-group string
+                    // decompression + materialization, which makes a near-unique
+                    // text key (e.g. URL, 275K+ distinct) lose to PG's HashAgg.
+                    // Integer keys carry no such cost: they pack into compact u128
+                    // keys aggregated in RAM-resident parallel Rust maps that beat
+                    // PG even at ~unique cardinality, where every PG plan spills
+                    // against a bounded work_mem (ClickBench Q32 `GROUP BY WatchID,
+                    // ClientIP`: DeltaXAgg ~9.5s vs PG's external-merge Sort ~60s /
+                    // HashAgg ~120s with multi-GB spill). Gating on text here is
+                    // also why accurate `n_distinct` (which now correctly flags
+                    // WatchID as near-unique) must NOT pull integer GROUP BY into
+                    // this bail — that flipped Q32 from DeltaXAgg to the spilling
+                    // PG fallback. Type list mirrors `has_text_group` above.
                     if !has_where {
                         let threshold = total_uncompressed_rows * 0.5;
-                        let has_high_cardinality = group_specs.iter().enumerate().any(|(i, gs)| {
+                        let has_high_card_text = group_specs.iter().enumerate().any(|(i, gs)| {
                             if !matches!(gs.expr, GroupByExpr::Column) {
+                                return false;
+                            }
+                            let is_text = gs.type_oid == pg_sys::TEXTOID
+                                || gs.type_oid == pg_sys::VARCHAROID
+                                || gs.type_oid == pg_sys::BPCHAROID
+                                || gs.type_oid == pg_sys::NAMEOID;
+                            if !is_text {
                                 return false;
                             }
                             let Some(col_name) = group_col_names[i].as_deref() else {
@@ -3937,7 +3957,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                                 .map(|&nd| nd as f64 > threshold)
                                 .unwrap_or(false)
                         });
-                        if has_high_cardinality {
+                        if has_high_card_text {
                             return;
                         }
                     }
@@ -3984,7 +4004,18 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             }
                         }
                         if all_found {
-                            ndistinct_estimated_groups = Some(product.min(total_uncompressed_rows));
+                            // The group count can't exceed the rows that
+                            // actually reach the aggregate — PG's
+                            // `estimate_num_groups` clamps the same way. Clamping
+                            // only to the full table over-estimates the GROUP BY
+                            // output of a selective WHERE by orders of magnitude
+                            // (e.g. `GROUP BY SearchPhrase` after a selective URL
+                            // filter: n_distinct ~1.9M vs ~10 surviving groups).
+                            // `input_rel->rows` is the filter-aware estimate of
+                            // the rows feeding the agg (set by our baserel-size
+                            // override), so it's the right upper bound.
+                            let input_rows = (*input_rel).rows.max(1.0);
+                            ndistinct_estimated_groups = Some(product.min(input_rows));
                         }
                     }
                 }
