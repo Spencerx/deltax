@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
+use std::ffi::CStr;
 
 /// Metadata for a deltax-managed deltatable.
 #[derive(Debug, Clone)]
@@ -39,6 +40,31 @@ pub struct PartitionInfo {
     /// back to positional `pg_attribute` mapping in that case. See
     /// `dev/docs/SCHEMA_CHANGES.md`.
     pub compressed_columns: Option<serde_json::Value>,
+}
+
+/// True if the extension's catalog exists in the *current* database.
+///
+/// When `pg_deltax` is in `shared_preload_libraries`, its ProcessUtility /
+/// planner / executor hooks fire in every database in the cluster — including
+/// databases where `CREATE EXTENSION pg_deltax` was never run. In those
+/// databases the `deltax.*` catalog tables don't exist, so any hook that
+/// queries them hard-fails. Callers must bail
+/// out of all deltax-specific processing when this returns `false`.
+///
+/// Implemented as two syscache lookups (`get_namespace_oid` with
+/// `missing_ok = true`, then `get_relname_relid`) rather than SPI: it runs on
+/// every intercepted utility statement, raises nothing when the schema/table
+/// is absent, and is cheap enough to call unconditionally.
+pub fn catalog_present() -> bool {
+    const SCHEMA: &CStr = c"deltax";
+    const RELATION: &CStr = c"deltax_deltatable";
+    unsafe {
+        let ns_oid = pg_sys::get_namespace_oid(SCHEMA.as_ptr(), true);
+        if ns_oid == pg_sys::InvalidOid {
+            return false;
+        }
+        pg_sys::get_relname_relid(RELATION.as_ptr(), ns_oid) != pg_sys::InvalidOid
+    }
 }
 
 /// Register a new deltatable in the catalog. Returns the new deltatable id.

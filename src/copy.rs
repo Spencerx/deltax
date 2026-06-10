@@ -244,6 +244,27 @@ unsafe extern "C-unwind" fn deltax_process_utility(
 ) {
     let utility_stmt = unsafe { (*pstmt).utilityStmt };
 
+    // When pg_deltax is in shared_preload_libraries, this hook fires in every
+    // database in the cluster — including ones where the extension was never
+    // `CREATE EXTENSION`'d. There the `deltax.*` catalog doesn't exist, so any
+    // of the interception paths below would hard-fail. Bail to the
+    // standard executor; with no catalog there are no deltatables to manage.
+    if !crate::catalog::catalog_present() {
+        unsafe {
+            chain_to_prev(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
+        }
+        return;
+    }
+
     // Intercept `ANALYZE <compressed_partition>` (and `VACUUM ANALYZE`)
     // before the standard executor samples our empty heap and overwrites
     // the `pg_statistic` rows we maintain ourselves. Compressed
