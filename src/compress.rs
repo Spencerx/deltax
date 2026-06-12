@@ -3425,8 +3425,8 @@ fn estimate_raw_size(client: &SpiClient, table_fqn: &str) -> i64 {
 /// the partition heap. Shared by full decompression
 /// (`decompress_partition_inner`) and per-segment decompose-on-write
 /// (`decompose_segments_for_dml`). Reads the segment's blobs from the
-/// `_blobs` companion (always populated, even in dual blob-file mode) — so
-/// it must run BEFORE the caller deletes the segment's blob rows.
+/// `_blobs` companion — so it must run BEFORE the caller deletes the
+/// segment's blob rows.
 ///
 /// `non_seg_cols` is the positional `(col_idx, name, data_type)` mapping for
 /// non-segment-by physical columns (synthetic json-extract columns live at
@@ -4428,12 +4428,11 @@ pub(crate) struct DmlDecomposeStats {
 /// (pre-commit snapshot) or the heap rows (post-commit), never both/neither.
 ///
 /// Sidecar/metadata effects (§6):
-/// - Partition bloom sentinels (`_segment_id = -1`) are NOT rebuilt: a
-///   sentinel covering removed values merely over-covers, which can only
-///   produce false positives (segments scanned unnecessarily) — never
-///   false negatives. The next full recompress rebuilds them.
-/// - Catalog `column_minmax` is NOT recomputed for the same reason:
-///   over-coverage only disables a pruning opportunity.
+/// - Catalog `column_minmax` is NOT recomputed: a range covering removed
+///   values merely over-covers, which can only disable a pruning
+///   opportunity (segments scanned unnecessarily) — never produce a wrong
+///   answer. The same rule applies to partition-level bloom sentinels
+///   (`_segment_id = -1`, PERF #47 — not on this branch) when they land.
 /// - `column_valmap`/HLL/MCV/pg_statistic go stale (planner-only; refreshed
 ///   by the next compaction or recompress).
 /// - Catalog `row_count`/`compressed_size` are decremented.
@@ -4442,8 +4441,6 @@ pub(crate) struct DmlDecomposeStats {
 ///   the shared blob/decompressed caches and the backend-local colstats
 ///   cache are keyed by `(companion_oid, segment_id, ...)` and id reuse
 ///   within one companion-table lifetime would poison them.
-/// - The dual-mode blob file is untouched; a dropped segment's bytes become
-///   unreachable dead weight until a full recompress.
 pub(crate) fn decompose_segments_for_dml(
     partition_oid: pg_sys::Oid,
     decompose_ids: &[i32],
@@ -4717,11 +4714,12 @@ pub(crate) fn decompose_segments_for_dml(
             .and_then(|r| r.first().get_one::<i64>().ok().flatten())
             .unwrap_or(0);
 
-        // Sidecar rows go with the segment (counts/minmax/blooms/bitmaps
-        // for LIVE segments stay exact — the architecture's invariant).
-        // `_segment_id = -1` partition bloom sentinels are untouched by
-        // construction (claimed ids are positive). Tombstone rows are
-        // consumed with their segment (the restore above skipped them).
+        // Sidecar rows go with the segment (colstats/blooms/bitmaps for
+        // LIVE segments stay exact — the architecture's invariant). Rows
+        // with negative `_segment_id` (reserved for partition-level
+        // sentinels, PERF #47) are untouched by construction: claimed ids
+        // are positive. Tombstone rows are consumed with their segment
+        // (the restore above skipped them).
         for fqn in [
             &colstats_fqn,
             &blobs_fqn,

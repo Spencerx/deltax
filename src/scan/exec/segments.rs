@@ -4312,9 +4312,9 @@ pub(in crate::scan) struct DmlCandidateSet {
 
 /// Locate the segments of `companion_oid` that may contain rows matching a
 /// DML statement's predicate, reusing the exact pruning pipeline the read
-/// path uses (`load_segments_heap`: partition minmax, bloom sentinels,
-/// colstats minmax index, per-segment blooms, valbitmaps, dictionary
-/// pruning). The result is a conservative superset: a segment is excluded
+/// path uses (`load_segments_heap`: partition minmax, colstats minmax
+/// index, per-segment blooms, valbitmaps, dictionary pruning). The result
+/// is a conservative superset: a segment is excluded
 /// only when metadata PROVES it holds no matching row — precisely the
 /// invariant the production scan path already depends on for correctness.
 ///
