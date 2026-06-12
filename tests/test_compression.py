@@ -4594,3 +4594,167 @@ class TestJsonbCompressionFidelity:
         ).fetchall()
         assert after == before
         assert before[0][0] is None  # NULL preserved as NULL, not '{}'
+
+
+# ---------------------------------------------------------------------------
+# Epoch-encoding regression tests (Unix epoch vs PG epoch, offset 946,684,800s)
+# ---------------------------------------------------------------------------
+
+class TestEpochEncoding:
+    """Regression tests for Unix-epoch vs PostgreSQL-epoch (2000-01-01,
+    offset 946,684,800 s) encoding confusions in segment metadata.
+
+    Two distinct bugs, both fixed in src/scan/exec/segments.rs:
+
+    1. Bloom probes hashed the raw PG-epoch datum of `col = const` /
+       `col IN (...)` constants while the bloom BUILD side (compress.rs)
+       hashes the colstats encoding (Unix-epoch microseconds for
+       timestamps/dates). Every segment was falsely bloom-rejected, so
+       equality predicates on timestamp/date columns returned ZERO rows
+       on compressed partitions.
+
+    2. `load_segments_heap` stored the time column's meta-table
+       `_min_`/`_max_` identity-encoded (PG-epoch datum) in `ColMinMax`,
+       whose consumers all decode the colstats encoding (Unix-epoch us) —
+       timestamps 30 years early on any path consuming that map.
+
+    Year-2000-adjacent data makes the two encodings maximally divergent,
+    which is the shape that exposed both bugs.
+    """
+
+    EPOCH_NOW = "2000-01-15 12:00:00+00"
+    EPOCH_BASE = "2000-01-15 00:00:00+00"
+
+    def _setup_and_compress(self, db, n_rows=1000):
+        """Timestamp-sort-key table with year-2000 data, one compressed
+        partition. Rows are 1 second apart starting at EPOCH_BASE; row i has
+        val = i and d alternating between 2000-01-15 and 2000-01-16."""
+        db.execute(f"SET pg_deltax.mock_now = '{self.EPOCH_NOW}'")
+        db.execute("""
+            CREATE TABLE epoch_t (
+                ts TIMESTAMPTZ NOT NULL,
+                d DATE,
+                device_id TEXT NOT NULL,
+                val BIGINT
+            )
+        """)
+        db.execute(
+            "SELECT deltax.deltax_create_table('epoch_t', 'ts', '1 day'::interval)"
+        )
+        db.execute(
+            "SELECT deltax.deltax_enable_compression('epoch_t', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.execute(f"""
+            INSERT INTO epoch_t
+            SELECT '{self.EPOCH_BASE}'::timestamptz + (i || ' seconds')::interval,
+                   CASE WHEN i % 2 = 0 THEN DATE '2000-01-15' ELSE DATE '2000-01-16' END,
+                   'dev-' || (i % 5)::text,
+                   i
+            FROM generate_series(0, {n_rows - 1}) i
+        """)
+        db.commit()
+
+        part_name = db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('epoch_t') "
+            "WHERE range_start <= '2000-01-15'::timestamptz "
+            "AND range_end > '2000-01-15'::timestamptz"
+        ).fetchone()[0]
+        db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
+        db.commit()
+        return part_name
+
+    def test_timestamp_equality_returns_matching_row(self, db):
+        """`ts = const` on the timestamp sort column must return the row.
+        Broken before the bloom-probe fix: the probe hashed the PG-epoch
+        datum, never matched the Unix-epoch build hashes, and every segment
+        was bloom-rejected (zero rows)."""
+        self._setup_and_compress(db)
+        rows = db.execute(
+            "SELECT ts, val FROM epoch_t WHERE ts = '2000-01-15 00:01:40+00'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][1] == 100
+
+    def test_timestamp_in_list_returns_matching_rows(self, db):
+        """`ts IN (...)` exercises the in-list bloom probe path."""
+        self._setup_and_compress(db)
+        rows = db.execute(
+            "SELECT val FROM epoch_t "
+            "WHERE ts IN ('2000-01-15 00:01:40+00', '2000-01-15 00:03:20+00') "
+            "ORDER BY val"
+        ).fetchall()
+        assert [r[0] for r in rows] == [100, 200]
+
+    def test_timestamp_equality_absent_value_returns_nothing(self, db):
+        """A constant inside the segment's [min, max] but absent from the
+        data must return zero rows — guards against an over-correction that
+        would defeat bloom pruning entirely."""
+        self._setup_and_compress(db)
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE ts = '2000-01-15 00:10:00.5+00'"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_date_equality_on_non_sort_column(self, db):
+        """`d = const` on a DATE payload column probes the per-segment bloom
+        with the DATE encoding (PG-epoch days -> Unix-epoch microseconds)."""
+        self._setup_and_compress(db)
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE d = DATE '2000-01-15'"
+        ).fetchone()[0]
+        assert count == 500
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE d = DATE '2000-01-17'"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_min_max_of_timestamp_sort_column(self, db):
+        """MIN/MAX of the timestamp column served from segment metadata must
+        not come back 30 years early (meta-table min/max encoding fix).
+        Several aggregate shapes, since they route to different paths
+        (DeltaXMinMax, DeltaXAgg metadata fast path)."""
+        self._setup_and_compress(db)
+        lo, hi = db.execute("SELECT min(ts), max(ts) FROM epoch_t").fetchone()
+        assert str(lo) == "2000-01-15 00:00:00+00:00"
+        assert str(hi) == "2000-01-15 00:16:39+00:00"
+
+        lo, hi, cnt = db.execute(
+            "SELECT min(ts), max(ts), count(*) FROM epoch_t"
+        ).fetchone()
+        assert str(lo) == "2000-01-15 00:00:00+00:00"
+        assert str(hi) == "2000-01-15 00:16:39+00:00"
+        assert cnt == 1000
+
+        lo, avg = db.execute(
+            "SELECT min(ts), avg(val) FROM epoch_t"
+        ).fetchone()
+        assert str(lo) == "2000-01-15 00:00:00+00:00"
+        assert float(avg) == 499.5
+
+    def test_range_predicates_across_year_2000(self, db):
+        """Range predicates with year-2000-adjacent constants: segment
+        min/max metadata must neither falsely skip (zero rows) nor falsely
+        all-pass (every row) when classified against the encoded constant."""
+        self._setup_and_compress(db)
+        sum_, cnt = db.execute(
+            "SELECT sum(val), count(*) FROM epoch_t "
+            "WHERE ts <= '2000-01-15 00:01:39+00'"
+        ).fetchone()
+        assert (sum_, cnt) == (4950, 100)
+
+        sum_, cnt = db.execute(
+            "SELECT sum(val), count(*) FROM epoch_t "
+            "WHERE ts >= '2000-01-15 00:01:40+00'"
+        ).fetchone()
+        assert (sum_, cnt) == (494550, 900)
+
+        # Fully outside the data range on either side of the data
+        cnt = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE ts < '2000-01-15 00:00:00+00'"
+        ).fetchone()[0]
+        assert cnt == 0
+        cnt = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE ts > '2000-01-15 00:16:39+00'"
+        ).fetchone()[0]
+        assert cnt == 0
