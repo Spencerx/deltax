@@ -323,6 +323,31 @@ pub(crate) unsafe extern "C-unwind" fn create_agg_scan_state(
     }
 }
 
+/// P1 heap-tail stale-plan guard. The planner never emits a DeltaXAgg path
+/// when any involved compressed partition holds loose heap rows (transparent
+/// INSERTs); the insert trigger sends a relcache invalidation on the
+/// empty→non-empty transition so cached plans replan. This guard catches the
+/// residual race (rows committed between plan revalidation and snapshot):
+/// DeltaXAgg's columnar accumulators cannot ingest row-form heap tuples, so
+/// silently proceeding would drop rows from the aggregate. Erroring is the
+/// correct-by-construction fallback; a retry replans onto the slow path.
+fn error_if_compressed_heap_tail(companion_oids: &[pg_sys::Oid]) {
+    for &oid in companion_oids {
+        let part_oid = super::super::segments::partition_oid_for_companion(oid);
+        if part_oid == pg_sys::InvalidOid {
+            pgrx::error!(
+                "pg_deltax: cannot resolve partition for companion OID {} (catalog inconsistency)",
+                u32::from(oid)
+            );
+        }
+        if !unsafe { crate::scan::relation_heap_is_empty(part_oid) } {
+            pgrx::error!(
+                "pg_deltax: a compressed partition gained uncompressed rows after this plan was created; retry the query"
+            );
+        }
+    }
+}
+
 /// BeginCustomScan callback for DeltaXAgg: decompress and aggregate.
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
@@ -360,6 +385,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             if plan.companion_oids.is_empty() {
                 pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
             }
+            error_if_compressed_heap_tail(&plan.companion_oids);
             reset_scan_buf_stats();
             let ctx = build_agg_exec_context_from_plan(plan);
             let state = build_deferred_agg_state(ctx, /* is_worker */ false);
@@ -383,6 +409,8 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         if plan.companion_oids.is_empty() {
             pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
         }
+
+        error_if_compressed_heap_tail(&plan.companion_oids);
 
         let (meta, metadata_us) = load_agg_metadata_from_plan(&plan.companion_oids);
 

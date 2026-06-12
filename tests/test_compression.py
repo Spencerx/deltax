@@ -2629,7 +2629,8 @@ class TestMinMaxPushdown:
 # ---------------------------------------------------------------------------
 
 class TestDMLBlocking:
-    """Verify that INSERT/UPDATE/DELETE on compressed partitions raise errors."""
+    """Verify DML semantics on compressed partitions: UPDATE/DELETE raise
+    errors; INSERT succeeds transparently (P1 heap-tail)."""
 
     def _setup_and_compress(self, db):
         """Create table, insert data, compress a partition. Return partition name."""
@@ -2654,14 +2655,25 @@ class TestDMLBlocking:
         db.commit()
         return part_name
 
-    def test_insert_blocked_on_compressed(self, db):
-        """INSERT into a compressed partition raises an error."""
+    def test_insert_into_compressed_lands_in_heap_tail(self, db):
+        """INSERT into a compressed partition succeeds (P1 transparent
+        INSERT): the row lands in the partition heap and is immediately
+        visible through the decompress union."""
         part_name = self._setup_and_compress(db)
-        with pytest.raises(Exception, match="cannot INSERT into compressed partition"):
-            db.execute(
-                f"INSERT INTO \"{part_name}\" (ts, device_id, temperature, pressure, status) "
-                f"VALUES ('2025-01-15 06:00:00+00', 'dev-new', 99.0, 1000.0, true)"
-            )
+        db.execute(
+            f"INSERT INTO \"{part_name}\" (ts, device_id, temperature, pressure, status) "
+            f"VALUES ('2025-01-15 06:00:00+00', 'dev-new', 99.0, 1000.0, true)"
+        )
+        db.commit()
+        count = db.execute(
+            f"SELECT count(*) FROM \"{part_name}\" WHERE device_id = 'dev-new'"
+        ).fetchone()[0]
+        assert count == 1
+        # The loose row physically sits in the partition heap.
+        loose_bytes = db.execute(
+            f"SELECT pg_relation_size('{part_name}')"
+        ).fetchone()[0]
+        assert loose_bytes > 0
 
     def test_update_blocked_on_compressed(self, db):
         """UPDATE on a compressed partition raises an error."""

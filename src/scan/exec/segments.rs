@@ -292,6 +292,59 @@ unsafe fn sibling_table_oid(meta_oid: pg_sys::Oid, suffix: &str) -> pg_sys::Oid 
     }
 }
 
+thread_local! {
+    /// Backend-local cache: companion (`_meta`) table OID → partition heap
+    /// OID. Reverse of `check_compressed_partition`. Cleared wholesale by
+    /// `metadata_relcache_callback` like `METADATA_CACHE`.
+    static PARTITION_OID_CACHE: RefCell<HashMap<pg_sys::Oid, pg_sys::Oid>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Resolve a companion (`_meta`) table OID back to the partition heap OID,
+/// via the `deltax.deltax_partition` catalog (the partition lives in the
+/// user's schema, not in `_deltax_compressed`, so `sibling_table_oid` can't
+/// be used). Returns `InvalidOid` when the partition can't be found.
+/// Cached per-backend; only successful lookups are cached.
+pub(crate) fn partition_oid_for_companion(companion_oid: pg_sys::Oid) -> pg_sys::Oid {
+    if let Some(oid) = PARTITION_OID_CACHE.with(|c| c.borrow().get(&companion_oid).copied()) {
+        return oid;
+    }
+    ensure_metadata_callback_registered();
+    let partition_name = unsafe {
+        let name_ptr = pg_sys::get_rel_name(companion_oid);
+        if name_ptr.is_null() {
+            return pg_sys::InvalidOid;
+        }
+        let meta_name = std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned();
+        match meta_name.strip_suffix("_meta") {
+            Some(p) => p.to_string(),
+            None => return pg_sys::InvalidOid,
+        }
+    };
+    let oid = pgrx::Spi::connect(|client| {
+        client
+            .select(
+                "SELECT c.oid
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   JOIN deltax.deltax_partition p
+                     ON p.schema_name = n.nspname AND p.table_name = c.relname
+                  WHERE p.table_name = $1",
+                Some(1),
+                &[partition_name.into()],
+            )
+            .ok()
+            .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
+            .unwrap_or(pg_sys::InvalidOid)
+    });
+    if oid != pg_sys::InvalidOid {
+        PARTITION_OID_CACHE.with(|c| c.borrow_mut().insert(companion_oid, oid));
+    }
+    oid
+}
+
 /// Locate the primary-key btree index on a heap relation by walking
 /// `RelationGetIndexList` and matching on `indisprimary`. Returns
 /// `InvalidOid` if the relation has no PK (e.g. blobs/blooms tables in
@@ -1038,6 +1091,7 @@ unsafe extern "C-unwind" fn metadata_relcache_callback(_arg: pg_sys::Datum, _rel
     // and this avoids tracking dependencies between MetadataInfo entries and
     // every catalog row they read (parent table pg_attribute, deltax catalog).
     METADATA_CACHE.with(|c| c.borrow_mut().clear());
+    PARTITION_OID_CACHE.with(|c| c.borrow_mut().clear());
 }
 
 fn ensure_metadata_callback_registered() {

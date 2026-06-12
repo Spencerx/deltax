@@ -32,6 +32,11 @@ thread_local! {
     /// When true, the ExecutorStart hook skips the DML-on-compressed check.
     /// Used by internal operations like deltax_decompress_partition.
     static DML_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Whether the planner-cache relcache callback has been registered in
+    /// this backend (one-shot, like the metadata-cache callback in
+    /// `segments.rs`).
+    static HOOK_CB_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn invalidate_compressed_cache() {
@@ -40,6 +45,35 @@ pub fn invalidate_compressed_cache() {
     META_COLS_CACHE.with(|cache| cache.borrow_mut().clear());
     cost::invalidate_caches();
     super::exec::segments::invalidate_colstats_cache();
+}
+
+/// Relcache-invalidation callback: conservatively wipe every planner-side
+/// thread-local cache on any relcache invalidation. This is what makes
+/// cross-backend state changes (a partition gaining its first loose row, a
+/// compaction bumping catalog row counts, compress/decompress in another
+/// session) visible here — the writer sends a relcache inval for the
+/// partition and every backend drops its cached row counts / valmaps /
+/// companion lookups. Mirrors `segments::metadata_relcache_callback`.
+#[pg_guard]
+unsafe extern "C-unwind" fn hook_caches_relcache_callback(
+    _arg: pg_sys::Datum,
+    _relid: pg_sys::Oid,
+) {
+    invalidate_compressed_cache();
+}
+
+fn ensure_hook_callback_registered() {
+    HOOK_CB_REGISTERED.with(|c| {
+        if !c.get() {
+            unsafe {
+                pg_sys::CacheRegisterRelcacheCallback(
+                    Some(hook_caches_relcache_callback),
+                    pg_sys::Datum::from(0u32),
+                );
+            }
+            c.set(true);
+        }
+    });
 }
 
 /// Look up the companion OID for a partition's heap OID, using
@@ -52,6 +86,7 @@ unsafe fn cached_companion_for_rel(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
     {
         return oid;
     }
+    ensure_hook_callback_registered();
     let oid = unsafe { check_compressed_partition(rel_oid) };
     COMPRESSED_CACHE.with(|c| c.borrow_mut().insert(rel_oid, oid));
     oid
@@ -121,6 +156,12 @@ unsafe fn get_meta_cols(parent_oid: pg_sys::Oid) -> Option<(String, Vec<String>)
 /// Set or clear the DML bypass flag for internal operations.
 pub(crate) fn set_dml_bypass(bypass: bool) {
     DML_BYPASS.with(|flag| flag.set(bypass));
+}
+
+/// Read the DML bypass flag (probed by the compressed-partition trigger via
+/// `deltax.deltax_dml_bypass_active()`).
+pub(crate) fn dml_bypass_active() -> bool {
+    DML_BYPASS.with(|flag| flag.get())
 }
 
 /// Get the time column's attribute number for a deltatable parent table.
@@ -572,6 +613,13 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         }
         let _profile = super::plan_profile::scope("set_rel_pathlist");
 
+        // Internal maintenance (compaction reading the loose heap rows of a
+        // compressed partition) must see the plain heap, not the
+        // segments ∪ heap union the custom scans produce.
+        if DML_BYPASS.with(|flag| flag.get()) {
+            return;
+        }
+
         // Only handle regular tables
         if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return;
@@ -585,8 +633,13 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         // Check if this is the parent of a partitioned table (for DeltaXAppend)
         if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL
             && (*rte).inh
-            && let Some(companion_oids) = collect_compressed_children(root, rti)
+            && let Some((companion_oids, any_heap_tail)) = collect_compressed_children(root, rti)
         {
+            // P1 heap tail: when any compressed child has loose heap rows,
+            // Top-N pushdown must be disabled — the pruned candidate set
+            // would not include the loose rows. The exec-time heap-tail
+            // union (Phase 3) keeps the plain scan correct.
+            let effective_limit = if any_heap_tail { 0 } else { effective_limit };
             // For Top-N, validate ORDER BY is a simple column reference.
             // Works for any column (time, text, numeric).
             let (append_topn_limit, append_sort_col_attno) = if effective_limit > 0 {
@@ -676,6 +729,14 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             return;
         }
 
+        // P1 heap tail: with loose rows in the partition heap the scan's
+        // output is segments ∪ heap tail. The heap tail is appended after
+        // the (time-ordered) segment rows, so the node can neither claim
+        // sorted output (pathkeys) nor push Top-N down. The plain path +
+        // upper Sort/Limit stays correct.
+        let heap_tail = !relation_heap_is_empty(rel_oid);
+        let effective_limit = if heap_tail { 0 } else { effective_limit };
+
         // For child partitions, check if we can advertise sorted output
         // and whether Top-N is valid.
         let parent_oid_opt = if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL {
@@ -689,7 +750,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
             .unwrap_or(false);
 
         // Pathkeys for sorted output: only when no segment_by and time pathkey matches
-        let (pathkeys, _sort_ascending) = if !has_segby {
+        let (pathkeys, _sort_ascending) = if !has_segby && !heap_tail {
             time_col_attno_opt
                 .map(|attno| check_time_pathkey(root, rel, attno))
                 .unwrap_or((std::ptr::null_mut(), true))
@@ -1941,6 +2002,10 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         if stage != pg_sys::UpperRelationKind::UPPERREL_GROUP_AGG {
             return;
         }
+        // Internal maintenance queries plan against the plain heap.
+        if DML_BYPASS.with(|flag| flag.get()) {
+            return;
+        }
         let _profile = super::plan_profile::scope("create_upper_paths");
 
         let parse = (*root).parse;
@@ -2625,6 +2690,16 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         // =====================================================================
         // DeltaXAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY ± WHERE ± HAVING
         // =====================================================================
+
+        // P1 heap tail: DeltaXAgg's columnar accumulators only ingest
+        // segment data — loose heap rows (transparent INSERTs into
+        // compressed partitions) would be silently dropped. Bail to the
+        // plain Agg over DeltaXDecompress/DeltaXAppend scans, which union
+        // the heap tail at exec time. (DeltaXCount/DeltaXMinMax above stay
+        // enabled: their executors fold the heap tail in.)
+        if any_compressed_rte_heap_nonempty(root) {
+            return;
+        }
 
         // Verify all WHERE quals are batch-pushable.  Each qual must be
         // extractable by extract_batch_quals at execution time, otherwise the
@@ -4504,7 +4579,7 @@ unsafe fn extract_oids_from_custom_path(
 /// ANALYZE having run. A drained-but-not-vacuumed partition keeps its blocks,
 /// so this is conservative (reports non-empty) — which is the safe direction
 /// for the DeltaXAppend correctness check.
-unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
+pub(crate) unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
     unsafe {
         let rel = pg_sys::table_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let nblocks =
@@ -4514,10 +4589,35 @@ unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
     }
 }
 
+/// True when any relation RTE in the query is a compressed partition whose
+/// heap holds loose rows (P1 transparent INSERT). Conservative gate for the
+/// DeltaXAgg pushdown, which cannot ingest row-form heap tuples.
+unsafe fn any_compressed_rte_heap_nonempty(root: *mut pg_sys::PlannerInfo) -> bool {
+    unsafe {
+        let array_size = (*root).simple_rel_array_size;
+        for rti in 1..array_size {
+            let rte = *(*root).simple_rte_array.add(rti as usize);
+            if rte.is_null()
+                || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
+                || (*rte).relid == pg_sys::InvalidOid
+            {
+                continue;
+            }
+            let relid = (*rte).relid;
+            if cached_companion_for_rel(relid) != pg_sys::InvalidOid
+                && !relation_heap_is_empty(relid)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 unsafe fn collect_compressed_children(
     root: *mut pg_sys::PlannerInfo,
     parent_rti: pg_sys::Index,
-) -> Option<Vec<pg_sys::Oid>> {
+) -> Option<(Vec<pg_sys::Oid>, bool)> {
     unsafe {
         let _profile = super::plan_profile::scope("collect_compressed_children");
         let list = (*root).append_rel_list;
@@ -4527,6 +4627,7 @@ unsafe fn collect_compressed_children(
 
         let len = (*list).length;
         let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+        let mut any_heap_tail = false;
 
         for i in 0..len {
             let node = pg_sys::list_nth(list, i) as *const pg_sys::AppendRelInfo;
@@ -4546,6 +4647,12 @@ unsafe fn collect_compressed_children(
             let companion_oid = cached_companion_for_rel(child_oid);
 
             if companion_oid != pg_sys::InvalidOid {
+                // P1 heap tail: compressed children may hold loose rows in
+                // their heap. DeltaXAppend scans those at exec time
+                // (Phase 3), but the caller must disable Top-N pushdown.
+                if !relation_heap_is_empty(child_oid) {
+                    any_heap_tail = true;
+                }
                 companion_oids.push(companion_oid);
             } else {
                 // Not compressed — DeltaXAppend reads only compressed
@@ -4568,7 +4675,7 @@ unsafe fn collect_compressed_children(
         if companion_oids.is_empty() {
             None
         } else {
-            Some(companion_oids)
+            Some((companion_oids, any_heap_tail))
         }
     }
 }
@@ -4645,6 +4752,24 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
             let rtable = (*planned_stmt).rtable;
             let n = (*result_relations).length;
 
+            // P1 transparent INSERT: plain INSERTs into compressed
+            // partitions are allowed — rows land in the partition heap
+            // (the loose-row region) and every read path unions them with
+            // the segment data. INSERT ... ON CONFLICT stays rejected:
+            // segment rows have no index entries, so conflict inference
+            // against compressed data would be silently wrong.
+            let insert_on_conflict = operation == pg_sys::CmdType::CMD_INSERT && {
+                let plan_tree = (*planned_stmt).planTree;
+                !plan_tree.is_null()
+                    && (*plan_tree).type_ == pg_sys::NodeTag::T_ModifyTable
+                    && (*(plan_tree as *mut pg_sys::ModifyTable)).onConflictAction
+                        != pg_sys::OnConflictAction::ONCONFLICT_NONE
+            };
+            if operation == pg_sys::CmdType::CMD_INSERT && !insert_on_conflict {
+                call_prev_executor_start(query_desc, eflags);
+                return;
+            }
+
             for i in 0..n {
                 // resultRelations is an IntList of 1-based RTE indices
                 let rti = (*(*result_relations).elements.add(i as usize)).int_value;
@@ -4660,13 +4785,22 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                 let relid = (*rte).relid;
 
                 let companion_oid = cached_companion_for_rel(relid);
+                // For INSERT ... ON CONFLICT, the named target is usually
+                // the partitioned parent (tuple routing picks the leaf
+                // later), so also reject when the parent has at least one
+                // compressed partition.
+                let blocked = companion_oid != pg_sys::InvalidOid
+                    || (insert_on_conflict && parent_has_compressed_partition(relid));
 
-                if companion_oid != pg_sys::InvalidOid {
-                    let op_name = match operation {
-                        pg_sys::CmdType::CMD_INSERT => "INSERT into",
-                        pg_sys::CmdType::CMD_UPDATE => "UPDATE",
-                        pg_sys::CmdType::CMD_DELETE => "DELETE from",
-                        _ => "modify",
+                if blocked {
+                    let op_name = if insert_on_conflict {
+                        "INSERT ... ON CONFLICT into"
+                    } else {
+                        match operation {
+                            pg_sys::CmdType::CMD_UPDATE => "UPDATE",
+                            pg_sys::CmdType::CMD_DELETE => "DELETE from",
+                            _ => "modify",
+                        }
                     };
                     let rel_name_ptr = pg_sys::get_rel_name(relid);
                     let rel_name = if rel_name_ptr.is_null() {
@@ -4676,17 +4810,51 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                             .to_string_lossy()
                             .into_owned()
                     };
-                    pgrx::error!(
-                        "cannot {} compressed partition \"{}\", decompress it first",
-                        op_name,
-                        rel_name,
-                    );
+                    if insert_on_conflict {
+                        pgrx::error!(
+                            "cannot {} \"{}\": ON CONFLICT cannot see rows in compressed partitions, decompress them first",
+                            op_name,
+                            rel_name,
+                        );
+                    } else {
+                        pgrx::error!(
+                            "cannot {} compressed partition \"{}\", decompress it first",
+                            op_name,
+                            rel_name,
+                        );
+                    }
                 }
             }
         }
 
         call_prev_executor_start(query_desc, eflags);
     }
+}
+
+/// True when `relid` is a deltax-managed parent table with at least one
+/// compressed partition. Used only on the (rare) INSERT ... ON CONFLICT
+/// path, so the SPI probe is acceptable.
+unsafe fn parent_has_compressed_partition(relid: pg_sys::Oid) -> bool {
+    if !crate::catalog::catalog_present() {
+        return false;
+    }
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT 1
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   JOIN deltax.deltax_deltatable h
+                     ON h.schema_name = n.nspname AND h.table_name = c.relname
+                   JOIN deltax.deltax_partition p ON p.deltatable_id = h.id
+                  WHERE c.oid = $1 AND p.is_compressed
+                  LIMIT 1",
+                Some(1),
+                &[relid.into()],
+            )
+            .map(|r| !r.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// Chain to the previous ExecutorStart hook or call standard_ExecutorStart.

@@ -4253,6 +4253,941 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
     compressed
 }
 
+// ============================================================================
+// P1 compaction: fold loose heap rows (transparent INSERTs into compressed
+// partitions) into new segments appended to the existing companion tables.
+// See dev/docs/COMPRESSED_DML.md §4.5.
+// ============================================================================
+
+/// Compact the loose heap rows of a compressed partition into new segments.
+///
+/// Loose rows are INSERTs that arrived after the partition was compressed
+/// (P1 transparent DML). They live in the partition heap and are unioned
+/// with the segment data at scan time; compaction moves them into proper
+/// segments so the metadata-only fast paths re-engage.
+#[pg_extern]
+fn deltax_compact_partition(partition: &str) -> String {
+    Spi::connect_mut(|client| compact_partition_impl(client, partition))
+}
+
+/// RAII guard for the backend-local DML/planner bypass flag. While held,
+/// the set_rel_pathlist / upper-paths hooks plan queries against the plain
+/// heap (no DeltaX custom scans) and the DML rejection (trigger + executor
+/// hook) is disabled. Drop-reset so an error inside compaction can't leave
+/// the backend planning every later query without DeltaX paths.
+struct DmlBypassGuard;
+
+impl DmlBypassGuard {
+    fn new() -> Self {
+        crate::scan::set_dml_bypass(true);
+        DmlBypassGuard
+    }
+}
+
+impl Drop for DmlBypassGuard {
+    fn drop(&mut self) {
+        crate::scan::set_dml_bypass(false);
+    }
+}
+
+/// Rewrite a companion `CREATE TABLE` DDL into `CREATE TABLE IF NOT EXISTS`.
+/// Compaction may need to create sidecar tables that the original
+/// compression skipped (e.g. `_blooms` when the GUC was off, `_text_lengths`
+/// when there were no text columns yet).
+fn ddl_if_not_exists(ddl: &str) -> String {
+    ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+}
+
+/// True when the relation named by `fqn` (a quoted, schema-qualified name)
+/// exists.
+fn relation_exists(client: &SpiClient, fqn: &str) -> bool {
+    client
+        .select("SELECT to_regclass($1) IS NOT NULL", Some(1), &[fqn.into()])
+        .ok()
+        .and_then(|r| r.first().get_one::<bool>().ok().flatten())
+        .unwrap_or(false)
+}
+
+pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+    let (schema, part_table) = crate::partition::resolve_relation(client, partition);
+    let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
+        .expect("failed to query partition")
+        .unwrap_or_else(|| {
+            pgrx::error!(
+                "pg_deltax: partition {}.{} not found in catalog",
+                schema,
+                part_table
+            )
+        });
+
+    if !part_info.is_compressed {
+        return format!(
+            "Partition {}.{} is not compressed; nothing to compact",
+            schema, part_table
+        );
+    }
+
+    let ht = catalog::get_deltatable_by_id(client, part_info.deltatable_id)
+        .expect("failed to query deltatable")
+        .unwrap();
+
+    let part_fqn = crate::partition::fqn(&schema, &part_table);
+
+    // Everything below reads the partition through plain heap plans (the
+    // custom scans would union the segments back in — double-counting) and
+    // deletes the compacted rows past the DML rejection. The guard resets
+    // the flag on every exit path, including errors.
+    let _bypass = DmlBypassGuard::new();
+
+    // Serialize against concurrent writers: the read → flush → delete cycle
+    // below requires a stable visible row set. The lock is acquired BEFORE
+    // the row-reading snapshot, so in READ COMMITTED every committed loose
+    // row is visible and TRUNCATE at the end cannot destroy unseen data.
+    client
+        .update(
+            &format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", part_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to lock partition for compaction");
+
+    let loose_rows: i64 = client
+        .select(
+            &format!("SELECT count(*) FROM ONLY {}", part_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to count loose rows")
+        .first()
+        .get_one::<i64>()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    if loose_rows == 0 {
+        return format!(
+            "Partition {}.{} has no loose rows to compact",
+            schema, part_table
+        );
+    }
+
+    // Schema-drift guard: appending segments assumes the companion layout
+    // (col_idx assignment) still matches the live table shape. Refuse when
+    // the parent's column shape changed since compression — the safe path
+    // is a full decompress + recompress.
+    let cc_now = catalog::snapshot_compressed_columns(
+        client,
+        &ht.schema_name,
+        &ht.table_name,
+        &ht.segment_by,
+    )
+    .expect("failed to snapshot column shape");
+    let cc_now_val: serde_json::Value =
+        serde_json::from_str(&cc_now).unwrap_or(serde_json::Value::Null);
+    let shape_matches =
+        matches!(&part_info.compressed_columns, Some(stored) if *stored == cc_now_val);
+    if !shape_matches {
+        pgrx::error!(
+            "pg_deltax: partition {}.{} has loose rows but its column shape changed since compression; run deltax_decompress_partition() + deltax_compress_partition() instead",
+            schema,
+            part_table
+        );
+    }
+
+    let columns = get_column_metadata(
+        client,
+        &schema,
+        &part_table,
+        &ht.segment_by,
+        &ht.time_column,
+        ht.json_extract.as_ref(),
+    );
+    if columns.is_empty() {
+        pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
+    }
+
+    let ddl = build_companion_ddl(&part_table, &columns);
+    if !relation_exists(client, &ddl.meta_fqn) {
+        pgrx::error!(
+            "pg_deltax: companion meta table missing for compressed partition {}.{}",
+            schema,
+            part_table
+        );
+    }
+
+    // New segment ids continue after the existing maximum (sentinel rows in
+    // _blooms use -1 and never appear in _meta).
+    let max_segment_id: i32 = client
+        .select(
+            &format!("SELECT COALESCE(MAX(_segment_id), 0) FROM {}", ddl.meta_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to read max segment id")
+        .first()
+        .get_one::<i32>()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let mut next_segment_id: i32 = max_segment_id + 1;
+    let first_new_segment_id = next_segment_id;
+
+    let segment_size = ht.segment_size as usize;
+    let kinds: Vec<ColumnKind> = columns
+        .iter()
+        .map(|c| classify_column(&c.data_type, c.is_segment_by))
+        .collect();
+
+    let select_cols = columns
+        .iter()
+        .zip(kinds.iter())
+        .map(|(c, kind)| {
+            if c.is_segment_by || matches!(kind, ColumnKind::Text) {
+                format!("\"{}\"::text", c.name)
+            } else {
+                format!("\"{}\"", c.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let order_clause = if !ht.segment_by.is_empty() {
+        let mut order_parts = Vec::new();
+        for s in &ht.segment_by {
+            order_parts.push(format!("\"{}\"", s));
+        }
+        for o in &ht.order_by {
+            order_parts.push(format!("\"{}\"", o));
+        }
+        format!(" ORDER BY {}", order_parts.join(", "))
+    } else {
+        String::new()
+    };
+
+    let order_col_indices: Vec<usize> = ht
+        .order_by
+        .iter()
+        .filter_map(|name| columns.iter().position(|c| c.name == *name))
+        .collect();
+    let seg_col_indices: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_segment_by)
+        .map(|(i, _)| i)
+        .collect();
+
+    let cursor_sql = format!(
+        "DECLARE compact_cursor CURSOR FOR SELECT {} FROM ONLY {}{}",
+        select_cols, part_fqn, order_clause
+    );
+    client
+        .update(&cursor_sql, None, &[])
+        .expect("failed to declare compaction cursor");
+    let batch_size = segment_size;
+    let fetch_sql = format!("FETCH {} FROM compact_cursor", batch_size);
+
+    let mut typed_cols = init_typed_columns(&columns, &kinds);
+    let mut current_seg_values: Vec<Option<String>> = Vec::new();
+    let mut rows_in_segment: usize = 0;
+    let mut total_compressed_size: i64 = 0;
+    let mut total_rows: i64 = 0;
+    let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new();
+    let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new();
+    let mut colstats_buffer: Vec<ColstatsRow> = Vec::new();
+    let mut text_length_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new();
+    let mut valbitmap_value_buffer: Vec<(u16, i32, SegValueCounts)> = Vec::new();
+    let num_nonseg_cols = columns.iter().filter(|c| !c.is_segment_by).count();
+    // Batch-only HLL — merged into the persisted partition sketches below.
+    let mut batch_hll: Vec<CardinalityEstimator<u64>> = (0..num_nonseg_cols)
+        .map(|_| CardinalityEstimator::<u64>::new())
+        .collect();
+    let mut batch_topvals: TopVals = (0..num_nonseg_cols)
+        .map(|_| std::collections::HashMap::new())
+        .collect();
+
+    loop {
+        let result = client
+            .select(&fetch_sql, None, &[])
+            .expect("failed to fetch from compaction cursor");
+        let fetched = result.len();
+        if fetched == 0 {
+            break;
+        }
+        let tuptable_to_free = unsafe { pg_sys::SPI_tuptable };
+
+        for row in result {
+            if !seg_col_indices.is_empty() {
+                let row_seg_values: Vec<Option<String>> = seg_col_indices
+                    .iter()
+                    .map(|&i| {
+                        row.get_datum_by_ordinal(i + 1)
+                            .unwrap()
+                            .value::<String>()
+                            .unwrap()
+                    })
+                    .collect();
+                if current_seg_values.is_empty() {
+                    current_seg_values = row_seg_values;
+                } else if row_seg_values != current_seg_values {
+                    if rows_in_segment > 0 {
+                        total_compressed_size += flush_with_splitting(
+                            client,
+                            &ddl.meta_fqn,
+                            &ddl.colstats_fqn,
+                            &columns,
+                            &typed_cols,
+                            &current_seg_values,
+                            rows_in_segment,
+                            segment_size,
+                            &mut next_segment_id,
+                            &mut blob_buffer,
+                            &mut bloom_buffer,
+                            &mut colstats_buffer,
+                            &mut text_length_buffer,
+                            &mut valbitmap_value_buffer,
+                            &mut batch_hll,
+                            &mut batch_topvals,
+                        );
+                        typed_cols = init_typed_columns(&columns, &kinds);
+                        rows_in_segment = 0;
+                    }
+                    current_seg_values = row_seg_values;
+                }
+            }
+
+            append_row_to_columns(&row, &columns, &kinds, &mut typed_cols);
+            rows_in_segment += 1;
+            total_rows += 1;
+
+            if rows_in_segment >= segment_size {
+                if seg_col_indices.is_empty() {
+                    sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
+                }
+                total_compressed_size += flush_with_splitting(
+                    client,
+                    &ddl.meta_fqn,
+                    &ddl.colstats_fqn,
+                    &columns,
+                    &typed_cols,
+                    &current_seg_values,
+                    rows_in_segment,
+                    segment_size,
+                    &mut next_segment_id,
+                    &mut blob_buffer,
+                    &mut bloom_buffer,
+                    &mut colstats_buffer,
+                    &mut text_length_buffer,
+                    &mut valbitmap_value_buffer,
+                    &mut batch_hll,
+                    &mut batch_topvals,
+                );
+                typed_cols = init_typed_columns(&columns, &kinds);
+                rows_in_segment = 0;
+            }
+        }
+
+        if !tuptable_to_free.is_null() {
+            unsafe { pg_sys::SPI_freetuptable(tuptable_to_free) };
+        }
+        if fetched < batch_size {
+            break;
+        }
+    }
+
+    if rows_in_segment > 0 {
+        if seg_col_indices.is_empty() {
+            sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
+        }
+        total_compressed_size += flush_with_splitting(
+            client,
+            &ddl.meta_fqn,
+            &ddl.colstats_fqn,
+            &columns,
+            &typed_cols,
+            &current_seg_values,
+            rows_in_segment,
+            segment_size,
+            &mut next_segment_id,
+            &mut blob_buffer,
+            &mut bloom_buffer,
+            &mut colstats_buffer,
+            &mut text_length_buffer,
+            &mut valbitmap_value_buffer,
+            &mut batch_hll,
+            &mut batch_topvals,
+        );
+    }
+
+    client
+        .update("CLOSE compact_cursor", None, &[])
+        .expect("failed to close compaction cursor");
+
+    if total_rows == 0 {
+        return format!(
+            "Partition {}.{} has no loose rows to compact",
+            schema, part_table
+        );
+    }
+
+    // ---- Append sidecar rows to the TOAST-backed companion tables. ----
+    if !colstats_buffer.is_empty() {
+        colstats_buffer.sort_by_key(|r| (r.col_idx, r.segment_id));
+        for chunk in colstats_buffer.chunks(100) {
+            let values: Vec<String> = chunk
+                .iter()
+                .map(|r| {
+                    let min_str = r.min_val.map_or("NULL".to_string(), |v| v.to_string());
+                    let max_str = r.max_val.map_or("NULL".to_string(), |v| v.to_string());
+                    let sum_str = r.sum_val.as_deref().unwrap_or("NULL");
+                    format!(
+                        "({}, {}, {}, {}, {}, {}, {}, {})",
+                        r.col_idx,
+                        r.segment_id,
+                        min_str,
+                        max_str,
+                        sum_str,
+                        r.nonnull_count,
+                        r.nonzero_count,
+                        r.ndistinct
+                    )
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
+                ddl.colstats_fqn,
+                values.join(", ")
+            );
+            client
+                .update(&sql, None, &[])
+                .expect("failed to insert compaction colstats");
+        }
+    }
+
+    if !blob_buffer.is_empty() {
+        client
+            .update(&ddl_if_not_exists(&ddl.blobs_ddl), None, &[])
+            .expect("failed to ensure blobs table");
+        blob_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+        for (col_idx, seg_id, blob) in blob_buffer {
+            use pgrx::datum::DatumWithOid;
+            let insert_sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
+                &ddl.blobs_fqn
+            );
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                seg_id.into(),
+                DatumWithOid::from(blob),
+            ];
+            client
+                .update(&insert_sql, None, &args)
+                .expect("failed to insert compaction blob");
+        }
+    }
+
+    if !bloom_buffer.is_empty() {
+        client
+            .update(&ddl_if_not_exists(&ddl.blooms_ddl), None, &[])
+            .expect("failed to ensure blooms table");
+        bloom_buffer.sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
+        for (col_idx, seg_id, num_hashes, bloom_bytes) in bloom_buffer {
+            use pgrx::datum::DatumWithOid;
+            let insert_sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
+                &ddl.blooms_fqn
+            );
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                seg_id.into(),
+                (num_hashes as i16).into(),
+                DatumWithOid::from(bloom_bytes),
+            ];
+            client
+                .update(&insert_sql, None, &args)
+                .expect("failed to insert compaction bloom");
+        }
+    }
+
+    if !text_length_buffer.is_empty() {
+        client
+            .update(&ddl_if_not_exists(&ddl.text_lengths_ddl), None, &[])
+            .expect("failed to ensure text_lengths table");
+        text_length_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+        for (col_idx, seg_id, blob) in text_length_buffer {
+            use pgrx::datum::DatumWithOid;
+            let insert_sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
+                &ddl.text_lengths_fqn
+            );
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                seg_id.into(),
+                DatumWithOid::from(blob),
+            ];
+            client
+                .update(&insert_sql, None, &args)
+                .expect("failed to insert compaction text length sidecar");
+        }
+    }
+
+    // NOTE for partition-level bloom sentinels (PERF #47, not yet on this
+    // branch): compaction appends segments to a live companion table, so if
+    // `_segment_id = -1` sentinel rows ever exist they MUST be fold-merged
+    // with the batch's value hashes or deleted here — a sentinel that
+    // under-covers any live segment produces wrong query results.
+
+    // ---- Valbitmap: keep every existing column's bitmap regime exact, or
+    // drop it (absence is safe — segments just stop being pruned on that
+    // column). ----
+    let new_segment_ids: Vec<i32> = (first_new_segment_id..next_segment_id).collect();
+    append_valbitmaps_for_compaction(
+        client,
+        part_info.id,
+        &ddl.valbitmap_fqn,
+        &columns,
+        &valbitmap_value_buffer,
+        &new_segment_ids,
+    );
+
+    // ---- Catalog refresh ----
+    catalog::bump_partition_compaction(client, part_info.id, total_rows, total_compressed_size)
+        .expect("failed to bump partition counters");
+
+    // Partition-level [min,max] map (Phase -1 pruning) — recomputed from the
+    // full colstats table, which now includes the new segments. CORRECTNESS-
+    // critical: new values may extend the old ranges.
+    catalog::update_partition_column_minmax(client, part_info.id, &ddl.colstats_fqn, &columns)
+        .expect("failed to refresh partition column_minmax");
+
+    // ndistinct/HLL: merge the batch sketches into the persisted ones
+    // (planner-only; best-effort).
+    merge_batch_hll_into_catalog(client, part_info.id, &columns, &batch_hll);
+
+    // ---- Remove the compacted loose rows. READ COMMITTED: TRUNCATE is safe
+    // (the AEL was taken before the reading snapshot, so the visible set is
+    // complete) and restores the zero-block state that re-enables every
+    // metadata fast path. Under REPEATABLE READ / SERIALIZABLE the reading
+    // snapshot may predate the lock, so DELETE only what we actually read
+    // (rows invisible to the snapshot survive for a later compaction). ----
+    let read_committed =
+        unsafe { pg_sys::XactIsoLevel } < pg_sys::XACT_REPEATABLE_READ as std::ffi::c_int;
+    if read_committed {
+        client
+            .update(&format!("TRUNCATE ONLY {}", part_fqn), None, &[])
+            .expect("failed to truncate compacted loose rows");
+    } else {
+        client
+            .update(&format!("DELETE FROM ONLY {}", part_fqn), None, &[])
+            .expect("failed to delete compacted loose rows");
+    }
+
+    // ANALYZE the touched companion tables and refresh pg_statistic /
+    // reltuples for the partition (best-effort).
+    let _ = client.update(&format!("ANALYZE {}", ddl.meta_fqn), None, &[]);
+    let _ = client.update(&format!("ANALYZE {}", ddl.colstats_fqn), None, &[]);
+    let msg = analyze_partition_impl_split(client, &schema, &part_table);
+    pgrx::debug1!("pg_deltax compact stats refresh: {}", msg);
+
+    // Make the change visible to cached plans in every backend: TRUNCATE
+    // already swaps the relfilenode (relcache inval), but the DELETE path
+    // needs an explicit invalidation; sending it twice is harmless.
+    let part_oid: pg_sys::Oid = client
+        .select(&format!("SELECT '{}'::regclass::oid", part_fqn), None, &[])
+        .ok()
+        .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
+        .unwrap_or(pg_sys::InvalidOid);
+    if part_oid != pg_sys::InvalidOid {
+        unsafe { pg_sys::CacheInvalidateRelcacheByRelid(part_oid) };
+    }
+    crate::scan::invalidate_compressed_cache();
+
+    format!(
+        "Compacted {}.{}: {} loose rows into {} new segment(s)",
+        schema,
+        part_table,
+        total_rows,
+        next_segment_id - first_new_segment_id,
+    )
+}
+
+/// Keep the per-segment value-presence bitmaps exact across a compaction.
+///
+/// For every column present in the catalog `column_valmap`:
+///   - if every new segment produced a complete value set and the union of
+///     old + new values still fits the bitmap budget, append the novel
+///     values to the END of the valmap (existing bitmaps stay valid — the
+///     scan probes positions linearly and missing trailing bits read as 0)
+///     and insert a bitmap row for each new segment;
+///   - otherwise DROP the column's bitmap regime entirely (delete its
+///     valbitmap rows + valmap/valcounts entries). Absence is safe; an
+///     incomplete valmap is not (`prune_all` would wrongly prune segments
+///     containing a new value).
+fn append_valbitmaps_for_compaction(
+    client: &mut SpiClient,
+    partition_id: i32,
+    valbitmap_fqn: &str,
+    columns: &[ColumnMeta],
+    value_buffer: &[(u16, i32, SegValueCounts)],
+    new_segment_ids: &[i32],
+) {
+    use std::collections::HashMap;
+
+    // Load the current valmap / valcounts from the catalog.
+    let (valmap_text, valcounts_text): (Option<String>, Option<String>) = {
+        let row = client
+            .select(
+                "SELECT column_valmap::text, column_valcounts::text
+                   FROM deltax.deltax_partition WHERE id = $1",
+                Some(1),
+                &[partition_id.into()],
+            )
+            .expect("failed to read partition valmap");
+        let first = row.first();
+        (first.get(1).ok().flatten(), first.get(2).ok().flatten())
+    };
+    let mut valmap: HashMap<String, Vec<String>> = valmap_text
+        .as_deref()
+        .and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or_default();
+    if valmap.is_empty() {
+        // No bitmap regime on any column — nothing to maintain.
+        return;
+    }
+    let mut valcounts: ColumnValcounts = valcounts_text
+        .as_deref()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .map(|v| {
+            let mut out: ColumnValcounts = HashMap::new();
+            if let serde_json::Value::Object(cols) = v {
+                for (name, counts) in cols {
+                    if let serde_json::Value::Object(m) = counts {
+                        let list: Vec<(String, i64)> = m
+                            .into_iter()
+                            .filter_map(|(k, c)| c.as_i64().map(|n| (k, n)))
+                            .collect();
+                        out.insert(name, list);
+                    }
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    // col_idx ↔ name mapping (non-segment-by enumeration order).
+    let mut idx_to_name: HashMap<u16, &str> = HashMap::new();
+    let mut name_to_idx: HashMap<&str, u16> = HashMap::new();
+    {
+        let mut ci: u16 = 0;
+        for col in columns {
+            if col.is_segment_by {
+                continue;
+            }
+            idx_to_name.insert(ci, col.name.as_str());
+            name_to_idx.insert(col.name.as_str(), ci);
+            ci += 1;
+        }
+    }
+
+    let mut changed = false;
+    let col_names: Vec<String> = valmap.keys().cloned().collect();
+    for col_name in col_names {
+        let Some(&col_idx) = name_to_idx.get(col_name.as_str()) else {
+            // Column no longer exists in the layout (shouldn't happen — the
+            // shape guard upstream rejects drift). Drop defensively.
+            drop_valbitmap_column(
+                client,
+                valbitmap_fqn,
+                None,
+                &mut valmap,
+                &mut valcounts,
+                &col_name,
+            );
+            changed = true;
+            continue;
+        };
+
+        // Collect this column's per-new-segment value sets.
+        let entries: Vec<&(u16, i32, SegValueCounts)> = value_buffer
+            .iter()
+            .filter(|(ci, _, _)| *ci == col_idx)
+            .collect();
+
+        // Completeness: every new segment must have produced a value set
+        // (compute_segment_valbitmap_values omits segments whose local
+        // distinct count overflowed — their values are unknown).
+        if entries.len() != new_segment_ids.len() {
+            drop_valbitmap_column(
+                client,
+                valbitmap_fqn,
+                Some(col_idx),
+                &mut valmap,
+                &mut valcounts,
+                &col_name,
+            );
+            changed = true;
+            continue;
+        }
+
+        // Union check + novel-value collection.
+        let existing = valmap.get(&col_name).cloned().unwrap_or_default();
+        let existing_set: std::collections::HashSet<&str> =
+            existing.iter().map(|s| s.as_str()).collect();
+        let mut novel: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, _, vals) in &entries {
+            for (v, _) in vals.iter() {
+                if !existing_set.contains(v.as_str()) {
+                    novel.insert(v.clone());
+                }
+            }
+        }
+        if existing.len() + novel.len() > VALBITMAP_MAX_DISTINCT {
+            drop_valbitmap_column(
+                client,
+                valbitmap_fqn,
+                Some(col_idx),
+                &mut valmap,
+                &mut valcounts,
+                &col_name,
+            );
+            changed = true;
+            continue;
+        }
+
+        // Append novel values (sorted among themselves) to the END of the
+        // valmap — existing bitmaps stay valid.
+        let mut updated = existing.clone();
+        updated.extend(novel.iter().cloned());
+        let bit_idx: HashMap<&str, u8> = updated
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.as_str(), i as u8))
+            .collect();
+
+        // Ensure the bitmap table exists (it might not when the original
+        // compress produced no bitmap rows but the catalog valmap exists —
+        // defensive; normally both exist together).
+        let n_bytes = updated.len().div_ceil(8);
+        for (_, seg_id, vals) in &entries {
+            let mut bits: Vec<u8> = vec![0; n_bytes.max(1)];
+            for (v, _) in vals.iter() {
+                if let Some(&bi) = bit_idx.get(v.as_str()) {
+                    bits[(bi / 8) as usize] |= 1u8 << (bi % 8);
+                }
+            }
+            use pgrx::datum::DatumWithOid;
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                (*seg_id).into(),
+                DatumWithOid::from(bits),
+            ];
+            client
+                .update(
+                    &format!(
+                        "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
+                        valbitmap_fqn
+                    ),
+                    None,
+                    &args,
+                )
+                .expect("failed to insert compaction valbitmap row");
+        }
+
+        // Merge counts into valcounts (stats-only).
+        if !novel.is_empty() || !entries.is_empty() {
+            let counts = valcounts.entry(col_name.clone()).or_default();
+            for (_, _, vals) in &entries {
+                for (v, c) in vals.iter() {
+                    if let Some(slot) = counts.iter_mut().find(|(k, _)| k == v) {
+                        slot.1 += *c as i64;
+                    } else {
+                        counts.push((v.clone(), *c as i64));
+                    }
+                }
+            }
+        }
+        if !novel.is_empty() {
+            valmap.insert(col_name.clone(), updated);
+        }
+        changed = true;
+    }
+
+    if changed {
+        catalog::update_partition_column_valmap(client, partition_id, &valmap)
+            .expect("failed to update partition column_valmap");
+        catalog::update_partition_column_valcounts(client, partition_id, &valcounts)
+            .expect("failed to update partition column_valcounts");
+    }
+}
+
+/// Remove one column's bitmap regime: its valbitmap rows (when the col_idx
+/// is known and the table exists) plus the valmap/valcounts entries.
+fn drop_valbitmap_column(
+    client: &mut SpiClient,
+    valbitmap_fqn: &str,
+    col_idx: Option<u16>,
+    valmap: &mut std::collections::HashMap<String, Vec<String>>,
+    valcounts: &mut ColumnValcounts,
+    col_name: &str,
+) {
+    if let Some(ci) = col_idx
+        && relation_exists(client, valbitmap_fqn)
+    {
+        client
+            .update(
+                &format!("DELETE FROM {} WHERE _col_idx = $1", valbitmap_fqn),
+                None,
+                &[(ci as i16).into()],
+            )
+            .expect("failed to delete valbitmap rows");
+    }
+    valmap.remove(col_name);
+    valcounts.remove(col_name);
+}
+
+/// Merge the compaction batch's per-column HLL sketches into the persisted
+/// partition sketches and refresh `column_ndistinct`. Planner-only data —
+/// every failure path silently keeps the (slightly stale) existing values.
+fn merge_batch_hll_into_catalog(
+    client: &mut SpiClient,
+    partition_id: i32,
+    columns: &[ColumnMeta],
+    batch_hll: &[CardinalityEstimator<u64>],
+) {
+    let stored: Option<String> = client
+        .select(
+            "SELECT column_hll::text FROM deltax.deltax_partition WHERE id = $1",
+            Some(1),
+            &[partition_id.into()],
+        )
+        .ok()
+        .and_then(|r| r.first().get_one::<String>().ok().flatten());
+    let Some(stored) = stored else { return };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&stored)
+    else {
+        return;
+    };
+
+    let nd_col_names: Vec<&str> = columns
+        .iter()
+        .filter(|c| !c.is_segment_by)
+        .map(|c| c.name.as_str())
+        .collect();
+
+    let mut merged: std::collections::HashMap<String, CardinalityEstimator<u64>> =
+        std::collections::HashMap::new();
+    for (name, val) in map {
+        if let Ok(sketch) = serde_json::from_value::<CardinalityEstimator<u64>>(val) {
+            merged.insert(name, sketch);
+        }
+    }
+    let mut nd_updates: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (name, sketch) in nd_col_names.iter().zip(batch_hll.iter()) {
+        if let Some(existing) = merged.get_mut(*name) {
+            existing.merge(sketch);
+            nd_updates.insert((*name).to_string(), existing.estimate() as i64);
+        }
+    }
+    if nd_updates.is_empty() {
+        return;
+    }
+
+    // Refresh column_ndistinct: existing values for untouched columns,
+    // merged estimates for the rest.
+    let existing_nd: std::collections::HashMap<String, i64> = client
+        .select(
+            "SELECT column_ndistinct::text FROM deltax.deltax_partition WHERE id = $1",
+            Some(1),
+            &[partition_id.into()],
+        )
+        .ok()
+        .and_then(|r| r.first().get_one::<String>().ok().flatten())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut nd_final = existing_nd;
+    for (k, v) in nd_updates {
+        nd_final.insert(k, v);
+    }
+    let _ = catalog::update_partition_column_ndistinct_from_map(client, partition_id, &nd_final);
+
+    // Re-serialize the merged sketches.
+    let names: Vec<&str> = merged.keys().map(|s| s.as_str()).collect();
+    let sketches: Vec<CardinalityEstimator<u64>> = names
+        .iter()
+        .map(|n| merged.get(*n).cloned().unwrap())
+        .collect();
+    if let Some(json) = serialize_partition_hll(&names, &sketches) {
+        let _ = catalog::update_partition_column_hll(client, partition_id, &json);
+    }
+}
+
+/// Worker entry point: compact every compressed partition of `ht` whose heap
+/// has accumulated loose rows. Returns the number of partitions compacted.
+/// Each partition runs inside a subtransaction (`PgTryBuilder`) so a lock
+/// timeout or transient failure on one partition doesn't abort the worker's
+/// whole maintenance cycle.
+pub fn auto_compact_partitions(client: &mut SpiClient<'_>, ht: &catalog::DeltatableInfo) -> i32 {
+    let candidates = client
+        .select(
+            "SELECT p.schema_name, p.table_name
+               FROM deltax.deltax_partition p
+              WHERE p.deltatable_id = $1
+                AND p.is_compressed
+                AND COALESCE(
+                        pg_catalog.pg_relation_size(
+                            pg_catalog.to_regclass(
+                                pg_catalog.format('%I.%I', p.schema_name, p.table_name))),
+                        0) > 0",
+            None,
+            &[ht.id.into()],
+        )
+        .expect("failed to query compaction candidates");
+
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for row in candidates {
+        let sch: Option<String> = row.get(1).ok().flatten();
+        let name: Option<String> = row.get(2).ok().flatten();
+        if let (Some(sch), Some(name)) = (sch, name) {
+            targets.push((sch, name));
+        }
+    }
+    if targets.is_empty() {
+        return 0;
+    }
+
+    // Don't let the AccessExclusive lock stall the worker behind long
+    // queries; skip locked partitions until the next cycle.
+    let _ = client.update("SET LOCAL lock_timeout = '5s'", None, &[]);
+
+    let mut compacted = 0;
+    for (sch, name) in &targets {
+        let qualified = format!("{}.{}", sch, name);
+        // `&mut SpiClient` is not UnwindSafe; PgTryBuilder runs the closure
+        // in a subtransaction and rolls it back on error, which is exactly
+        // the recovery the SPI stack needs — assert the boundary.
+        let client_cell = std::panic::AssertUnwindSafe(&mut *client);
+        let ok = pgrx::PgTryBuilder::new(move || {
+            let client_cell = client_cell;
+            let msg = compact_partition_impl(client_cell.0, &qualified);
+            pgrx::log!("pg_deltax: {}", msg);
+            true
+        })
+        .catch_others(|_e| {
+            pgrx::log!(
+                "pg_deltax: compaction of a partition was skipped (lock timeout or error); will retry next cycle"
+            );
+            false
+        })
+        .execute();
+        if ok {
+            compacted += 1;
+        }
+    }
+
+    let _ = client.update("SET LOCAL lock_timeout = 0", None, &[]);
+
+    compacted
+}
+
+
 /// Re-populate pg_class.reltuples + pg_statistic for an already-compressed
 /// partition. `stats::analyze_partition_from_catalog` reads the
 /// authoritative per-column distinct counts persisted at compression time

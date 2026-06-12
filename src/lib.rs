@@ -209,6 +209,22 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    -- P1 transparent DML: INSERTs land in the partition heap (the "loose
+    -- row" region) and are unioned with segment data at scan time. The
+    -- helper sends a relcache invalidation on the empty->non-empty
+    -- transition so cached plans that assumed an empty heap get replanned.
+    IF TG_OP = 'INSERT' THEN
+        PERFORM deltax.deltax_note_compressed_insert(TG_RELID);
+        RETURN NEW;
+    END IF;
+    -- Internal maintenance (compaction deleting just-compacted loose rows)
+    -- runs with the DML bypass flag set; let it through.
+    IF deltax.deltax_dml_bypass_active() THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
     RAISE EXCEPTION 'cannot % compressed partition "%.%", decompress it first',
         TG_OP,
         TG_TABLE_SCHEMA,

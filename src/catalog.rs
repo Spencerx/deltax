@@ -408,6 +408,31 @@ pub fn mark_partition_compressed(
     Ok(())
 }
 
+/// Add a compaction batch's row count and compressed size to a partition's
+/// counters. Unlike `mark_partition_compressed` (full rebuild) this is
+/// incremental — used when loose heap rows are folded into new segments.
+pub fn bump_partition_compaction(
+    client: &mut SpiClient,
+    partition_id: i32,
+    added_rows: i64,
+    added_compressed_size: i64,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET row_count = COALESCE(row_count, 0) + $1,
+             compressed_size = COALESCE(compressed_size, 0) + $2,
+             compressed_at = now()
+         WHERE id = $3",
+        None,
+        &[
+            added_rows.into(),
+            added_compressed_size.into(),
+            partition_id.into(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Write a pre-computed per-column ndistinct map (typically from
 /// HLL sketches merged across segments during compression) to the
 /// `deltax.deltax_partition.column_ndistinct` JSONB column.
@@ -1016,11 +1041,44 @@ pub fn mark_partition_decompressed(
     Ok(())
 }
 
+/// Per-row helper for the compressed-partition DML trigger's INSERT branch.
+///
+/// On the heap's empty → non-empty transition (the BEFORE INSERT trigger for
+/// the first loose row still sees zero blocks) this sends a relcache
+/// invalidation for the partition, so cached plans in *all* backends that
+/// were built assuming an empty heap (metadata-only aggregate pushdowns,
+/// pathkey-claiming sorted scans, Top-N pushdowns) are replanned against the
+/// new loose-row state. Subsequent rows see `nblocks > 0` and do nothing, so
+/// the per-row cost is one lseek.
+#[pg_extern]
+fn deltax_note_compressed_insert(relid: pg_sys::Oid) -> bool {
+    unsafe {
+        let rel = pg_sys::table_open(relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let nblocks =
+            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        if nblocks == 0 {
+            pg_sys::CacheInvalidateRelcacheByRelid(relid);
+        }
+    }
+    true
+}
+
+/// SQL-visible probe for the backend-local DML bypass flag, used by the
+/// compressed-partition trigger to let internal maintenance DML (compaction's
+/// delete of just-compacted loose rows) through while still rejecting user
+/// UPDATE/DELETE.
+#[pg_extern]
+fn deltax_dml_bypass_active() -> bool {
+    crate::scan::dml_bypass_active()
+}
+
 /// Install the DML rejection trigger on a compressed leaf partition.
 ///
 /// Parent-table INSERTs are routed to the leaf after ExecutorStart, so the
 /// result-relation hook cannot reliably catch them. A row trigger on the leaf
-/// fires after tuple routing and blocks both direct and routed DML.
+/// fires after tuple routing; since P1 it lets INSERTs through (loose rows)
+/// and blocks UPDATE/DELETE.
 pub fn install_compressed_dml_trigger(
     client: &mut SpiClient,
     schema: &str,

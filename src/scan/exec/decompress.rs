@@ -138,6 +138,65 @@ pub(crate) struct DecompressState {
     /// `ShutdownCustomScan` before the DSM is torn down. Empty on workers
     /// and in the serial path. Consumed by `ExplainCustomScan`.
     pub(crate) cached_worker_timings: Vec<ScanTimingShmem>,
+
+    /// P1 heap tail (Phase 3): loose rows INSERTed into compressed
+    /// partitions live in the partition heap and are emitted after the last
+    /// segment. `None` when every involved partition heap is empty (the
+    /// common case — zero overhead). Workers never set this; in parallel
+    /// DeltaXAppend only the leader emits the heap tail.
+    heap_tail: Option<HeapTailScan>,
+}
+
+/// State for the Phase 3 heap-tail scan: iterates the live tuples of one or
+/// more partition heaps under the query snapshot.
+struct HeapTailScan {
+    /// Partition heap OIDs left to scan (DeltaXDecompress: one; DeltaXAppend:
+    /// every compressed child whose heap had blocks at begin time).
+    oids: Vec<pg_sys::Oid>,
+    /// Index of the relation currently being scanned (or next to open).
+    idx: usize,
+    /// Currently open relation (null when between relations).
+    rel: pg_sys::Relation,
+    /// Active heap scan on `rel` (null when between relations).
+    scan: pg_sys::TableScanDesc,
+    /// Query snapshot captured at BeginCustomScan.
+    snapshot: pg_sys::Snapshot,
+}
+
+impl HeapTailScan {
+    fn new(oids: Vec<pg_sys::Oid>, snapshot: pg_sys::Snapshot) -> Self {
+        HeapTailScan {
+            oids,
+            idx: 0,
+            rel: std::ptr::null_mut(),
+            scan: std::ptr::null_mut(),
+            snapshot,
+        }
+    }
+
+    /// Close the currently open scan + relation, if any.
+    unsafe fn close_current(&mut self) {
+        unsafe {
+            if !self.scan.is_null() {
+                if let Some(end) = (*(*self.rel).rd_tableam).scan_end {
+                    end(self.scan);
+                }
+                self.scan = std::ptr::null_mut();
+            }
+            if !self.rel.is_null() {
+                pg_sys::table_close(self.rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                self.rel = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Reset for rescan: close anything open and start over.
+    unsafe fn reset(&mut self) {
+        unsafe {
+            self.close_current();
+        }
+        self.idx = 0;
+    }
 }
 
 /// Wall-clock timing for the decompress scan phases.
@@ -201,6 +260,9 @@ pub(crate) struct ScanTiming {
     pub(crate) blob_cache_misses: u64,
     /// Bytes served from the blob cache (sum across hits).
     pub(crate) blob_cache_bytes_served: u64,
+    /// Rows emitted from the Phase 3 heap tail (loose rows inserted into
+    /// compressed partitions after compression).
+    pub(crate) heap_tail_rows: u64,
 }
 
 /// POD projection of `ScanTiming` for cross-process DSM aggregation.
@@ -374,6 +436,11 @@ struct ParsedCustomPrivate {
     header: Vec<i32>,
     needed_indices: Vec<usize>,
     topn: Option<TopNRaw>,
+    /// `[-4, flag]` trailer: true when the planner claimed sorted output
+    /// (pathkeys) for this scan. The executor errors if the flag is set but
+    /// the partition heap has gained loose rows since planning (stale
+    /// cached plan) — appended heap-tail rows would break the sort promise.
+    pathkeys_claimed: bool,
 }
 
 struct TopNRaw {
@@ -391,11 +458,13 @@ unsafe fn parse_custom_private(list: *mut pg_sys::List) -> ParsedCustomPrivate {
     let mut header = Vec::new();
     let mut needed_indices = Vec::new();
     let mut topn: Option<TopNRaw> = None;
+    let mut pathkeys_claimed = false;
     if list.is_null() {
         return ParsedCustomPrivate {
             header,
             needed_indices,
             topn,
+            pathkeys_claimed,
         };
     }
     let len = unsafe { (*list).length };
@@ -406,6 +475,14 @@ unsafe fn parse_custom_private(list: *mut pg_sys::List) -> ParsedCustomPrivate {
         if val == -1 && sec == 0 {
             sec = 1;
             i += 1;
+            continue;
+        }
+        if val == -4 && sec >= 1 {
+            // Two-int pathkeys-claimed marker; section state is unchanged.
+            if i + 1 < len {
+                pathkeys_claimed = unsafe { pg_sys::list_nth_int(list, i + 1) } != 0;
+            }
+            i += 2;
             continue;
         }
         if val == -2 && sec == 1 {
@@ -443,6 +520,7 @@ unsafe fn parse_custom_private(list: *mut pg_sys::List) -> ParsedCustomPrivate {
         header,
         needed_indices,
         topn,
+        pathkeys_claimed,
     }
 }
 
@@ -523,7 +601,7 @@ pub(crate) unsafe extern "C-unwind" fn create_custom_scan_state(
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
     node: *mut pg_sys::CustomScanState,
-    _estate: *mut pg_sys::EState,
+    estate: *mut pg_sys::EState,
     _eflags: i32,
 ) {
     unsafe {
@@ -540,7 +618,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         let companion_oid = pg_sys::Oid::from(parsed.header[0] as u32);
         let needed_indices = parsed.needed_indices;
         let (
-            topn_limit,
+            mut topn_limit,
             topn_ascending,
             topn_nulls_first,
             topn_multi_col_sort,
@@ -556,14 +634,58 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
             None => (0i64, true, false, false, 0i32),
         };
 
+        // P1 heap tail (Phase 3): the scan relation (the partition heap,
+        // opened by PG core since scanrelid > 0) may hold loose rows
+        // inserted after compression. Detect that here; exec then unions
+        // the heap tail after the segments.
+        let scan_rel = (*node).ss.ss_currentRelation;
+        let heap_tail_oids: Vec<pg_sys::Oid> = if !scan_rel.is_null()
+            && pg_sys::RelationGetNumberOfBlocksInFork(scan_rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+                > 0
+        {
+            if parsed.pathkeys_claimed {
+                pgrx::error!(
+                    "pg_deltax: compressed partition \"{}\" gained uncompressed rows after this plan was created (sorted scan); retry the query",
+                    relation_name(scan_rel),
+                );
+            }
+            // Heap-tail rows disable Top-N pushdown — the pruned candidate
+            // set would not include loose rows. The plan-time gate already
+            // does this for fresh plans; this covers stale cached plans.
+            topn_limit = 0;
+            vec![(*scan_rel).rd_id]
+        } else {
+            Vec::new()
+        };
+
         // Load metadata (cached), then load segment data via direct heap scan
         // (plan_qual is passed so batch qual columns are included in needed_cols)
         let plan_qual = (*(*node).ss.ps.plan).qual;
         let mut state =
             load_decompress_state(companion_oid, &needed_indices, plan_qual, topn_limit);
 
-        // If all plan quals are handled by batch eval, skip PG's per-row ExecQual
-        if state.all_quals_batch_handled {
+        if !heap_tail_oids.is_empty() {
+            // Schema guard: heap tuples are deformed positionally into the
+            // scan slot, which requires a 1:1 physical layout match with the
+            // companion's column list (no json_extract synthetic columns,
+            // no dropped columns).
+            let rel_natts = (*(*scan_rel).rd_att).natts as usize;
+            if rel_natts != state.col_names.len() {
+                pgrx::error!(
+                    "pg_deltax: compressed partition \"{}\" has uncompressed rows but its physical layout ({} attrs) does not match the compressed layout ({} cols); decompress and recompress it",
+                    relation_name(scan_rel),
+                    rel_natts,
+                    state.col_names.len(),
+                );
+            }
+            state.heap_tail = Some(HeapTailScan::new(heap_tail_oids, (*estate).es_snapshot));
+        }
+
+        // If all plan quals are handled by batch eval, skip PG's per-row
+        // ExecQual — except when a heap tail exists: heap-tail rows are not
+        // batch-filtered, so the full qual must run per row (segment rows
+        // get double-filtered, which is correct, just slightly slower).
+        if state.all_quals_batch_handled && state.heap_tail.is_none() {
             (*node).ss.ps.qual = std::ptr::null_mut();
         }
 
@@ -677,6 +799,7 @@ fn make_worker_stub_state() -> DecompressState {
         wire_view: None,
         is_worker_stub: true,
         cached_worker_timings: Vec::new(),
+        heap_tail: None,
     }
 }
 
@@ -684,7 +807,7 @@ fn make_worker_stub_state() -> DecompressState {
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
     node: *mut pg_sys::CustomScanState,
-    _estate: *mut pg_sys::EState,
+    estate: *mut pg_sys::EState,
     _eflags: i32,
 ) {
     unsafe {
@@ -711,7 +834,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             .collect();
         let needed_indices = parsed.needed_indices;
         let (
-            topn_limit,
+            mut topn_limit,
             topn_ascending,
             topn_nulls_first,
             topn_multi_col_sort,
@@ -731,6 +854,33 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             pgrx::error!("pg_deltax: DeltaXAppend has no companion tables");
         }
 
+        // P1 heap tail (Phase 3): collect the compressed children whose
+        // partition heap holds loose rows (transparent INSERTs after
+        // compression). Their live tuples are emitted by the leader after
+        // the segment cursor is exhausted.
+        let heap_tail_oids: Vec<pg_sys::Oid> = {
+            let mut v = Vec::new();
+            for &oid in &companion_oids {
+                let part_oid = super::segments::partition_oid_for_companion(oid);
+                if part_oid == pg_sys::InvalidOid {
+                    pgrx::error!(
+                        "pg_deltax: cannot resolve partition for companion OID {} (catalog inconsistency)",
+                        u32::from(oid)
+                    );
+                }
+                if !crate::scan::relation_heap_is_empty(part_oid) {
+                    v.push(part_oid);
+                }
+            }
+            v
+        };
+        if !heap_tail_oids.is_empty() {
+            // Loose rows would be invisible to the Top-N candidate pass;
+            // fall back to the full scan (upper Sort/Limit stays correct —
+            // DeltaXAppend never claims pathkeys).
+            topn_limit = 0;
+        }
+
         // Load metadata for first companion table (cached per-backend).
         let t0 = Instant::now();
         let meta = super::segments::load_metadata_cached(companion_oids[0]);
@@ -746,8 +896,10 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             (*plan_qual).length as usize
         };
         let all_quals_batch_handled = handled_count > 0 && handled_count == nquals;
-        if all_quals_batch_handled {
-            // All quals are handled by batch eval — skip PG's per-row ExecQual
+        if all_quals_batch_handled && heap_tail_oids.is_empty() {
+            // All quals are handled by batch eval — skip PG's per-row
+            // ExecQual. With a heap tail the full qual must keep running:
+            // heap-tail rows are never batch-filtered.
             (*node).ss.ps.qual = std::ptr::null_mut();
         }
 
@@ -940,6 +1092,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             wire_view: None,
             is_worker_stub: false,
             cached_worker_timings: Vec::new(),
+            heap_tail: None,
         };
 
         // Create per-segment memory context
@@ -956,6 +1109,10 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         state
             .segments_data
             .sort_by_key(|s| s.min_time.unwrap_or(i64::MAX));
+
+        if !heap_tail_oids.is_empty() {
+            state.heap_tail = Some(HeapTailScan::new(heap_tail_oids, (*estate).es_snapshot));
+        }
 
         let state_box = Box::new(state);
         let state_ptr = Box::into_raw(state_box);
@@ -1135,6 +1292,7 @@ fn load_decompress_state(
         wire_view: None,
         is_worker_stub: false,
         cached_worker_timings: Vec::new(),
+        heap_tail: None,
     }
 }
 
@@ -3389,9 +3547,136 @@ pub(super) unsafe extern "C-unwind" fn exec_custom_scan(
                 return slot;
             }
             if !load_next_segment(state, instrument) {
+                // Phase 3: heap tail — live tuples sitting in the partition
+                // heap (loose rows inserted after compression). Emitted by
+                // the leader only, after every segment is consumed.
+                if let Some(slot) =
+                    try_emit_heap_tail_row(state, scan_slot, econtext, qual, proj_info)
+                {
+                    return slot;
+                }
                 pg_sys::ExecClearTuple(scan_slot);
                 return scan_slot;
             }
+        }
+    }
+}
+
+/// Phase 3: emit the next qualifying live tuple from the partition heap(s).
+///
+/// Active only when `state.heap_tail` was armed at begin time (some involved
+/// partition heap had blocks). Tuples are read with a plain heap scan under
+/// the query snapshot, deformed positionally into the scan slot (layout
+/// verified at begin), filtered through the full plan qual (`ExecQual` — heap
+/// rows never went through batch quals), and projected like segment rows.
+///
+/// Parallel DeltaXAppend: the heap tail is leader-only; workers return None
+/// immediately (their stub state has `heap_tail = None` anyway).
+///
+/// Returns `Some(slot)` for each qualifying row, `None` when every heap is
+/// exhausted (end of scan).
+unsafe fn try_emit_heap_tail_row(
+    state: &mut DecompressState,
+    scan_slot: *mut pg_sys::TupleTableSlot,
+    econtext: *mut pg_sys::ExprContext,
+    qual: *mut pg_sys::ExprState,
+    proj_info: *mut pg_sys::ProjectionInfo,
+) -> Option<*mut pg_sys::TupleTableSlot> {
+    unsafe {
+        // Belt-and-suspenders: never emit the heap tail from a worker.
+        if pg_sys::ParallelWorkerNumber >= 0 {
+            return None;
+        }
+        // Disjoint field borrows: the heap-tail cursor and the timing
+        // counters are updated independently inside the loop.
+        let ncols = state.col_names.len();
+        let timing = &mut state.timing;
+        let ht = state.heap_tail.as_mut()?;
+        loop {
+            if ht.scan.is_null() {
+                if ht.idx >= ht.oids.len() {
+                    return None;
+                }
+                let oid = ht.oids[ht.idx];
+                let rel = pg_sys::table_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let rel_natts = (*(*rel).rd_att).natts as usize;
+                if rel_natts != ncols {
+                    let name = relation_name(rel);
+                    pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    pgrx::error!(
+                        "pg_deltax: compressed partition \"{}\" has uncompressed rows but its physical layout ({} attrs) does not match the compressed layout ({} cols); decompress and recompress it",
+                        name,
+                        rel_natts,
+                        ncols,
+                    );
+                }
+                let flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
+                    | pg_sys::ScanOptions::SO_ALLOW_STRAT
+                    | pg_sys::ScanOptions::SO_ALLOW_SYNC
+                    | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
+                let scan = (*(*rel).rd_tableam).scan_begin.unwrap()(
+                    rel,
+                    ht.snapshot,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    flags,
+                );
+                ht.rel = rel;
+                ht.scan = scan;
+            }
+
+            let tuple = pg_sys::heap_getnext(ht.scan, pg_sys::ScanDirection::ForwardScanDirection);
+            if tuple.is_null() {
+                ht.close_current();
+                ht.idx += 1;
+                continue;
+            }
+
+            // Deform positionally into the scan slot (1:1 layout verified
+            // above). Pass-by-reference datums point into the scan's pinned
+            // page, which stays valid until the next heap_getnext — i.e.
+            // until the next call, matching the slot contract.
+            pg_sys::ExecClearTuple(scan_slot);
+            pg_sys::heap_deform_tuple(
+                tuple,
+                (*ht.rel).rd_att,
+                (*scan_slot).tts_values,
+                (*scan_slot).tts_isnull,
+            );
+            pg_sys::ExecStoreVirtualTuple(scan_slot);
+            (*econtext).ecxt_scantuple = scan_slot;
+
+            // Full plan qual — heap rows are never batch-filtered.
+            if !qual.is_null() && !exec_qual(qual, econtext) {
+                pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
+                timing.rows_filtered += 1;
+                continue;
+            }
+
+            let result = if !proj_info.is_null() {
+                exec_project(proj_info)
+            } else {
+                scan_slot
+            };
+            timing.rows_emitted += 1;
+            timing.heap_tail_rows += 1;
+            return Some(result);
+        }
+    }
+}
+
+/// Best-effort relation name for error messages.
+unsafe fn relation_name(rel: pg_sys::Relation) -> String {
+    unsafe {
+        if rel.is_null() {
+            return "?".to_string();
+        }
+        let p = pg_sys::get_rel_name((*rel).rd_id);
+        if p.is_null() {
+            format!("OID {}", u32::from((*rel).rd_id))
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
         }
     }
 }
@@ -3911,7 +4196,10 @@ pub(super) unsafe extern "C-unwind" fn end_custom_scan(node: *mut pg_sys::Custom
     unsafe {
         let state_ptr = (*node).custom_ps as *mut DecompressState;
         if !state_ptr.is_null() {
-            let state = Box::from_raw(state_ptr);
+            let mut state = Box::from_raw(state_ptr);
+            if let Some(ht) = state.heap_tail.as_mut() {
+                ht.close_current();
+            }
 
             // Emit timing summary at LOG level (visible with SET client_min_messages = log)
             // All timers are non-overlapping:
@@ -3951,6 +4239,9 @@ pub(super) unsafe extern "C-unwind" fn end_custom_scan(node: *mut pg_sys::Custom
                 t.topn_limit,
                 t.topn_candidates,
             );
+            if t.heap_tail_rows > 0 {
+                pgrx::log!("pg_deltax heap_tail: rows={}", t.heap_tail_rows);
+            }
 
             if !state.segment_mcxt.is_null() {
                 pg_sys::MemoryContextDelete(state.segment_mcxt);
@@ -3973,6 +4264,9 @@ pub(super) unsafe extern "C-unwind" fn rescan_custom_scan(node: *mut pg_sys::Cus
         state.topn_buffer.clear();
         state.topn_cursor = 0;
         state.topn_done = false;
+        if let Some(ht) = state.heap_tail.as_mut() {
+            ht.reset();
+        }
     }
 }
 

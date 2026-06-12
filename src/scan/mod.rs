@@ -61,6 +61,22 @@ pub(crate) fn set_dml_bypass(bypass: bool) {
     hook::set_dml_bypass(bypass);
 }
 
+/// Read the backend-local DML bypass flag (used by the compressed-partition
+/// trigger via `deltax.deltax_dml_bypass_active()`).
+pub(crate) fn dml_bypass_active() -> bool {
+    hook::dml_bypass_active()
+}
+
+/// True if the relation's main fork has zero blocks (no loose heap rows
+/// possible). Conservative in the non-empty direction: deleted-but-not-
+/// vacuumed rows keep their blocks.
+///
+/// # Safety
+/// Must be called with a valid transaction (opens the relation).
+pub(crate) unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
+    unsafe { hook::relation_heap_is_empty(oid) }
+}
+
 /// Look up the companion OID for a compressed partition's relation OID,
 /// or `InvalidOid` if it's not a pg_deltax-managed compressed table.
 ///
