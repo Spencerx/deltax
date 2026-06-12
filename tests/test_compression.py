@@ -4604,7 +4604,7 @@ class TestEpochEncoding:
     """Regression tests for Unix-epoch vs PostgreSQL-epoch (2000-01-01,
     offset 946,684,800 s) encoding confusions in segment metadata.
 
-    Two distinct bugs, both fixed in src/scan/exec/segments.rs:
+    Three distinct bugs, all fixed in src/scan/exec/segments.rs:
 
     1. Bloom probes hashed the raw PG-epoch datum of `col = const` /
        `col IN (...)` constants while the bloom BUILD side (compress.rs)
@@ -4613,13 +4613,18 @@ class TestEpochEncoding:
        equality predicates on timestamp/date columns returned ZERO rows
        on compressed partitions.
 
-    2. `load_segments_heap` stored the time column's meta-table
+    2. The colstats min/max in-list filter identity-encoded raw PG-epoch
+       datums for timestamp/date IN-lists on non-time columns, while the
+       colstats `_min`/`_max` it compares against are Unix-epoch
+       microseconds — every segment falsely pruned, zero rows.
+
+    3. `load_segments_heap` stored the time column's meta-table
        `_min_`/`_max_` identity-encoded (PG-epoch datum) in `ColMinMax`,
        whose consumers all decode the colstats encoding (Unix-epoch us) —
        timestamps 30 years early on any path consuming that map.
 
     Year-2000-adjacent data makes the two encodings maximally divergent,
-    which is the shape that exposed both bugs.
+    which is the shape that exposed these bugs.
     """
 
     EPOCH_NOW = "2000-01-15 12:00:00+00"
@@ -4706,6 +4711,24 @@ class TestEpochEncoding:
         assert count == 500
         count = db.execute(
             "SELECT count(*) FROM epoch_t WHERE d = DATE '2000-01-17'"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_date_in_list_on_non_sort_column(self, db):
+        """`d IN (...)` on a DATE payload column: both the bloom probe and
+        the colstats min/max in-list filter must compare in the colstats
+        domain (Unix-epoch microseconds). The in-list arm of the colstats
+        filter identity-encoded the raw PG-epoch datum, so every segment was
+        falsely min/max-pruned (zero rows)."""
+        self._setup_and_compress(db)
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t "
+            "WHERE d IN (DATE '2000-01-15', DATE '2000-01-17')"
+        ).fetchone()[0]
+        assert count == 500
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t "
+            "WHERE d IN (DATE '2000-01-17', DATE '2000-01-18')"
         ).fetchone()[0]
         assert count == 0
 

@@ -2090,34 +2090,24 @@ pub(super) unsafe fn load_segments_heap(
             // but every `ColMinMax` consumer (`decode_encoded_to_datum`,
             // `decode_encoded_to_pg_i64`, `segment_all_rows_pass`, ...)
             // expects the order-preserving colstats encoding (Unix-epoch
-            // microseconds for timestamps/dates) — so convert here.
+            // microseconds for timestamps/dates) — so convert here with the
+            // same `encode_datum_to_i64` rule used to populate colstats.
             let mut col_minmax = HashMap::new();
             for (col_name, min_att, max_att, type_oid) in &minmax_col_attnos {
                 let min_null = nulls[*min_att];
                 let max_null = nulls[*max_att];
-                let encode_meta = |raw: i64| -> i64 {
-                    match *type_oid {
-                        pg_sys::DATEOID => {
-                            // raw is PG-epoch days (int32 datum) → Unix-epoch microseconds
-                            ((raw as i32 as i64) + crate::compress::PG_EPOCH_OFFSET_DAYS)
-                                * 86_400_000_000
-                        }
-                        pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
-                            // raw is PG-epoch usec → Unix-epoch usec
-                            raw + crate::compress::PG_EPOCH_OFFSET_USEC
-                        }
-                        _ => raw,
-                    }
+                let encode_meta = |d: pg_sys::Datum| -> i64 {
+                    encode_datum_to_i64(d, *type_oid).unwrap_or_else(|| d.value() as i64)
                 };
                 let min_enc = if min_null {
                     0i64
                 } else {
-                    encode_meta(values[*min_att].value() as i64)
+                    encode_meta(values[*min_att])
                 };
                 let max_enc = if max_null {
                     0i64
                 } else {
-                    encode_meta(values[*max_att].value() as i64)
+                    encode_meta(values[*max_att])
                 };
                 col_minmax.insert(
                     col_name.clone(),
@@ -2338,22 +2328,25 @@ pub(super) unsafe fn load_segments_heap(
                         None => continue,
                     };
 
-                    // For float in-list, re-encode from raw datum bits to order-preserving i64
-                    let encoded_in_list = bq.in_list_i64.as_ref().map(|vals| {
-                        vals.iter()
+                    // `in_list_i64` holds raw PG datum bits — re-encode each
+                    // value into the colstats domain with the same rule as
+                    // `const_i64` above (timestamps/dates: PG epoch → Unix
+                    // epoch; floats: order-preserving bits; ints: identity).
+                    let encoded_in_list = match bq.in_list_i64.as_ref() {
+                        None => None,
+                        Some(vals) => match vals
+                            .iter()
                             .map(|&v| {
-                                match bq.type_oid {
-                                    pg_sys::FLOAT4OID => {
-                                        encode_f32_to_i64(f32::from_bits(v as u32))
-                                    }
-                                    pg_sys::FLOAT8OID => {
-                                        encode_f64_to_i64(f64::from_bits(v as u64))
-                                    }
-                                    _ => v, // int/timestamp/date: identity
-                                }
+                                encode_datum_to_i64(pg_sys::Datum::from(v as usize), bq.type_oid)
                             })
-                            .collect()
-                    });
+                            .collect::<Option<Vec<i64>>>()
+                        {
+                            Some(enc) => Some(enc),
+                            // Unencodable element — skip minmax pruning for
+                            // this qual rather than risk a wrong prune.
+                            None => continue,
+                        },
+                    };
 
                     cs_minmax_filters.push(MinMaxFilter {
                         col_idx: ci,
