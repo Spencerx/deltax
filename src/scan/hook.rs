@@ -4725,12 +4725,17 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
 ) {
     unsafe {
         let operation = (*query_desc).operation;
+        let planned_stmt = (*query_desc).plannedstmt;
 
-        // Only check DML commands
-        if operation != pg_sys::CmdType::CMD_INSERT
-            && operation != pg_sys::CmdType::CMD_UPDATE
-            && operation != pg_sys::CmdType::CMD_DELETE
-        {
+        // Only check DML commands — plus statements whose data-modifying
+        // CTEs hide an INSERT ... ON CONFLICT (their top-level operation
+        // is CMD_SELECT, but the conflict inference is just as blind to
+        // segment rows as a top-level one).
+        let is_dml = operation == pg_sys::CmdType::CMD_INSERT
+            || operation == pg_sys::CmdType::CMD_UPDATE
+            || operation == pg_sys::CmdType::CMD_DELETE;
+        let insert_on_conflict = stmt_has_on_conflict(planned_stmt);
+        if !is_dml && !insert_on_conflict {
             call_prev_executor_start(query_desc, eflags);
             return;
         }
@@ -4741,7 +4746,6 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
             return;
         }
 
-        let planned_stmt = (*query_desc).plannedstmt;
         if planned_stmt.is_null() {
             call_prev_executor_start(query_desc, eflags);
             return;
@@ -4758,13 +4762,6 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
             // the segment data. INSERT ... ON CONFLICT stays rejected:
             // segment rows have no index entries, so conflict inference
             // against compressed data would be silently wrong.
-            let insert_on_conflict = operation == pg_sys::CmdType::CMD_INSERT && {
-                let plan_tree = (*planned_stmt).planTree;
-                !plan_tree.is_null()
-                    && (*plan_tree).type_ == pg_sys::NodeTag::T_ModifyTable
-                    && (*(plan_tree as *mut pg_sys::ModifyTable)).onConflictAction
-                        != pg_sys::OnConflictAction::ONCONFLICT_NONE
-            };
             if operation == pg_sys::CmdType::CMD_INSERT && !insert_on_conflict {
                 call_prev_executor_start(query_desc, eflags);
                 return;
@@ -4828,6 +4825,41 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
         }
 
         call_prev_executor_start(query_desc, eflags);
+    }
+}
+
+/// True when any ModifyTable in the statement uses ON CONFLICT — the
+/// top-level plan, or a data-modifying CTE (those are planned into
+/// `PlannedStmt.subplans`, so a wrapping SELECT/UPDATE would otherwise
+/// smuggle the conflict inference past the top-level `operation` check).
+unsafe fn stmt_has_on_conflict(planned_stmt: *mut pg_sys::PlannedStmt) -> bool {
+    unsafe fn is_on_conflict_modifytable(plan: *mut pg_sys::Plan) -> bool {
+        unsafe {
+            !plan.is_null()
+                && (*plan).type_ == pg_sys::NodeTag::T_ModifyTable
+                && (*(plan as *mut pg_sys::ModifyTable)).onConflictAction
+                    != pg_sys::OnConflictAction::ONCONFLICT_NONE
+        }
+    }
+    unsafe {
+        if planned_stmt.is_null() {
+            return false;
+        }
+        if is_on_conflict_modifytable((*planned_stmt).planTree) {
+            return true;
+        }
+        if (*planned_stmt).hasModifyingCTE {
+            let subplans = (*planned_stmt).subplans;
+            if !subplans.is_null() {
+                for i in 0..(*subplans).length {
+                    if is_on_conflict_modifytable(pg_sys::list_nth(subplans, i) as *mut pg_sys::Plan)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 

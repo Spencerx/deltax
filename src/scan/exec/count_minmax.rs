@@ -124,7 +124,9 @@ unsafe fn for_each_heap_tail_row(
         };
         let econtext = (*node).ss.ps.ps_ExprContext;
 
-        let snapshot = pg_sys::GetActiveSnapshot();
+        // The executor's query snapshot — same visibility as the rest of
+        // the plan (segment meta rows, sibling scans).
+        let snapshot = (*(*node).ss.ps.state).es_snapshot;
         for &oid in &heap_oids {
             let rel = pg_sys::table_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             let tupdesc = (*rel).rd_att;
@@ -278,7 +280,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             }
         }
 
-        let state = if catalog_hit {
+        let mut state = if catalog_hit {
             // Approximate segment count from pg_class.reltuples (one row per segment).
             let mut total_segments: u64 = 0;
             for &oid in &companion_oids {
@@ -361,7 +363,6 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
         // P1 heap tail: add the loose rows sitting in the partition heaps
         // (transparent INSERTs after compression), filtered through the
         // full qual list. Zero-cost when every heap is empty.
-        let mut state = state;
         {
             let expected_natts = if qual_bytes.is_empty() {
                 0 // COUNT(*) without quals reads no columns

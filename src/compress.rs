@@ -4351,6 +4351,27 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
         )
         .expect("failed to lock partition for compaction");
 
+    // Re-read the catalog row now that the lock is held: a concurrent
+    // decompress could have flipped is_compressed between the unlocked
+    // check above and the lock grant — compacting then would treat the
+    // fully-restored heap as "loose rows" and truncate real data. The
+    // re-read also pins compressed_columns for the shape guard below.
+    let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
+        .expect("failed to re-query partition")
+        .unwrap_or_else(|| {
+            pgrx::error!(
+                "pg_deltax: partition {}.{} disappeared from catalog during compaction",
+                schema,
+                part_table
+            )
+        });
+    if !part_info.is_compressed {
+        return format!(
+            "Partition {}.{} is not compressed; nothing to compact",
+            schema, part_table
+        );
+    }
+
     let loose_rows: i64 = client
         .select(
             &format!("SELECT count(*) FROM ONLY {}", part_fqn),
@@ -4364,6 +4385,30 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
         .flatten()
         .unwrap_or(0);
     if loose_rows == 0 {
+        // A prior REPEATABLE READ compaction deletes (rather than truncates)
+        // the rows it compacted, and autovacuum is disabled on compressed
+        // partitions — so dead rows would keep the heap at nonzero blocks
+        // forever, pinning every scan on the slower heap-tail path and
+        // re-locking here each worker cycle. With the AEL held and zero
+        // visible rows, truncating away the dead tuples is the same MVCC
+        // tradeoff as the compress-time TRUNCATE.
+        let read_committed =
+            unsafe { pg_sys::XactIsoLevel } < pg_sys::XACT_REPEATABLE_READ as std::ffi::c_int;
+        let heap_bytes: i64 = client
+            .select(
+                &format!("SELECT pg_relation_size('{}'::regclass)", part_fqn),
+                Some(1),
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get_one::<i64>().ok().flatten())
+            .unwrap_or(0);
+        if read_committed && heap_bytes > 0 {
+            client
+                .update(&format!("TRUNCATE ONLY {}", part_fqn), None, &[])
+                .expect("failed to truncate dead loose-row region");
+            crate::scan::invalidate_compressed_cache();
+        }
         return format!(
             "Partition {}.{} has no loose rows to compact",
             schema, part_table
@@ -4403,6 +4448,17 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
     );
     if columns.is_empty() {
         pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
+    }
+    // Synthetic json_extract columns don't exist in the partition heap, so
+    // the loose-row cursor below cannot read them (and the companion layout
+    // expects them). Bail with the supported remedy instead of a raw SQL
+    // error from the cursor.
+    if columns.iter().any(|c| c.extracted.is_some()) {
+        pgrx::error!(
+            "pg_deltax: partition {}.{} uses json_extract; compacting loose rows is not supported — run deltax_decompress_partition() + deltax_compress_partition() instead",
+            schema,
+            part_table
+        );
     }
 
     let ddl = build_companion_ddl(&part_table, &columns);
@@ -5125,6 +5181,12 @@ fn merge_batch_hll_into_catalog(
 /// timeout or transient failure on one partition doesn't abort the worker's
 /// whole maintenance cycle.
 pub fn auto_compact_partitions(client: &mut SpiClient<'_>, ht: &catalog::DeltatableInfo) -> i32 {
+    // json_extract deltatables can't be compacted (synthetic columns have no
+    // heap presence — compact_partition_impl rejects them); skip instead of
+    // error-logging every worker cycle.
+    if ht.json_extract.is_some() && crate::get_json_extract_mode() != crate::JsonExtractMode::None {
+        return 0;
+    }
     let candidates = client
         .select(
             "SELECT p.schema_name, p.table_name
@@ -5186,7 +5248,6 @@ pub fn auto_compact_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltata
 
     compacted
 }
-
 
 /// Re-populate pg_class.reltuples + pg_statistic for an already-compressed
 /// partition. `stats::analyze_partition_from_catalog` reads the

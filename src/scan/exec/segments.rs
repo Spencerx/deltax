@@ -323,6 +323,10 @@ pub(crate) fn partition_oid_for_companion(companion_oid: pg_sys::Oid) -> pg_sys:
             None => return pg_sys::InvalidOid,
         }
     };
+    // `is_compressed` disambiguates same-named partitions across schemas:
+    // companions live in the single `_deltax_compressed` namespace, so at
+    // most one partition of a given name can be compressed (and it is the
+    // one this companion belongs to).
     let oid = pgrx::Spi::connect(|client| {
         client
             .select(
@@ -331,7 +335,7 @@ pub(crate) fn partition_oid_for_companion(companion_oid: pg_sys::Oid) -> pg_sys:
                    JOIN pg_namespace n ON n.oid = c.relnamespace
                    JOIN deltax.deltax_partition p
                      ON p.schema_name = n.nspname AND p.table_name = c.relname
-                  WHERE p.table_name = $1",
+                  WHERE p.table_name = $1 AND p.is_compressed",
                 Some(1),
                 &[partition_name.into()],
             )

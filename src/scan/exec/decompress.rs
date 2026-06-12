@@ -879,6 +879,17 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             // fall back to the full scan (upper Sort/Limit stays correct —
             // DeltaXAppend never claims pathkeys).
             topn_limit = 0;
+            // The heap tail is emitted by the leader's plan copy only. With
+            // parallel_leader_participation=off and workers launched, Gather
+            // never drives the leader's copy, so the tail would be silently
+            // dropped. Error instead — never wrong results.
+            if (*(*node).ss.ps.plan).parallel_aware && !pg_sys::parallel_leader_participation {
+                pgrx::error!(
+                    "pg_deltax: a compressed partition holds uncompressed rows, which a parallel \
+                     scan can only return with parallel_leader_participation=on; re-enable it or \
+                     run deltax_compact_partition() and retry"
+                );
+            }
         }
 
         // Load metadata for first companion table (cached per-backend).
@@ -3600,14 +3611,20 @@ unsafe fn try_emit_heap_tail_row(
                 let oid = ht.oids[ht.idx];
                 let rel = pg_sys::table_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
                 let rel_natts = (*(*rel).rd_att).natts as usize;
-                if rel_natts != ncols {
+                // The slot tupdesc is the partition's for DeltaXDecompress
+                // but the PARENT's for DeltaXAppend — plan Vars index it, so
+                // all three layouts must agree before deforming positionally
+                // (a dropped column on one side would silently misalign).
+                let slot_natts = (*(*scan_slot).tts_tupleDescriptor).natts as usize;
+                if rel_natts != ncols || slot_natts != rel_natts {
                     let name = relation_name(rel);
                     pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
                     pgrx::error!(
-                        "pg_deltax: compressed partition \"{}\" has uncompressed rows but its physical layout ({} attrs) does not match the compressed layout ({} cols); decompress and recompress it",
+                        "pg_deltax: compressed partition \"{}\" has uncompressed rows but its physical layout ({} attrs) does not match the compressed layout ({} cols, {} scan attrs); decompress and recompress it",
                         name,
                         rel_natts,
                         ncols,
+                        slot_natts,
                     );
                 }
                 let flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN

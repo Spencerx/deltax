@@ -270,6 +270,24 @@ class TestCompressedInsert:
         db.rollback()
         assert "ON CONFLICT" in str(exc.value)
 
+    def test_insert_on_conflict_in_cte_rejected(self, db):
+        # A data-modifying CTE hides the INSERT under a top-level SELECT;
+        # the ON CONFLICT rejection must still fire (conflict inference is
+        # just as blind to segment rows as a top-level INSERT).
+        setup_tables(db)
+        compress_all(db)
+
+        with pytest.raises(Exception) as exc:
+            db.execute(
+                "WITH ins AS ("
+                "    INSERT INTO events (ts, device_id, val, temperature) "
+                f"    VALUES ('{LATE_TS}', 'x', 1, 1.0) "
+                "    ON CONFLICT DO NOTHING RETURNING 1"
+                ") SELECT count(*) FROM ins"
+            )
+        db.rollback()
+        assert "ON CONFLICT" in str(exc.value)
+
     def test_compact_partition(self, db):
         setup_tables(db)
         compress_all(db)
