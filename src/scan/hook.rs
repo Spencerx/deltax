@@ -4925,9 +4925,14 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                 // Whole-segment DELETE fast path (§5.4) preconditions: the
                 // executor never sees the dropped rows, so anything that
                 // would observe them per-row must force decompose instead.
+                // RETURNING is checked on THIS ModifyTable (not
+                // `planned_stmt.hasReturning`, which only reflects the
+                // top-level query): a data-modifying CTE's `DELETE ...
+                // RETURNING` feeds the outer query and must materialize
+                // every row.
                 let allow_whole_drop = mt_op == pg_sys::CmdType::CMD_DELETE
-                    && !(*planned_stmt).hasReturning
-                    && !has_user_row_delete_trigger(relid);
+                    && (*mt).returningLists.is_null()
+                    && !delete_rows_are_observed(mt, rtable, relid);
 
                 // P2.5 tombstone fast path (DELETE only): when the complete
                 // predicate is exactly batch-evaluable, matching rows are
@@ -4938,6 +4943,14 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                 let tombstone_eligible = allow_whole_drop
                     && cand_set.all_quals_handled
                     && super::exec::segments::batch_quals_tombstone_exact(&cand_set.batch_quals);
+
+                // Command-tag credit (es_processed) only applies when this
+                // ModifyTable IS the statement's top plan node. Rows removed
+                // by a data-modifying CTE never count toward the outer
+                // statement's tag in PostgreSQL ("WITH d AS (DELETE ...)
+                // SELECT 1" reports SELECT 1 regardless), so crediting them
+                // would corrupt it.
+                let credit_command_tag = mt as *mut pg_sys::Plan == (*planned_stmt).planTree;
 
                 let mut drop_ids: Vec<i32> = Vec::new();
                 let mut decompose_ids: Vec<i32> = Vec::new();
@@ -4983,7 +4996,9 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                     }
                     if !targets.is_empty() {
                         let tombstoned = crate::compress::insert_dml_tombstones(relid, &targets);
-                        extra_processed += tombstoned as u64;
+                        if credit_command_tag {
+                            extra_processed += tombstoned as u64;
+                        }
                         pgrx::debug1!(
                             "pg_deltax tombstone DELETE: \"{}\": {} row(s) tombstoned across {} segment(s)",
                             rel_display_name(relid),
@@ -4997,7 +5012,9 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                     crate::compress::decompose_segments_for_dml(relid, &decompose_ids, &drop_ids);
                 if stats.decomposed_segments > 0 || stats.dropped_segments > 0 {
                     any_decomposed = true;
-                    extra_processed += stats.dropped_rows as u64;
+                    if credit_command_tag {
+                        extra_processed += stats.dropped_rows as u64;
+                    }
                     pgrx::debug1!(
                         "pg_deltax decompose-on-write: \"{}\": {} segment(s) decomposed ({} rows restored), {} segment(s) dropped whole ({} rows)",
                         rel_display_name(relid),
@@ -5283,18 +5300,53 @@ unsafe fn scan_qual_walk_list(
     }
 }
 
+/// True when something must observe each deleted row, disqualifying the
+/// whole-segment-drop / tombstone fast paths (which never materialize the
+/// rows): a row-level DELETE trigger on the leaf, or an AFTER DELETE
+/// trigger with an OLD TABLE transition relation on the leaf OR on the
+/// statement's named target (`nominalRelation`) — transition capture on a
+/// partitioned parent collects rows from every leaf.
+unsafe fn delete_rows_are_observed(
+    mt: *mut pg_sys::ModifyTable,
+    rtable: *mut pg_sys::List,
+    leaf_relid: pg_sys::Oid,
+) -> bool {
+    unsafe {
+        if rel_observes_row_deletes(leaf_relid) {
+            return true;
+        }
+        let nominal_rti = (*mt).nominalRelation;
+        if nominal_rti != 0 && !rtable.is_null() {
+            let rte =
+                pg_sys::list_nth(rtable, nominal_rti as i32 - 1) as *const pg_sys::RangeTblEntry;
+            if !rte.is_null()
+                && (*rte).relid != leaf_relid
+                && rel_observes_row_deletes((*rte).relid)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// True when the relation has any user-defined (or constraint/RI) row-level
-/// DELETE trigger besides pg_deltax's own `deltax_reject_compressed_dml`.
-/// Such triggers must fire per row, so the whole-segment DELETE fast path
-/// (which never materializes the rows) is disabled and the segments are
-/// decomposed instead.
-unsafe fn has_user_row_delete_trigger(relid: pg_sys::Oid) -> bool {
+/// DELETE trigger besides pg_deltax's own `deltax_reject_compressed_dml`,
+/// or any AFTER trigger with an OLD TABLE transition relation (whose
+/// contents must include every deleted row).
+unsafe fn rel_observes_row_deletes(relid: pg_sys::Oid) -> bool {
     unsafe {
         let rel = pg_sys::table_open(relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let mut found = false;
         let trigdesc = (*rel).trigdesc;
         if !trigdesc.is_null() {
+            if (*trigdesc).trig_delete_old_table {
+                found = true;
+            }
             for i in 0..(*trigdesc).numtriggers {
+                if found {
+                    break;
+                }
                 let trig = (*trigdesc).triggers.add(i as usize);
                 let tgtype = (*trig).tgtype as u32;
                 let row_delete = tgtype & pg_sys::TRIGGER_TYPE_ROW != 0
@@ -5305,7 +5357,6 @@ unsafe fn has_user_row_delete_trigger(relid: pg_sys::Oid) -> bool {
                 let name = std::ffi::CStr::from_ptr((*trig).tgname).to_string_lossy();
                 if name != "deltax_reject_compressed_dml" {
                     found = true;
-                    break;
                 }
             }
         }
@@ -5315,13 +5366,16 @@ unsafe fn has_user_row_delete_trigger(relid: pg_sys::Oid) -> bool {
 }
 
 thread_local! {
-    /// Pending command-tag correction for the whole-segment DELETE fast
-    /// path: `(QueryDesc address, logically deleted rows)`. Consumed by the
-    /// ExecutorRun hook for the matching QueryDesc; cleared at transaction
-    /// end so a stale entry from an errored statement can never attach to a
-    /// future QueryDesc that happens to reuse the same address.
-    static PENDING_DML_EXTRA_ROWS: std::cell::Cell<Option<(usize, u64)>> =
-        const { std::cell::Cell::new(None) };
+    /// Pending command-tag corrections for the whole-segment DELETE fast
+    /// path: `(QueryDesc address, logically deleted rows)` entries. A Vec
+    /// because statements can nest (a trigger or function body running DML
+    /// on another compressed partition while the outer statement's credit
+    /// is still pending). Entries are consumed by the ExecutorRun hook of
+    /// the matching QueryDesc; leftovers are cleared at transaction end so
+    /// a stale entry from an errored statement can never attach to a future
+    /// QueryDesc that happens to reuse the same address.
+    static PENDING_DML_EXTRA_ROWS: std::cell::RefCell<Vec<(usize, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static DML_XACT_CB_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -5337,7 +5391,7 @@ fn set_pending_dml_extra_rows(qd_addr: usize, rows: u64) {
             c.set(true);
         }
     });
-    PENDING_DML_EXTRA_ROWS.with(|c| c.set(Some((qd_addr, rows))));
+    PENDING_DML_EXTRA_ROWS.with(|c| c.borrow_mut().push((qd_addr, rows)));
 }
 
 #[pg_guard]
@@ -5353,18 +5407,27 @@ unsafe extern "C-unwind" fn dml_extra_rows_xact_callback(
             | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT
             | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
     ) {
-        PENDING_DML_EXTRA_ROWS.with(|c| c.set(None));
+        PENDING_DML_EXTRA_ROWS.with(|c| c.borrow_mut().clear());
     }
 }
 
 /// Fold the pending whole-segment-drop row count into `es_processed` after
-/// the run, so the command tag reports the logical row count.
+/// the run, so the command tag reports the logical row count. Consumes (and
+/// sums) every entry recorded for this QueryDesc.
 unsafe fn apply_pending_dml_extra_rows(query_desc: *mut pg_sys::QueryDesc) {
-    let pending = PENDING_DML_EXTRA_ROWS.with(|c| c.get());
-    if let Some((addr, rows)) = pending
-        && addr == query_desc as usize
-    {
-        PENDING_DML_EXTRA_ROWS.with(|c| c.set(None));
+    let addr = query_desc as usize;
+    let mut rows: u64 = 0;
+    PENDING_DML_EXTRA_ROWS.with(|c| {
+        c.borrow_mut().retain(|&(a, r)| {
+            if a == addr {
+                rows += r;
+                false
+            } else {
+                true
+            }
+        })
+    });
+    if rows > 0 {
         unsafe {
             let estate = (*query_desc).estate;
             if !estate.is_null() {

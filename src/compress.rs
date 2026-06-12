@@ -4972,7 +4972,7 @@ impl Drop for DmlBypassGuard {
 /// Compaction may need to create sidecar tables that the original
 /// compression skipped (e.g. `_blooms` when the GUC was off, `_text_lengths`
 /// when there were no text columns yet).
-fn ddl_if_not_exists(ddl: &str) -> String {
+pub(crate) fn ddl_if_not_exists(ddl: &str) -> String {
     ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
 }
 

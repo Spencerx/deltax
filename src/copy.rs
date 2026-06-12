@@ -2977,8 +2977,7 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             let ddl = crate::compress::build_companion_ddl(&buf.partition_table, columns);
             client
                 .update(
-                    &ddl.tombstones_ddl
-                        .replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
+                    &crate::compress::ddl_if_not_exists(&ddl.tombstones_ddl),
                     None,
                     &[],
                 )

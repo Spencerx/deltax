@@ -21,10 +21,12 @@ segments with the read path's pruning pipeline
 heap rows (`decompose_segments_for_dml`, per-segment refactor of the
 decompress loop) under `DML_BYPASS`, bumps the statement snapshot's command
 id, and lets the planned heap scan run the DML normally. The whole-segment
-direct DELETE (§5.4) is implemented behind three guards (no RETURNING, no
-user row DELETE triggers, every qual batch-provable AllPass) with an
-ExecutorRun hook folding dropped rows into `es_processed` so command tags
-stay truthful. The row trigger no longer rejects UPDATE/DELETE (rows it
+direct DELETE (§5.4) is implemented behind three guards (no RETURNING on
+that ModifyTable — CTE-level, not just top-level; no row DELETE triggers or
+OLD TABLE transition relations on the leaf or the named target; every qual
+batch-provable AllPass) with an ExecutorRun hook folding dropped rows into
+`es_processed` so command tags stay truthful (top-level statements only —
+CTE-deleted rows never count toward the outer tag, matching PostgreSQL). The row trigger no longer rejects UPDATE/DELETE (rows it
 sees are by construction heap rows); ON CONFLICT stays rejected.
 P2 deviations/details vs this design:
 - Locking is an AccessExclusive partition lock (same as compaction) taken

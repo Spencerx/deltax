@@ -968,3 +968,79 @@ class TestDmlConcurrency:
         assert db.execute(
             "SELECT count(*) FROM events WHERE temperature = -77"
         ).fetchone()[0] == 200
+
+
+# ---------------------------------------------------------------------------
+# Observers of deleted rows: CTEs, RETURNING, transition tables
+# ---------------------------------------------------------------------------
+
+class TestDeleteObservers:
+    def test_cte_delete_returning_yields_every_row(self, db):
+        """A data-modifying CTE's DELETE ... RETURNING feeds the outer query,
+        so the whole-segment-drop / tombstone fast paths must be disabled
+        even though the TOP-level statement (a SELECT) has no RETURNING —
+        every deleted row must be materialized and flow through the CTE."""
+        setup_tables(db)
+        compress_all(db)
+
+        q = ("WITH d AS (DELETE FROM {} WHERE device_id = 'device-1' "
+             "RETURNING val) SELECT count(*), sum(val) FROM d")
+        got = db.execute(q.format("events")).fetchone()
+        want = db.execute(q.format("events_plain")).fetchone()
+        db.commit()
+        assert got == want == (200, sum(range(1000, 1200)))
+        assert_tables_match(db)
+        assert_queries_match(db)
+
+    def test_cte_delete_without_returning_keeps_outer_tag(self, db):
+        """`WITH d AS (DELETE ...) SELECT 1`: the rows are deleted, but the
+        outer SELECT's command tag must not absorb the CTE's row count
+        (PostgreSQL reports SELECT 1 regardless of CTE-deleted rows)."""
+        setup_tables(db)
+        compress_all(db)
+
+        cur = db.execute("WITH d AS (DELETE FROM events) SELECT 1")
+        assert cur.fetchall() == [(1,)]
+        assert cur.statusmessage == "SELECT 1"
+        db.execute("WITH d AS (DELETE FROM events_plain) SELECT 1")
+        db.commit()
+        assert db.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert_tables_match(db)
+
+    def test_delete_with_transition_table_sees_every_row(self, db):
+        """An AFTER DELETE statement trigger with REFERENCING OLD TABLE must
+        observe every deleted row — the fast paths (whole-drop, tombstone)
+        never materialize rows, so they must be disabled."""
+        setup_tables(db)
+        compress_all(db)
+        part = data_partition(db)
+        db.execute("""
+            CREATE TABLE delete_audit (n BIGINT, sum_val BIGINT);
+            CREATE FUNCTION audit_deletes() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO delete_audit
+                SELECT count(*), COALESCE(sum(val), 0) FROM old_rows;
+                RETURN NULL;
+            END $$;
+            CREATE TRIGGER events_delete_audit
+                AFTER DELETE ON events
+                REFERENCING OLD TABLE AS old_rows
+                FOR EACH STATEMENT EXECUTE FUNCTION audit_deletes();
+        """)
+        db.commit()
+
+        # Covers one whole segment (would be a whole-drop candidate) plus a
+        # tombstone-eligible single row in another segment.
+        cur = db.execute("DELETE FROM events WHERE val <= 199 OR val = 2050")
+        assert cur.rowcount == 201
+        db.execute("DELETE FROM events_plain WHERE val <= 199 OR val = 2050")
+        db.commit()
+
+        assert db.execute(
+            "SELECT n, sum_val FROM delete_audit"
+        ).fetchall() == [(201, sum(range(200)) + 2050)]
+        # Mechanism: the transition table forced decompose for both segments.
+        assert tombstone_rows(db, part) == set()
+        assert_tables_match(db)
+        assert_queries_match(db)
