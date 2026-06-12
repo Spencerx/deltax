@@ -82,44 +82,56 @@ def _rtabench_case(name: str):
         ("copy_csv_mixed_s25", "copy_csv", 25),
     ),
 )
-def test_rtabench_compressed_partition_rejects_parent_routed_insert(
+def test_rtabench_compressed_partition_accepts_parent_routed_insert(
     db,
     layout_name,
     load_path,
     segment_size,
 ):
+    # P1 transparent DML: a plain INSERT routed through the parent into a
+    # compressed partition succeeds — the row lands in the partition heap
+    # (the "loose row" region) and every read path unions it with the
+    # segment data.
     plain_table, deltax_table = create_rtabench_synthetic_pair(
         db,
         deltax_table=f"rtabench_events_{layout_name}",
         load_path=load_path,
         segment_size=segment_size,
     )
-    with pytest.raises(Exception, match="compressed partition"):
-        db.execute(
-            f"""
-            INSERT INTO {deltax_table} (
-                order_id,
-                counter,
-                event_created,
-                event_type,
-                satisfaction,
-                processor,
-                backup_processor,
-                event_payload
-            )
-            VALUES (
-                181,
-                9001,
-                '2024-05-04 12:00:00+00',
-                'Delivered',
-                4.5,
-                'proc-a',
-                'proc-b',
-                '{{}}'::jsonb
-            )
-            """
+    insert_template = """
+        INSERT INTO {table} (
+            order_id,
+            counter,
+            event_created,
+            event_type,
+            satisfaction,
+            processor,
+            backup_processor,
+            event_payload
         )
-    db.rollback()
+        VALUES (
+            181,
+            9001,
+            '2024-05-04 12:00:00+00',
+            'Delivered',
+            4.5,
+            'proc-a',
+            'proc-b',
+            '{{}}'::jsonb
+        )
+    """
+    db.execute(insert_template.format(table=deltax_table))
+    db.execute(insert_template.format(table=plain_table))
+    db.commit()
+
+    # The loose row must be visible through the deltax read path.
+    visible = db.execute(
+        f"SELECT count(*) FROM {deltax_table} WHERE counter = 9001"
+    ).fetchone()[0]
+    assert visible == 1
+    deltax_total = db.execute(f"SELECT count(*) FROM {deltax_table}").fetchone()[0]
+    plain_total = db.execute(f"SELECT count(*) FROM {plain_table}").fetchone()[0]
+    assert deltax_total == plain_total
 
     assert_query_case(
         db,
