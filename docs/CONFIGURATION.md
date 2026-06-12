@@ -27,6 +27,12 @@ All settings are PostgreSQL GUCs and follow the usual scoping rules (`SET`, `ALT
 | `pg_deltax.json_extract_mode` | `none` | userset | How `COPY ... WITH (FORMAT deltax_compress)` extracts JSON paths into extra columnar columns. `none` disables extraction and the planner-side rewrite; `fields` uses the path list configured in `deltax_enable_compression(... json_extract => ...)`; `all` is reserved for auto-discovery (not yet implemented). |
 | `pg_deltax.use_lz4` | `on` | userset | Declare internal columnar-blob companion columns (`_blobs._data`, `_blooms._data`, `_text_lengths._data`, `_valbitmap._bits`) with `BYTEA COMPRESSION lz4`. The columnar compression itself happens in Rust regardless; this attribute only controls the Postgres TOAST pass on those already-compressed bytes. Default ON. If the running PG was not built with `--with-lz4` the attribute is omitted automatically (and `deltax_enable_compression` emits a one-shot `WARNING` per backend) so `CREATE TABLE` doesn't fail. Set OFF explicitly to suppress the attribute on an lz4-capable build. Without lz4 the on-disk size is somewhat larger and cold-cache reads slower. |
 
+## Maintenance worker
+
+| GUC | Default | Context | Description |
+|---|---|---|---|
+| `pg_deltax.target_database` | `postgres` | postmaster | Comma-separated list of databases the maintenance background worker services (e.g. `postgres,metrics_db`). A background worker binds to exactly one database for its lifetime, so one worker is registered per listed database; each drains, premakes, compresses and applies retention only for deltatables registered in its own database. Entries are trimmed and deduplicated; a short-lived launcher reads the list at startup and spawns one dynamic worker per entry (each consumes one `max_worker_processes` slot). `pg_stat_activity` shows one `pg_deltax maintenance worker (<db>)` row per entry. Requires a server restart to take effect. |
+
 ## Testing
 
 | GUC | Default | Context | Description |
