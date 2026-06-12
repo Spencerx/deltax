@@ -7,7 +7,8 @@ Covers dev/docs/COMPRESSED_DML.md §4 (P1):
     scans, COUNT(*), MIN/MAX/SUM pushdowns, GROUP BY aggregates, point
     lookups (partition bloom sentinels must never hide heap rows), and
     ORDER BY ... LIMIT.
-  - UPDATE / DELETE stay rejected.
+  - UPDATE / DELETE work via P2 decompose-on-write (full suite in
+    test_compressed_dml.py; a smoke test lives here).
   - INSERT ... ON CONFLICT stays rejected.
   - deltax_compact_partition() folds loose rows into new segments; results
     are unchanged afterwards and the heap is empty again.
@@ -235,24 +236,32 @@ class TestCompressedInsert:
         # plain Agg over scans that union the heap tail.
         assert "DeltaXAgg" not in plan_after
 
-    def test_update_delete_still_rejected(self, db):
+    def test_update_delete_work_on_compressed(self, db):
+        # P2 decompose-on-write smoke test: UPDATE/DELETE on compressed
+        # partitions (direct and via the parent) behave exactly like on the
+        # plain twin. The dedicated suite is tests/test_compressed_dml.py.
         setup_tables(db)
         compress_all(db)
         part = data_partition(db)
         insert_late_rows(db)
 
         for stmt in (
-            f"UPDATE events SET val = 0 WHERE ts >= '{BASE_TS}'::timestamptz",
-            f"UPDATE {part} SET val = 0",
-            f"DELETE FROM events WHERE ts >= '{BASE_TS}'::timestamptz",
-            f"DELETE FROM {part}",
+            "UPDATE {} SET val = val + 1 WHERE device_id = 'device-1'",
+            "DELETE FROM {} WHERE val = 2050",
         ):
-            with pytest.raises(Exception) as exc:
-                db.execute(stmt)
-            db.rollback()
-            db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
-            db.commit()
-            assert "compressed partition" in str(exc.value)
+            got = db.execute(stmt.format("events")).rowcount
+            want = db.execute(stmt.format("events_plain")).rowcount
+            assert got == want, f"{stmt}: deltax={got} plain={want}"
+        # Direct partition-targeted DML too (twin has no partitions; apply
+        # the same statement to the whole twin table — the partition holds
+        # all rows in this dataset).
+        got = db.execute(f"UPDATE {part} SET temperature = -1.0").rowcount
+        want = db.execute("UPDATE events_plain SET temperature = -1.0").rowcount
+        assert got == want
+        db.commit()
+
+        assert_tables_match(db)
+        assert_queries_match(db)
 
     def test_insert_on_conflict_rejected(self, db):
         setup_tables(db)

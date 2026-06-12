@@ -158,8 +158,10 @@ pub(crate) fn set_dml_bypass(bypass: bool) {
     DML_BYPASS.with(|flag| flag.set(bypass));
 }
 
-/// Read the DML bypass flag (probed by the compressed-partition trigger via
-/// `deltax.deltax_dml_bypass_active()`).
+/// Read the DML bypass flag (exposed to SQL via
+/// `deltax.deltax_dml_bypass_active()` for diagnostics; since P2 the row
+/// trigger no longer probes it — any UPDATE/DELETE row it sees is already a
+/// plain heap row).
 pub(crate) fn dml_bypass_active() -> bool {
     DML_BYPASS.with(|flag| flag.get())
 }
@@ -623,6 +625,26 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         // Only handle regular tables
         if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return;
+        }
+
+        // P2 (COMPRESSED_DML.md §5.2): never replace a DML target relation's
+        // scan with a custom scan. ModifyTable consumes real ctids from its
+        // target scan, which a CustomScan over companion tables cannot
+        // supply. Decompose-on-write (the ExecutorStart interceptor)
+        // materializes affected segment rows into the partition heap
+        // instead, and the plain heap plan picks them up at execution.
+        // Covers the named target rel and, for partitioned targets, its
+        // leaf children (which appear as OTHER_MEMBER_RELs). Source rels of
+        // the same statement (e.g. `UPDATE t ... FROM compressed`) keep
+        // their custom paths.
+        {
+            let parse = (*root).parse;
+            if !parse.is_null() && (*parse).resultRelation != 0 {
+                let result_rti = (*parse).resultRelation as pg_sys::Index;
+                if rti == result_rti || rel_descends_from(root, rti, result_rti) {
+                    return;
+                }
+            }
         }
 
         // Extract LIMIT/OFFSET from parse tree for Top-N optimization
@@ -2581,7 +2603,13 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     Some(std::ptr::null_mut())
                 };
 
-                if let Some(qual_list) = qual_list_opt {
+                // P2.5: per-segment metadata describes physical rows;
+                // tombstoned partitions must take the row path (exec-time
+                // tombstone filtering). DeltaXCount stays enabled — its
+                // executor subtracts tombstones exactly.
+                if let Some(qual_list) = qual_list_opt
+                    && !any_companion_may_have_tombstones(&companion_oids)
+                {
                     path::add_minmax_path(
                         root,
                         output_rel,
@@ -2675,7 +2703,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 });
             }
 
-            if !minmax_specs.is_empty() {
+            if !minmax_specs.is_empty() && !any_companion_may_have_tombstones(&companion_oids) {
                 path::add_minmax_path(
                     root,
                     output_rel,
@@ -4590,8 +4618,10 @@ pub(crate) unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
 }
 
 /// True when any relation RTE in the query is a compressed partition whose
-/// heap holds loose rows (P1 transparent INSERT). Conservative gate for the
-/// DeltaXAgg pushdown, which cannot ingest row-form heap tuples.
+/// heap holds loose rows (P1 transparent INSERT) or whose `_tombstones`
+/// companion is non-empty (P2.5 logically deleted rows). Conservative gate
+/// for the DeltaXAgg pushdown, whose columnar accumulators cannot ingest
+/// row-form heap tuples and whose metadata shortcuts count physical rows.
 unsafe fn any_compressed_rte_heap_nonempty(root: *mut pg_sys::PlannerInfo) -> bool {
     unsafe {
         let array_size = (*root).simple_rel_array_size;
@@ -4604,10 +4634,57 @@ unsafe fn any_compressed_rte_heap_nonempty(root: *mut pg_sys::PlannerInfo) -> bo
                 continue;
             }
             let relid = (*rte).relid;
-            if cached_companion_for_rel(relid) != pg_sys::InvalidOid
-                && !relation_heap_is_empty(relid)
+            let companion_oid = cached_companion_for_rel(relid);
+            if companion_oid != pg_sys::InvalidOid
+                && (!relation_heap_is_empty(relid)
+                    || super::exec::segments::companion_may_have_tombstones(companion_oid))
             {
                 return true;
+            }
+        }
+        false
+    }
+}
+
+/// True when any of the companion tables' partitions may hold tombstones
+/// (conservative nblocks probe). Plan-time gate for DeltaXMinMax — its
+/// executor answers MIN/MAX/SUM/COUNT purely from per-segment metadata,
+/// which describes physical rows; a tombstone may hold the extremum.
+unsafe fn any_companion_may_have_tombstones(companion_oids: &[pg_sys::Oid]) -> bool {
+    companion_oids
+        .iter()
+        .any(|&oid| unsafe { super::exec::segments::companion_may_have_tombstones(oid) })
+}
+
+/// True when `rti` is an inheritance/partition descendant of `ancestor_rti`,
+/// following the `append_rel_list` child → parent chain. Used to keep DML
+/// target partitions (children of `parse->resultRelation`) on plain heap
+/// paths.
+unsafe fn rel_descends_from(
+    root: *mut pg_sys::PlannerInfo,
+    mut rti: pg_sys::Index,
+    ancestor_rti: pg_sys::Index,
+) -> bool {
+    unsafe {
+        let list = (*root).append_rel_list;
+        if list.is_null() {
+            return false;
+        }
+        let len = (*list).length;
+        // Bounded walk: inheritance trees are shallow; 64 hops is paranoia.
+        for _ in 0..64 {
+            let mut parent: Option<pg_sys::Index> = None;
+            for i in 0..len {
+                let node = pg_sys::list_nth(list, i) as *const pg_sys::AppendRelInfo;
+                if !node.is_null() && (*node).child_relid == rti {
+                    parent = Some((*node).parent_relid);
+                    break;
+                }
+            }
+            match parent {
+                Some(p) if p == ancestor_rti => return true,
+                Some(p) => rti = p,
+                None => return false,
             }
         }
         false
@@ -4713,11 +4790,26 @@ pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys:
     }
 }
 
-/// ExecutorStart hook: block DML on compressed partitions.
+/// ExecutorStart hook: transparent DML on compressed partitions
+/// (dev/docs/COMPRESSED_DML.md).
 ///
-/// INSERT/UPDATE/DELETE on a compressed partition would silently produce
-/// incorrect results (writes go to the truncated heap, reads come from the
-/// companion table). This hook raises an error before execution begins.
+/// - **INSERT (P1):** passes through — rows land in the partition heap (the
+///   loose-row region) and every read path unions them with segment data.
+///   `INSERT ... ON CONFLICT` stays rejected: segment rows have no index
+///   entries, so conflict inference against compressed data would be
+///   silently wrong.
+/// - **UPDATE / DELETE / MERGE (P2, §5):** decompose-on-write. Before the
+///   DML executes, candidate segments are located with the read path's
+///   pruning pipeline (conservative superset), decomposed into ordinary
+///   heap rows (meta + sidecar rows deleted, rows restored), and the
+///   planned heap scan then sees them like any other tuples — MVCC,
+///   rollback, triggers, RLS and RETURNING all behave normally. A DELETE
+///   whose predicate provably covers a whole segment drops it directly
+///   (§5.4) without materializing rows.
+///
+/// Data-modifying CTEs are handled by walking every ModifyTable node in the
+/// plan (including subplans), so `WITH d AS (DELETE ...) SELECT` decomposes
+/// too even though the top-level operation is CMD_SELECT.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn deltax_executor_start(
     query_desc: *mut pg_sys::QueryDesc,
@@ -4727,101 +4819,218 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
         let operation = (*query_desc).operation;
         let planned_stmt = (*query_desc).plannedstmt;
 
-        // Only check DML commands — plus statements whose data-modifying
-        // CTEs hide an INSERT ... ON CONFLICT (their top-level operation
-        // is CMD_SELECT, but the conflict inference is just as blind to
-        // segment rows as a top-level one).
-        let is_dml = operation == pg_sys::CmdType::CMD_INSERT
-            || operation == pg_sys::CmdType::CMD_UPDATE
-            || operation == pg_sys::CmdType::CMD_DELETE;
-        let insert_on_conflict = stmt_has_on_conflict(planned_stmt);
-        if !is_dml && !insert_on_conflict {
+        // Only check DML commands — plus statements with data-modifying
+        // CTEs (their top-level operation is CMD_SELECT, but the hidden
+        // ModifyTable subplans — including INSERT ... ON CONFLICT, whose
+        // conflict inference is just as blind to segment rows as a
+        // top-level one — still need the per-node walk below).
+        let is_dml = matches!(
+            operation,
+            pg_sys::CmdType::CMD_INSERT
+                | pg_sys::CmdType::CMD_UPDATE
+                | pg_sys::CmdType::CMD_DELETE
+                | pg_sys::CmdType::CMD_MERGE
+        );
+        let has_modifying_cte = !planned_stmt.is_null() && (*planned_stmt).hasModifyingCTE;
+        if planned_stmt.is_null() || (!is_dml && !has_modifying_cte) {
             call_prev_executor_start(query_desc, eflags);
             return;
         }
 
-        // Skip check when internal operations (e.g. decompress) set the bypass flag
+        // Skip when internal operations (decompress/compaction/decompose)
+        // set the bypass flag — their SPI commands re-enter this hook.
         if DML_BYPASS.with(|flag| flag.get()) {
             call_prev_executor_start(query_desc, eflags);
             return;
         }
 
-        if planned_stmt.is_null() {
+        // Hot-path shortcut: a plain top-level INSERT (no ON CONFLICT, no
+        // modifying CTEs) needs no plan walk at all. `stmt_has_on_conflict`
+        // is the authoritative ON CONFLICT detector (it also walks wCTE
+        // subplans, though with `!has_modifying_cte` only the top plan can
+        // exist here).
+        if operation == pg_sys::CmdType::CMD_INSERT
+            && !has_modifying_cte
+            && !stmt_has_on_conflict(planned_stmt)
+        {
             call_prev_executor_start(query_desc, eflags);
             return;
         }
 
-        let result_relations = (*planned_stmt).resultRelations;
-        if !result_relations.is_null() {
-            let rtable = (*planned_stmt).rtable;
-            let n = (*result_relations).length;
+        // EXPLAIN (without ANALYZE) initializes but never runs the plan —
+        // it must not mutate the partition. ON CONFLICT rejection below
+        // still applies (matching pre-P2 behavior).
+        let explain_only = (eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int) != 0;
 
-            // P1 transparent INSERT: plain INSERTs into compressed
-            // partitions are allowed — rows land in the partition heap
-            // (the loose-row region) and every read path unions them with
-            // the segment data. INSERT ... ON CONFLICT stays rejected:
-            // segment rows have no index entries, so conflict inference
-            // against compressed data would be silently wrong.
-            if operation == pg_sys::CmdType::CMD_INSERT && !insert_on_conflict {
-                call_prev_executor_start(query_desc, eflags);
-                return;
+        let rtable = (*planned_stmt).rtable;
+        let mut any_decomposed = false;
+        let mut extra_processed: u64 = 0;
+
+        for mt in collect_modify_table_nodes(planned_stmt) {
+            let mt_op = (*mt).operation;
+            let insert_on_conflict = mt_op == pg_sys::CmdType::CMD_INSERT
+                && (*mt).onConflictAction != pg_sys::OnConflictAction::ONCONFLICT_NONE;
+            if mt_op == pg_sys::CmdType::CMD_INSERT && !insert_on_conflict {
+                continue;
+            }
+            let result_relations = (*mt).resultRelations;
+            if result_relations.is_null() || rtable.is_null() {
+                continue;
             }
 
-            for i in 0..n {
+            for i in 0..(*result_relations).length {
                 // resultRelations is an IntList of 1-based RTE indices
                 let rti = (*(*result_relations).elements.add(i as usize)).int_value;
-                if rti <= 0 || rtable.is_null() {
+                if rti <= 0 {
                     continue;
                 }
-
-                // Get the RTE at this index (0-based in the list)
                 let rte = pg_sys::list_nth(rtable, rti - 1) as *const pg_sys::RangeTblEntry;
                 if rte.is_null() {
                     continue;
                 }
                 let relid = (*rte).relid;
-
                 let companion_oid = cached_companion_for_rel(relid);
-                // For INSERT ... ON CONFLICT, the named target is usually
-                // the partitioned parent (tuple routing picks the leaf
-                // later), so also reject when the parent has at least one
-                // compressed partition.
-                let blocked = companion_oid != pg_sys::InvalidOid
-                    || (insert_on_conflict && parent_has_compressed_partition(relid));
 
-                if blocked {
-                    let op_name = if insert_on_conflict {
-                        "INSERT ... ON CONFLICT into"
-                    } else {
-                        match operation {
-                            pg_sys::CmdType::CMD_UPDATE => "UPDATE",
-                            pg_sys::CmdType::CMD_DELETE => "DELETE from",
-                            _ => "modify",
-                        }
-                    };
-                    let rel_name_ptr = pg_sys::get_rel_name(relid);
-                    let rel_name = if rel_name_ptr.is_null() {
-                        format!("OID {}", relid)
-                    } else {
-                        std::ffi::CStr::from_ptr(rel_name_ptr)
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    if insert_on_conflict {
+                if insert_on_conflict {
+                    // The named target is usually the partitioned parent
+                    // (tuple routing picks the leaf later), so also reject
+                    // when the parent has a compressed partition.
+                    if companion_oid != pg_sys::InvalidOid || parent_has_compressed_partition(relid)
+                    {
                         pgrx::error!(
-                            "cannot {} \"{}\": ON CONFLICT cannot see rows in compressed partitions, decompress them first",
-                            op_name,
-                            rel_name,
+                            "cannot INSERT ... ON CONFLICT into \"{}\": ON CONFLICT cannot see rows in compressed partitions, decompress them first",
+                            rel_display_name(relid),
                         );
+                    }
+                    continue;
+                }
+
+                // UPDATE / DELETE / MERGE on a compressed leaf partition:
+                // decompose-on-write.
+                if companion_oid == pg_sys::InvalidOid || explain_only {
+                    continue;
+                }
+
+                let (qual_lists, quals_complete) =
+                    collect_target_scan_quals(mt, rti as pg_sys::Index);
+                let cand_set = super::exec::segments::dml_candidate_segments(
+                    companion_oid,
+                    &qual_lists,
+                    quals_complete,
+                );
+                if cand_set.candidates.is_empty() {
+                    continue;
+                }
+
+                // Whole-segment DELETE fast path (§5.4) preconditions: the
+                // executor never sees the dropped rows, so anything that
+                // would observe them per-row must force decompose instead.
+                let allow_whole_drop = mt_op == pg_sys::CmdType::CMD_DELETE
+                    && !(*planned_stmt).hasReturning
+                    && !has_user_row_delete_trigger(relid);
+
+                // P2.5 tombstone fast path (DELETE only): when the complete
+                // predicate is exactly batch-evaluable, matching rows are
+                // identified during a single decode pass of the qual columns
+                // and recorded as `(segment_id, row_offset)` tombstones —
+                // no decompose, no heap materialization. Same observation
+                // guards as whole-drop (the executor never sees the rows).
+                let tombstone_eligible = allow_whole_drop
+                    && cand_set.all_quals_handled
+                    && super::exec::segments::batch_quals_tombstone_exact(&cand_set.batch_quals);
+
+                let mut drop_ids: Vec<i32> = Vec::new();
+                let mut decompose_ids: Vec<i32> = Vec::new();
+                let mut tomb_candidates: Vec<super::exec::segments::DmlSegmentCandidate> =
+                    Vec::new();
+                for c in cand_set.candidates {
+                    if allow_whole_drop && c.all_rows_match {
+                        drop_ids.push(c.segment_id);
+                    } else if tombstone_eligible {
+                        tomb_candidates.push(c);
                     } else {
-                        pgrx::error!(
-                            "cannot {} compressed partition \"{}\", decompress it first",
-                            op_name,
-                            rel_name,
+                        decompose_ids.push(c.segment_id);
+                    }
+                }
+
+                if !tomb_candidates.is_empty() {
+                    // Claim: FOR UPDATE on the candidates' meta rows blocks
+                    // concurrent decompose/compaction of those segments for
+                    // the rest of our transaction; segments already gone
+                    // (concurrently decomposed) are skipped — the P2
+                    // delete-first protocol's "0 rows" rule.
+                    let ids: Vec<i32> = tomb_candidates.iter().map(|c| c.segment_id).collect();
+                    let survivors: std::collections::HashSet<i32> =
+                        crate::compress::claim_segments_for_tombstone(relid, &ids)
+                            .into_iter()
+                            .collect();
+                    let mut targets: Vec<(i32, Vec<u32>)> = Vec::new();
+                    for mut c in tomb_candidates {
+                        if !survivors.contains(&c.segment_id) {
+                            continue;
+                        }
+                        match super::exec::segments::dml_matching_offsets(
+                            companion_oid,
+                            &mut c.seg,
+                            &cand_set.batch_quals,
+                        ) {
+                            Some(offsets) if offsets.is_empty() => {} // pruning false positive
+                            Some(offsets) => targets.push((c.segment_id, offsets)),
+                            // Exactness lost (unexpected shape) — never skip,
+                            // degrade to decompose like every other ambiguity.
+                            None => decompose_ids.push(c.segment_id),
+                        }
+                    }
+                    if !targets.is_empty() {
+                        let tombstoned = crate::compress::insert_dml_tombstones(relid, &targets);
+                        extra_processed += tombstoned as u64;
+                        pgrx::debug1!(
+                            "pg_deltax tombstone DELETE: \"{}\": {} row(s) tombstoned across {} segment(s)",
+                            rel_display_name(relid),
+                            tombstoned,
+                            targets.len(),
                         );
                     }
                 }
+
+                let stats =
+                    crate::compress::decompose_segments_for_dml(relid, &decompose_ids, &drop_ids);
+                if stats.decomposed_segments > 0 || stats.dropped_segments > 0 {
+                    any_decomposed = true;
+                    extra_processed += stats.dropped_rows as u64;
+                    pgrx::debug1!(
+                        "pg_deltax decompose-on-write: \"{}\": {} segment(s) decomposed ({} rows restored), {} segment(s) dropped whole ({} rows)",
+                        rel_display_name(relid),
+                        stats.decomposed_segments,
+                        stats.restored_rows,
+                        stats.dropped_segments,
+                        stats.dropped_rows,
+                    );
+                }
             }
+        }
+
+        if any_decomposed {
+            // §5.2 step 5: the statement snapshot was taken before we
+            // decomposed, so advance its command id to make the restored
+            // heap rows (and the meta/sidecar deletes) visible to the DML
+            // executor — the same dance TimescaleDB performs before letting
+            // ModifyTable run.
+            pg_sys::CommandCounterIncrement();
+            if pg_sys::ActiveSnapshotSet() {
+                pg_sys::UpdateActiveSnapshotCommandId();
+            }
+            let snap = (*query_desc).snapshot;
+            if !snap.is_null() {
+                (*snap).curcid = pg_sys::GetCurrentCommandId(false);
+            }
+        }
+        if extra_processed > 0 {
+            // Whole-segment drops bypass the executor, which would
+            // under-report the command tag ("DELETE 25" for a statement
+            // that logically removed 30,025 rows). The ExecutorRun hook
+            // folds this count into es_processed after the run.
+            set_pending_dml_extra_rows(query_desc as usize, extra_processed);
         }
 
         call_prev_executor_start(query_desc, eflags);
@@ -4860,6 +5069,359 @@ unsafe fn stmt_has_on_conflict(planned_stmt: *mut pg_sys::PlannedStmt) -> bool {
             }
         }
         false
+    }
+}
+
+/// Human-readable relation name for error/log messages.
+unsafe fn rel_display_name(relid: pg_sys::Oid) -> String {
+    unsafe {
+        let rel_name_ptr = pg_sys::get_rel_name(relid);
+        if rel_name_ptr.is_null() {
+            format!("OID {}", relid)
+        } else {
+            std::ffi::CStr::from_ptr(rel_name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+}
+
+/// Collect every ModifyTable node in the planned statement — the main tree
+/// plus all subplans (data-modifying CTEs are planned as subplans).
+unsafe fn collect_modify_table_nodes(
+    planned_stmt: *mut pg_sys::PlannedStmt,
+) -> Vec<*mut pg_sys::ModifyTable> {
+    unsafe {
+        let mut out: Vec<*mut pg_sys::ModifyTable> = Vec::new();
+        walk_plan_for_modify_tables((*planned_stmt).planTree, &mut out);
+        let subplans = (*planned_stmt).subplans;
+        if !subplans.is_null() {
+            for i in 0..(*subplans).length {
+                let p = (*(*subplans).elements.add(i as usize)).ptr_value as *mut pg_sys::Plan;
+                walk_plan_for_modify_tables(p, &mut out);
+            }
+        }
+        out
+    }
+}
+
+unsafe fn walk_plan_for_modify_tables(
+    plan: *mut pg_sys::Plan,
+    out: &mut Vec<*mut pg_sys::ModifyTable>,
+) {
+    unsafe {
+        if plan.is_null() {
+            return;
+        }
+        if (*plan).type_ == pg_sys::NodeTag::T_ModifyTable {
+            out.push(plan as *mut pg_sys::ModifyTable);
+        }
+        walk_plan_for_modify_tables((*plan).lefttree, out);
+        walk_plan_for_modify_tables((*plan).righttree, out);
+        let extra_children: *mut pg_sys::List = match (*plan).type_ {
+            pg_sys::NodeTag::T_Append => (*(plan as *mut pg_sys::Append)).appendplans,
+            pg_sys::NodeTag::T_MergeAppend => (*(plan as *mut pg_sys::MergeAppend)).mergeplans,
+            pg_sys::NodeTag::T_BitmapAnd => (*(plan as *mut pg_sys::BitmapAnd)).bitmapplans,
+            pg_sys::NodeTag::T_BitmapOr => (*(plan as *mut pg_sys::BitmapOr)).bitmapplans,
+            pg_sys::NodeTag::T_CustomScan => (*(plan as *mut pg_sys::CustomScan)).custom_plans,
+            pg_sys::NodeTag::T_SubqueryScan => {
+                walk_plan_for_modify_tables((*(plan as *mut pg_sys::SubqueryScan)).subplan, out);
+                std::ptr::null_mut()
+            }
+            _ => std::ptr::null_mut(),
+        };
+        if !extra_children.is_null() {
+            for i in 0..(*extra_children).length {
+                let p =
+                    (*(*extra_children).elements.add(i as usize)).ptr_value as *mut pg_sys::Plan;
+                walk_plan_for_modify_tables(p, out);
+            }
+        }
+    }
+}
+
+/// State for the target-scan qual search under a ModifyTable.
+struct ScanQualSearch {
+    matches: usize,
+    lists: Vec<*mut pg_sys::List>,
+    complete: bool,
+}
+
+/// Find the scan node for result-relation `rti` under `mt` and return its
+/// qual lists, plus whether those lists are PROVABLY the complete statement
+/// predicate for that relation.
+///
+/// Conservative contract (decompose-more, never less):
+/// - zero or multiple matching scans, or any unrecognized shape, returns
+///   `(no quals, incomplete)` → every segment becomes a candidate;
+/// - `complete` is only true for a SeqScan / IndexScan / BitmapHeapScan
+///   reached exclusively through Append/MergeAppend nodes with no quals of
+///   their own (a gating Result or a join in between means the scan quals
+///   are a subset of the real predicate — fine for pruning, fatal for the
+///   whole-segment DELETE fast path).
+unsafe fn collect_target_scan_quals(
+    mt: *mut pg_sys::ModifyTable,
+    rti: pg_sys::Index,
+) -> (Vec<*mut pg_sys::List>, bool) {
+    unsafe {
+        let mut st = ScanQualSearch {
+            matches: 0,
+            lists: Vec::new(),
+            complete: false,
+        };
+        scan_qual_walk((*(mt as *mut pg_sys::Plan)).lefttree, rti, true, &mut st);
+        if st.matches == 1 {
+            (st.lists, st.complete)
+        } else {
+            (Vec::new(), false)
+        }
+    }
+}
+
+unsafe fn scan_qual_walk(
+    plan: *mut pg_sys::Plan,
+    rti: pg_sys::Index,
+    pure_path: bool,
+    st: &mut ScanQualSearch,
+) {
+    unsafe {
+        if plan.is_null() {
+            return;
+        }
+        let tag = (*plan).type_;
+        let is_scan = matches!(
+            tag,
+            pg_sys::NodeTag::T_SeqScan
+                | pg_sys::NodeTag::T_SampleScan
+                | pg_sys::NodeTag::T_IndexScan
+                | pg_sys::NodeTag::T_IndexOnlyScan
+                | pg_sys::NodeTag::T_BitmapHeapScan
+                | pg_sys::NodeTag::T_TidScan
+                | pg_sys::NodeTag::T_TidRangeScan
+                | pg_sys::NodeTag::T_ForeignScan
+        );
+        if is_scan {
+            if (*(plan as *mut pg_sys::Scan)).scanrelid == rti {
+                st.matches += 1;
+                let mut lists = vec![(*plan).qual];
+                let mut complete = pure_path;
+                match tag {
+                    pg_sys::NodeTag::T_SeqScan => {}
+                    pg_sys::NodeTag::T_IndexScan => {
+                        // indexqualorig + qual = the full original predicate
+                        lists.push((*(plan as *mut pg_sys::IndexScan)).indexqualorig);
+                    }
+                    pg_sys::NodeTag::T_BitmapHeapScan => {
+                        lists.push((*(plan as *mut pg_sys::BitmapHeapScan)).bitmapqualorig);
+                    }
+                    _ => {
+                        // TidScan etc.: tid quals aren't representable as
+                        // segment predicates — usable for pruning (the
+                        // plain qual list), never for whole-segment drops.
+                        complete = false;
+                    }
+                }
+                st.lists = lists;
+                st.complete = complete;
+            }
+            // Never descend into a scan's children: a BitmapHeapScan's
+            // BitmapIndexScan child shares its scanrelid and carries
+            // rewritten quals that would double-match.
+            return;
+        }
+        match tag {
+            pg_sys::NodeTag::T_Append => {
+                let child_pure = pure_path && (*plan).qual.is_null();
+                let children = (*(plan as *mut pg_sys::Append)).appendplans;
+                scan_qual_walk_list(children, rti, child_pure, st);
+            }
+            pg_sys::NodeTag::T_MergeAppend => {
+                let child_pure = pure_path && (*plan).qual.is_null();
+                let children = (*(plan as *mut pg_sys::MergeAppend)).mergeplans;
+                scan_qual_walk_list(children, rti, child_pure, st);
+            }
+            pg_sys::NodeTag::T_SubqueryScan => {
+                scan_qual_walk(
+                    (*(plan as *mut pg_sys::SubqueryScan)).subplan,
+                    rti,
+                    false,
+                    st,
+                );
+            }
+            pg_sys::NodeTag::T_CustomScan => {
+                scan_qual_walk_list(
+                    (*(plan as *mut pg_sys::CustomScan)).custom_plans,
+                    rti,
+                    false,
+                    st,
+                );
+            }
+            _ => {
+                // Joins, gating Results, Sorts, ...: quals found below are
+                // a subset of the real predicate.
+                scan_qual_walk((*plan).lefttree, rti, false, st);
+                scan_qual_walk((*plan).righttree, rti, false, st);
+            }
+        }
+    }
+}
+
+unsafe fn scan_qual_walk_list(
+    list: *mut pg_sys::List,
+    rti: pg_sys::Index,
+    pure_path: bool,
+    st: &mut ScanQualSearch,
+) {
+    unsafe {
+        if list.is_null() {
+            return;
+        }
+        for i in 0..(*list).length {
+            let p = (*(*list).elements.add(i as usize)).ptr_value as *mut pg_sys::Plan;
+            scan_qual_walk(p, rti, pure_path, st);
+        }
+    }
+}
+
+/// True when the relation has any user-defined (or constraint/RI) row-level
+/// DELETE trigger besides pg_deltax's own `deltax_reject_compressed_dml`.
+/// Such triggers must fire per row, so the whole-segment DELETE fast path
+/// (which never materializes the rows) is disabled and the segments are
+/// decomposed instead.
+unsafe fn has_user_row_delete_trigger(relid: pg_sys::Oid) -> bool {
+    unsafe {
+        let rel = pg_sys::table_open(relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let mut found = false;
+        let trigdesc = (*rel).trigdesc;
+        if !trigdesc.is_null() {
+            for i in 0..(*trigdesc).numtriggers {
+                let trig = (*trigdesc).triggers.add(i as usize);
+                let tgtype = (*trig).tgtype as u32;
+                let row_delete = tgtype & pg_sys::TRIGGER_TYPE_ROW != 0
+                    && tgtype & pg_sys::TRIGGER_TYPE_DELETE != 0;
+                if !row_delete {
+                    continue;
+                }
+                let name = std::ffi::CStr::from_ptr((*trig).tgname).to_string_lossy();
+                if name != "deltax_reject_compressed_dml" {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        found
+    }
+}
+
+thread_local! {
+    /// Pending command-tag correction for the whole-segment DELETE fast
+    /// path: `(QueryDesc address, logically deleted rows)`. Consumed by the
+    /// ExecutorRun hook for the matching QueryDesc; cleared at transaction
+    /// end so a stale entry from an errored statement can never attach to a
+    /// future QueryDesc that happens to reuse the same address.
+    static PENDING_DML_EXTRA_ROWS: std::cell::Cell<Option<(usize, u64)>> =
+        const { std::cell::Cell::new(None) };
+    static DML_XACT_CB_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn set_pending_dml_extra_rows(qd_addr: usize, rows: u64) {
+    DML_XACT_CB_REGISTERED.with(|c| {
+        if !c.get() {
+            unsafe {
+                pg_sys::RegisterXactCallback(
+                    Some(dml_extra_rows_xact_callback),
+                    std::ptr::null_mut(),
+                );
+            }
+            c.set(true);
+        }
+    });
+    PENDING_DML_EXTRA_ROWS.with(|c| c.set(Some((qd_addr, rows))));
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn dml_extra_rows_xact_callback(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
+    if matches!(
+        event,
+        pg_sys::XactEvent::XACT_EVENT_COMMIT
+            | pg_sys::XactEvent::XACT_EVENT_ABORT
+            | pg_sys::XactEvent::XACT_EVENT_PREPARE
+            | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT
+            | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
+    ) {
+        PENDING_DML_EXTRA_ROWS.with(|c| c.set(None));
+    }
+}
+
+/// Fold the pending whole-segment-drop row count into `es_processed` after
+/// the run, so the command tag reports the logical row count.
+unsafe fn apply_pending_dml_extra_rows(query_desc: *mut pg_sys::QueryDesc) {
+    let pending = PENDING_DML_EXTRA_ROWS.with(|c| c.get());
+    if let Some((addr, rows)) = pending
+        && addr == query_desc as usize
+    {
+        PENDING_DML_EXTRA_ROWS.with(|c| c.set(None));
+        unsafe {
+            let estate = (*query_desc).estate;
+            if !estate.is_null() {
+                (*estate).es_processed += rows;
+            }
+        }
+    }
+}
+
+/// ExecutorRun hook (PG 17 signature): chain, then apply any pending
+/// command-tag correction from the whole-segment DELETE fast path.
+#[cfg(feature = "pg17")]
+#[pg_guard]
+pub unsafe extern "C-unwind" fn deltax_executor_run(
+    query_desc: *mut pg_sys::QueryDesc,
+    direction: pg_sys::ScanDirection::Type,
+    count: u64,
+    execute_once: bool,
+) {
+    unsafe {
+        let prev = super::PREV_EXECUTOR_RUN_HOOK.load(Ordering::SeqCst);
+        if !prev.is_null() {
+            let prev_fn: unsafe extern "C-unwind" fn(
+                *mut pg_sys::QueryDesc,
+                pg_sys::ScanDirection::Type,
+                u64,
+                bool,
+            ) = std::mem::transmute(prev);
+            prev_fn(query_desc, direction, count, execute_once);
+        } else {
+            pg_sys::standard_ExecutorRun(query_desc, direction, count, execute_once);
+        }
+        apply_pending_dml_extra_rows(query_desc);
+    }
+}
+
+/// ExecutorRun hook (PG 18 signature — `execute_once` was removed).
+#[cfg(feature = "pg18")]
+#[pg_guard]
+pub unsafe extern "C-unwind" fn deltax_executor_run(
+    query_desc: *mut pg_sys::QueryDesc,
+    direction: pg_sys::ScanDirection::Type,
+    count: u64,
+) {
+    unsafe {
+        let prev = super::PREV_EXECUTOR_RUN_HOOK.load(Ordering::SeqCst);
+        if !prev.is_null() {
+            let prev_fn: unsafe extern "C-unwind" fn(
+                *mut pg_sys::QueryDesc,
+                pg_sys::ScanDirection::Type,
+                u64,
+            ) = std::mem::transmute(prev);
+            prev_fn(query_desc, direction, count);
+        } else {
+            pg_sys::standard_ExecutorRun(query_desc, direction, count);
+        }
+        apply_pending_dml_extra_rows(query_desc);
     }
 }
 

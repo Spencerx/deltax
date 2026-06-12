@@ -1761,7 +1761,11 @@ unsafe fn exec_topn_two_pass(
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx: usize = 0;
             let mut seg_val_idx: usize = 0;
-            let mut pre_selection: Vec<bool> = Vec::new();
+            // P2.5: tombstoned rows seed the selection (sized to the
+            // truncated row range when a Top-N cutoff applies).
+            let mut pre_selection: Vec<bool> = seg
+                .tombstone_preselection(cutoff_row.unwrap_or(seg.row_count as usize))
+                .unwrap_or_default();
             let mut sort_col_blob_idx: Option<usize> = None;
 
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
@@ -2368,8 +2372,9 @@ fn process_topn_text_chunk(
         };
         let row_count = seg.row_count as usize;
 
-        // Decompress filter columns and build selection
-        let mut selection: Vec<bool> = Vec::new();
+        // Decompress filter columns and build selection. P2.5: tombstoned
+        // rows seed it (text filters AND into a non-empty selection).
+        let mut selection: Vec<bool> = seg.tombstone_preselection(row_count).unwrap_or_default();
 
         // Apply text quals via SegTextColumn
         for tqi in &config.text_qual_infos {
@@ -3070,7 +3075,10 @@ unsafe fn exec_topn_text_sequential(
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx: usize = 0;
             let mut seg_val_idx: usize = 0;
-            let mut pre_selection: Vec<bool> = Vec::new();
+            // P2.5: tombstoned rows seed the selection.
+            let mut pre_selection: Vec<bool> = seg
+                .tombstone_preselection(seg.row_count as usize)
+                .unwrap_or_default();
 
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
@@ -3972,7 +3980,11 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx = 0;
             let mut seg_val_idx = 0;
-            let mut pre_selection: Vec<bool> = Vec::new();
+            // P2.5: tombstoned (logically deleted) rows seed the selection
+            // vector — every downstream emit/aggregate path honors it.
+            let mut pre_selection: Vec<bool> = seg
+                .tombstone_preselection(seg.row_count as usize)
+                .unwrap_or_default();
             let has_batch_quals = !state.batch_quals.is_empty();
             let mut phase2_cols: Vec<(usize, usize)> = Vec::new(); // (col_idx, blob_idx)
 
@@ -4483,7 +4495,29 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
                 col_sums: std::collections::HashMap::new(),
                 toast_pointers: vec![Vec::new(); num_blob_cols],
                 cached_blob_pins: Vec::new(),
+                tombstones: None,
             });
+        }
+        // P2.5: the DSM wire doesn't carry tombstones — each worker loads
+        // the (tiny) per-companion tombstone map itself under the shared
+        // parallel snapshot, so leader and workers see the same set. Cost is
+        // one syscache + nblocks probe per companion when none exist.
+        {
+            type TombMap = std::collections::HashMap<i32, std::sync::Arc<Vec<u32>>>;
+            let mut tomb_maps: std::collections::HashMap<pg_sys::Oid, Option<TombMap>> =
+                std::collections::HashMap::new();
+            for seg in segments_data.iter_mut() {
+                let map = tomb_maps.entry(seg.companion_oid).or_insert_with(|| {
+                    if super::segments::companion_may_have_tombstones(seg.companion_oid) {
+                        super::segments::load_tombstone_map(seg.companion_oid)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(m) = map {
+                    seg.tombstones = m.get(&seg.segment_id).cloned();
+                }
+            }
         }
         state.segments_data = segments_data;
         state.wire_view = Some(view);
@@ -4832,6 +4866,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            tombstones: None,
         };
         // No filters, no time range — never pruned.
         assert!(!segment_pre_pruned_by_metadata(&seg, &[], None, None));
@@ -4852,6 +4887,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            tombstones: None,
         };
         // svi=0, filter "host-a" matches
         assert!(!segment_pre_pruned_by_metadata(
@@ -4898,6 +4934,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            tombstones: None,
         };
         // Query range [3_000, ..) → seg.max_time (2_000) < 3_000, prune
         assert!(segment_pre_pruned_by_metadata(&seg, &[], Some(3_000), None));

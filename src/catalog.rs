@@ -433,6 +433,33 @@ pub fn bump_partition_compaction(
     Ok(())
 }
 
+/// Subtract a decompose batch's row count and compressed size from a
+/// partition's counters (P2 decompose-on-write: segments turned back into
+/// loose heap rows by an UPDATE/DELETE). The inverse of
+/// `bump_partition_compaction`; floors at 0 so a racing estimate can never
+/// drive the counters negative. These counters feed planner cost estimates
+/// only — exactness per segment lives in the companion tables.
+pub fn bump_partition_decompose(
+    client: &mut SpiClient,
+    partition_id: i32,
+    removed_rows: i64,
+    removed_compressed_size: i64,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET row_count = GREATEST(COALESCE(row_count, 0) - $1, 0),
+             compressed_size = GREATEST(COALESCE(compressed_size, 0) - $2, 0)
+         WHERE id = $3",
+        None,
+        &[
+            removed_rows.into(),
+            removed_compressed_size.into(),
+            partition_id.into(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Write a pre-computed per-column ndistinct map (typically from
 /// HLL sketches merged across segments during compression) to the
 /// `deltax.deltax_partition.column_ndistinct` JSONB column.
@@ -870,6 +897,7 @@ pub fn compressed_companion_tables(
                      OR c.relname = p.table_name || '_blooms'
                      OR c.relname = p.table_name || '_text_lengths'
                      OR c.relname = p.table_name || '_valbitmap'
+                     OR c.relname = p.table_name || '_tombstones'
                  )
            )",
         None,
@@ -1033,7 +1061,7 @@ pub fn mark_partition_decompressed(
     client.update(
         "UPDATE deltax.deltax_partition
          SET is_compressed = false, compressed_size = NULL, raw_size = NULL,
-             row_count = NULL, compressed_at = NULL
+             row_count = NULL, compressed_at = NULL, max_segment_id = NULL
          WHERE id = $1",
         None,
         &[partition_id.into()],

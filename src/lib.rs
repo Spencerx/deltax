@@ -203,6 +203,7 @@ ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_mcv JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS max_segment_id INT;
 
 CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger
@@ -217,19 +218,17 @@ BEGIN
         PERFORM deltax.deltax_note_compressed_insert(TG_RELID);
         RETURN NEW;
     END IF;
-    -- Internal maintenance (compaction deleting just-compacted loose rows)
-    -- runs with the DML bypass flag set; let it through.
-    IF deltax.deltax_dml_bypass_active() THEN
-        IF TG_OP = 'DELETE' THEN
-            RETURN OLD;
-        END IF;
-        RETURN NEW;
+    -- P2 decompose-on-write: by the time a row-level UPDATE/DELETE fires,
+    -- the ExecutorStart interceptor has already decomposed every candidate
+    -- segment into ordinary heap rows, so any row this trigger can see IS a
+    -- heap row -- let it through. Rows still inside segments are by
+    -- construction invisible to the DML executor (the partition heap holds
+    -- only loose/decomposed rows). Internal maintenance (compaction,
+    -- decompose) is likewise plain heap DML.
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
     END IF;
-    RAISE EXCEPTION 'cannot % compressed partition "%.%", decompress it first',
-        TG_OP,
-        TG_TABLE_SCHEMA,
-        TG_TABLE_NAME
-        USING ERRCODE = 'object_not_in_prerequisite_state';
+    RETURN NEW;
 END;
 $$;
 "#,
@@ -357,6 +356,9 @@ pub extern "C-unwind" fn _PG_init() {
     }
     unsafe {
         scan::register_executor_start_hook();
+    }
+    unsafe {
+        scan::register_executor_run_hook();
     }
     unsafe {
         copy::register_process_utility_hook();

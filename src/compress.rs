@@ -990,6 +990,14 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     catalog::install_compressed_dml_trigger(client, &schema, &part_table)
         .expect("failed to install compressed partition DML trigger");
 
+    // P2.5: eagerly create the (empty) `_tombstones` companion so the
+    // OWNER/GRANT cascade covers it and tombstone DELETEs by non-owner
+    // roles don't need CREATE on the companion schema. Zero blocks ⇒ zero
+    // cost on every read path.
+    client
+        .update(&ddl_if_not_exists(&ddl.tombstones_ddl), None, &[])
+        .expect("failed to create tombstones table");
+
     // Persist per-column ndistinct from the partition-level HLL merge
     // (strictly more accurate than the old MAX-over-segments approach,
     // especially for time-clustered high-cardinality keys like order_id
@@ -2261,6 +2269,7 @@ pub(crate) struct CompanionDdl {
     pub(crate) blooms_ddl: String,
     pub(crate) text_lengths_ddl: String,
     pub(crate) valbitmap_ddl: String,
+    pub(crate) tombstones_ddl: String,
 }
 
 /// Cached probe result for whether the running PostgreSQL was built with
@@ -2399,6 +2408,17 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
         valbitmap_fqn, lz4
     );
 
+    // P2.5 tombstones: one row per logically deleted segment row
+    // (`dev/docs/COMPRESSED_DML.md` P2.5). Ordinary heap rows ⇒ MVCC,
+    // rollback and replication are native. Created (empty) at compress time
+    // so the GRANT/OWNER cascade covers it; zero blocks = zero read-side
+    // cost. The PK doubles as the indexed existence probe.
+    let tombstones_fqn = format!("\"{}\".\"{}_tombstones\"", companion_schema, part_table);
+    let tombstones_ddl = format!(
+        "CREATE TABLE {} (_segment_id INT NOT NULL, _row_offset INT NOT NULL, PRIMARY KEY (_segment_id, _row_offset))",
+        tombstones_fqn
+    );
+
     CompanionDdl {
         meta_fqn,
         colstats_fqn,
@@ -2412,6 +2432,7 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
         blooms_ddl,
         text_lengths_ddl,
         valbitmap_ddl,
+        tombstones_ddl,
     }
 }
 
@@ -3400,6 +3421,188 @@ fn estimate_raw_size(client: &SpiClient, table_fqn: &str) -> i64 {
 // Decompression
 // ============================================================================
 
+/// Decode one segment's column blobs and INSERT the restored rows back into
+/// the partition heap. Shared by full decompression
+/// (`decompress_partition_inner`) and per-segment decompose-on-write
+/// (`decompose_segments_for_dml`). Reads the segment's blobs from the
+/// `_blobs` companion (always populated, even in dual blob-file mode) — so
+/// it must run BEFORE the caller deletes the segment's blob rows.
+///
+/// `non_seg_cols` is the positional `(col_idx, name, data_type)` mapping for
+/// non-segment-by physical columns (synthetic json-extract columns live at
+/// higher `_col_idx` values and are intentionally not restored — the
+/// original JSONB column is physical and lands in the heap row).
+///
+/// `skip_offsets` (P2.5 tombstones) lists 0-based row offsets that are
+/// logically deleted and must NOT be rematerialized — every restore path
+/// (full decompress, decompose-on-write, compaction rewrite) honors it.
+/// Returns the number of rows actually inserted (live rows).
+#[allow(clippy::too_many_arguments)]
+fn restore_segment_rows(
+    client: &mut SpiClient,
+    part_fqn: &str,
+    blobs_fqn: &str,
+    columns: &[ColumnMeta],
+    non_seg_cols: &[(u16, String, String)],
+    segment_id: i32,
+    segment_by_vals: &[Option<String>],
+    row_count: i32,
+    skip_offsets: Option<&std::collections::HashSet<i32>>,
+) -> i64 {
+    // Read blobs for this segment from the blobs table
+    let blob_query = format!(
+        "SELECT _col_idx, _data FROM {} WHERE _segment_id = $1 ORDER BY _col_idx",
+        blobs_fqn
+    );
+    let blob_rows = client
+        .select(&blob_query, None, &[segment_id.into()])
+        .expect("failed to read blobs");
+
+    let mut blob_map: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
+    for brow in blob_rows {
+        let ci: i16 = brow
+            .get_datum_by_ordinal(1)
+            .unwrap()
+            .value::<i16>()
+            .unwrap()
+            .unwrap_or(0);
+        let data: Option<Vec<u8>> = brow
+            .get_datum_by_ordinal(2)
+            .unwrap()
+            .value::<Vec<u8>>()
+            .unwrap();
+        blob_map.insert(ci as u16, data.unwrap_or_default());
+    }
+
+    // Decompress all columns
+    let mut decompressed_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
+
+    // Segment-by columns: repeat the value for every row
+    let mut seg_idx = 0;
+    for col in columns {
+        if col.is_segment_by {
+            let val = &segment_by_vals[seg_idx];
+            let repeated: Vec<Option<String>> = (0..row_count).map(|_| val.clone()).collect();
+            decompressed_cols.push((col.name.clone(), repeated));
+            seg_idx += 1;
+        }
+    }
+
+    // Compressed columns: decompress from blob_map
+    for (ci, name, data_type) in non_seg_cols {
+        let blob = blob_map.get(ci).cloned().unwrap_or_default();
+        let values = decompress_column_values(&blob, data_type);
+        decompressed_cols.push((name.clone(), values));
+    }
+
+    // Sort columns back to original order
+    let mut ordered_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
+    for col in columns {
+        for dc in &decompressed_cols {
+            if dc.0 == col.name {
+                ordered_cols.push(dc.clone());
+                break;
+            }
+        }
+    }
+
+    // INSERT rows back into partition
+    let col_names: String = ordered_cols
+        .iter()
+        .map(|(name, _)| format!("\"{}\"", name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    const BATCH_SIZE: usize = 1000;
+    let mut batch_start = 0;
+    let mut inserted: i64 = 0;
+    while batch_start < row_count as usize {
+        let batch_end = (batch_start + BATCH_SIZE).min(row_count as usize);
+
+        let mut all_row_values = Vec::with_capacity(batch_end - batch_start);
+        for row_idx in batch_start..batch_end {
+            if let Some(skip) = skip_offsets
+                && skip.contains(&(row_idx as i32))
+            {
+                continue; // tombstoned — logically deleted, do not resurrect
+            }
+            let vals: Vec<String> = ordered_cols
+                .iter()
+                .enumerate()
+                .map(|(col_idx, (_, values))| {
+                    let col_meta = &columns[col_idx];
+                    match &values[row_idx] {
+                        None => "NULL".to_string(),
+                        Some(v) => format_value_for_insert(v, &col_meta.data_type),
+                    }
+                })
+                .collect();
+            all_row_values.push(format!("({})", vals.join(", ")));
+        }
+        if !all_row_values.is_empty() {
+            inserted += all_row_values.len() as i64;
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                part_fqn,
+                col_names,
+                all_row_values.join(", ")
+            );
+            client
+                .update(&insert_sql, None, &[])
+                .expect("failed to insert decompressed rows");
+        }
+
+        batch_start = batch_end;
+    }
+
+    inserted
+}
+
+/// Read tombstoned row offsets (P2.5) for the given segments — or all
+/// segments when `only_ids` is `None` — as `segment_id → set of offsets`.
+/// Returns an empty map when the tombstones table doesn't exist (data
+/// compressed before P2.5) or holds no matching rows.
+fn load_tombstone_offsets_sql(
+    client: &SpiClient,
+    tombstones_fqn: &str,
+    only_ids: Option<&[i32]>,
+) -> std::collections::HashMap<i32, std::collections::HashSet<i32>> {
+    let mut map: std::collections::HashMap<i32, std::collections::HashSet<i32>> =
+        std::collections::HashMap::new();
+    if !relation_exists(client, tombstones_fqn) {
+        return map;
+    }
+    let where_clause = match only_ids {
+        Some([]) => return map,
+        Some(ids) => format!(
+            " WHERE _segment_id IN ({})",
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => String::new(),
+    };
+    let rows = client
+        .select(
+            &format!(
+                "SELECT _segment_id, _row_offset FROM {}{}",
+                tombstones_fqn, where_clause
+            ),
+            None,
+            &[],
+        )
+        .expect("failed to read tombstones");
+    for row in rows {
+        let sid: Option<i32> = row.get(1).ok().flatten();
+        let off: Option<i32> = row.get(2).ok().flatten();
+        if let (Some(sid), Some(off)) = (sid, off) {
+            map.entry(sid).or_default().insert(off);
+        }
+    }
+    map
+}
+
 fn decompress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // Bypass the DML-on-compressed check for the INSERT we are about to do
     crate::scan::set_dml_bypass(true);
@@ -3449,9 +3652,14 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
     let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
     let valbitmap_fqn = format!("\"{}\".\"{}_valbitmap\"", companion_schema, part_table);
+    let tombstones_fqn = format!("\"{}\".\"{}_tombstones\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
     catalog::drop_compressed_dml_trigger(client, &schema, &part_table)
         .expect("failed to drop compressed partition DML trigger");
+
+    // P2.5: tombstoned rows are logically deleted — they must not be
+    // rematerialized by the full decompress.
+    let tombstones = load_tombstone_offsets_sql(client, &tombstones_fqn, None);
 
     // 3. Read compressed segments from meta + blobs tables
 
@@ -3532,109 +3740,17 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         if seg_meta.row_count == 0 {
             continue;
         }
-
-        // Read blobs for this segment from the blobs table
-        let blob_query = format!(
-            "SELECT _col_idx, _data FROM {} WHERE _segment_id = $1 ORDER BY _col_idx",
-            blobs_fqn
+        total_rows_restored += restore_segment_rows(
+            client,
+            &part_fqn,
+            &blobs_fqn,
+            &columns,
+            &non_seg_cols,
+            seg_meta.segment_id,
+            &seg_meta.segment_by_vals,
+            seg_meta.row_count,
+            tombstones.get(&seg_meta.segment_id),
         );
-        let blob_rows = client
-            .select(&blob_query, None, &[seg_meta.segment_id.into()])
-            .expect("failed to read blobs");
-
-        let mut blob_map: std::collections::HashMap<u16, Vec<u8>> =
-            std::collections::HashMap::new();
-        for brow in blob_rows {
-            let ci: i16 = brow
-                .get_datum_by_ordinal(1)
-                .unwrap()
-                .value::<i16>()
-                .unwrap()
-                .unwrap_or(0);
-            let data: Option<Vec<u8>> = brow
-                .get_datum_by_ordinal(2)
-                .unwrap()
-                .value::<Vec<u8>>()
-                .unwrap();
-            blob_map.insert(ci as u16, data.unwrap_or_default());
-        }
-
-        // Decompress all columns
-        let mut decompressed_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
-
-        // Segment-by columns: repeat the value for every row
-        let mut seg_idx = 0;
-        for col in &columns {
-            if col.is_segment_by {
-                let val = &seg_meta.segment_by_vals[seg_idx];
-                let repeated: Vec<Option<String>> =
-                    (0..seg_meta.row_count).map(|_| val.clone()).collect();
-                decompressed_cols.push((col.name.clone(), repeated));
-                seg_idx += 1;
-            }
-        }
-
-        // Compressed columns: decompress from blob_map
-        for (ci, name, data_type) in &non_seg_cols {
-            let blob = blob_map.get(ci).cloned().unwrap_or_default();
-            let values = decompress_column_values(&blob, data_type);
-            decompressed_cols.push((name.clone(), values));
-        }
-
-        // Sort columns back to original order
-        let mut ordered_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
-        for col in &columns {
-            for dc in &decompressed_cols {
-                if dc.0 == col.name {
-                    ordered_cols.push(dc.clone());
-                    break;
-                }
-            }
-        }
-        let segment_row_count = seg_meta.row_count;
-
-        // INSERT rows back into partition
-        let col_names: String = ordered_cols
-            .iter()
-            .map(|(name, _)| format!("\"{}\"", name))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        const BATCH_SIZE: usize = 1000;
-        let mut batch_start = 0;
-        while batch_start < segment_row_count as usize {
-            let batch_end = (batch_start + BATCH_SIZE).min(segment_row_count as usize);
-
-            let mut all_row_values = Vec::with_capacity(batch_end - batch_start);
-            for row_idx in batch_start..batch_end {
-                let vals: Vec<String> = ordered_cols
-                    .iter()
-                    .enumerate()
-                    .map(|(col_idx, (_, values))| {
-                        let col_meta = &columns[col_idx];
-                        match &values[row_idx] {
-                            None => "NULL".to_string(),
-                            Some(v) => format_value_for_insert(v, &col_meta.data_type),
-                        }
-                    })
-                    .collect();
-                all_row_values.push(format!("({})", vals.join(", ")));
-            }
-
-            let insert_sql = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                part_fqn,
-                col_names,
-                all_row_values.join(", ")
-            );
-            client
-                .update(&insert_sql, None, &[])
-                .expect("failed to insert decompressed rows");
-
-            batch_start = batch_end;
-        }
-
-        total_rows_restored += segment_row_count as i64;
     }
 
     // 4. Drop meta + colstats + blobs + blooms + text_lengths + valbitmap tables
@@ -3661,6 +3777,13 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     client
         .update(&format!("DROP TABLE IF EXISTS {}", colstats_fqn), None, &[])
         .expect("failed to drop colstats table");
+    client
+        .update(
+            &format!("DROP TABLE IF EXISTS {}", tombstones_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to drop tombstones table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", meta_fqn), None, &[])
         .expect("failed to drop meta table");
@@ -4259,6 +4382,556 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
 // See dev/docs/COMPRESSED_DML.md §4.5.
 // ============================================================================
 
+// ============================================================================
+// P2 decompose-on-write (COMPRESSED_DML.md §5): per-segment decompose for
+// transparent UPDATE/DELETE on compressed partitions.
+// ============================================================================
+
+/// Outcome of `decompose_segments_for_dml`. Counts reflect only segments
+/// actually claimed by THIS transaction (the delete-first protocol skips
+/// segments a concurrent transaction decomposed first).
+pub(crate) struct DmlDecomposeStats {
+    /// Rows restored into the partition heap from decomposed segments.
+    pub(crate) restored_rows: i64,
+    pub(crate) decomposed_segments: usize,
+    /// Segments removed by the whole-segment DELETE fast path (§5.4) —
+    /// their rows were never materialized.
+    pub(crate) dropped_segments: usize,
+    /// Logical rows removed by whole-segment drops (command-tag credit).
+    pub(crate) dropped_rows: i64,
+}
+
+/// Decompose the given segments of a compressed partition back into ordinary
+/// heap rows (`decompose_ids`), and/or drop them outright (`drop_ids`,
+/// whole-segment DELETE fast path). Runs inside the user's transaction from
+/// the ExecutorStart interceptor, BEFORE the UPDATE/DELETE executes.
+///
+/// Mechanics per segment: delete its `_meta` row (claim), decode its blobs
+/// into rows inserted into the partition heap (skipped for `drop_ids`),
+/// then delete its sidecar rows in `_colstats`/`_blobs`/`_blooms`/
+/// `_text_lengths`/`_valbitmap`. Everything is plain WAL-logged heap DML in
+/// one transaction, so MVCC, rollback and crash recovery need no
+/// extension-side machinery (§5.3).
+///
+/// Locking & concurrency (§5.5): takes the same ACCESS EXCLUSIVE lock on the
+/// partition that compaction takes, held to end of transaction. Because
+/// every user DML already holds ROW EXCLUSIVE from planning, two concurrent
+/// DMLs on the same compressed partition cannot interleave here — one
+/// blocks (or the deadlock detector cancels one of them; the survivor is
+/// always correct). The meta-row delete is the serialization point proper:
+/// delete-first wins; a claim that deletes 0 rows means a concurrent
+/// transaction already decomposed that segment and it is skipped. Under
+/// REPEATABLE READ/SERIALIZABLE a lost claim surfaces as a serialization
+/// error, matching vanilla PostgreSQL semantics. Readers that only hold
+/// ACCESS SHARE block for the duration of the writing transaction — the
+/// honest cost of decompose-on-write; reads either see the segment intact
+/// (pre-commit snapshot) or the heap rows (post-commit), never both/neither.
+///
+/// Sidecar/metadata effects (§6):
+/// - Partition bloom sentinels (`_segment_id = -1`) are NOT rebuilt: a
+///   sentinel covering removed values merely over-covers, which can only
+///   produce false positives (segments scanned unnecessarily) — never
+///   false negatives. The next full recompress rebuilds them.
+/// - Catalog `column_minmax` is NOT recomputed for the same reason:
+///   over-coverage only disables a pruning opportunity.
+/// - `column_valmap`/HLL/MCV/pg_statistic go stale (planner-only; refreshed
+///   by the next compaction or recompress).
+/// - Catalog `row_count`/`compressed_size` are decremented.
+/// - `max_segment_id` is raised to the current meta maximum BEFORE deleting,
+///   so a later compaction can never reuse a decomposed segment's id —
+///   the shared blob/decompressed caches and the backend-local colstats
+///   cache are keyed by `(companion_oid, segment_id, ...)` and id reuse
+///   within one companion-table lifetime would poison them.
+/// - The dual-mode blob file is untouched; a dropped segment's bytes become
+///   unreachable dead weight until a full recompress.
+pub(crate) fn decompose_segments_for_dml(
+    partition_oid: pg_sys::Oid,
+    decompose_ids: &[i32],
+    drop_ids: &[i32],
+) -> DmlDecomposeStats {
+    let mut stats = DmlDecomposeStats {
+        restored_rows: 0,
+        decomposed_segments: 0,
+        dropped_segments: 0,
+        dropped_rows: 0,
+    };
+    if decompose_ids.is_empty() && drop_ids.is_empty() {
+        return stats;
+    }
+
+    // Internal DML below (companion deletes + heap inserts) must bypass the
+    // ExecutorStart interception and plan against the plain heap. Guard
+    // resets the flag on every exit path, including errors.
+    let _bypass = DmlBypassGuard::new();
+
+    let (schema, part_table) = partition_names_for_oid(partition_oid);
+
+    Spi::connect_mut(|client| {
+        let Some(part_info) = catalog::get_partition_by_name(client, &schema, &part_table)
+            .expect("failed to query partition")
+        else {
+            return;
+        };
+        if !part_info.is_compressed {
+            // Raced with a full decompress — the rows are already plain
+            // heap tuples and the DML needs no help.
+            return;
+        }
+        let ht = catalog::get_deltatable_by_id(client, part_info.deltatable_id)
+            .expect("failed to query deltatable")
+            .unwrap();
+
+        // Decompose restores the parent table's physical columns only —
+        // synthetic json_extract columns live solely in the companion blobs
+        // (the physical JSONB column carries the data into the heap row).
+        let columns = get_column_metadata(
+            client,
+            &ht.schema_name,
+            &ht.table_name,
+            &ht.segment_by,
+            &ht.time_column,
+            None,
+        );
+
+        // Schema-drift guard (same rule as compaction): the positional
+        // col_idx mapping below assumes the column shape is unchanged since
+        // compression. Decomposing with a drifted shape would restore
+        // garbage — refuse and point at the full-rebuild path.
+        let cc_now = catalog::snapshot_compressed_columns(
+            client,
+            &ht.schema_name,
+            &ht.table_name,
+            &ht.segment_by,
+        )
+        .expect("failed to snapshot column shape");
+        let cc_now_val: serde_json::Value =
+            serde_json::from_str(&cc_now).unwrap_or(serde_json::Value::Null);
+        let shape_matches =
+            matches!(&part_info.compressed_columns, Some(stored) if *stored == cc_now_val);
+        if !shape_matches {
+            pgrx::error!(
+                "pg_deltax: cannot UPDATE/DELETE in compressed partition {}.{}: its column shape changed since compression; run deltax_decompress_partition() + deltax_compress_partition() first",
+                schema,
+                part_table
+            );
+        }
+
+        let companion_schema = "_deltax_compressed";
+        let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
+        let colstats_fqn = format!("\"{}\".\"{}_colstats\"", companion_schema, part_table);
+        let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
+        let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
+        let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
+        let valbitmap_fqn = format!("\"{}\".\"{}_valbitmap\"", companion_schema, part_table);
+        let tombstones_fqn = format!("\"{}\".\"{}_tombstones\"", companion_schema, part_table);
+        let part_fqn = crate::partition::fqn(&schema, &part_table);
+
+        // Serialize against compaction and concurrent decompose (§5.5).
+        client
+            .update(
+                &format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", part_fqn),
+                None,
+                &[],
+            )
+            .expect("failed to lock partition for decompose");
+
+        // Raise the segment-id high-water mark BEFORE any deletion so
+        // compaction can never reuse the ids we are about to remove.
+        client
+            .update(
+                &format!(
+                    "UPDATE deltax.deltax_partition
+                     SET max_segment_id = GREATEST(COALESCE(max_segment_id, 0),
+                         (SELECT COALESCE(MAX(_segment_id), 0) FROM {}))
+                     WHERE id = $1",
+                    meta_fqn
+                ),
+                None,
+                &[part_info.id.into()],
+            )
+            .expect("failed to bump segment-id high-water mark");
+
+        let id_list = |ids: &[i32]| {
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        // P2.5: tombstoned rows of the affected segments are already
+        // logically deleted — they must neither be rematerialized by the
+        // restore nor counted by the whole-drop's command-tag credit.
+        let all_target_ids: Vec<i32> = drop_ids
+            .iter()
+            .chain(decompose_ids.iter())
+            .copied()
+            .collect();
+        let tombstones = load_tombstone_offsets_sql(client, &tombstones_fqn, Some(&all_target_ids));
+
+        let mut removed_ids: Vec<i32> = Vec::new();
+
+        // Whole-segment DELETE fast path: claim + account, no row restore.
+        if !drop_ids.is_empty() {
+            let rows = client
+                .update(
+                    &format!(
+                        "DELETE FROM {} WHERE _segment_id IN ({}) RETURNING _segment_id, _row_count",
+                        meta_fqn,
+                        id_list(drop_ids)
+                    ),
+                    None,
+                    &[],
+                )
+                .expect("failed to claim segments for whole-segment delete");
+            for row in rows {
+                let sid: i32 = row
+                    .get_datum_by_ordinal(1)
+                    .unwrap()
+                    .value::<i32>()
+                    .unwrap()
+                    .unwrap_or(0);
+                let rc: i32 = row
+                    .get_datum_by_ordinal(2)
+                    .unwrap()
+                    .value::<i32>()
+                    .unwrap()
+                    .unwrap_or(0);
+                let tomb_count = tombstones.get(&sid).map_or(0, |s| s.len() as i32);
+                removed_ids.push(sid);
+                stats.dropped_segments += 1;
+                stats.dropped_rows += (rc - tomb_count).max(0) as i64;
+            }
+        }
+
+        // Decompose path: claim, then decode + restore each segment's rows.
+        if !decompose_ids.is_empty() {
+            // Positional col_idx mapping (same rule as compression /
+            // decompress): non-segment-by physical columns in ordinal order.
+            let mut non_seg_cols: Vec<(u16, String, String)> = Vec::new();
+            let mut col_idx: u16 = 0;
+            for col in &columns {
+                if !col.is_segment_by {
+                    non_seg_cols.push((col_idx, col.name.clone(), col.data_type.clone()));
+                    col_idx += 1;
+                }
+            }
+
+            let mut returning_cols = vec!["_segment_id".to_string()];
+            for col in &columns {
+                if col.is_segment_by {
+                    returning_cols.push(format!("\"{}\"::text", col.name));
+                }
+            }
+            returning_cols.push("_row_count".to_string());
+
+            struct ClaimedSegment {
+                segment_id: i32,
+                segment_by_vals: Vec<Option<String>>,
+                row_count: i32,
+            }
+            let mut claimed: Vec<ClaimedSegment> = Vec::new();
+            {
+                let rows = client
+                    .update(
+                        &format!(
+                            "DELETE FROM {} WHERE _segment_id IN ({}) RETURNING {}",
+                            meta_fqn,
+                            id_list(decompose_ids),
+                            returning_cols.join(", ")
+                        ),
+                        None,
+                        &[],
+                    )
+                    .expect("failed to claim segments for decompose");
+                for row in rows {
+                    let mut ordinal = 1;
+                    let segment_id: i32 = row
+                        .get_datum_by_ordinal(ordinal)
+                        .unwrap()
+                        .value::<i32>()
+                        .unwrap()
+                        .unwrap_or(0);
+                    ordinal += 1;
+                    let mut segment_by_vals: Vec<Option<String>> = Vec::new();
+                    for col in &columns {
+                        if col.is_segment_by {
+                            let val: Option<String> = row
+                                .get_datum_by_ordinal(ordinal)
+                                .unwrap()
+                                .value::<String>()
+                                .unwrap();
+                            segment_by_vals.push(val);
+                            ordinal += 1;
+                        }
+                    }
+                    let row_count: i32 = row
+                        .get_datum_by_ordinal(ordinal)
+                        .unwrap()
+                        .value::<i32>()
+                        .unwrap()
+                        .unwrap_or(0);
+                    claimed.push(ClaimedSegment {
+                        segment_id,
+                        segment_by_vals,
+                        row_count,
+                    });
+                }
+            }
+
+            for seg in &claimed {
+                if seg.row_count > 0 {
+                    stats.restored_rows += restore_segment_rows(
+                        client,
+                        &part_fqn,
+                        &blobs_fqn,
+                        &columns,
+                        &non_seg_cols,
+                        seg.segment_id,
+                        &seg.segment_by_vals,
+                        seg.row_count,
+                        tombstones.get(&seg.segment_id),
+                    );
+                }
+                removed_ids.push(seg.segment_id);
+                stats.decomposed_segments += 1;
+            }
+        }
+
+        if removed_ids.is_empty() {
+            return;
+        }
+
+        // Compressed bytes being removed (planner-side counter only) —
+        // measured before the blob rows are deleted.
+        let removed_bytes: i64 = client
+            .select(
+                &format!(
+                    "SELECT COALESCE(SUM(octet_length(_data)), 0)::bigint FROM {} WHERE _segment_id IN ({})",
+                    blobs_fqn,
+                    id_list(&removed_ids)
+                ),
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get_one::<i64>().ok().flatten())
+            .unwrap_or(0);
+
+        // Sidecar rows go with the segment (counts/minmax/blooms/bitmaps
+        // for LIVE segments stay exact — the architecture's invariant).
+        // `_segment_id = -1` partition bloom sentinels are untouched by
+        // construction (claimed ids are positive). Tombstone rows are
+        // consumed with their segment (the restore above skipped them).
+        for fqn in [
+            &colstats_fqn,
+            &blobs_fqn,
+            &blooms_fqn,
+            &text_lengths_fqn,
+            &valbitmap_fqn,
+            &tombstones_fqn,
+        ] {
+            if relation_exists(client, fqn) {
+                client
+                    .update(
+                        &format!(
+                            "DELETE FROM {} WHERE _segment_id IN ({})",
+                            fqn,
+                            id_list(&removed_ids)
+                        ),
+                        None,
+                        &[],
+                    )
+                    .expect("failed to delete segment sidecar rows");
+            }
+        }
+
+        catalog::bump_partition_decompose(
+            client,
+            part_info.id,
+            stats.restored_rows + stats.dropped_rows,
+            removed_bytes,
+        )
+        .expect("failed to update partition counters after decompose");
+    });
+
+    // Let other backends drop cached row-count/plan state for this
+    // partition (mirrors compaction; the empty→non-empty heap transition
+    // also fires the insert-note trigger, but that only covers the first
+    // decompose).
+    unsafe { pg_sys::CacheInvalidateRelcacheByRelid(partition_oid) };
+
+    stats
+}
+
+/// Resolve a partition OID to `(schema, table)` names, erroring out on
+/// failure (shared by the P2 decompose and P2.5 tombstone write paths).
+fn partition_names_for_oid(partition_oid: pg_sys::Oid) -> (String, String) {
+    unsafe {
+        let name_ptr = pg_sys::get_rel_name(partition_oid);
+        let ns_ptr = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(partition_oid));
+        if name_ptr.is_null() || ns_ptr.is_null() {
+            pgrx::error!(
+                "pg_deltax: cannot resolve partition OID {} for compressed DML",
+                u32::from(partition_oid)
+            );
+        }
+        (
+            std::ffi::CStr::from_ptr(ns_ptr)
+                .to_string_lossy()
+                .into_owned(),
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// P2.5 tombstone DELETE, step 1: lock the candidate segments' `_meta` rows
+/// `FOR UPDATE` (ordered, to avoid ABBA between concurrent tombstone
+/// writers) and return the ids still alive. The row locks are held to end
+/// of transaction, so a concurrent decompose/compaction of those segments
+/// blocks until we commit — and then sees our tombstones (its restore
+/// excludes them). Candidates whose meta row is already gone (concurrently
+/// decomposed) are simply absent from the result: their rows are ordinary
+/// heap tuples now and the planned DELETE handles whatever its snapshot
+/// sees — the same "0 rows claimed → skip" rule P2 uses. Returns an empty
+/// vec when the partition is no longer compressed (raced a full decompress).
+pub(crate) fn claim_segments_for_tombstone(
+    partition_oid: pg_sys::Oid,
+    segment_ids: &[i32],
+) -> Vec<i32> {
+    if segment_ids.is_empty() {
+        return Vec::new();
+    }
+    let _bypass = DmlBypassGuard::new();
+    let (_schema, part_table) = partition_names_for_oid(partition_oid);
+    let meta_fqn = format!("\"_deltax_compressed\".\"{}_meta\"", part_table);
+
+    Spi::connect_mut(|client| {
+        if !relation_exists(client, &meta_fqn) {
+            return Vec::new();
+        }
+        let id_list = segment_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Goes through `update` (read_only = false): SELECT ... FOR UPDATE
+        // is not allowed on SPI's read-only path.
+        let rows = client
+            .update(
+                &format!(
+                    "SELECT _segment_id FROM {} WHERE _segment_id IN ({}) ORDER BY _segment_id FOR UPDATE",
+                    meta_fqn, id_list
+                ),
+                None,
+                &[],
+            )
+            .expect("failed to lock segments for tombstone DELETE");
+        let mut survivors = Vec::new();
+        for row in rows {
+            if let Some(sid) = row.get::<i32>(1).ok().flatten() {
+                survivors.push(sid);
+            }
+        }
+        survivors
+    })
+}
+
+/// P2.5 tombstone DELETE, step 2: record the exactly-matching rows as
+/// `(segment_id, row_offset)` tombstones. Ordinary heap inserts in the
+/// user's transaction ⇒ MVCC, rollback and replication are native; readers
+/// see the segment unfiltered until commit and exactly filtered after.
+///
+/// `ON CONFLICT DO NOTHING` deduplicates rows that are already tombstoned
+/// (by us under a previous statement, or by a concurrent committed
+/// transaction — matching READ COMMITTED's "row already deleted → skip");
+/// only rows actually inserted count toward the command tag and the catalog
+/// `row_count` decrement (catalog counts stay exact: they track LIVE rows
+/// stored in segments, which is what `DeltaXCount`'s catalog path serves).
+///
+/// Returns the number of rows logically deleted.
+pub(crate) fn insert_dml_tombstones(
+    partition_oid: pg_sys::Oid,
+    targets: &[(i32, Vec<u32>)],
+) -> i64 {
+    if targets.is_empty() {
+        return 0;
+    }
+    let _bypass = DmlBypassGuard::new();
+    let (schema, part_table) = partition_names_for_oid(partition_oid);
+    let tombstones_fqn = format!("\"_deltax_compressed\".\"{}_tombstones\"", part_table);
+
+    let inserted = Spi::connect_mut(|client| {
+        let Some(part_info) = catalog::get_partition_by_name(client, &schema, &part_table)
+            .expect("failed to query partition")
+        else {
+            return 0i64;
+        };
+        if !part_info.is_compressed {
+            return 0i64;
+        }
+        // Lazy creation for partitions compressed before P2.5 (newer
+        // compressions create it eagerly so the GRANT cascade covers it).
+        if !relation_exists(client, &tombstones_fqn) {
+            client
+                .update(
+                    &format!(
+                        "CREATE TABLE IF NOT EXISTS {} (_segment_id INT NOT NULL, _row_offset INT NOT NULL, PRIMARY KEY (_segment_id, _row_offset))",
+                        tombstones_fqn
+                    ),
+                    None,
+                    &[],
+                )
+                .expect("failed to create tombstones table");
+        }
+
+        let mut inserted: i64 = 0;
+        for (segment_id, offsets) in targets {
+            if offsets.is_empty() {
+                continue;
+            }
+            let offs = offsets
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = client
+                .update(
+                    &format!(
+                        "INSERT INTO {} (_segment_id, _row_offset)
+                         SELECT {}, o FROM unnest(ARRAY[{}]::int4[]) AS o
+                         ON CONFLICT DO NOTHING
+                         RETURNING 1",
+                        tombstones_fqn, segment_id, offs
+                    ),
+                    None,
+                    &[],
+                )
+                .expect("failed to insert tombstones");
+            inserted += rows.len() as i64;
+        }
+
+        if inserted > 0 {
+            // Catalog row_count tracks live segment rows — keep it exact so
+            // the DeltaXCount catalog shortcut and planner stats stay right.
+            catalog::bump_partition_decompose(client, part_info.id, inserted, 0)
+                .expect("failed to update partition counters after tombstone DELETE");
+        }
+        inserted
+    });
+
+    if inserted > 0 {
+        // Invalidate cached plans for this partition: plans built before the
+        // first tombstone may carry DeltaXAgg / DeltaXMinMax fast paths that
+        // are gated off while tombstones exist (their exec-time stale guards
+        // would otherwise error). Same mechanism P1 uses for the heap-tail
+        // empty→non-empty transition.
+        unsafe { pg_sys::CacheInvalidateRelcacheByRelid(partition_oid) };
+    }
+    inserted
+}
+
 /// Compact the loose heap rows of a compressed partition into new segments.
 ///
 /// Loose rows are INSERTs that arrived after the partition was compressed
@@ -4273,20 +4946,25 @@ fn deltax_compact_partition(partition: &str) -> String {
 /// RAII guard for the backend-local DML/planner bypass flag. While held,
 /// the set_rel_pathlist / upper-paths hooks plan queries against the plain
 /// heap (no DeltaX custom scans) and the DML rejection (trigger + executor
-/// hook) is disabled. Drop-reset so an error inside compaction can't leave
-/// the backend planning every later query without DeltaX paths.
-struct DmlBypassGuard;
+/// hook) is disabled. Drop-restore (not drop-reset) so guards NEST safely —
+/// compaction holds one while calling `decompose_segments_for_dml`, which
+/// takes its own — and an error inside compaction can't leave the backend
+/// planning every later query without DeltaX paths.
+struct DmlBypassGuard {
+    prev: bool,
+}
 
 impl DmlBypassGuard {
     fn new() -> Self {
+        let prev = crate::scan::dml_bypass_active();
         crate::scan::set_dml_bypass(true);
-        DmlBypassGuard
+        DmlBypassGuard { prev }
     }
 }
 
 impl Drop for DmlBypassGuard {
     fn drop(&mut self) {
-        crate::scan::set_dml_bypass(false);
+        crate::scan::set_dml_bypass(self.prev);
     }
 }
 
@@ -4372,6 +5050,59 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
         );
     }
 
+    // P2.5: physically rewrite tombstone-bearing segments. Decompose them
+    // (P2 machinery — the restore skips tombstoned rows and deletes the
+    // segments' tombstone rows), then let the normal compaction below fold
+    // the restored live rows into fresh, pristine segments. Finally restore
+    // the zero-block fast gate by TRUNCATE-ing the now-empty tombstones
+    // table (also clears dead pages left by rolled-back tombstone DML).
+    let tombstones_fqn = format!("\"_deltax_compressed\".\"{}_tombstones\"", part_table);
+    let mut rewritten_segments = 0usize;
+    if relation_exists(client, &tombstones_fqn) {
+        let mut tomb_ids: Vec<i32> = Vec::new();
+        for row in client
+            .select(
+                &format!("SELECT DISTINCT _segment_id FROM {}", tombstones_fqn),
+                None,
+                &[],
+            )
+            .expect("failed to read tombstoned segment ids")
+        {
+            if let Some(sid) = row.get::<i32>(1).ok().flatten() {
+                tomb_ids.push(sid);
+            }
+        }
+        if !tomb_ids.is_empty() {
+            let part_oid: pg_sys::Oid = client
+                .select(
+                    "SELECT to_regclass($1)::oid",
+                    Some(1),
+                    &[part_fqn.as_str().into()],
+                )
+                .ok()
+                .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
+                .unwrap_or(pg_sys::InvalidOid);
+            if part_oid != pg_sys::InvalidOid {
+                let stats = decompose_segments_for_dml(part_oid, &tomb_ids, &[]);
+                rewritten_segments = stats.decomposed_segments;
+            }
+        }
+        let any_left: bool = client
+            .select(
+                &format!("SELECT EXISTS (SELECT 1 FROM {})", tombstones_fqn),
+                Some(1),
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get_one::<bool>().ok().flatten())
+            .unwrap_or(true);
+        if !any_left {
+            client
+                .update(&format!("TRUNCATE {}", tombstones_fqn), None, &[])
+                .expect("failed to truncate tombstones table");
+        }
+    }
+
     let loose_rows: i64 = client
         .select(
             &format!("SELECT count(*) FROM ONLY {}", part_fqn),
@@ -4408,6 +5139,16 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
                 .update(&format!("TRUNCATE ONLY {}", part_fqn), None, &[])
                 .expect("failed to truncate dead loose-row region");
             crate::scan::invalidate_compressed_cache();
+        }
+        if rewritten_segments > 0 {
+            // Everything in the tombstoned segments was deleted — the
+            // decompose removed them outright and there is nothing to fold
+            // (decompose_segments_for_dml already fired the relcache
+            // invalidation for this partition).
+            return format!(
+                "Partition {}.{}: rewrote {} tombstoned segment(s); no loose rows to compact",
+                schema, part_table, rewritten_segments
+            );
         }
         return format!(
             "Partition {}.{} has no loose rows to compact",
@@ -4471,10 +5212,22 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
     }
 
     // New segment ids continue after the existing maximum (sentinel rows in
-    // _blooms use -1 and never appear in _meta).
+    // _blooms use -1 and never appear in _meta). The catalog high-water
+    // mark guards against id REUSE: decompose-on-write (P2) deletes meta
+    // rows — possibly the current maximum — after recording it in
+    // `max_segment_id`. Reusing such an id would poison the shared
+    // blob/decompressed caches and the backend-local colstats cache, which
+    // are keyed by `(companion_oid, segment_id, ...)` and assume ids are
+    // never recycled within a companion table's lifetime.
     let max_segment_id: i32 = client
         .select(
-            &format!("SELECT COALESCE(MAX(_segment_id), 0) FROM {}", ddl.meta_fqn),
+            &format!(
+                "SELECT GREATEST(COALESCE(MAX(_segment_id), 0),
+                        (SELECT COALESCE(max_segment_id, 0)
+                           FROM deltax.deltax_partition WHERE id = {}))
+                 FROM {}",
+                part_info.id, ddl.meta_fqn
+            ),
             None,
             &[],
         )
@@ -5187,17 +5940,28 @@ pub fn auto_compact_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltata
     if ht.json_extract.is_some() && crate::get_json_extract_mode() != crate::JsonExtractMode::None {
         return 0;
     }
+
+    // Candidates: loose heap rows (P1 INSERTs / P2 decomposed rows) OR a
+    // non-empty `_tombstones` companion (P2.5 — compaction physically
+    // rewrites tombstoned segments and TRUNCATEs the table back to the
+    // zero-block steady state).
     let candidates = client
         .select(
             "SELECT p.schema_name, p.table_name
                FROM deltax.deltax_partition p
               WHERE p.deltatable_id = $1
                 AND p.is_compressed
-                AND COALESCE(
+                AND (COALESCE(
                         pg_catalog.pg_relation_size(
                             pg_catalog.to_regclass(
                                 pg_catalog.format('%I.%I', p.schema_name, p.table_name))),
-                        0) > 0",
+                        0) > 0
+                  OR COALESCE(
+                        pg_catalog.pg_relation_size(
+                            pg_catalog.to_regclass(
+                                pg_catalog.format('_deltax_compressed.%I',
+                                                  p.table_name || '_tombstones'))),
+                        0) > 0)",
             None,
             &[ht.id.into()],
         )
@@ -5415,9 +6179,98 @@ pub(crate) fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> Stri
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use super::*;
+
+    /// End-to-end P2 decompose-on-write inside the pgrx harness (this also
+    /// runs against PG 18 via `make test PG_MAJOR=18`, covering the
+    /// version-gated ExecutorRun hook): an UPDATE on a compressed partition
+    /// decomposes only the candidate segment; an unqualified DELETE drops
+    /// the remaining segments directly.
+    #[pg_test]
+    fn test_decompose_on_write_update_delete() {
+        Spi::run("SET pg_deltax.mock_now = '2025-01-15 12:00:00+00'").unwrap();
+        Spi::run("CREATE TABLE dml_e2e (ts timestamptz NOT NULL, device text NOT NULL, val int)")
+            .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_create_table('dml_e2e', 'ts', '1 day'::interval)",
+        )
+        .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_enable_compression('dml_e2e', \
+             segment_by => ARRAY['device'], order_by => ARRAY['ts'])",
+        )
+        .unwrap();
+        // 3 devices x 50 points; disjoint val ranges per device so equality
+        // quals are colstats-prunable to a single segment.
+        Spi::run(
+            "INSERT INTO dml_e2e \
+             SELECT '2025-01-15'::timestamptz + (p || ' minutes')::interval, \
+                    'dev-' || d, d * 1000 + p \
+             FROM generate_series(0, 2) d, generate_series(0, 49) p",
+        )
+        .unwrap();
+
+        let part: String = Spi::get_one(
+            "SELECT partition_name FROM deltax.deltax_partition_info('dml_e2e') \
+             WHERE range_start <= '2025-01-15'::timestamptz \
+               AND range_end > '2025-01-15'::timestamptz",
+        )
+        .unwrap()
+        .unwrap();
+        let result: String = Spi::get_one(&format!(
+            "SELECT deltax.deltax_compress_partition('{part}')"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("Compressed"), "compress failed: {result}");
+
+        let part_table = part.rsplit('.').next().unwrap();
+        let meta = format!("_deltax_compressed.\"{part_table}_meta\"");
+        let seg_count = || -> i64 {
+            Spi::get_one(&format!(
+                "SELECT count(*) FROM {meta} WHERE _segment_id > 0"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(seg_count(), 3, "expected one segment per device");
+
+        // Targeted UPDATE: val = 1010 lives only in dev-1's segment.
+        Spi::run("UPDATE dml_e2e SET val = -1 WHERE val = 1010").unwrap();
+        assert_eq!(seg_count(), 2, "exactly one segment decomposed");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e"),
+            Ok(Some(150)),
+            "row count unchanged by UPDATE"
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e WHERE val = -1"),
+            Ok(Some(1)),
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e WHERE val = 1010"),
+            Ok(Some(0)),
+        );
+        // Sidecars went with the decomposed segment.
+        assert_eq!(
+            Spi::get_one::<i64>(&format!(
+                "SELECT count(DISTINCT _segment_id) \
+                 FROM _deltax_compressed.\"{part_table}_colstats\" WHERE _segment_id > 0"
+            )),
+            Ok(Some(2)),
+        );
+
+        // Unqualified DELETE drops the remaining segments + heap rows.
+        Spi::run("DELETE FROM dml_e2e").unwrap();
+        assert_eq!(seg_count(), 0);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e"),
+            Ok(Some(0)),
+        );
+    }
 
     #[test]
     fn select_partial_mcv_keeps_heavy_hitters() {

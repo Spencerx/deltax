@@ -343,7 +343,12 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                     false,
                 );
                 for seg in &segs {
-                    total_count += seg.row_count as i64;
+                    // P2.5: count live rows only — `_meta._row_count` is the
+                    // physical count; tombstoned rows are logically deleted.
+                    // Exact because this path is only planned when the quals
+                    // (time/segment-by bounds) provably cover every row of
+                    // the surviving segments, tombstoned ones included.
+                    total_count += seg.live_row_count() as i64;
                 }
                 total_segments += segs.len() as u64;
             }
@@ -525,6 +530,20 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
             });
         }
         let qual_bytes = parse_trailing_qual_bytes(custom_private, idx);
+
+        // P2.5 tombstone stale-plan guard (same contract as DeltaXAgg's
+        // heap-tail guard): the planner never emits DeltaXMinMax when a
+        // partition has tombstones — its per-segment min/max/sum metadata
+        // describes physical rows, and a tombstone may hold the extremum.
+        // The tombstone writer fires a relcache invalidation so cached
+        // plans replan; this catches the residual race.
+        for &oid in &companion_oids {
+            if super::segments::companion_has_live_tombstones(oid) {
+                pgrx::error!(
+                    "pg_deltax: a compressed partition gained tombstoned rows after this plan was created; retry the query"
+                );
+            }
+        }
 
         // Load metadata for first companion table (cached per-backend).
         let t0 = Instant::now();

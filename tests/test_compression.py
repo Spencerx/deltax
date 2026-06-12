@@ -2625,12 +2625,14 @@ class TestMinMaxPushdown:
 
 
 # ---------------------------------------------------------------------------
-# DML blocking on compressed partitions
+# DML on compressed partitions
 # ---------------------------------------------------------------------------
 
 class TestDMLBlocking:
-    """Verify DML semantics on compressed partitions: UPDATE/DELETE raise
-    errors; INSERT succeeds transparently (P1 heap-tail)."""
+    """Verify DML semantics on compressed partitions: INSERT succeeds
+    transparently (P1 heap-tail); UPDATE/DELETE succeed via P2
+    decompose-on-write (see tests/test_compressed_dml.py for the full
+    suite)."""
 
     def _setup_and_compress(self, db):
         """Create table, insert data, compress a partition. Return partition name."""
@@ -2675,21 +2677,29 @@ class TestDMLBlocking:
         ).fetchone()[0]
         assert loose_bytes > 0
 
-    def test_update_blocked_on_compressed(self, db):
-        """UPDATE on a compressed partition raises an error."""
+    def test_update_on_compressed_decomposes(self, db):
+        """UPDATE on a compressed partition succeeds (P2 decompose-on-write)
+        and the new values are visible through the union scan."""
         part_name = self._setup_and_compress(db)
-        with pytest.raises(Exception, match="cannot UPDATE compressed partition"):
-            db.execute(
-                f"UPDATE \"{part_name}\" SET temperature = 0.0"
-            )
+        before = db.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0]
+        cur = db.execute(f'UPDATE "{part_name}" SET temperature = 0.0')
+        assert cur.rowcount == before
+        db.commit()
+        zeroed = db.execute(
+            f'SELECT count(*) FROM "{part_name}" WHERE temperature = 0.0'
+        ).fetchone()[0]
+        assert zeroed == before
 
-    def test_delete_blocked_on_compressed(self, db):
-        """DELETE from a compressed partition raises an error."""
+    def test_delete_on_compressed(self, db):
+        """DELETE from a compressed partition succeeds (P2): the unqualified
+        DELETE removes every row and reports the logical row count."""
         part_name = self._setup_and_compress(db)
-        with pytest.raises(Exception, match="cannot DELETE from compressed partition"):
-            db.execute(
-                f"DELETE FROM \"{part_name}\""
-            )
+        before = db.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0]
+        assert before > 0
+        cur = db.execute(f'DELETE FROM "{part_name}"')
+        assert cur.rowcount == before
+        db.commit()
+        assert db.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0] == 0
 
     def test_dml_works_after_decompress(self, db):
         """After decompression, DML works again."""

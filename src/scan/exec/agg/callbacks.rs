@@ -345,6 +345,15 @@ fn error_if_compressed_heap_tail(companion_oids: &[pg_sys::Oid]) {
                 "pg_deltax: a compressed partition gained uncompressed rows after this plan was created; retry the query"
             );
         }
+        // P2.5: DeltaXAgg's metadata fast paths and AllPass shortcuts count
+        // physical rows — tombstoned (logically deleted) rows would leak in.
+        // The planner never emits this path when tombstones exist; catch
+        // the stale-plan race here, exactly like the heap-tail guard.
+        if unsafe { super::super::segments::companion_has_live_tombstones(oid) } {
+            pgrx::error!(
+                "pg_deltax: a compressed partition gained tombstoned rows after this plan was created; retry the query"
+            );
+        }
     }
 }
 

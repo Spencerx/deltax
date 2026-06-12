@@ -5,16 +5,48 @@ compressed partitions, heap-tail union on every read path
 (`DeltaXDecompress`/`DeltaXAppend` Phase 3, exec-time folding in
 `DeltaXCount`/`DeltaXMinMax`, plan-time gating + stale-plan guard for
 `DeltaXAgg`/Top-N/pathkeys), `deltax_compact_partition()` + worker
-compaction with valmap append. P1 deviations from this design: `DeltaXAgg`
-bails to plain Agg over heap-tail-aware scans instead of ingesting the tail
-(steady state in §4.3 is future work), Top-N disables instead of merging
-heap candidates, and compaction takes an AccessExclusive lock + TRUNCATE
-instead of `FOR UPDATE SKIP LOCKED` (§4.5 step 1 refinement deferred to
-P3). Logical-replication origin filtering (§5.6) is not implemented yet.
+compaction with valmap append. P1 deviations from this
+design: `DeltaXAgg` bails to plain Agg over heap-tail-aware scans instead of
+ingesting the tail (steady state in §4.3 is future work), Top-N disables
+instead of merging heap candidates, and compaction takes an
+AccessExclusive lock + TRUNCATE instead of `FOR UPDATE SKIP LOCKED` (§4.5
+step 1 refinement deferred to P3). Logical-replication origin filtering
+(§5.6) is not implemented yet.
 
-P2 (UPDATE/DELETE via option (a), segment-level decompose-on-write, §5) and
-P2.5 (tombstone fast layer) are design-only on this branch; their
-implementation is being extracted as a follow-up PR that stacks on P1.
+P2 (UPDATE/DELETE via option (a), segment-level decompose-on-write, §5) is
+implemented: the ExecutorStart interceptor walks every ModifyTable node
+(including data-modifying CTEs and MERGE targets), locates candidate
+segments with the read path's pruning pipeline
+(`dml_candidate_segments` → `load_segments_heap`), decomposes them into
+heap rows (`decompose_segments_for_dml`, per-segment refactor of the
+decompress loop) under `DML_BYPASS`, bumps the statement snapshot's command
+id, and lets the planned heap scan run the DML normally. The whole-segment
+direct DELETE (§5.4) is implemented behind three guards (no RETURNING, no
+user row DELETE triggers, every qual batch-provable AllPass) with an
+ExecutorRun hook folding dropped rows into `es_processed` so command tags
+stay truthful. The row trigger no longer rejects UPDATE/DELETE (rows it
+sees are by construction heap rows); ON CONFLICT stays rejected.
+P2 deviations/details vs this design:
+- Locking is an AccessExclusive partition lock (same as compaction) taken
+  before the meta deletes, held to end of transaction — concurrent DML on
+  the same compressed partition serializes (or one statement is cancelled
+  by the deadlock detector; never silent wrongness), and concurrent
+  readers block until the writing transaction commits. The meta-row
+  delete-first protocol (§5.5) is implemented on top: losers see 0 deleted
+  meta rows and skip (READ COMMITTED) or get a serialization error (RR+).
+- `pg_deltax.max_segments_decomposed_per_dml` GUC: deferred to P3 (no
+  decompose cap; an unprunable UPDATE decomposes the whole partition).
+- Segment-id reuse guard: decompose records `max_segment_id` in the
+  catalog before deleting meta rows; compaction allocates above it. The
+  shared blob/decomp caches and the colstats cache are keyed by
+  `(companion_oid, segment_id, ...)`, so id recycling within a companion's
+  lifetime would poison them.
+- Sentinels/column_minmax are NOT rebuilt on decompose (over-coverage =
+  false positives only, §6); valbitmap/_counts/colstats/blooms/
+  text_lengths rows are deleted with their segment, keeping live-segment
+  metadata exact; catalog row_count/compressed_size are decremented.
+- Cross-partition UPDATE works via PG's delete + routed insert (the insert
+  lands in the target's loose region per P1).
 
 Provenance note: this document covers the whole DML program and was written
 on a longer perf-session branch. Some infrastructure it references lives in
@@ -442,8 +474,7 @@ fast; P3 policy work follows.
 
 ### P2.5 implementation status (DELETE-only tombstones)
 
-Implemented in the follow-up DML P2/P2.5 PR for **DELETE only**; UPDATE
-stays on P2 decompose-on-write.
+Implemented for **DELETE only**; UPDATE stays on P2 decompose-on-write.
 Honesty check outcome: a tombstone-fast UPDATE must still materialize the
 old row versions into the heap for the executor to apply SET expressions /
 fire triggers / serve RETURNING, so its synchronous cost is dominated by
