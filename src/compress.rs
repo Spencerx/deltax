@@ -1523,22 +1523,7 @@ impl IntoDatum for JsonbRaw {
 /// in datum_utils.
 pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
     unsafe {
-        let scratch = JSONB_SCRATCH_CTX.with(|c| {
-            let p = c.get();
-            if p.is_null() {
-                let new_ctx = pgrx::pg_sys::AllocSetContextCreateInternal(
-                    pgrx::pg_sys::TopMemoryContext,
-                    c"pg_deltax_jsonb_scratch".as_ptr(),
-                    pgrx::pg_sys::ALLOCSET_SMALL_MINSIZE as usize,
-                    pgrx::pg_sys::ALLOCSET_SMALL_INITSIZE as usize,
-                    pgrx::pg_sys::ALLOCSET_SMALL_MAXSIZE as usize,
-                );
-                c.set(new_ctx);
-                new_ctx
-            } else {
-                p
-            }
-        });
+        let scratch = jsonb_scratch_ctx();
 
         let old = pgrx::pg_sys::MemoryContextSwitchTo(scratch);
 
@@ -1559,6 +1544,69 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
         pgrx::pg_sys::MemoryContextReset(scratch);
 
         bytes
+    }
+}
+
+/// Lazily create (once per backend) and return the scratch memory context
+/// used by the per-row jsonb conversions above/below.
+unsafe fn jsonb_scratch_ctx() -> pgrx::pg_sys::MemoryContext {
+    unsafe {
+        JSONB_SCRATCH_CTX.with(|c| {
+            let p = c.get();
+            if p.is_null() {
+                let new_ctx = pgrx::pg_sys::AllocSetContextCreateInternal(
+                    pgrx::pg_sys::TopMemoryContext,
+                    c"pg_deltax_jsonb_scratch".as_ptr(),
+                    pgrx::pg_sys::ALLOCSET_SMALL_MINSIZE as usize,
+                    pgrx::pg_sys::ALLOCSET_SMALL_INITSIZE as usize,
+                    pgrx::pg_sys::ALLOCSET_SMALL_MAXSIZE as usize,
+                );
+                c.set(new_ctx);
+                new_ctx
+            } else {
+                p
+            }
+        })
+    }
+}
+
+/// Convert a stored binary jsonb varlena payload (the bytes after the
+/// varlena header, as produced by `jsonb_text_to_binary` or direct
+/// compressed COPY ingest) back to canonical JSON text via PG's `jsonb_out`.
+/// Inverse of `jsonb_text_to_binary`; used when restoring segment rows to
+/// the partition heap (full decompress, decompose-on-write, compaction),
+/// where rows are rebuilt through SQL INSERT literals.
+pub(crate) unsafe fn jsonb_binary_to_text(payload: &[u8]) -> String {
+    unsafe {
+        let scratch = jsonb_scratch_ctx();
+        let old = pgrx::pg_sys::MemoryContextSwitchTo(scratch);
+
+        // Rebuild a 4-byte-header varlena around the stored payload.
+        let total_len = pgrx::pg_sys::VARHDRSZ + payload.len();
+        let varlena_ptr = pgrx::pg_sys::palloc(total_len) as *mut pgrx::pg_sys::varlena;
+        pgrx::set_varsize_4b(varlena_ptr, total_len as i32);
+        std::ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            (varlena_ptr as *mut u8).add(pgrx::pg_sys::VARHDRSZ),
+            payload.len(),
+        );
+
+        let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+        let mut typisvarlena = false;
+        pgrx::pg_sys::getTypeOutputInfo(pgrx::pg_sys::JSONBOID, &mut typoutput, &mut typisvarlena);
+        let cstr = pgrx::pg_sys::OidOutputFunctionCall(
+            typoutput,
+            pgrx::pg_sys::Datum::from(varlena_ptr as usize),
+        );
+        let text = std::ffi::CStr::from_ptr(cstr)
+            .to_str()
+            .expect("jsonb_out produced invalid UTF-8")
+            .to_owned();
+
+        pgrx::pg_sys::MemoryContextSwitchTo(old);
+        pgrx::pg_sys::MemoryContextReset(scratch);
+
+        text
     }
 }
 
@@ -2475,7 +2523,9 @@ fn compress_partition_streaming(
 
     // Build SELECT list: segment_by and text-classified cols cast to ::text,
     // others as native types. The ::text cast is needed for CHAR/VARCHAR
-    // columns which have different OIDs than text.
+    // columns which have different OIDs than text. jsonb must stay native:
+    // `append_row_to_columns` reads it as a raw binary varlena via `JsonbRaw`
+    // (no jsonb_out/jsonb_in round-trip, which would be lossy — see #27).
     let select_cols = columns
         .iter()
         .zip(kinds.iter())
@@ -3491,7 +3541,17 @@ fn restore_segment_rows(
     // Compressed columns: decompress from blob_map
     for (ci, name, data_type) in non_seg_cols {
         let blob = blob_map.get(ci).cloned().unwrap_or_default();
-        let values = decompress_column_values(&blob, data_type);
+        let values = if data_type.eq_ignore_ascii_case("jsonb") {
+            // jsonb blobs hold binary jsonb varlena payloads, not UTF-8 text:
+            // decode byte-safe, then convert back to JSON text via jsonb_out
+            // so the value can travel through the INSERT literal below.
+            decompress_column_byte_values(&blob)
+                .into_iter()
+                .map(|opt| opt.map(|payload| unsafe { jsonb_binary_to_text(&payload) }))
+                .collect()
+        } else {
+            decompress_column_values(&blob, data_type)
+        };
         decompressed_cols.push((name.clone(), values));
     }
 
@@ -3940,6 +4000,57 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
             }
         }
     }
+}
+
+/// Byte-level counterpart of `decompress_column_values` for jsonb columns,
+/// whose stored values are binary jsonb varlena payloads (NOT UTF-8 text —
+/// see `compress_byte_values`). Decodes through the byte-safe codec variants
+/// so no UTF-8 validation runs on the payload bytes.
+fn decompress_column_byte_values(blob: &[u8]) -> Vec<Option<Vec<u8>>> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+
+    let cc = CompressedColumn::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+
+    let bytes: Vec<Vec<u8>> = match cc.type_tag {
+        CompressionType::Dictionary => {
+            compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect()
+        }
+        CompressionType::DictionaryLz4 => {
+            let normalized = compression::dictionary::normalize_lz4(&cc.data);
+            compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect()
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) = compression::lz4::decode_to_ranges(&cc.data, non_null_count);
+            ranges
+                .iter()
+                .map(|&(off, len)| buf[off..off + len].to_vec())
+                .collect()
+        }
+        CompressionType::Lz4Blocked => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
+            ranges
+                .iter()
+                .map(|&(off, len)| buf[off..off + len].to_vec())
+                .collect()
+        }
+        other => pgrx::error!(
+            "pg_deltax: unexpected compression tag {:?} for a jsonb column blob",
+            other
+        ),
+    };
+
+    compression::reinsert_nulls(&bytes, &cc.null_bitmap, total_count)
 }
 
 /// Count non-null values given a null bitmap and total count.
@@ -5244,6 +5355,9 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
         .map(|c| classify_column(&c.data_type, c.is_segment_by))
         .collect();
 
+    // segment_by and text cols cast to ::text; jsonb stays native for the
+    // `JsonbRaw` read (see the matching SELECT builder in
+    // compress_partition_impl for why).
     let select_cols = columns
         .iter()
         .zip(kinds.iter())
@@ -6267,6 +6381,90 @@ mod tests {
         assert_eq!(
             Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e"),
             Ok(Some(0)),
+        );
+    }
+
+    /// jsonb columns store binary jsonb varlena payloads in segment blobs
+    /// (not UTF-8 text). Restoring rows to the heap — decompose-on-write for
+    /// UPDATE and full deltax_decompress_partition() — must go through the
+    /// byte-safe decode + jsonb_out path, not the text codec (which would
+    /// panic with "invalid UTF-8 in LZ4 data").
+    #[pg_test]
+    fn test_decompose_and_decompress_roundtrip_jsonb() {
+        Spi::run("SET pg_deltax.mock_now = '2025-01-15 12:00:00+00'").unwrap();
+        Spi::run("CREATE TABLE dml_jsonb (ts timestamptz NOT NULL, val int, payload jsonb)")
+            .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_create_table('dml_jsonb', 'ts', '1 day'::interval)",
+        )
+        .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_enable_compression('dml_jsonb', \
+             segment_by => ARRAY[]::text[], order_by => ARRAY['ts'])",
+        )
+        .unwrap();
+        // Distinct payloads per row defeat dictionary encoding so the blob
+        // takes the Lz4Blocked path; a NULL exercises the null bitmap.
+        Spi::run(
+            "INSERT INTO dml_jsonb \
+             SELECT '2025-01-15'::timestamptz + (p || ' minutes')::interval, p, \
+                    CASE WHEN p = 7 THEN NULL \
+                         ELSE jsonb_build_object('k', p, 'tag', 'v-' || p) END \
+             FROM generate_series(0, 49) p",
+        )
+        .unwrap();
+
+        let part: String = Spi::get_one(
+            "SELECT partition_name FROM deltax.deltax_partition_info('dml_jsonb') \
+             WHERE range_start <= '2025-01-15'::timestamptz \
+               AND range_end > '2025-01-15'::timestamptz",
+        )
+        .unwrap()
+        .unwrap();
+        let result: String = Spi::get_one(&format!(
+            "SELECT deltax.deltax_compress_partition('{part}')"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("Compressed"), "compress failed: {result}");
+
+        // UPDATE decomposes the segment; the restored heap rows must carry
+        // the original jsonb payloads.
+        Spi::run("UPDATE dml_jsonb SET val = -1 WHERE val = 10").unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_jsonb"),
+            Ok(Some(50)),
+        );
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT payload->>'tag' FROM dml_jsonb WHERE payload->>'k' = '10'"
+            ),
+            Ok(Some("v-10".to_string())),
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_jsonb WHERE payload IS NULL"),
+            Ok(Some(1)),
+        );
+
+        // Compact (folds the decomposed heap rows back into segments — this
+        // exercises the post-INSERT jsonb compression path too), then full
+        // decompress: the same restore path, all rows.
+        Spi::get_one::<String>(&format!("SELECT deltax.deltax_compact_partition('{part}')"))
+            .unwrap();
+        Spi::get_one::<String>(&format!(
+            "SELECT deltax.deltax_decompress_partition('{part}')"
+        ))
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_jsonb"),
+            Ok(Some(50)),
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*) FROM dml_jsonb \
+                 WHERE payload IS NOT NULL AND payload->>'tag' = 'v-' || (payload->>'k')"
+            ),
+            Ok(Some(49)),
         );
     }
 
