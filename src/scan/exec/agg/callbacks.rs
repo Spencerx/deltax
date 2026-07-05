@@ -396,14 +396,9 @@ pub(crate) unsafe extern "C-unwind" fn create_agg_scan_state(
 /// `hook::DML_FLAGS`).
 fn error_if_compressed_heap_tail(companion_oids: &[pg_sys::Oid]) {
     for &oid in companion_oids {
-        let part_oid = super::super::segments::partition_oid_for_companion(oid);
-        if part_oid == pg_sys::InvalidOid {
-            pgrx::error!(
-                "pg_deltax: cannot resolve partition for companion OID {} (catalog inconsistency)",
-                u32::from(oid)
-            );
-        }
-        if crate::scan::hook::partition_has_loose_rows(part_oid) {
+        // Flag lookups keyed by companion OID (the flag map holds both keys)
+        // — no partition-OID resolution needed.
+        if crate::scan::hook::companion_has_loose_rows_flag(oid) {
             pgrx::error!(
                 "pg_deltax: a compressed partition gained uncompressed rows after this plan was created; retry the query"
             );

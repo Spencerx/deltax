@@ -97,9 +97,13 @@ unsafe fn for_each_heap_tail_row(
     unsafe {
         // Cheap gate: collect only partitions the `has_loose_rows` catalog
         // flag marks non-empty (avoids opening every partition heap; see
-        // `hook::DML_FLAGS`).
+        // `hook::DML_FLAGS`). Flag lookup by companion OID first, so the
+        // partition-OID resolution runs only for partitions with loose rows.
         let mut heap_oids: Vec<pg_sys::Oid> = Vec::new();
         for &oid in companion_oids {
+            if !crate::scan::hook::companion_has_loose_rows_flag(oid) {
+                continue;
+            }
             let part_oid = super::segments::partition_oid_for_companion(oid);
             if part_oid == pg_sys::InvalidOid {
                 pgrx::error!(
@@ -107,9 +111,7 @@ unsafe fn for_each_heap_tail_row(
                     u32::from(oid)
                 );
             }
-            if crate::scan::hook::partition_has_loose_rows(part_oid) {
-                heap_oids.push(part_oid);
-            }
+            heap_oids.push(part_oid);
         }
         if heap_oids.is_empty() {
             return;

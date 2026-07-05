@@ -208,10 +208,15 @@ pub fn invalidate_compressed_cache() {
 }
 
 /// Bulk-load the `(has_loose_rows, has_tombstones)` flags for every
-/// compressed partition into `DML_FLAGS`, keyed by the partition heap OID.
-/// One SPI joining `deltax_partition` to `pg_class`; the partition heaps
-/// themselves are never opened. Registers the relcache callback so a later
-/// flag flip (insert / tombstone / compaction) drops the cache.
+/// compressed partition into `DML_FLAGS` in ONE SPI. The map is keyed by
+/// BOTH the partition heap OID and its `_meta` companion OID (both point at
+/// the same flag tuple), so the loose-rows gate (keyed by partition OID)
+/// and the tombstone gate (keyed by companion OID) each do a single hash
+/// lookup — no `partition_oid_for_companion` round-trip (branch-only, an SPI
+/// per companion → ~127 on a cold backend) and no partition-heap /
+/// `_tombstones` opens anywhere on the steady-state path. Registers the
+/// relcache callback so a flag flip (insert / tombstone / compaction) drops
+/// the cache.
 fn ensure_dml_flags_loaded() {
     DML_FLAGS.with(|cell| {
         if cell.borrow().is_some() {
@@ -220,22 +225,34 @@ fn ensure_dml_flags_loaded() {
         ensure_hook_callback_registered();
         let loaded = Spi::connect(|client| {
             let mut map: HashMap<pg_sys::Oid, (bool, bool)> = HashMap::new();
+            // Resolve both the partition heap OID (user schema) and the
+            // `<part>_meta` companion OID (in _deltax_compressed) alongside
+            // the flags, so gate lookups need no further catalog access.
             if let Ok(rows) = client.select(
-                "SELECT c.oid, p.has_loose_rows, p.has_tombstones
+                "SELECT pc.oid AS part_oid, mc.oid AS meta_oid,
+                        p.has_loose_rows, p.has_tombstones
                    FROM deltax.deltax_partition p
-                   JOIN pg_namespace n ON n.nspname = p.schema_name
-                   JOIN pg_class c ON c.relname = p.table_name
-                                  AND c.relnamespace = n.oid
+                   JOIN pg_namespace pn ON pn.nspname = p.schema_name
+                   JOIN pg_class pc ON pc.relname = p.table_name
+                                   AND pc.relnamespace = pn.oid
+                   JOIN pg_namespace cn ON cn.nspname = '_deltax_compressed'
+                   LEFT JOIN pg_class mc ON mc.relname = p.table_name || '_meta'
+                                        AND mc.relnamespace = cn.oid
                   WHERE p.is_compressed",
                 None,
                 &[],
             ) {
                 for row in rows {
-                    let oid: Option<pg_sys::Oid> = row.get(1).ok().flatten();
-                    let loose: Option<bool> = row.get(2).ok().flatten();
-                    let tomb: Option<bool> = row.get(3).ok().flatten();
-                    if let Some(oid) = oid {
-                        map.insert(oid, (loose.unwrap_or(false), tomb.unwrap_or(false)));
+                    let part_oid: Option<pg_sys::Oid> = row.get(1).ok().flatten();
+                    let meta_oid: Option<pg_sys::Oid> = row.get(2).ok().flatten();
+                    let loose: Option<bool> = row.get(3).ok().flatten();
+                    let tomb: Option<bool> = row.get(4).ok().flatten();
+                    let flags = (loose.unwrap_or(false), tomb.unwrap_or(false));
+                    if let Some(oid) = part_oid {
+                        map.insert(oid, flags);
+                    }
+                    if let Some(oid) = meta_oid {
+                        map.insert(oid, flags);
                     }
                 }
             }
@@ -260,23 +277,31 @@ pub(crate) fn partition_has_loose_rows(partition_oid: pg_sys::Oid) -> bool {
     })
 }
 
-/// True when the compressed partition holds tombstones (logically deleted
-/// rows), from the `deltax_partition.has_tombstones` catalog flag — no
-/// physical `_tombstones` open. `companion_oid` is the `_meta` table; it is
-/// resolved to the partition heap OID via the cached
-/// `partition_oid_for_companion`.
-pub(crate) fn companion_has_tombstones_flag(companion_oid: pg_sys::Oid) -> bool {
-    let part_oid = super::exec::segments::partition_oid_for_companion(companion_oid);
-    if part_oid == pg_sys::InvalidOid {
-        // Can't resolve — fall back to the exact physical probe rather than
-        // risk a false negative (which would leak tombstoned rows).
-        return unsafe { super::exec::segments::companion_may_have_tombstones(companion_oid) };
-    }
+/// `has_loose_rows` keyed by the `_meta` companion OID (the flag map holds
+/// both keys). Lets the exec-time heap-tail collectors gate on the flag with
+/// a single lookup and resolve the partition OID (via
+/// `partition_oid_for_companion`) only when loose rows actually exist.
+pub(crate) fn companion_has_loose_rows_flag(companion_oid: pg_sys::Oid) -> bool {
     ensure_dml_flags_loaded();
     DML_FLAGS.with(|c| {
         c.borrow()
             .as_ref()
-            .and_then(|m| m.get(&part_oid))
+            .and_then(|m| m.get(&companion_oid))
+            .map(|&(loose, _)| loose)
+            .unwrap_or(false)
+    })
+}
+
+/// True when the compressed partition holds tombstones (logically deleted
+/// rows), from the `deltax_partition.has_tombstones` catalog flag — no
+/// physical `_tombstones` open. `companion_oid` is the `_meta` table; the
+/// flag map is keyed by companion OID directly (see `ensure_dml_flags_loaded`).
+pub(crate) fn companion_has_tombstones_flag(companion_oid: pg_sys::Oid) -> bool {
+    ensure_dml_flags_loaded();
+    DML_FLAGS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|m| m.get(&companion_oid))
             .map(|&(_, tomb)| tomb)
             .unwrap_or(false)
     })

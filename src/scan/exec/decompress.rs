@@ -884,6 +884,12 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let heap_tail_oids: Vec<pg_sys::Oid> = {
             let mut v = Vec::new();
             for &oid in &companion_oids {
+                // Flag lookup by companion OID first (one hash probe, no
+                // catalog round-trip). Only when loose rows actually exist
+                // do we resolve the partition OID and scan its heap.
+                if !crate::scan::hook::companion_has_loose_rows_flag(oid) {
+                    continue;
+                }
                 let part_oid = super::segments::partition_oid_for_companion(oid);
                 if part_oid == pg_sys::InvalidOid {
                     pgrx::error!(
@@ -891,9 +897,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                         u32::from(oid)
                     );
                 }
-                if crate::scan::hook::partition_has_loose_rows(part_oid) {
-                    v.push(part_oid);
-                }
+                v.push(part_oid);
             }
             v
         };
