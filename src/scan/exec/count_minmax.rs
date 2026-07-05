@@ -95,7 +95,9 @@ unsafe fn for_each_heap_tail_row(
     mut f: impl FnMut(*mut pg_sys::TupleTableSlot),
 ) {
     unsafe {
-        // Cheap gate: collect only partitions with a non-empty heap.
+        // Cheap gate: collect only partitions the `has_loose_rows` catalog
+        // flag marks non-empty (avoids opening every partition heap; see
+        // `hook::DML_FLAGS`).
         let mut heap_oids: Vec<pg_sys::Oid> = Vec::new();
         for &oid in companion_oids {
             let part_oid = super::segments::partition_oid_for_companion(oid);
@@ -105,7 +107,7 @@ unsafe fn for_each_heap_tail_row(
                     u32::from(oid)
                 );
             }
-            if !crate::scan::relation_heap_is_empty(part_oid) {
+            if crate::scan::hook::partition_has_loose_rows(part_oid) {
                 heap_oids.push(part_oid);
             }
         }
@@ -680,13 +682,14 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
         let qual_bytes = parse_trailing_qual_bytes(custom_private, idx);
 
         // P2.5 tombstone stale-plan guard (same contract as DeltaXAgg's
-        // heap-tail guard): the planner never emits DeltaXMinMax when a
-        // partition has tombstones — its per-segment min/max/sum metadata
-        // describes physical rows, and a tombstone may hold the extremum.
-        // The tombstone writer fires a relcache invalidation so cached
-        // plans replan; this catches the residual race.
+        // guard): the planner never emits DeltaXMinMax when a partition has
+        // tombstones — its per-segment min/max/sum metadata describes
+        // physical rows, and a tombstone may hold the extremum. Reads the
+        // `has_tombstones` catalog flag (MVCC-atomic with the tombstones,
+        // refreshed at command start via the relcache invalidation the
+        // writer fires) rather than opening every `_tombstones` table.
         for &oid in &companion_oids {
-            if super::segments::companion_has_live_tombstones(oid) {
+            if crate::scan::hook::companion_has_tombstones_flag(oid) {
                 pgrx::error!(
                     "pg_deltax: a compressed partition gained tombstoned rows after this plan was created; retry the query"
                 );

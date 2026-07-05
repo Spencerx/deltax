@@ -4920,12 +4920,21 @@ pub(crate) fn decompose_segments_for_dml(
             removed_bytes,
         )
         .expect("failed to update partition counters after decompose");
+
+        // Restored rows are loose rows in the partition heap. The insert
+        // trigger skips its flag UPDATE under DML_BYPASS (active here), so
+        // set `has_loose_rows` explicitly on this client. Only when rows
+        // were actually restored — a pure whole-segment DELETE (drop_ids,
+        // restored_rows == 0) adds no loose rows.
+        if stats.restored_rows > 0 {
+            catalog::set_partition_has_loose_rows(client, part_info.id, true)
+                .expect("failed to set has_loose_rows flag after decompose");
+        }
     });
 
     // Let other backends drop cached row-count/plan state for this
-    // partition (mirrors compaction; the empty→non-empty heap transition
-    // also fires the insert-note trigger, but that only covers the first
-    // decompose).
+    // partition (mirrors compaction; the flag flip above is what the gates
+    // read, and this invalidation drops their cached flag map).
     unsafe { pg_sys::CacheInvalidateRelcacheByRelid(partition_oid) };
 
     stats
@@ -5085,6 +5094,11 @@ pub(crate) fn insert_dml_tombstones(
             // the DeltaXCount catalog shortcut and planner stats stay right.
             catalog::bump_partition_decompose(client, part_info.id, inserted, 0)
                 .expect("failed to update partition counters after tombstone DELETE");
+            // Flip the P2.5 gate flag in the same transaction (MVCC-atomic
+            // with the tombstone rows): the plan/exec gates read this
+            // instead of probing the _tombstones table.
+            catalog::set_partition_has_tombstones(client, part_info.id, true)
+                .expect("failed to set has_tombstones flag");
         }
         inserted
     });
@@ -5268,6 +5282,10 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
             client
                 .update(&format!("TRUNCATE {}", tombstones_fqn), None, &[])
                 .expect("failed to truncate tombstones table");
+            // All tombstones folded away — clear the P2.5 gate flag so
+            // MIN/MAX/agg pushdowns re-engage for this partition.
+            catalog::set_partition_has_tombstones(client, part_info.id, false)
+                .expect("failed to clear has_tombstones flag after compaction");
         }
     }
 
@@ -5308,6 +5326,10 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
                 .expect("failed to truncate dead loose-row region");
             crate::scan::invalidate_compressed_cache();
         }
+        // No visible loose rows remain (dead pages from a rolled-back or
+        // RR-deleted insert don't count) — clear the stale P1 gate flag.
+        catalog::set_partition_has_loose_rows(client, part_info.id, false)
+            .expect("failed to clear has_loose_rows flag");
         if rewritten_segments > 0 {
             // Everything in the tombstoned segments was deleted — the
             // decompose removed them outright and there is nothing to fold
@@ -5759,6 +5781,12 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
             .update(&format!("DELETE FROM ONLY {}", part_fqn), None, &[])
             .expect("failed to delete compacted loose rows");
     }
+    // Every loose row visible to this compaction is now folded into a
+    // segment; clear the P1 gate flag so plan/exec fast paths re-engage.
+    // (A concurrent inserter's rows aren't visible here and its own commit
+    // re-sets the flag.) MVCC-atomic with the row removal above.
+    catalog::set_partition_has_loose_rows(client, part_info.id, false)
+        .expect("failed to clear has_loose_rows flag after compaction");
 
     // ANALYZE the touched companion tables and refresh pg_statistic /
     // reltuples for the partition (best-effort).

@@ -109,6 +109,79 @@ def segment_count(conn, part):
     ).fetchone()[0]
 
 
+def dml_flags(conn, part):
+    """(has_loose_rows, has_tombstones) from the catalog for a partition."""
+    return conn.execute(
+        "SELECT has_loose_rows, has_tombstones FROM deltax.deltax_partition "
+        f"WHERE table_name = '{part.split('.')[-1]}'"
+    ).fetchone()
+
+
+class TestDmlGateFlags:
+    """The `has_loose_rows` / `has_tombstones` catalog flags drive the
+    plan/exec fast-path gates (replacing per-partition physical heap probes).
+    They must track DML transactionally and be cleared by compaction."""
+
+    def test_flag_lifecycle(self, db):
+        setup_tables(db)
+        compress_all(db)
+        part = data_partition(db)
+
+        # Fresh compression: both flags false.
+        assert dml_flags(db, part) == (False, False)
+
+        # A transparent INSERT into the compressed partition sets
+        # has_loose_rows in the same transaction (BEFORE-INSERT trigger).
+        db.execute(
+            f"INSERT INTO events (ts, device_id, val, temperature) VALUES "
+            f"('{BASE_TS}'::timestamptz + interval '5 minutes', 'device-9', 99999, 1.0)"
+        )
+        assert dml_flags(db, part)[0] is True, "INSERT must set has_loose_rows"
+        db.commit()
+        assert dml_flags(db, part)[0] is True
+
+        # Compaction folds the loose row into a segment and clears the flag.
+        db.execute(f"SELECT deltax.deltax_compact_partition('{part}')")
+        db.commit()
+        assert dml_flags(db, part) == (False, False), "compaction must clear has_loose_rows"
+
+        # A tombstone-eligible DELETE sets has_tombstones.
+        db.execute("DELETE FROM events WHERE val = 2050")
+        assert dml_flags(db, part)[1] is True, "tombstone DELETE must set has_tombstones"
+        db.commit()
+
+        # Compaction rewrites the tombstoned segment and clears the flag.
+        db.execute(f"SELECT deltax.deltax_compact_partition('{part}')")
+        db.commit()
+        assert dml_flags(db, part) == (False, False), "compaction must clear has_tombstones"
+
+    def test_insert_rollback_leaves_flag_consistent(self, db):
+        """A rolled-back INSERT must not leave has_loose_rows stuck true
+        (the flag UPDATE rolls back with the insert; the per-txn memo is
+        cleared on abort so a later insert re-sets it)."""
+        setup_tables(db)
+        compress_all(db)
+        part = data_partition(db)
+
+        db.execute(
+            f"INSERT INTO events (ts, device_id, val, temperature) VALUES "
+            f"('{BASE_TS}'::timestamptz + interval '6 minutes', 'device-9', 88888, 1.0)"
+        )
+        assert dml_flags(db, part)[0] is True
+        db.rollback()
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.commit()
+        assert dml_flags(db, part) == (False, False), "rolled-back INSERT must not set the flag"
+
+        # A subsequent committed insert still sets it (memo was cleared).
+        db.execute(
+            f"INSERT INTO events (ts, device_id, val, temperature) VALUES "
+            f"('{BASE_TS}'::timestamptz + interval '7 minutes', 'device-9', 77777, 1.0)"
+        )
+        db.commit()
+        assert dml_flags(db, part)[0] is True
+
+
 def sidecar_segment_ids(conn, part, sidecar):
     name = part.split(".")[-1]
     return {
@@ -896,14 +969,25 @@ class TestDmlConcurrency:
         """A reader concurrent with a decomposing UPDATE sees either the
         full pre-state or the full post-state — never a partial mix.
 
-        The decompose path takes an ACCESS EXCLUSIVE lock on the partition,
-        so a reader that needs a new lock blocks until the writer commits
-        and then must see the complete post-commit state.
+        The plan/exec DML gates read the `has_loose_rows` / `has_tombstones`
+        catalog flags rather than physically probing the partition heap, so
+        an analytic reader no longer takes an ACCESS SHARE lock on the
+        partition during planning and therefore does NOT block behind the
+        decompose's ACCESS EXCLUSIVE lock (standard PostgreSQL MVCC: readers
+        don't block writers). Because the writer's transaction is still open
+        when the reader runs, the reader's snapshot — and the committed
+        catalog flags it reads — both reflect the pre-state, so it reads a
+        consistent pre-image. The invariant under test is "pre OR post,
+        never torn"; the flag's MVCC atomicity with the decomposed rows is
+        what guarantees the two never disagree.
         """
         setup_tables(db)
         compress_all(db)
 
-        expected_after = None
+        expected_before = db.execute(
+            "SELECT count(*), sum(val), "
+            "count(*) FILTER (WHERE temperature = -42) FROM events"
+        ).fetchone()
         results = {}
 
         def reader():
@@ -921,16 +1005,21 @@ class TestDmlConcurrency:
             "count(*) FILTER (WHERE temperature = -42) FROM events_plain"
         ).fetchone()
 
-        # Start the reader while the writing transaction is still open: it
-        # blocks on the partition lock, then must observe the post-state.
+        # The reader runs while the writing transaction is still open. It
+        # does not block (MVCC read), and must observe a self-consistent
+        # snapshot — never a partial mix of decomposed and still-segmented
+        # rows.
         t = threading.Thread(target=reader)
         t.start()
-        t.join(timeout=2)
-        assert t.is_alive(), "reader should block on the decompose lock"
-        db.commit()
         t.join(timeout=30)
-        assert not t.is_alive(), "reader never finished after writer commit"
-        assert results["row"] == expected_after
+        assert not t.is_alive(), "reader never finished"
+        assert results["row"] in (expected_before, expected_after), (
+            f"reader saw a torn state: {results['row']} "
+            f"(pre={expected_before}, post={expected_after})"
+        )
+        # Deterministically the pre-image, since the writer is uncommitted.
+        assert results["row"] == expected_before
+        db.commit()
         assert_tables_match(db)
 
     def test_repeatable_read_reader_keeps_pre_state(self, db):

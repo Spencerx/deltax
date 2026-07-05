@@ -377,14 +377,23 @@ pub(crate) unsafe extern "C-unwind" fn create_agg_scan_state(
     }
 }
 
-/// P1 heap-tail stale-plan guard. The planner never emits a DeltaXAgg path
-/// when any involved compressed partition holds loose heap rows (transparent
-/// INSERTs); the insert trigger sends a relcache invalidation on the
-/// empty→non-empty transition so cached plans replan. This guard catches the
-/// residual race (rows committed between plan revalidation and snapshot):
-/// DeltaXAgg's columnar accumulators cannot ingest row-form heap tuples, so
-/// silently proceeding would drop rows from the aggregate. Erroring is the
-/// correct-by-construction fallback; a retry replans onto the slow path.
+/// P1/P2.5 stale-plan guard. The planner never emits a DeltaXAgg path when
+/// any involved compressed partition holds loose heap rows (transparent
+/// INSERTs) or tombstones — DeltaXAgg's columnar accumulators cannot ingest
+/// row-form heap tuples and its metadata fast paths count physical rows, so
+/// either would silently corrupt the aggregate. This guard catches a cached
+/// plan re-executed after such a change: the writer flips the
+/// `has_loose_rows` / `has_tombstones` catalog flag and fires a relcache
+/// invalidation; command-start invalidation processing both replans the
+/// cached plan and drops this backend's flag map, so re-reading the flag
+/// here sees the new state and errors (a retry replans onto the slow path).
+///
+/// Reads the catalog flags rather than physically probing every partition
+/// heap + `_tombstones` table (which forced a cold relcache build per
+/// partition on every agg query — the dominant fresh-backend cost): the
+/// flags are MVCC-atomic with the rows and refreshed at command start, so
+/// they are as current as a physical probe would be here (see
+/// `hook::DML_FLAGS`).
 fn error_if_compressed_heap_tail(companion_oids: &[pg_sys::Oid]) {
     for &oid in companion_oids {
         let part_oid = super::super::segments::partition_oid_for_companion(oid);
@@ -394,16 +403,12 @@ fn error_if_compressed_heap_tail(companion_oids: &[pg_sys::Oid]) {
                 u32::from(oid)
             );
         }
-        if !unsafe { crate::scan::relation_heap_is_empty(part_oid) } {
+        if crate::scan::hook::partition_has_loose_rows(part_oid) {
             pgrx::error!(
                 "pg_deltax: a compressed partition gained uncompressed rows after this plan was created; retry the query"
             );
         }
-        // P2.5: DeltaXAgg's metadata fast paths and AllPass shortcuts count
-        // physical rows — tombstoned (logically deleted) rows would leak in.
-        // The planner never emits this path when tombstones exist; catch
-        // the stale-plan race here, exactly like the heap-tail guard.
-        if unsafe { super::super::segments::companion_has_live_tombstones(oid) } {
+        if crate::scan::hook::companion_has_tombstones_flag(oid) {
             pgrx::error!(
                 "pg_deltax: a compressed partition gained tombstoned rows after this plan was created; retry the query"
             );

@@ -205,6 +205,16 @@ CREATE TABLE IF NOT EXISTS deltax.deltax_partition (
     column_minmax   JSONB,
     column_valcounts JSONB,
     column_mcv      JSONB,
+    -- P1/P2.5 DML gate flags, maintained transactionally by the writers
+    -- (insert-note trigger, decompose, tombstone claim, compaction). The
+    -- planner and executor gates read these instead of physically probing
+    -- every partition heap + _tombstones table, which forced ~3 relcache
+    -- builds per partition per fresh backend (+30ms/query at 127
+    -- partitions). MVCC makes them exact: a snapshot that can see the
+    -- loose rows / tombstones can see the flag set in the same
+    -- transaction.
+    has_loose_rows  BOOLEAN NOT NULL DEFAULT false,
+    has_tombstones  BOOLEAN NOT NULL DEFAULT false,
     UNIQUE(schema_name, table_name)
 );
 
@@ -217,6 +227,10 @@ ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS max_segment_id INT;
+-- DEFAULT false is correct for every pre-DML deployment: compressed
+-- partitions were read-only, so no loose rows or tombstones can exist.
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS has_loose_rows BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS has_tombstones BOOLEAN NOT NULL DEFAULT false;
 
 CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger

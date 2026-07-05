@@ -376,23 +376,17 @@ pub(crate) unsafe fn load_tombstone_map(
     }
 }
 
-/// Exact probe: true when at least one tombstone row is visible for this
-/// companion under the active snapshot. Used by the exec-time stale-plan
-/// guards (DeltaXAgg / DeltaXMinMax), which must not fire on a tombstone
-/// table that merely has dead heap pages (rolled-back DML, pre-compaction).
-pub(crate) unsafe fn companion_has_live_tombstones(meta_oid: pg_sys::Oid) -> bool {
-    unsafe { companion_may_have_tombstones(meta_oid) && load_tombstone_map(meta_oid).is_some() }
-}
-
 /// Attach per-segment tombstone offsets to freshly loaded segments. No-op
-/// (and near-zero cost) when the partition has no `_tombstones` companion
-/// or it has zero blocks.
+/// (and near-zero cost) when the partition's `has_tombstones` catalog flag
+/// is false — avoids opening the `_tombstones` table on the steady-state
+/// read path (see `hook::DML_FLAGS`). When the flag is set, the exact map
+/// is loaded under the scan's active snapshot.
 pub(super) unsafe fn attach_tombstones(meta_oid: pg_sys::Oid, segments: &mut [SegmentData]) {
     if segments.is_empty() {
         return;
     }
     unsafe {
-        if !companion_may_have_tombstones(meta_oid) {
+        if !crate::scan::hook::companion_has_tombstones_flag(meta_oid) {
             return;
         }
         if let Some(map) = load_tombstone_map(meta_oid) {

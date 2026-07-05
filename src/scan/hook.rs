@@ -55,28 +55,32 @@ thread_local! {
     /// `segments.rs`).
     static HOOK_CB_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-    /// P1 gate cache: compressed-partition heap OID → "heap holds loose
-    /// rows". The physical probe (`relation_heap_is_empty`: table_open +
-    /// nblocks lseek) is cheap alone but runs at several plan-time gates ×
-    /// every partition on every planning — ~30ms/query on a 127-partition
-    /// table. Cacheable ONLY for compressed partitions: their empty →
-    /// non-empty transition fires a relcache invalidation
-    /// (`deltax_note_compressed_insert`, decompose, compaction), which
-    /// clears this map via `invalidate_compressed_cache`. Uncompressed
-    /// heaps get no such invalidation and must keep the physical probe.
-    static HEAP_LOOSE_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, bool>> =
-        std::cell::RefCell::new(HashMap::new());
-
-    /// P2.5 gate cache: companion (`_meta`) OID → "the partition's
-    /// `_tombstones` table may hold rows" (conservative nblocks gate).
-    /// Same invalidation contract: the tombstone writer and compaction
-    /// fire relcache invalidations on the partition, clearing this map.
-    /// A rolled-back tombstone DML sends no invalidation but only leaves
-    /// dead heap pages, for which the uncached probe answers "maybe" and
-    /// the subsequent exact map load finds nothing — so a cached `false`
-    /// (no committed tombstones) reaches the same result cheaper.
-    static TOMBSTONE_GATE_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, bool>> =
-        std::cell::RefCell::new(HashMap::new());
+    /// P1/P2.5 DML gate map: compressed partition heap OID →
+    /// `(has_loose_rows, has_tombstones)`, read from the `deltax_partition`
+    /// catalog flags in ONE bulk SPI (like `COMPRESSED_NAMESET`), lazily on
+    /// first gate query, cached for the backend. `None` = not yet loaded.
+    ///
+    /// Replaces the per-partition physical probes (`relation_heap_is_empty`
+    /// on the heap + on the `_tombstones` table) that every plan-time and
+    /// exec-time gate ran on every compressed partition. Those force a cold
+    /// relcache + smgr build for ~each of a table's partitions and their
+    /// tombstone companions — relations a segment-only scan never otherwise
+    /// opens — costing ~40ms on the first query of a fresh backend at 127
+    /// partitions (RTABench point queries). The flags open nothing beyond
+    /// the `deltax_partition` catalog itself.
+    ///
+    /// Correctness rides the same MVCC + invalidation contract as
+    /// `COMPRESSED_NAMESET`: a writer sets the flag in the same transaction
+    /// as the loose rows / tombstones (so any snapshot that sees the rows
+    /// sees the flag) and fires a relcache invalidation on the false→true
+    /// transition; `invalidate_compressed_cache` drops this map, and pending
+    /// invalidations are processed at command start, so a fresh query always
+    /// reloads current flags. Missing partitions (uncompressed children) are
+    /// absent from the map and handled by the caller's physical-emptiness
+    /// path — those have no catalog flags and are cheap (empty default /
+    /// pre-created future partitions).
+    static DML_FLAGS: std::cell::RefCell<Option<HashMap<pg_sys::Oid, (bool, bool)>>> =
+        const { std::cell::RefCell::new(None) };
 
     /// Parent relids the flatten walker set `inh = false` on during the
     /// current top-level planning, mapped to their (bound-ordered) companion
@@ -198,39 +202,84 @@ pub fn invalidate_compressed_cache() {
     COMPRESSED_NAMESET.with(|cell| *cell.borrow_mut() = None);
     TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().clear());
     META_COLS_CACHE.with(|cache| cache.borrow_mut().clear());
-    HEAP_LOOSE_CACHE.with(|cache| cache.borrow_mut().clear());
-    TOMBSTONE_GATE_CACHE.with(|cache| cache.borrow_mut().clear());
+    DML_FLAGS.with(|cache| *cache.borrow_mut() = None);
     cost::invalidate_caches();
     super::exec::segments::invalidate_colstats_cache();
 }
 
-/// Cached plan-time variant of `!relation_heap_is_empty` for COMPRESSED
-/// partition heaps only (see `HEAP_LOOSE_CACHE` for the invalidation
-/// contract; uncompressed heaps must keep the physical probe). Exec-time
-/// consumers (heap-tail collection in `begin_deltax_append`, the
-/// count/minmax heap folds, the stale-plan guards) stay on the physical
-/// probe as the last line of defense.
-unsafe fn cached_compressed_heap_has_loose_rows(partition_oid: pg_sys::Oid) -> bool {
-    if let Some(v) = HEAP_LOOSE_CACHE.with(|c| c.borrow().get(&partition_oid).copied()) {
-        return v;
-    }
-    ensure_hook_callback_registered();
-    let v = unsafe { !relation_heap_is_empty(partition_oid) };
-    HEAP_LOOSE_CACHE.with(|c| c.borrow_mut().insert(partition_oid, v));
-    v
+/// Bulk-load the `(has_loose_rows, has_tombstones)` flags for every
+/// compressed partition into `DML_FLAGS`, keyed by the partition heap OID.
+/// One SPI joining `deltax_partition` to `pg_class`; the partition heaps
+/// themselves are never opened. Registers the relcache callback so a later
+/// flag flip (insert / tombstone / compaction) drops the cache.
+fn ensure_dml_flags_loaded() {
+    DML_FLAGS.with(|cell| {
+        if cell.borrow().is_some() {
+            return;
+        }
+        ensure_hook_callback_registered();
+        let loaded = Spi::connect(|client| {
+            let mut map: HashMap<pg_sys::Oid, (bool, bool)> = HashMap::new();
+            if let Ok(rows) = client.select(
+                "SELECT c.oid, p.has_loose_rows, p.has_tombstones
+                   FROM deltax.deltax_partition p
+                   JOIN pg_namespace n ON n.nspname = p.schema_name
+                   JOIN pg_class c ON c.relname = p.table_name
+                                  AND c.relnamespace = n.oid
+                  WHERE p.is_compressed",
+                None,
+                &[],
+            ) {
+                for row in rows {
+                    let oid: Option<pg_sys::Oid> = row.get(1).ok().flatten();
+                    let loose: Option<bool> = row.get(2).ok().flatten();
+                    let tomb: Option<bool> = row.get(3).ok().flatten();
+                    if let Some(oid) = oid {
+                        map.insert(oid, (loose.unwrap_or(false), tomb.unwrap_or(false)));
+                    }
+                }
+            }
+            map
+        });
+        *cell.borrow_mut() = Some(loaded);
+    });
 }
 
-/// Cached plan-time variant of `companion_may_have_tombstones` (see
-/// `TOMBSTONE_GATE_CACHE`). Exec-time consumers (`attach_tombstones`,
-/// `companion_has_live_tombstones` stale-plan guards) stay uncached.
-unsafe fn cached_companion_may_have_tombstones(companion_oid: pg_sys::Oid) -> bool {
-    if let Some(v) = TOMBSTONE_GATE_CACHE.with(|c| c.borrow().get(&companion_oid).copied()) {
-        return v;
+/// True when the compressed partition's heap holds loose rows (transparent
+/// INSERTs / decomposed rows), from the `deltax_partition.has_loose_rows`
+/// catalog flag — no physical heap open. Replaces `!relation_heap_is_empty`
+/// at every gate. See `DML_FLAGS` for the correctness contract.
+pub(crate) fn partition_has_loose_rows(partition_oid: pg_sys::Oid) -> bool {
+    ensure_dml_flags_loaded();
+    DML_FLAGS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|m| m.get(&partition_oid))
+            .map(|&(loose, _)| loose)
+            .unwrap_or(false)
+    })
+}
+
+/// True when the compressed partition holds tombstones (logically deleted
+/// rows), from the `deltax_partition.has_tombstones` catalog flag — no
+/// physical `_tombstones` open. `companion_oid` is the `_meta` table; it is
+/// resolved to the partition heap OID via the cached
+/// `partition_oid_for_companion`.
+pub(crate) fn companion_has_tombstones_flag(companion_oid: pg_sys::Oid) -> bool {
+    let part_oid = super::exec::segments::partition_oid_for_companion(companion_oid);
+    if part_oid == pg_sys::InvalidOid {
+        // Can't resolve — fall back to the exact physical probe rather than
+        // risk a false negative (which would leak tombstoned rows).
+        return unsafe { super::exec::segments::companion_may_have_tombstones(companion_oid) };
     }
-    ensure_hook_callback_registered();
-    let v = unsafe { super::exec::segments::companion_may_have_tombstones(companion_oid) };
-    TOMBSTONE_GATE_CACHE.with(|c| c.borrow_mut().insert(companion_oid, v));
-    v
+    ensure_dml_flags_loaded();
+    DML_FLAGS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|m| m.get(&part_oid))
+            .map(|&(_, tomb)| tomb)
+            .unwrap_or(false)
+    })
 }
 
 /// Relcache-invalidation callback: conservatively wipe every planner-side
@@ -1188,7 +1237,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         // the (time-ordered) segment rows, so the node can neither claim
         // sorted output (pathkeys) nor push Top-N down. The plain path +
         // upper Sort/Limit stays correct.
-        let heap_tail = cached_compressed_heap_has_loose_rows(rel_oid);
+        let heap_tail = partition_has_loose_rows(rel_oid);
         let effective_limit = if heap_tail { 0 } else { effective_limit };
 
         // For child partitions, check if we can advertise sorted output
@@ -4996,8 +5045,8 @@ unsafe fn any_compressed_rte_heap_nonempty(root: *mut pg_sys::PlannerInfo) -> bo
             let relid = (*rte).relid;
             let companion_oid = cached_companion_for_rel(relid);
             if companion_oid != pg_sys::InvalidOid
-                && (cached_compressed_heap_has_loose_rows(relid)
-                    || cached_companion_may_have_tombstones(companion_oid))
+                && (partition_has_loose_rows(relid)
+                    || companion_has_tombstones_flag(companion_oid))
             {
                 return true;
             }
@@ -5013,7 +5062,7 @@ unsafe fn any_compressed_rte_heap_nonempty(root: *mut pg_sys::PlannerInfo) -> bo
 unsafe fn any_companion_may_have_tombstones(companion_oids: &[pg_sys::Oid]) -> bool {
     companion_oids
         .iter()
-        .any(|&oid| unsafe { cached_companion_may_have_tombstones(oid) })
+        .any(|&oid| companion_has_tombstones_flag(oid))
 }
 
 /// True when `rti` is an inheritance/partition descendant of `ancestor_rti`,
@@ -5165,8 +5214,8 @@ unsafe fn flatten_eligible_companions(parent_oid: pg_sys::Oid) -> Option<Vec<pg_
                 // expansion keeps all P1/P2 gating intact; compaction
                 // restores the zero-block state and with it the flatten
                 // fast path.
-                if cached_compressed_heap_has_loose_rows(child_oid)
-                    || cached_companion_may_have_tombstones(companion_oid)
+                if partition_has_loose_rows(child_oid)
+                    || companion_has_tombstones_flag(companion_oid)
                 {
                     return None;
                 }
@@ -5337,7 +5386,7 @@ unsafe fn collect_compressed_children(
                 // P1 heap tail: compressed children may hold loose rows in
                 // their heap. DeltaXAppend scans those at exec time
                 // (Phase 3), but the caller must disable Top-N pushdown.
-                if cached_compressed_heap_has_loose_rows(child_oid) {
+                if partition_has_loose_rows(child_oid) {
                     any_heap_tail = true;
                 }
                 companion_oids.push(companion_oid);

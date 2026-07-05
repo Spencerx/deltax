@@ -874,6 +874,13 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         // partition heap holds loose rows (transparent INSERTs after
         // compression). Their live tuples are emitted by the leader after
         // the segment cursor is exhausted.
+        // Consult the `has_loose_rows` catalog flag (via the backend flag
+        // map) instead of physically probing each partition heap: a
+        // segment-only scan otherwise never opens the partition heaps, and
+        // opening all of them just to check emptiness is the dominant
+        // fresh-backend cost on wide point queries. The flag is MVCC-exact
+        // and invalidation-backed (see `hook::DML_FLAGS`); only partitions
+        // the flag marks as holding loose rows get opened and scanned.
         let heap_tail_oids: Vec<pg_sys::Oid> = {
             let mut v = Vec::new();
             for &oid in &companion_oids {
@@ -884,7 +891,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                         u32::from(oid)
                     );
                 }
-                if !crate::scan::relation_heap_is_empty(part_oid) {
+                if crate::scan::hook::partition_has_loose_rows(part_oid) {
                     v.push(part_oid);
                 }
             }
