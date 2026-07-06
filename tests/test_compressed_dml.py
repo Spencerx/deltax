@@ -317,6 +317,43 @@ class TestCompressedDmlTwin:
         assert got == want and len(got) == 800
         assert_tables_match(db)
 
+    def test_time_range_delete_whole_drops_not_decompose(self, db):
+        """A time-range DELETE that fully covers a partition must take the
+        whole-segment-drop fast path, NOT decompose every segment.
+
+        Regression: the time column's colstats `_nonnull_count` is a zero
+        placeholder (its real stats live in _meta), so classify_segment_quals
+        read 0 non-null rows and returned Ambiguous — defeating the drop, so
+        `ts < boundary` retention deletes decomposed/tombstoned every row
+        (~80x slower). The discriminator here is `has_loose_rows`: whole-drop
+        never inserts into the heap (flag stays false); decompose restores
+        rows first (flag flips true)."""
+        # No segment_by → segments are time-ordered, so a partition-boundary
+        # predicate cleanly covers whole segments. days=2 → two partitions.
+        setup_tables(db, segment_by=False, days=2)
+        compress_all(db)
+        day2 = "2025-01-16 00:00:00+00"
+        first_part = db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('events') "
+            "WHERE is_compressed ORDER BY range_start LIMIT 1"
+        ).fetchone()[0]
+        segs_before = segment_count(db, first_part)
+        assert segs_before > 0
+
+        got = db.execute(f"DELETE FROM events WHERE ts < '{day2}'::timestamptz").rowcount
+        want = db.execute(
+            f"DELETE FROM events_plain WHERE ts < '{day2}'::timestamptz"
+        ).rowcount
+        assert got == want > 0
+        # Whole-drop: the earliest partition's segments are gone and NOTHING
+        # was decomposed into the heap (flag false ⇒ no heap inserts happened).
+        assert segment_count(db, first_part) == 0, "earliest partition not dropped"
+        assert dml_flags(db, first_part) == (False, False), (
+            "time-range retention DELETE decomposed instead of whole-dropping"
+        )
+        db.commit()
+        assert_tables_match(db)
+
     def test_update_on_loose_rows_only(self, db):
         # An UPDATE matching only loose (P1-inserted) rows must not be
         # blocked and must leave segments alone when pruning rules them out.

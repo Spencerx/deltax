@@ -672,16 +672,21 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
 
         if !heap_tail_oids.is_empty() {
             // Schema guard: heap tuples are deformed positionally into the
-            // scan slot, which requires a 1:1 physical layout match with the
-            // companion's column list (no json_extract synthetic columns,
-            // no dropped columns).
+            // scan slot, so the partition heap and the scan output slot must
+            // share a physical layout. Compared against the scan slot's
+            // natts, NOT the compressed column count — the latter includes
+            // json_extract synthetic columns (absent from the heap and from
+            // a scan that doesn't select them). The emit path re-checks per
+            // partition; this is the early, single-partition catch.
             let rel_natts = (*(*scan_rel).rd_att).natts as usize;
-            if rel_natts != state.col_names.len() {
+            let slot_natts =
+                (*(*(*node).ss.ss_ScanTupleSlot).tts_tupleDescriptor).natts as usize;
+            if rel_natts != slot_natts {
                 pgrx::error!(
-                    "pg_deltax: compressed partition \"{}\" has uncompressed rows but its physical layout ({} attrs) does not match the compressed layout ({} cols); decompress and recompress it",
+                    "pg_deltax: compressed partition \"{}\" has uncompressed rows whose physical layout ({} attrs) does not match the scan output ({} attrs); this can happen when a query selects a json_extract column from a partition with loose rows — run deltax_compact_partition() or decompress + recompress it",
                     relation_name(scan_rel),
                     rel_natts,
-                    state.col_names.len(),
+                    slot_natts,
                 );
             }
             state.heap_tail = Some(HeapTailScan::new(heap_tail_oids, (*estate).es_snapshot));
@@ -3838,15 +3843,25 @@ unsafe fn try_emit_heap_tail_row(
                 // but the PARENT's for DeltaXAppend — plan Vars index it, so
                 // all three layouts must agree before deforming positionally
                 // (a dropped column on one side would silently misalign).
+                // The heap tuple is deformed positionally into the scan
+                // slot, so the partition heap and the scan slot must have
+                // the SAME physical layout. We do NOT compare against
+                // `ncols` (the compressed column count): it includes
+                // json-extract synthetic columns, which are absent from
+                // both the heap and this scan slot (the scan emits physical
+                // columns; synthetic values are computed by the upper plan
+                // from the physical payload column). A query that DOES need
+                // synthetic columns on heap-tail rows produces a wider scan
+                // slot (slot_natts > rel_natts) and is caught here.
                 let slot_natts = (*(*scan_slot).tts_tupleDescriptor).natts as usize;
-                if rel_natts != ncols || slot_natts != rel_natts {
+                let _ = ncols;
+                if slot_natts != rel_natts {
                     let name = relation_name(rel);
                     pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
                     pgrx::error!(
-                        "pg_deltax: compressed partition \"{}\" has uncompressed rows but its physical layout ({} attrs) does not match the compressed layout ({} cols, {} scan attrs); decompress and recompress it",
+                        "pg_deltax: compressed partition \"{}\" has uncompressed rows whose physical layout ({} attrs) does not match the scan output ({} attrs); this can happen when a query selects a json_extract column from a partition with loose rows — run deltax_compact_partition() or decompress + recompress it",
                         name,
                         rel_natts,
-                        ncols,
                         slot_natts,
                     );
                 }

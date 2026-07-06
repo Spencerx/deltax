@@ -392,6 +392,7 @@ pub(super) struct ParallelCompactConfig<'a> {
     pub(super) group_specs: &'a [GroupByColSpec],
     pub(super) col_names: &'a [String],
     pub(super) col_types: &'a [pg_sys::Oid],
+    pub(super) time_column: &'a str,
     pub(super) segment_by: &'a [String],
     /// Persisted `_col_idx` map (see `MetadataInfo.blob_idx`).
     pub(super) blob_idx: &'a [Option<u16>],
@@ -819,7 +820,7 @@ pub(super) fn process_segments_compact_filtered(
         let seg_qual_result = if config.batch_quals.is_empty() {
             SegmentQualResult::AllPass
         } else {
-            classify_segment_quals(seg, config.batch_quals, config.col_names)
+            classify_segment_quals(seg, config.batch_quals, config.col_names, config.time_column)
         };
         if matches!(seg_qual_result, SegmentQualResult::NonePass) {
             // No row in this segment passes the quals — skip entirely.
@@ -2988,6 +2989,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             group_specs: &group_specs,
             col_names: &meta.col_names,
             col_types: &meta.col_types,
+            time_column: &meta.time_column,
             segment_by: &meta.segment_by,
             blob_idx: &meta.blob_idx,
             missing_values: &meta.missing_values,

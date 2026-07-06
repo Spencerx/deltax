@@ -871,10 +871,21 @@ pub(super) fn classify_segment_quals_numeric(
 }
 
 /// Classify a segment: can we prove all rows pass all batch quals using metadata?
+///
+/// `time_column` is the partition/time column name: it is non-null by
+/// construction in a compressed (non-default) partition — NULL partition
+/// keys route to the default partition — so its NULL-safety check below is
+/// satisfied without a `col_sums` entry. Compression writes the time
+/// column's colstats row with a ZERO `_nonnull_count` placeholder (its
+/// authoritative min/max live in `_meta`, populated into `col_minmax`
+/// separately), so consulting `col_sums` for it would spuriously read 0
+/// non-null rows and return `Ambiguous`, defeating whole-segment DELETE and
+/// the metadata fast paths on time-range predicates.
 pub(super) fn classify_segment_quals(
     seg: &SegmentData,
     batch_quals: &[BatchQual],
     col_names: &[String],
+    time_column: &str,
 ) -> SegmentQualResult {
     let mut any_nonepass = false;
     for bq in batch_quals {
@@ -918,6 +929,11 @@ pub(super) fn classify_segment_quals(
     // min/max covers only non-NULL values, so if NULLs exist, we can't trust row_count.
     for bq in batch_quals {
         let col_name = &col_names[bq.col_idx];
+        // The time column is non-null by construction here (see fn doc); its
+        // colstats nonnull_count is a zero placeholder, so skip the check.
+        if col_name == time_column {
+            continue;
+        }
         match seg.col_sums.get(col_name) {
             Some(cs) => {
                 if cs.nonnull_count < seg.row_count as i64 {
@@ -1205,7 +1221,6 @@ pub(super) struct MetadataInfo {
     /// `pg_sys::getmissingattr` for columns added after compression;
     /// kept on `MetadataInfo` for future descriptor-shape resolution
     /// that needs to join by attnum rather than name.
-    #[allow(dead_code)] // surfaced for downstream consumers; unused today
     pub(super) attnums: Vec<i32>,
     /// Parallel to `col_names`. `Some((datum, is_null))` = pre-computed
     /// missing value via `pg_sys::getmissingattr` for a column that was
@@ -1216,6 +1231,20 @@ pub(super) struct MetadataInfo {
     /// partition relation's tupdesc and is only valid while the relation
     /// remains open (PG's relcache keeps it live for the query duration).
     pub(super) missing_values: Vec<Option<(pg_sys::Datum, bool)>>,
+}
+
+impl MetadataInfo {
+    /// Number of PHYSICAL columns (those present in the partition heap).
+    /// json-extract synthetic columns are appended to `col_names` with an
+    /// `attnum` of 0 (no pg_attribute row); every real column — including
+    /// segment_by — has a positive attnum. The partition heap's `natts`
+    /// equals this count, so heap-tail layout guards compare against it
+    /// rather than `col_names.len()` (which over-counts by the synthetic
+    /// columns and would false-fire on any json_extract table with loose
+    /// rows).
+    pub(super) fn physical_col_count(&self) -> usize {
+        self.attnums.iter().filter(|&&a| a != 0).count()
+    }
 }
 
 // SAFETY: `MetadataInfo` is shared across threads only during parallel
@@ -4483,7 +4512,12 @@ pub(in crate::scan) unsafe fn dml_candidate_segments(
             let all_rows_match = all_quals_handled
                 && (batch_quals.is_empty()
                     || matches!(
-                        classify_segment_quals(&seg, &batch_quals, &meta.col_names),
+                        classify_segment_quals(
+                            &seg,
+                            &batch_quals,
+                            &meta.col_names,
+                            &meta.time_column,
+                        ),
                         SegmentQualResult::AllPass
                     ));
             DmlSegmentCandidate {

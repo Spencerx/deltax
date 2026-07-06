@@ -524,9 +524,11 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             let expected_natts = if qual_bytes.is_empty() {
                 0 // COUNT(*) without quals reads no columns
             } else {
-                super::segments::load_metadata_cached(companion_oids[0])
-                    .col_names
-                    .len()
+                // Physical column count (the heap tuple's natts) — NOT
+                // col_names.len(), which includes json-extract synthetic
+                // columns absent from the heap and would false-fire the
+                // layout guard on a json_extract table with loose rows.
+                super::segments::load_metadata_cached(companion_oids[0]).physical_col_count()
             };
             let t_heap = Instant::now();
             let mut heap_rows: i64 = 0;

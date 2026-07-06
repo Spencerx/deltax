@@ -17,6 +17,7 @@ Correctness is asserted by comparing against an identical plain-PostgreSQL
 twin table after every step.
 """
 
+import psycopg
 import pytest
 
 MOCK_NOW = "2025-01-15 12:00:00+00"
@@ -396,3 +397,130 @@ class TestCompressedInsert:
         ).fetchone()[0]
         db.commit()
         assert "not compressed" in result
+
+
+class TestCompressedInsertJsonExtract:
+    """json_extract-configured compressed tables (a synthetic column derived
+    from a jsonb path) must also accept transparent INSERT.
+
+    Regression: the heap-tail layout guard compared the partition heap's
+    physical column count against the companion `col_names` count, which
+    includes json_extract synthetic columns — so any INSERT into a
+    json_extract table followed by a read tripped a spurious "layout does
+    not match" error. The synthetic column is absent from the physical heap
+    and from a scan that doesn't select it, so a query not referencing it
+    must work; the value is computed by the upper plan from the physical
+    payload column."""
+
+    def _setup(self, db):
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("SET pg_deltax.json_extract_mode = 'fields'")
+        db.execute("""
+            CREATE TABLE jx (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                val INT,
+                payload JSONB
+            )
+        """)
+        db.execute("SELECT deltax.deltax_create_table('jx', 'ts', '1 day'::interval)")
+        db.execute(
+            "SELECT deltax.deltax_enable_compression('jx', order_by => ARRAY['ts'], "
+            "json_extract => '[{\"src\":\"payload\",\"path\":[\"terminal\"],"
+            "\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
+        )
+        db.commit()
+        # json_extract tables are loaded via the COPY-extract path
+        # (deltax_compress_csv), which extracts the synthetic x_terminal
+        # column from payload and compresses on load — a plain INSERT +
+        # deltax_compress_partition can't produce the synthetic column.
+        copy_sql = (
+            "COPY jx (ts, device_id, val, payload) FROM STDIN "
+            "WITH (FORMAT deltax_compress_csv, DELIMITER E'\\t')"
+        )
+        with db.cursor() as cur:
+            with cur.copy(copy_sql) as cp:
+                for p in range(400):
+                    # CSV-quote the JSON payload (double the inner quotes) so
+                    # its `"` don't collide with the CSV quote char.
+                    payload = f'"{{""terminal"": ""t{p % 3}""}}"'
+                    cp.write(
+                        f"2025-01-15 {p // 60:02d}:{p % 60:02d}:00+00\tdev-{p % 4}\t{p}\t"
+                        f"{payload}\n"
+                    )
+        db.commit()
+        part = db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('jx') "
+            "WHERE partition_name NOT LIKE '%default%' "
+            "AND range_start <= '2025-01-15'::timestamptz "
+            "AND range_end > '2025-01-15'::timestamptz"
+        ).fetchone()[0]
+        assert db.execute(
+            "SELECT is_compressed FROM deltax.deltax_partition "
+            f"WHERE table_name = '{part.split('.')[-1]}'"
+        ).fetchone()[0], "COPY-extract load should have compressed the partition"
+        return part
+
+    def test_insert_and_read_json_extract_table(self, db):
+        part = self._setup(db)
+        # A loose row in the compressed partition's heap.
+        db.execute(
+            f"INSERT INTO jx (ts, device_id, val, payload) VALUES "
+            f"('{BASE_TS}'::timestamptz + interval '5 minutes', 'dev-late', 99999, "
+            f"'{{\"terminal\": \"tX\"}}'::jsonb)"
+        )
+        db.commit()
+        assert db.execute(f"SELECT pg_relation_size('{part}')").fetchone()[0] > 0
+
+        # Reads that DON'T select the synthetic column must succeed (this is
+        # what regressed): COUNT(*), physical columns, and a filter/scan that
+        # returns the loose row among segment rows.
+        assert db.execute("SELECT count(*) FROM jx").fetchone()[0] == 401
+        assert db.execute("SELECT count(*) FROM jx WHERE val = 99999").fetchone()[0] == 1
+        got = db.execute(
+            "SELECT device_id, val FROM jx WHERE val >= 99999 ORDER BY val"
+        ).fetchall()
+        assert got == [("dev-late", 99999)]
+        # The raw jsonb payload (a physical column) is still readable.
+        assert db.execute(
+            "SELECT payload FROM jx WHERE val = 99999"
+        ).fetchone()[0] == {"terminal": "tX"}
+
+    def test_synthetic_column_read_errors_clearly_with_loose_rows(self, db):
+        """Selecting the extracted path (`payload->>'terminal'`, which the
+        json_extract walker rewrites to the synthetic `x_terminal` column)
+        while loose rows exist can't be served — the heap-tail row has no
+        synthetic value — so it must fail with a CLEAR, actionable message,
+        not a cryptic layout-mismatch. This is the intended limitation until
+        json_extract heap-tail materialization is implemented."""
+        self._setup(db)
+        db.execute(
+            f"INSERT INTO jx (ts, device_id, val, payload) VALUES "
+            f"('{BASE_TS}'::timestamptz + interval '5 minutes', 'dev-late', 99999, "
+            f"'{{\"terminal\": \"tX\"}}'::jsonb)"
+        )
+        db.commit()
+        with pytest.raises(psycopg.errors.InternalError) as exc:
+            db.execute("SELECT payload->>'terminal' FROM jx WHERE val = 99999").fetchall()
+        msg = str(exc.value)
+        assert "json_extract" in msg and "decompress" in msg
+        db.rollback()
+
+    def test_json_extract_table_compaction_refused(self, db):
+        """Compaction is not supported on json_extract tables (the synthetic
+        column can't be re-extracted by the loose-row fold path); it refuses
+        with a clear remedy rather than corrupting or erroring cryptically.
+        This also means a json_extract table's loose rows must be cleared via
+        decompress + recompress."""
+        part = self._setup(db)
+        db.execute(
+            f"INSERT INTO jx (ts, device_id, val, payload) VALUES "
+            f"('{BASE_TS}'::timestamptz + interval '5 minutes', 'dev-late', 99999, "
+            f"'{{\"terminal\": \"tX\"}}'::jsonb)"
+        )
+        db.commit()
+        with pytest.raises(psycopg.errors.InternalError) as exc:
+            db.execute(f"SELECT deltax.deltax_compact_partition('{part}')")
+        msg = str(exc.value)
+        assert "json_extract" in msg and "decompress" in msg
+        db.rollback()
