@@ -18,9 +18,6 @@ one of these fails.
 
 from __future__ import annotations
 
-import psycopg
-import pytest
-
 MOCK_NOW = "2025-01-15 12:00:00+00"
 BASE_TS = "2025-01-15 00:00:00+00"
 NROWS = 2000
@@ -281,42 +278,14 @@ class TestDmlAllTypes:
         assert_wide_match(db)
 
 
-# ---------------------------------------------------------------------------
-# Known compression-layer corruption (NOT DML-specific): types without a
-# specialized codec (numeric, uuid, bytea) round-trip through compression as
-# their TEXT output form and come back corrupted. Surfaced by the wide-type
-# matrix above; tracked here so the bug is visible and these flip to XPASS
-# when the codec/fallback is fixed. ClickBench/RTABench never exercise these
-# types, which is why it stayed latent.
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("coltype,value_sql", [
-    ("numeric", "(g::numeric / 3)"),
-    ("uuid", "md5(g::text)::uuid"),
-    ("bytea", "decode(md5(g::text), 'hex')"),
-])
-@pytest.mark.xfail(strict=False,
-                   reason="non-specialized types corrupt on compressed read "
-                          "(stored as text-output form); see wide-type matrix")
-def test_unspecialized_type_roundtrips_through_compression(db, coltype, value_sql):
-    db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
-    db.execute(f"CREATE TABLE ct (ts timestamptz NOT NULL, v {coltype})")
-    db.execute(f"CREATE TABLE ct_plain (ts timestamptz NOT NULL, v {coltype})")
-    db.execute("SELECT deltax.deltax_create_table('ct', 'ts', '1 day'::interval)")
-    db.execute("SELECT deltax.deltax_enable_compression('ct', order_by => ARRAY['ts'])")
-    db.commit()
-    gen = (f"SELECT '{BASE_TS}'::timestamptz + (g || ' seconds')::interval, {value_sql} "
-           "FROM generate_series(1, 100) g")
-    for name in ("ct", "ct_plain"):
-        db.execute(f"INSERT INTO {name} (ts, v) {gen}")
-    db.commit()
-    part = db.execute(
-        "SELECT partition_name FROM deltax.deltax_partition_info('ct') "
-        "WHERE range_start <= %s::timestamptz AND range_end > %s::timestamptz",
-        (BASE_TS, BASE_TS),
-    ).fetchone()[0]
-    db.execute(f"SELECT deltax.deltax_compress_partition('{part}')")
-    db.commit()
-    got = db.execute("SELECT v::text FROM ct ORDER BY ts").fetchall()
-    want = db.execute("SELECT v::text FROM ct_plain ORDER BY ts").fetchall()
-    assert got == want
+# NOTE: the wide-type matrix above deliberately EXCLUDES numeric, time, uuid,
+# and bytea. Those types have no specialized codec and fall back to the
+# byte/text pipeline, which currently round-trips them incorrectly on a
+# compressed read (a pre-existing, non-DML compression bug — types get stored
+# as their text-output form and decoded back wrong). That corruption is the
+# canonical, strict=True tracking in
+# `tests/correctness/test_codecs_extended.py` (numeric / time / uuid / bytea
+# fallback cases); it is a base-codec issue independent of DML, so it is not
+# re-tracked here to avoid duplicate xfails. When the codec fallback is fixed,
+# add these types back into the matrix above to get DML round-trip coverage
+# for them too.
