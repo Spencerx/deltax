@@ -115,6 +115,18 @@ pub(crate) static USE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// Intended for ad-hoc profiling; default off to avoid benchmark noise.
 pub(crate) static PROFILE_PLANNING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// When ON, DELETEs on compressed partitions always decompose-on-write
+/// instead of using the tombstone / whole-segment-drop fast paths. Decompose
+/// materializes the rows into the partition heap and runs an ordinary heap
+/// DELETE — the only DELETE form that emits a WAL row-event a logical
+/// subscriber can apply. The fast paths touch only companion tables, which a
+/// Scenario-1 subscription (publish the user table, `origin = none`) excludes,
+/// so a fast-path delete would never reach the subscriber. Off by default
+/// (fast paths win on latency); a Scenario-1 publisher turns it on, typically
+/// per-database (`ALTER DATABASE … SET pg_deltax.replicable_deletes = on`).
+/// See `dev/docs/COMPRESSED_DML.md` §7.
+pub(crate) static REPLICABLE_DELETES: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -340,6 +352,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Disable DeltaXCount/DeltaXMinMax fast paths for queries with WHERE clauses",
         c"When ON, queries that could be answered from per-segment metadata fall through to the generic DeltaXAgg path instead. Used for correctness A/B testing.",
         &DISABLE_META_AGG_FASTPATH,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.replicable_deletes",
+        c"Force DELETEs on compressed partitions to decompose-on-write so they replicate logically",
+        c"When ON, DELETEs on compressed partitions skip the tombstone and whole-segment-drop fast paths and decompose into ordinary heap rows, so the delete emits a WAL row-event that a logical subscriber (Scenario 1: publish the user table with origin=none) can apply. Off by default: the fast paths are much faster but touch only companion tables, which a Scenario-1 subscription excludes.",
+        &REPLICABLE_DELETES,
         GucContext::Userset,
         GucFlags::default(),
     );

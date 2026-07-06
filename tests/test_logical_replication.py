@@ -499,6 +499,61 @@ def test_decompose_dml_on_compressed_replicates_without_duplication(replicated_p
         ).fetchone()[0] == 40
 
 
+def test_replicable_deletes_guc_propagates_delete_on_compressed(replicated_pair):
+    """With `pg_deltax.replicable_deletes = on`, a DELETE on a compressed
+    partition replicates to a Scenario-1 subscriber.
+
+    By default a DELETE on compressed data uses the tombstone / whole-segment
+    -drop fast path, which touches only companion tables — excluded from a
+    Scenario-1 publication — so the subscriber would keep the row. The GUC
+    forces decompose-on-write, turning the delete into an ordinary heap DELETE
+    that replicates like any row delete (the decompose re-inserts are
+    origin-tagged and filtered by origin=none).
+    """
+    repl = replicated_pair
+    _setup_publication_and_subscription(
+        repl, publish="insert, update, delete", replica_identity="FULL", origin="none"
+    )
+
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        pub.execute(
+            f"INSERT INTO metrics (ts, device_id, temperature) "
+            f"SELECT '{BASE_TS}'::timestamptz + (g * interval '1 minute'), "
+            f"       'device-' || MOD(g, 5)::text, 20.0 + g * 0.1 "
+            f"FROM generate_series(0, 199) g"
+        )
+    with _db_conn(repl["sub_db"]) as sub:
+        _wait_for_row_count(sub, "metrics", 200)
+
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(
+            "SELECT deltax.deltax_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        (part,) = pub.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
+            f"WHERE range_start <= '{BASE_TS}'::timestamptz "
+            f"  AND range_end   >  '{BASE_TS}'::timestamptz"
+        ).fetchone()
+        pub.execute(f"SELECT deltax.deltax_compress_partition('{part}')")
+
+    # DELETE device-2's 40 rows on the compressed partition, with the GUC on
+    # so it decomposes rather than tombstoning.
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute("SET pg_deltax.replicable_deletes = on")
+        n = pub.execute("DELETE FROM metrics WHERE device_id = 'device-2'").rowcount
+        assert n == 40
+        assert pub.execute("SELECT count(*) FROM metrics").fetchone()[0] == 160
+
+    # The delete must reach the subscriber: 200 - 40 = 160, and no device-2.
+    with _db_conn(repl["sub_db"]) as sub:
+        _wait_for_row_count(sub, "metrics", 160)
+        assert sub.execute(
+            "SELECT count(*) FROM metrics WHERE device_id = 'device-2'"
+        ).fetchone()[0] == 0
+
+
 def test_partition_attached_after_publication_auto_publishes(replicated_pair):
     """A partition attached to the parent AFTER the publication is created
     is automatically part of the published stream.

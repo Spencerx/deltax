@@ -5632,6 +5632,17 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                     continue;
                 }
 
+                // When `pg_deltax.replicable_deletes` is on, both DELETE fast
+                // paths are disabled so every DELETE decomposes into heap rows
+                // and runs as an ordinary heap DELETE — the only form that
+                // produces a WAL row-event a logical subscriber can apply.
+                // The tombstone / whole-segment-drop fast paths touch only the
+                // companion tables, which a Scenario-1 subscription excludes,
+                // so the delete would otherwise never reach the subscriber.
+                // Off by default (fast paths win); Scenario-1 publishers set
+                // it (e.g. per-database). See COMPRESSED_DML.md §7.
+                let replicable_deletes = crate::REPLICABLE_DELETES.get();
+
                 // Whole-segment DELETE fast path (§5.4) preconditions: the
                 // executor never sees the dropped rows, so anything that
                 // would observe them per-row must force decompose instead.
@@ -5640,7 +5651,8 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                 // top-level query): a data-modifying CTE's `DELETE ...
                 // RETURNING` feeds the outer query and must materialize
                 // every row.
-                let allow_whole_drop = mt_op == pg_sys::CmdType::CMD_DELETE
+                let allow_whole_drop = !replicable_deletes
+                    && mt_op == pg_sys::CmdType::CMD_DELETE
                     && (*mt).returningLists.is_null()
                     && !delete_rows_are_observed(mt, rtable, relid);
 

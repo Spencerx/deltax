@@ -25,23 +25,42 @@ def _unique_table():
 
 
 def _cleanup(db, table_name):
-    """Drop test table and its catalog entries."""
+    """Drop test table and its catalog entries.
+
+    These tests run against the `postgres` DB where the real background worker
+    is active, so the cleanup's catalog DELETEs + `DROP TABLE` race the
+    worker's concurrent maintenance of the same table (e.g. its
+    `ensure_future_partitions`). That race can deadlock — PostgreSQL aborts one
+    side, and here the cleanup is the victim. Deadlocks are retryable (the next
+    attempt runs after the worker's brief maintenance pass has released its
+    locks), so retry rather than fail the test on teardown.
+    """
     # Reset the worker's clock
     _alter_system("ALTER SYSTEM RESET pg_deltax.mock_now")
 
-    # The connection may be in an error state; roll back first
-    db.rollback()
-    db.execute("RESET pg_deltax.mock_now")
-    db.execute(
-        "DELETE FROM deltax.deltax_partition WHERE deltatable_id IN "
-        "(SELECT id FROM deltax.deltax_deltatable WHERE table_name = %s)",
-        (table_name,),
-    )
-    db.execute(
-        "DELETE FROM deltax.deltax_deltatable WHERE table_name = %s", (table_name,)
-    )
-    db.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
-    db.commit()
+    last_err = None
+    for _ in range(20):
+        try:
+            # The connection may be in an error state; roll back first.
+            db.rollback()
+            db.execute("RESET pg_deltax.mock_now")
+            db.execute(
+                "DELETE FROM deltax.deltax_partition WHERE deltatable_id IN "
+                "(SELECT id FROM deltax.deltax_deltatable WHERE table_name = %s)",
+                (table_name,),
+            )
+            db.execute(
+                "DELETE FROM deltax.deltax_deltatable WHERE table_name = %s",
+                (table_name,),
+            )
+            db.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
+            db.commit()
+            return
+        except psycopg.errors.DeadlockDetected as e:
+            last_err = e
+            db.rollback()
+            time.sleep(0.5)
+    raise last_err
 
 
 def test_worker_creates_future_partitions(postgres_db):

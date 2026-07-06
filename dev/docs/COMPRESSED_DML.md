@@ -296,12 +296,14 @@ cadence on write-heavy compressed partitions.
   - **Scenario 2** — replicate the raw companion + heap storage: use the
     default `origin = any`; the tagged changes are received normally (the tag
     is just metadata), keeping both sides byte-identical.
-  Remaining caveat: the **tombstone and whole-segment-drop fast-path DELETEs**
-  touch only companion tables, so under Scenario 1 (companions excluded) the
-  delete produces no replicated event and the subscriber keeps the row. Until
-  the fast paths can emit a replicable heap event, a Scenario-1 publisher that
-  needs `DELETE`-on-compressed to propagate should force decompose-on-write for
-  those deletes (see §8).
+  Fast-path DELETEs: the **tombstone and whole-segment-drop** paths touch only
+  companion tables, so under Scenario 1 (companions excluded) they produce no
+  replicated event and the subscriber would keep the row. A Scenario-1
+  publisher sets `pg_deltax.replicable_deletes = on` (typically per-database)
+  so DELETEs on compressed partitions decompose-on-write instead — the delete
+  then runs as an ordinary heap DELETE and replicates like any row delete.
+  It's off by default because the fast paths are much faster; Scenario 2 leaves
+  it off and lets the tombstone rows replicate through the companion tables.
 
 ## 8. Things we still want to improve
 
@@ -334,14 +336,11 @@ cadence on write-heavy compressed partitions.
 - **Partition bloom sentinels.** When the partition-level bloom sentinels land,
   compaction must fold new value hashes into (or invalidate) the affected
   sentinels; `compact_partition_impl` carries an inline note for this.
-- **Fast-path DELETE under Scenario-1 logical replication.** Tombstone and
-  whole-segment-drop DELETEs touch only companion tables, so a Scenario-1
-  subscriber (companions excluded, `origin = none`) never sees the delete and
-  keeps the row. Options: a per-table/GUC switch that forces decompose-on-write
-  for deletes when the table is published for Scenario-1 replication (decompose
-  emits a replicable heap delete), or emitting a synthetic heap-level tombstone
-  event. Origin tagging of the internal decompose/compaction churn is done
-  (§7); this DELETE-propagation case is the remaining logical-replication gap.
+- **Cheaper replicable DELETE.** `pg_deltax.replicable_deletes` (§7) makes
+  fast-path DELETEs replicate under Scenario 1 by forcing decompose-on-write —
+  correct, but it pays the full decompose cost for every delete. A lighter
+  option would emit a synthetic heap-level delete event for tombstoned rows so
+  the fast path stays fast AND replicates; not yet done.
 - **Object-storage offload alignment.** The loose region is the natural write
   buffer and tombstones are the natural merge-on-read delete layer for a future
   S3/Parquet tier. The design already keeps segment metadata local and treats
