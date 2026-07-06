@@ -679,8 +679,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
             // a scan that doesn't select them). The emit path re-checks per
             // partition; this is the early, single-partition catch.
             let rel_natts = (*(*scan_rel).rd_att).natts as usize;
-            let slot_natts =
-                (*(*(*node).ss.ss_ScanTupleSlot).tts_tupleDescriptor).natts as usize;
+            let slot_natts = (*(*(*node).ss.ss_ScanTupleSlot).tts_tupleDescriptor).natts as usize;
             if rel_natts != slot_natts {
                 pgrx::error!(
                     "pg_deltax: compressed partition \"{}\" has uncompressed rows whose physical layout ({} attrs) does not match the scan output ({} attrs); this can happen when a query selects a json_extract column from a partition with loose rows — run deltax_compact_partition() or decompress + recompress it",

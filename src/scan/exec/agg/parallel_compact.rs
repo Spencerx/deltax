@@ -820,7 +820,12 @@ pub(super) fn process_segments_compact_filtered(
         let seg_qual_result = if config.batch_quals.is_empty() {
             SegmentQualResult::AllPass
         } else {
-            classify_segment_quals(seg, config.batch_quals, config.col_names, config.time_column)
+            classify_segment_quals(
+                seg,
+                config.batch_quals,
+                config.col_names,
+                config.time_column,
+            )
         };
         if matches!(seg_qual_result, SegmentQualResult::NonePass) {
             // No row in this segment passes the quals — skip entirely.

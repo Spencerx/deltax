@@ -5070,8 +5070,7 @@ unsafe fn any_compressed_rte_heap_nonempty(root: *mut pg_sys::PlannerInfo) -> bo
             let relid = (*rte).relid;
             let companion_oid = cached_companion_for_rel(relid);
             if companion_oid != pg_sys::InvalidOid
-                && (partition_has_loose_rows(relid)
-                    || companion_has_tombstones_flag(companion_oid))
+                && (partition_has_loose_rows(relid) || companion_has_tombstones_flag(companion_oid))
             {
                 return true;
             }
