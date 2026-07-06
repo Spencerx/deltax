@@ -4630,6 +4630,11 @@ pub(crate) fn decompose_segments_for_dml(
     // ExecutorStart interception and plan against the plain heap. Guard
     // resets the flag on every exit path, including errors.
     let _bypass = DmlBypassGuard::new();
+    // Tag the restored-row heap inserts + companion deletes with the
+    // deltax_internal replication origin so origin=none logical subscribers
+    // filter them (the user's own UPDATE/DELETE runs AFTER this returns, with
+    // the origin reset, so it replicates normally). See COMPRESSED_DML.md §7.
+    let _origin = InternalOriginGuard::new();
 
     let (schema, part_table) = partition_names_for_oid(partition_oid);
 
@@ -5150,6 +5155,61 @@ impl Drop for DmlBypassGuard {
     }
 }
 
+/// Backend-local cache of the `deltax_internal` replication-origin id.
+/// `InvalidRepOriginId` (0) means "not found" — the guard then no-ops.
+fn internal_origin_id() -> pg_sys::RepOriginId {
+    thread_local! {
+        static ID: std::cell::Cell<pg_sys::RepOriginId> =
+            const { std::cell::Cell::new(pg_sys::InvalidRepOriginId as pg_sys::RepOriginId) };
+    }
+    ID.with(|c| {
+        let cached = c.get();
+        if cached != pg_sys::InvalidRepOriginId as pg_sys::RepOriginId {
+            return cached;
+        }
+        // Look up by name at the C level (no SQL-function ACL; the origin is
+        // created in the extension SQL). `missing_ok = true` returns
+        // InvalidRepOriginId rather than erroring when absent.
+        let id = unsafe { pg_sys::replorigin_by_name(c"deltax_internal".as_ptr(), true) };
+        if id != pg_sys::InvalidRepOriginId as pg_sys::RepOriginId {
+            c.set(id);
+        }
+        id
+    })
+}
+
+/// RAII guard that tags all WAL written in its scope with the
+/// `deltax_internal` replication origin, so logical subscribers created
+/// `WITH (origin = none)` filter these internal maintenance changes
+/// (decompose-on-write's restored-row inserts, compaction's segment folds and
+/// loose-row removal) while still receiving the user's own DML. Subscribers
+/// using the default `origin = any` receive the tagged changes normally, so
+/// tagging is safe for both replication topologies (see COMPRESSED_DML.md §7).
+///
+/// Sets the backend-local `replorigin_session_origin` directly rather than via
+/// `replorigin_session_setup`: we only need per-record WAL tagging, not the
+/// exclusive progress slot session_setup reserves (which would serialize
+/// concurrent internal writers). Nests safely (save/restore).
+struct InternalOriginGuard {
+    prev: pg_sys::RepOriginId,
+}
+
+impl InternalOriginGuard {
+    fn new() -> Self {
+        let prev = unsafe { pg_sys::replorigin_session_origin };
+        // If the origin is absent, id is Invalid → this is a no-op (records
+        // stay untagged), preserving today's behavior.
+        unsafe { pg_sys::replorigin_session_origin = internal_origin_id() };
+        InternalOriginGuard { prev }
+    }
+}
+
+impl Drop for InternalOriginGuard {
+    fn drop(&mut self) {
+        unsafe { pg_sys::replorigin_session_origin = self.prev };
+    }
+}
+
 /// Rewrite a companion `CREATE TABLE` DDL into `CREATE TABLE IF NOT EXISTS`.
 /// Compaction may need to create sidecar tables that the original
 /// compression skipped (e.g. `_blooms` when the GUC was off, `_text_lengths`
@@ -5198,6 +5258,11 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
     // deletes the compacted rows past the DML rejection. The guard resets
     // the flag on every exit path, including errors.
     let _bypass = DmlBypassGuard::new();
+    // Compaction is pure internal churn (fold loose rows into fresh segments,
+    // rewrite tombstoned segments, delete/truncate the loose region) — none of
+    // it changes the table's logical content. Tag its WAL so origin=none
+    // logical subscribers ignore it. See COMPRESSED_DML.md §7.
+    let _origin = InternalOriginGuard::new();
 
     // Serialize against concurrent writers: the read → flush → delete cycle
     // below requires a stable visible row set. The lock is acquired BEFORE

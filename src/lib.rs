@@ -258,6 +258,28 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+-- Replication origin used to tag the WAL of internal maintenance writes
+-- (decompose-on-write's restored rows, compaction's segment folds + loose-row
+-- removal). Logical subscribers that hold the user table and (de)compress on
+-- their own schedule create their subscription WITH (origin = none) to filter
+-- this internal churn while still receiving the user's own DML; subscribers
+-- that replicate the raw companion/heap storage use the default origin = any
+-- and receive everything. Created eagerly (superuser, any wal_level); the
+-- Rust write paths look it up by name and no-op if it is somehow absent.
+-- Name has no `pg_` prefix (that prefix is reserved for origins).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin
+                   WHERE roname = 'deltax_internal') THEN
+        PERFORM pg_catalog.pg_replication_origin_create('deltax_internal');
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    -- Best-effort: if the origin can't be created (unusual), DML-on-compressed
+    -- still works — it just can't be origin-filtered by logical subscribers
+    -- until the origin exists.
+    NULL;
+END $$;
 "#,
     name = "create_catalog_tables",
 );

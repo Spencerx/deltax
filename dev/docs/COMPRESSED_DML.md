@@ -274,9 +274,34 @@ cadence on write-heavy compressed partitions.
   tables. Clearing loose rows requires `deltax_decompress_partition` +
   `deltax_compress_partition`. These tables must be loaded via the
   `COPY … FORMAT deltax_compress_csv` extract path.
-- **Replicas:** physical standbys see consistent WAL'd state; the worker skips
-  replicas. Logical replication of DML-on-compressed needs origin filtering to
-  avoid duplicating decomposed-row inserts — see §8.
+- **Physical replicas:** fully correct, nothing special needed. Every DML
+  effect is ordinary WAL-logged heap/TOAST activity (loose-row inserts,
+  decompose inserts + meta/sidecar deletes, tombstone rows, compaction segment
+  inserts + `TRUNCATE`, whole-segment drops) — no non-WAL state — so a standby
+  replays a byte-identical copy. The maintenance worker skips standbys
+  (`pg_is_in_recovery()`), and DML can't originate on a read-only standby, so a
+  standby never diverges.
+- **Logical replicas:** internal maintenance WAL (decompose-on-write's
+  restored-row inserts, compaction's segment folds + loose-row removal) is
+  tagged with the `deltax_internal` replication origin, set per-record via the
+  backend-local `replorigin_session_origin` around those writes (see
+  `InternalOriginGuard` in `compress.rs`; the origin is created in the
+  extension SQL). Two topologies:
+  - **Scenario 1** — publish the user table, subscriber holds it and
+    (de)compresses independently: create the subscription
+    `WITH (origin = none)` (and exclude `TRUNCATE` from the publication). The
+    origin filter drops the internal churn while the user's own origin-less
+    `INSERT`/`UPDATE`/decompose-`DELETE` replicate normally — so a
+    decompose-UPDATE no longer duplicates the whole segment on the subscriber.
+  - **Scenario 2** — replicate the raw companion + heap storage: use the
+    default `origin = any`; the tagged changes are received normally (the tag
+    is just metadata), keeping both sides byte-identical.
+  Remaining caveat: the **tombstone and whole-segment-drop fast-path DELETEs**
+  touch only companion tables, so under Scenario 1 (companions excluded) the
+  delete produces no replicated event and the subscriber keeps the row. Until
+  the fast paths can emit a replicable heap event, a Scenario-1 publisher that
+  needs `DELETE`-on-compressed to propagate should force decompose-on-write for
+  those deletes (see §8).
 
 ## 8. Things we still want to improve
 
@@ -309,10 +334,14 @@ cadence on write-heavy compressed partitions.
 - **Partition bloom sentinels.** When the partition-level bloom sentinels land,
   compaction must fold new value hashes into (or invalidate) the affected
   sentinels; `compact_partition_impl` carries an inline note for this.
-- **Logical replication recipes.** Origin-tag maintenance/decompose
-  transactions (`deltax_internal`) and document the publication recipes for the
-  companion-excluded vs companion-replicated scenarios, with test coverage for
-  DML-on-compressed under each.
+- **Fast-path DELETE under Scenario-1 logical replication.** Tombstone and
+  whole-segment-drop DELETEs touch only companion tables, so a Scenario-1
+  subscriber (companions excluded, `origin = none`) never sees the delete and
+  keeps the row. Options: a per-table/GUC switch that forces decompose-on-write
+  for deletes when the table is published for Scenario-1 replication (decompose
+  emits a replicable heap delete), or emitting a synthetic heap-level tombstone
+  event. Origin tagging of the internal decompose/compaction churn is done
+  (§7); this DELETE-propagation case is the remaining logical-replication gap.
 - **Object-storage offload alignment.** The loose region is the natural write
   buffer and tombstones are the natural merge-on-read delete layer for a future
   S3/Parquet tier. The design already keeps segment metadata local and treats
