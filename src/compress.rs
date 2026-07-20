@@ -1613,6 +1613,38 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
     }
 }
 
+/// Convert a binary jsonb varlena payload (everything after the varlena
+/// header, as produced by `jsonb_text_to_binary` / `JsonbRaw`) back to its
+/// canonical JSON text by wrapping it in a fresh varlena header and calling
+/// PG's jsonb output function. Exact inverse of `jsonb_text_to_binary`.
+/// Must only be called from the main backend thread.
+pub(crate) unsafe fn jsonb_binary_to_text(payload: &[u8]) -> String {
+    unsafe {
+        let total_len = pgrx::pg_sys::VARHDRSZ + payload.len();
+        let varlena = pgrx::pg_sys::palloc(total_len) as *mut pgrx::pg_sys::varlena;
+        pgrx::set_varsize_4b(varlena, total_len as i32);
+        std::ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            (varlena as *mut u8).add(pgrx::pg_sys::VARHDRSZ),
+            payload.len(),
+        );
+        let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+        let mut typisvarlena: bool = false;
+        pgrx::pg_sys::getTypeOutputInfo(pgrx::pg_sys::JSONBOID, &mut typoutput, &mut typisvarlena);
+        let cstr = pgrx::pg_sys::OidOutputFunctionCall(
+            typoutput,
+            pgrx::pg_sys::Datum::from(varlena as usize),
+        );
+        let text = std::ffi::CStr::from_ptr(cstr)
+            .to_str()
+            .expect("jsonb_out produced invalid UTF-8")
+            .to_string();
+        pgrx::pg_sys::pfree(cstr.cast());
+        pgrx::pg_sys::pfree(varlena.cast());
+        text
+    }
+}
+
 /// Sort typed columns in-place by the given order_by column indices.
 /// Computes a permutation from the sort keys, then reorders all columns by that permutation.
 pub(crate) fn sort_typed_columns(
@@ -3744,6 +3776,51 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
     let cc = CompressedColumn::from_bytes(blob);
     let total_count = cc.row_count as usize;
     let dt = data_type.to_lowercase();
+
+    // jsonb blobs store PG's BINARY jsonb varlena payload (not UTF-8 text — see
+    // `jsonb_text_to_binary` / `JsonbRaw`), so they must be decoded via the
+    // byte-level codec entry points and converted back to canonical JSON text
+    // through jsonb's output function. Routing them through the UTF-8-validating
+    // text decoders below panics with "invalid UTF-8 in dictionary" /
+    // "invalid UTF-8 in LZ4 data".
+    if dt == "jsonb" {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let strings: Vec<String> = match cc.type_tag {
+            CompressionType::Dictionary => {
+                compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
+                    .iter()
+                    .map(|b| unsafe { jsonb_binary_to_text(b) })
+                    .collect()
+            }
+            CompressionType::DictionaryLz4 => {
+                let normalized = compression::dictionary::normalize_lz4(&cc.data);
+                compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
+                    .iter()
+                    .map(|b| unsafe { jsonb_binary_to_text(b) })
+                    .collect()
+            }
+            CompressionType::Lz4 => {
+                let (buf, ranges) = compression::lz4::decode_to_ranges(&cc.data, non_null_count);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| unsafe { jsonb_binary_to_text(&buf[off..off + len]) })
+                    .collect()
+            }
+            CompressionType::Lz4Blocked => {
+                let (buf, ranges) =
+                    compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| unsafe { jsonb_binary_to_text(&buf[off..off + len]) })
+                    .collect()
+            }
+            other => pgrx::error!(
+                "pg_deltax: unexpected compression type {:?} for jsonb column",
+                other
+            ),
+        };
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
 
     match cc.type_tag {
         CompressionType::Gorilla => {

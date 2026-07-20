@@ -1554,10 +1554,17 @@ pub(super) unsafe fn str_to_text_datum(
     typmod: i32,
 ) -> pg_sys::Datum {
     unsafe {
-        // bpchar needs the type input function for padding; jsonb stores
-        // as canonical text and needs the input function to produce a real
-        // jsonb binary Datum (otherwise jsonb operators segfault).
-        if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
+        // Only text/varchar may take the direct raw-varlena fast path. Every
+        // other type_oid means `s` is the TEXT RENDERING of a different type:
+        // bpchar (needs input function for blank-padding), jsonb (canonical
+        // text → real binary jsonb Datum, otherwise jsonb operators segfault),
+        // and the `classify_column` fallthrough types stored via their `::text`
+        // rendering (text[], inet, numeric, uuid, bytea, time, ...). Those must
+        // be reconstructed via the type input function — the inverse of the
+        // write side — so the Datum matches the attribute's real binary layout.
+        // Handing a raw text varlena to e.g. a text[] slot makes PG read text
+        // bytes as an ArrayType header: garbage dims, silent NULLs or a crash.
+        if !matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID) {
             let cstr = std::ffi::CString::new(s).unwrap();
             let mut typinput: pg_sys::Oid = pg_sys::InvalidOid;
             let mut typioparam: pg_sys::Oid = pg_sys::InvalidOid;
@@ -1577,17 +1584,23 @@ pub(super) unsafe fn str_to_text_datum(
 /// large block and packs all varlena headers + string data sequentially.
 /// This dramatically improves cache locality during the per-row emit loop.
 ///
-/// For bpchar, falls back to per-string allocation (needs type input function for padding).
+/// For anything that isn't text/varchar, falls back to per-string
+/// reconstruction through the type input function (bpchar padding, and the
+/// `classify_column` fallthrough types stored via their text rendering:
+/// text[], inet, numeric, uuid, ...).
 pub(super) unsafe fn str_slices_to_text_datums_arena(
     slices: &[&str],
     type_oid: pg_sys::Oid,
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
-    // bpchar needs the input function for padding. jsonb should normally go
-    // through `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not
-    // UTF-8); this branch is only a safety net for any caller that still
-    // hands us text.
-    if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
+    // Only text/varchar attributes may take the raw-varlena arena fast path.
+    // Any other type_oid means the stored strings are TEXT RENDERINGS of a
+    // different type and must be reconstructed via the type input function so
+    // the resulting Datum matches the attribute's real binary representation
+    // (see `str_to_text_datum`). jsonb normally goes through
+    // `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not UTF-8);
+    // this branch is only a safety net for any caller that still hands us text.
+    if !matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID) {
         return unsafe {
             slices
                 .iter()
@@ -1695,9 +1708,14 @@ unsafe fn ranges_to_varlena_datums(buf: &[u8], ranges: &[(usize, usize)]) -> Vec
 /// Build text/varchar/jsonb/bpchar Datums from decompressed `(buf, ranges)`.
 ///
 /// text/varchar/jsonb take the zero-validation arena path
-/// ([`ranges_to_varlena_datums`]). bpchar still needs the type input function
-/// for blank-padding, so it falls back to the per-string path (and is the only
-/// case that pays UTF-8 validation).
+/// ([`ranges_to_varlena_datums`]) — their stored bytes ARE the binary
+/// representation the attribute expects (jsonb payload / raw text). Every other
+/// type_oid holds a TEXT RENDERING of a different type (bpchar padding, and the
+/// `classify_column` fallthrough types: text[], inet, numeric, uuid, ...) and
+/// must be reconstructed through the type input function via `str_to_text_datum`
+/// — otherwise PG reads the text bytes as the attribute's binary layout (e.g. a
+/// text[] ArrayType header) and returns silent NULLs or crashes. These pay UTF-8
+/// validation (their `::text` rendering is valid UTF-8).
 unsafe fn text_ranges_to_datums(
     buf: &[u8],
     ranges: &[(usize, usize)],
@@ -1705,7 +1723,10 @@ unsafe fn text_ranges_to_datums(
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
     unsafe {
-        if type_oid == pg_sys::BPCHAROID {
+        if !matches!(
+            type_oid,
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::JSONBOID
+        ) {
             ranges
                 .iter()
                 .map(|&(off, len)| {
@@ -1722,10 +1743,12 @@ unsafe fn text_ranges_to_datums(
 
 /// Selection-aware variant of [`text_ranges_to_datums`]: build datums only for
 /// rows where `nn_selection[i]` is true (in order, for `merge_with_placeholder`).
-/// Skips UTF-8 validation for text/varchar (PG stores raw bytes); only bpchar
-/// pays the input function + validation. Avoids materializing a `Vec<&str>` over
-/// the whole column — important for the monolithic Lz4 path, which otherwise
-/// validates every row just to keep the (often few) matching ones.
+/// Skips UTF-8 validation for text/varchar/jsonb (PG stores raw bytes); bpchar
+/// and the `classify_column` fallthrough types (text[], inet, numeric, ...) pay
+/// the input function + validation so their Datum matches the attribute's real
+/// binary layout. Avoids materializing a `Vec<&str>` over the whole column —
+/// important for the monolithic Lz4 path, which otherwise validates every row
+/// just to keep the (often few) matching ones.
 unsafe fn matched_text_ranges_to_datums(
     buf: &[u8],
     ranges: &[(usize, usize)],
@@ -1734,7 +1757,10 @@ unsafe fn matched_text_ranges_to_datums(
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
     unsafe {
-        if type_oid == pg_sys::BPCHAROID {
+        if !matches!(
+            type_oid,
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::JSONBOID
+        ) {
             ranges
                 .iter()
                 .zip(nn_selection.iter())

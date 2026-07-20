@@ -37,11 +37,22 @@ pub fn parse_header(data: &[u8]) -> DictHeader<'_> {
     offset += 2;
 
     let mut dict: Vec<&str> = Vec::with_capacity(dict_size);
-    for _ in 0..dict_size {
+    for entry_idx in 0..dict_size {
         let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
-        let s = std::str::from_utf8(&data[offset..offset + str_len])
-            .expect("invalid UTF-8 in dictionary");
+        let s = std::str::from_utf8(&data[offset..offset + str_len]).unwrap_or_else(|e| {
+            // Reaching this means a non-text payload (e.g. binary jsonb) was
+            // routed through the text dictionary decoder — an encoding-dispatch
+            // bug in the caller, which should use `parse_header_bytes` /
+            // `decode_to_byte_slices` instead. The panic unwinds into a regular
+            // PG ERROR (pgrx catches it at the FFI boundary); it never takes
+            // down the backend.
+            panic!(
+                "invalid UTF-8 in dictionary entry {} of {} (len {}): {}; \
+                 non-text payloads must be decoded via the byte-level dictionary API",
+                entry_idx, dict_size, str_len, e
+            )
+        });
         offset += str_len;
         dict.push(s);
     }
