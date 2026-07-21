@@ -887,7 +887,72 @@ fn deltax_table_size(relation: &str) -> i64 {
 // Internal implementation
 // ============================================================================
 
+/// Scoped pin of the GUCs that affect the `::text` renderings compression
+/// stores for fallback-typed columns (`classify_column` → `ColumnKind::Text`
+/// with a non-text attribute type: interval, date/timestamp inside arrays or
+/// composites, float arrays, ...). The stored text must parse back to the
+/// same value under ANY reader session GUCs, so rendering pins:
+///
+/// - `IntervalStyle = postgres`: unit-labeled output that `interval_in`
+///   parses identically under every IntervalStyle (sql_standard renderings
+///   like '1-2' are re-interpreted differently per style — the pg_dump
+///   caveat, which pins the same value);
+/// - `DateStyle = ISO, MDY`: ISO date/timestamp text is unambiguous under
+///   every DateStyle (a 'DMY'-rendered '02/03/2025' inside e.g. a
+///   timestamptz[] would silently swap day/month for an 'MDY' reader);
+/// - `extra_float_digits = 1`: shortest-precise float rendering; a session
+///   with a negative setting would render floats inside arrays/composites
+///   lossily — permanent data loss, not just a read-side issue.
+///
+/// Uses the standard PG nest-level save/restore idiom (`NewGUCNestLevel` +
+/// `GUC_ACTION_SAVE` + `AtEOXact_GUC`), so the previous values come back at
+/// scope exit instead of leaking a `SET LOCAL` into the caller's transaction.
+/// On error, the transaction abort path restores them.
+struct RenderGucGuard {
+    nest_level: std::ffi::c_int,
+}
+
+impl RenderGucGuard {
+    fn pin() -> Self {
+        let nest_level = unsafe { pgrx::pg_sys::NewGUCNestLevel() };
+        for (name, value) in [
+            ("intervalstyle", "postgres"),
+            ("datestyle", "ISO, MDY"),
+            ("extra_float_digits", "1"),
+        ] {
+            let name_c = std::ffi::CString::new(name).unwrap();
+            let value_c = std::ffi::CString::new(value).unwrap();
+            unsafe {
+                pgrx::pg_sys::set_config_option(
+                    name_c.as_ptr(),
+                    value_c.as_ptr(),
+                    pgrx::pg_sys::GucContext::PGC_USERSET,
+                    pgrx::pg_sys::GucSource::PGC_S_SESSION,
+                    pgrx::pg_sys::GucAction::GUC_ACTION_SAVE,
+                    true,
+                    pgrx::pg_sys::PGERROR as std::ffi::c_int,
+                    false,
+                );
+            }
+        }
+        Self { nest_level }
+    }
+}
+
+impl Drop for RenderGucGuard {
+    fn drop(&mut self) {
+        // On panic/error the transaction abort path runs AtEOXact_GUC itself;
+        // calling it here with isCommit=true would be wrong mid-abort.
+        if !std::thread::panicking() {
+            unsafe { pgrx::pg_sys::AtEOXact_GUC(true, self.nest_level) };
+        }
+    }
+}
+
 fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+    // Pin rendering GUCs for the whole pass: covers the streaming `::text`
+    // SELECT and the segment-by stats/valcounts queries.
+    let _render_gucs = RenderGucGuard::pin();
     // 1. Look up partition in catalog
     let (schema, part_table) = crate::partition::resolve_relation(client, partition);
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
@@ -1217,7 +1282,11 @@ pub(crate) enum ColumnKind {
     Timestamp,   // timestamp without time zone — read as pgrx::Timestamp → i64 usec
     TimestampTz, // timestamp with time zone — read as pgrx::TimestampWithTimeZone → i64 usec
     Date,        // date — read as pgrx::Date → i64 usec
+    Time,        // time without time zone — read as pgrx::Time → i64 usec since midnight
     Jsonb,       // jsonb — stored as the binary varlena form produced by jsonb_in
+    Uuid,        // uuid — stored as the raw 16 bytes (fixed-length, by-reference)
+    Bytea,       // bytea — stored as the raw varlena payload bytes
+    Inet,        // inet/cidr — stored as the raw varlena payload (inet_struct bytes)
 }
 
 /// Column data stored in native types.
@@ -1311,6 +1380,19 @@ pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKin
         ColumnKind::Date
     } else if dt == "jsonb" {
         ColumnKind::Jsonb
+    } else if crate::FORCE_TEXT_FALLBACK.get() {
+        // TESTING: force the graduated types back onto the legacy ::text
+        // codecs so mixed-generation reads can be exercised with current code.
+        ColumnKind::Text
+    } else if dt == "time" || dt == "time without time zone" {
+        // timetz stays on the text fallback (carries a zone offset).
+        ColumnKind::Time
+    } else if dt == "uuid" {
+        ColumnKind::Uuid
+    } else if dt == "bytea" {
+        ColumnKind::Bytea
+    } else if dt == "inet" || dt == "cidr" {
+        ColumnKind::Inet
     } else {
         ColumnKind::Text
     }
@@ -1326,9 +1408,10 @@ pub(crate) fn new_typed_column(kind: ColumnKind) -> TypedColumn {
         ColumnKind::Float32 => TypedColumn::Float32(Vec::new()),
         ColumnKind::Float64 => TypedColumn::Float64(Vec::new()),
         ColumnKind::Bool => TypedColumn::Bool(Vec::new()),
-        ColumnKind::Timestamp | ColumnKind::TimestampTz | ColumnKind::Date => {
+        ColumnKind::Timestamp | ColumnKind::TimestampTz | ColumnKind::Date | ColumnKind::Time => {
             TypedColumn::Int64(Vec::new())
         }
+        ColumnKind::Uuid | ColumnKind::Bytea | ColumnKind::Inet => TypedColumn::Bytes(Vec::new()),
     }
 }
 
@@ -1485,6 +1568,17 @@ fn append_row_to_columns(
                     }));
                 }
             }
+            ColumnKind::Time => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<pgrx::datum::Time>()
+                    .unwrap();
+                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
+                    // TimeADT is already microseconds since midnight
+                    vec.push(v.map(|t| t.into_inner()));
+                }
+            }
             ColumnKind::Text => {
                 let v = row
                     .get_datum_by_ordinal(ordinal)
@@ -1512,6 +1606,49 @@ fn append_row_to_columns(
                     vec.push(v.map(|j| j.0));
                 }
             }
+            ColumnKind::Uuid => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<UuidRaw>()
+                    .unwrap();
+                if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
+                    vec.push(v.map(|u| u.0.to_vec()));
+                }
+            }
+            ColumnKind::Bytea | ColumnKind::Inet => {
+                // Same raw-varlena-payload read as jsonb: detoast and copy
+                // the bytes after the varlena header.
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<JsonbRaw>()
+                    .unwrap();
+                if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
+                    vec.push(v.map(|j| j.0));
+                }
+            }
+        }
+    }
+}
+
+/// A fixed-length pass-by-reference Datum (uuid: 16 bytes) read verbatim.
+pub(crate) struct UuidRaw(pub [u8; 16]);
+
+impl FromDatum for UuidRaw {
+    unsafe fn from_polymorphic_datum(
+        datum: pgrx::pg_sys::Datum,
+        is_null: bool,
+        _typoid: pgrx::pg_sys::Oid,
+    ) -> Option<Self> {
+        if is_null {
+            return None;
+        }
+        unsafe {
+            let ptr = datum.cast_mut_ptr::<u8>();
+            let mut bytes = [0u8; 16];
+            std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), 16);
+            Some(UuidRaw(bytes))
         }
     }
 }
@@ -1573,6 +1710,30 @@ impl IntoDatum for JsonbRaw {
     fn type_oid() -> pgrx::pg_sys::Oid {
         pgrx::pg_sys::JSONBOID
     }
+
+    fn is_compatible_with(other: pgrx::pg_sys::Oid) -> bool {
+        // JsonbRaw is a generic "detoasted varlena payload" reader — the
+        // bytea/inet native codecs reuse it to capture their raw payload
+        // bytes (see the Bytea/Inet extraction arms).
+        matches!(
+            other,
+            pgrx::pg_sys::JSONBOID
+                | pgrx::pg_sys::BYTEAOID
+                | pgrx::pg_sys::INETOID
+                | pgrx::pg_sys::CIDROID
+        )
+    }
+}
+
+impl IntoDatum for UuidRaw {
+    fn into_datum(self) -> Option<pgrx::pg_sys::Datum> {
+        // Read-only helper, same contract as JsonbRaw.
+        unreachable!("UuidRaw is read-only and must not be converted back into a Datum")
+    }
+
+    fn type_oid() -> pgrx::pg_sys::Oid {
+        pgrx::pg_sys::UUIDOID
+    }
 }
 
 /// Convert canonical JSON text to the binary jsonb varlena payload
@@ -1629,43 +1790,68 @@ unsafe fn jsonb_scratch_ctx() -> pgrx::pg_sys::MemoryContext {
     }
 }
 
-/// Convert a stored binary jsonb varlena payload (the bytes after the
-/// varlena header, as produced by `jsonb_text_to_binary` or direct
-/// compressed COPY ingest) back to canonical JSON text via PG's `jsonb_out`.
-/// Inverse of `jsonb_text_to_binary`; used when restoring segment rows to
-/// the partition heap (full decompress, decompose-on-write, compaction),
-/// where rows are rebuilt through SQL INSERT literals.
-pub(crate) unsafe fn jsonb_binary_to_text(payload: &[u8]) -> String {
-    unsafe {
-        let scratch = jsonb_scratch_ctx();
-        let old = pgrx::pg_sys::MemoryContextSwitchTo(scratch);
+/// A type's output function resolved once, for converting stored binary
+/// payloads (jsonb container bytes, uuid bytes, bytea/inet varlena payloads)
+/// back to their canonical text inside per-value loops. Hoists the
+/// `getTypeOutputInfo` syscache lookup and the `fmgr_info` resolution out of
+/// the loop. Must only be used on the main backend thread.
+pub(crate) struct TypeOutFn {
+    finfo: pgrx::pg_sys::FmgrInfo,
+}
 
-        // Rebuild a 4-byte-header varlena around the stored payload.
-        let total_len = pgrx::pg_sys::VARHDRSZ + payload.len();
-        let varlena_ptr = pgrx::pg_sys::palloc(total_len) as *mut pgrx::pg_sys::varlena;
-        pgrx::set_varsize_4b(varlena_ptr, total_len as i32);
-        std::ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            (varlena_ptr as *mut u8).add(pgrx::pg_sys::VARHDRSZ),
-            payload.len(),
-        );
+impl TypeOutFn {
+    pub(crate) unsafe fn resolve(type_oid: pgrx::pg_sys::Oid) -> Self {
+        unsafe {
+            let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+            let mut typisvarlena: bool = false;
+            pgrx::pg_sys::getTypeOutputInfo(type_oid, &mut typoutput, &mut typisvarlena);
+            let mut finfo = pgrx::pg_sys::FmgrInfo::default();
+            pgrx::pg_sys::fmgr_info(typoutput, &mut finfo);
+            Self { finfo }
+        }
+    }
 
-        let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
-        let mut typisvarlena = false;
-        pgrx::pg_sys::getTypeOutputInfo(pgrx::pg_sys::JSONBOID, &mut typoutput, &mut typisvarlena);
-        let cstr = pgrx::pg_sys::OidOutputFunctionCall(
-            typoutput,
-            pgrx::pg_sys::Datum::from(varlena_ptr as usize),
-        );
-        let text = std::ffi::CStr::from_ptr(cstr)
-            .to_str()
-            .expect("jsonb_out produced invalid UTF-8")
-            .to_owned();
+    unsafe fn call_out(&mut self, datum: pgrx::pg_sys::Datum) -> String {
+        unsafe {
+            let cstr = pgrx::pg_sys::OutputFunctionCall(&mut self.finfo, datum);
+            let text = std::ffi::CStr::from_ptr(cstr)
+                .to_str()
+                .expect("type output function produced invalid UTF-8")
+                .to_string();
+            pgrx::pg_sys::pfree(cstr.cast());
+            text
+        }
+    }
 
-        pgrx::pg_sys::MemoryContextSwitchTo(old);
-        pgrx::pg_sys::MemoryContextReset(scratch);
+    /// Wrap `payload` (the bytes after the varlena header) in a fresh varlena
+    /// header and call the type's output function. For jsonb this is the
+    /// exact inverse of `jsonb_text_to_binary`.
+    pub(crate) unsafe fn render(&mut self, payload: &[u8]) -> String {
+        unsafe {
+            let total_len = pgrx::pg_sys::VARHDRSZ + payload.len();
+            let varlena = pgrx::pg_sys::palloc(total_len) as *mut pgrx::pg_sys::varlena;
+            pgrx::set_varsize_4b(varlena, total_len as i32);
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                (varlena as *mut u8).add(pgrx::pg_sys::VARHDRSZ),
+                payload.len(),
+            );
+            let text = self.call_out(pgrx::pg_sys::Datum::from(varlena as usize));
+            pgrx::pg_sys::pfree(varlena.cast());
+            text
+        }
+    }
 
-        text
+    /// Render a fixed-length by-reference value (uuid: 16 bytes) — the datum
+    /// is a bare pointer to the bytes, no varlena header.
+    pub(crate) unsafe fn render_fixed(&mut self, bytes: &[u8]) -> String {
+        unsafe {
+            let buf = pgrx::pg_sys::palloc(bytes.len()) as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+            let text = self.call_out(pgrx::pg_sys::Datum::from(buf as usize));
+            pgrx::pg_sys::pfree(buf.cast());
+            text
+        }
     }
 }
 
@@ -2890,7 +3076,7 @@ fn compress_partition_streaming(
             use pgrx::datum::DatumWithOid;
             let insert_sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                &ddl.blobs_fqn
+                ddl.blobs_fqn
             );
             let args: Vec<DatumWithOid> = vec![
                 (col_idx as i16).into(),
@@ -2915,7 +3101,7 @@ fn compress_partition_streaming(
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
                     "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
-                    &ddl.blooms_fqn
+                    ddl.blooms_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
                     (col_idx as i16).into(),
@@ -2945,7 +3131,7 @@ fn compress_partition_streaming(
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
                     "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                    &ddl.text_lengths_fqn
+                    ddl.text_lengths_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
                     (col_idx as i16).into(),
@@ -3108,7 +3294,7 @@ fn finalize_and_insert_valbitmaps(
         use pgrx::datum::DatumWithOid;
         let insert_sql = format!(
             "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
-            &ddl.valbitmap_fqn
+            ddl.valbitmap_fqn
         );
         let args: Vec<DatumWithOid> = vec![
             (col_idx as i16).into(),
@@ -3226,13 +3412,33 @@ pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<
             .to_bytes()
         }
         TypedColumn::Text(values) => {
+            let dt = data_type.to_lowercase();
+            if (dt.starts_with("numeric") || dt.starts_with("decimal"))
+                && !crate::FORCE_TEXT_FALLBACK.get()
+            {
+                // Try the scaled-i64 numeric codec; per-blob text fallback for
+                // NaN/Infinity, mixed dscale, or mantissas beyond i64.
+                if let Some(blob) = compress_numeric_scaled(values) {
+                    return blob;
+                }
+            }
             // Delegate to existing string-based compression
             compress_column_values(values, data_type, "")
         }
         TypedColumn::Bytes(values) => {
-            // jsonb varlena payloads: treat as opaque byte blobs, reuse the
-            // same variable-length compression pipeline as text.
-            compress_byte_values(values)
+            let dt = data_type.to_lowercase();
+            if dt == "jsonb" {
+                // jsonb varlena payloads: treat as opaque byte blobs, reuse
+                // the same variable-length compression pipeline as text. Keeps
+                // the legacy text-family tags for on-disk compatibility —
+                // jsonb readers disambiguate by type oid, not by tag.
+                compress_byte_values(values)
+            } else {
+                // uuid/bytea/inet binary payloads: same pipeline, but with
+                // the Binary* tags so readers know these blobs hold raw bytes
+                // and not the legacy `::text` renderings.
+                compress_binary_values(values)
+            }
         }
     }
 }
@@ -3440,6 +3646,42 @@ fn compress_byte_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
     compress_column_values(&as_strings, "jsonb", "")
 }
 
+/// Compress raw binary payloads (uuid/bytea/inet) through the byte pipeline,
+/// then remap the codec tag to its Binary* variant. The blob layout is
+/// otherwise identical — only the tag byte differs, marking the payloads as
+/// raw bytes so the read side never routes them through the UTF-8 text or
+/// input-function paths.
+/// Encode a segment of `numeric_out` renderings as scaled-i64 mantissas
+/// (`CompressionType::NumericScaled`): data = [dscale][inner integer tag]
+/// [inner encoding]. Returns `None` when the segment doesn't qualify
+/// (see `compression::numeric_scaled::to_uniform_scaled`).
+fn compress_numeric_scaled(values: &[Option<String>]) -> Option<Vec<u8>> {
+    let (scaled, dscale) = compression::numeric_scaled::to_uniform_scaled(values)?;
+    let (non_null, null_bitmap) = compression::extract_nulls(&scaled);
+    let (inner_tag, encoded) = compression::bitpacked::best_encoding_i64(&non_null);
+    let mut data = Vec::with_capacity(2 + encoded.len());
+    data.push(dscale);
+    data.push(inner_tag as u8);
+    data.extend_from_slice(&encoded);
+    Some(
+        CompressedColumn {
+            type_tag: CompressionType::NumericScaled,
+            row_count: values.len() as u32,
+            null_bitmap,
+            data,
+        }
+        .to_bytes(),
+    )
+}
+
+fn compress_binary_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut blob = compress_byte_values(values);
+    if let Some(tag) = blob.first_mut() {
+        *tag = CompressionType::from_u8(*tag).to_binary_variant() as u8;
+    }
+    blob
+}
+
 /// Get column metadata for a table.
 pub(crate) fn get_column_metadata(
     client: &SpiClient,
@@ -3604,9 +3846,10 @@ fn restore_segment_rows(
             // jsonb blobs hold binary jsonb varlena payloads, not UTF-8 text:
             // decode byte-safe, then convert back to JSON text via jsonb_out
             // so the value can travel through the INSERT literal below.
+            let mut jsonb_out = unsafe { TypeOutFn::resolve(pgrx::pg_sys::JSONBOID) };
             decompress_column_byte_values(&blob)
                 .into_iter()
-                .map(|opt| opt.map(|payload| unsafe { jsonb_binary_to_text(&payload) }))
+                .map(|opt| opt.map(|payload| unsafe { jsonb_out.render(&payload) }))
                 .collect()
         } else {
             decompress_column_values(&blob, data_type)
@@ -3928,6 +4171,170 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
     let total_count = cc.row_count as usize;
     let dt = data_type.to_lowercase();
 
+    // jsonb blobs store PG's BINARY jsonb varlena payload (not UTF-8 text — see
+    // `jsonb_text_to_binary` / `JsonbRaw`), so they must be decoded via the
+    // byte-level codec entry points and converted back to canonical JSON text
+    // through jsonb's output function. Routing them through the UTF-8-validating
+    // text decoders below panics with "invalid UTF-8 in dictionary" /
+    // "invalid UTF-8 in LZ4 data".
+    if dt == "jsonb" {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let mut jsonb_out = unsafe { TypeOutFn::resolve(pgrx::pg_sys::JSONBOID) };
+        let strings: Vec<String> = match cc.type_tag {
+            CompressionType::Dictionary => {
+                compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
+                    .iter()
+                    .map(|b| unsafe { jsonb_out.render(b) })
+                    .collect()
+            }
+            CompressionType::DictionaryLz4 => {
+                let normalized = compression::dictionary::normalize_lz4(&cc.data);
+                compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
+                    .iter()
+                    .map(|b| unsafe { jsonb_out.render(b) })
+                    .collect()
+            }
+            CompressionType::Lz4 => {
+                let (buf, ranges) = compression::lz4::decode_to_ranges(&cc.data, non_null_count);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| unsafe { jsonb_out.render(&buf[off..off + len]) })
+                    .collect()
+            }
+            CompressionType::Lz4Blocked => {
+                let (buf, ranges) =
+                    compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| unsafe { jsonb_out.render(&buf[off..off + len]) })
+                    .collect()
+            }
+            other => pgrx::error!(
+                "pg_deltax: unexpected compression type {:?} for jsonb column",
+                other
+            ),
+        };
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
+    // Binary-tag blobs (uuid/bytea/inet native codecs) hold the type's raw
+    // binary payload; render back to canonical text via the type's output
+    // function for the re-INSERT.
+    if matches!(
+        cc.type_tag,
+        CompressionType::BinaryDictionary
+            | CompressionType::BinaryDictionaryLz4
+            | CompressionType::BinaryLz4Blocked
+    ) {
+        let (type_oid, is_fixed_len) = match dt.as_str() {
+            "uuid" => (pgrx::pg_sys::UUIDOID, true),
+            "bytea" => (pgrx::pg_sys::BYTEAOID, false),
+            "inet" => (pgrx::pg_sys::INETOID, false),
+            "cidr" => (pgrx::pg_sys::CIDROID, false),
+            other => pgrx::error!(
+                "pg_deltax: unexpected binary-tag blob for column type {}",
+                other
+            ),
+        };
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let mut out_fn = unsafe { TypeOutFn::resolve(type_oid) };
+        let mut render = |b: &[u8]| -> String {
+            unsafe {
+                if is_fixed_len {
+                    out_fn.render_fixed(b)
+                } else {
+                    out_fn.render(b)
+                }
+            }
+        };
+        let strings: Vec<String> = match cc.type_tag {
+            CompressionType::BinaryDictionary => {
+                compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
+                    .iter()
+                    .map(|b| render(b))
+                    .collect()
+            }
+            CompressionType::BinaryDictionaryLz4 => {
+                let normalized = compression::dictionary::normalize_lz4(&cc.data);
+                compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
+                    .iter()
+                    .map(|b| render(b))
+                    .collect()
+            }
+            CompressionType::BinaryLz4Blocked => {
+                let (buf, ranges) =
+                    compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| render(&buf[off..off + len]))
+                    .collect()
+            }
+            _ => unreachable!(),
+        };
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
+    // NumericScaled blobs: decode the scaled-i64 mantissas and render the
+    // exact numeric_out text back (pure Rust inverse of the write side).
+    if cc.type_tag == CompressionType::NumericScaled {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let dscale = cc.data[0];
+        let inner_tag = CompressionType::from_u8(cc.data[1]);
+        let payload = &cc.data[2..];
+        let ints: Vec<i64> = match inner_tag {
+            CompressionType::DeltaVarint => {
+                compression::integer::decode_i64(payload, non_null_count)
+            }
+            CompressionType::Constant => {
+                compression::bitpacked::decode_constant_i64(payload, non_null_count)
+            }
+            CompressionType::ForBitpacked => {
+                compression::bitpacked::decode_for_i64(payload, non_null_count)
+            }
+            other => pgrx::error!(
+                "pg_deltax: unexpected inner tag {:?} in NumericScaled blob",
+                other
+            ),
+        };
+        let strings: Vec<String> = ints
+            .iter()
+            .map(|&m| compression::numeric_scaled::format_numeric_scaled(m, dscale))
+            .collect();
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
+    // time columns: integer-tag blobs (native codec) hold microseconds since
+    // midnight and must be rendered as 'HH:MM:SS[.ffffff]' for the re-INSERT.
+    // Legacy text-tag blobs hold the time's text rendering already and fall
+    // through to the generic dictionary/LZ4 arms below.
+    if (dt == "time" || dt == "time without time zone")
+        && matches!(
+            cc.type_tag,
+            CompressionType::DeltaVarint
+                | CompressionType::Constant
+                | CompressionType::ForBitpacked
+        )
+    {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let usecs: Vec<i64> = match cc.type_tag {
+            CompressionType::DeltaVarint => {
+                compression::integer::decode_i64(&cc.data, non_null_count)
+            }
+            CompressionType::Constant => {
+                compression::bitpacked::decode_constant_i64(&cc.data, non_null_count)
+            }
+            CompressionType::ForBitpacked => {
+                compression::bitpacked::decode_for_i64(&cc.data, non_null_count)
+            }
+            _ => unreachable!(),
+        };
+        let strings: Vec<String> = usecs
+            .iter()
+            .map(|&u| crate::timeparse::usec_to_time_string(u))
+            .collect();
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
     match cc.type_tag {
         CompressionType::Gorilla => {
             if dt.contains("timestamp") || dt == "date" {
@@ -4026,6 +4433,16 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
                 .collect();
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
+        // Handled by the early-return branches above for the types that
+        // write these tags; anything else is corrupt.
+        CompressionType::BinaryDictionary
+        | CompressionType::BinaryDictionaryLz4
+        | CompressionType::BinaryLz4Blocked
+        | CompressionType::NumericScaled => pgrx::error!(
+            "pg_deltax: unexpected {:?} blob for column type {}",
+            cc.type_tag,
+            dt
+        ),
         CompressionType::Constant => {
             let non_null_count = count_non_null(&cc.null_bitmap, total_count);
             if dt == "smallint" || dt == "int2" {
@@ -4161,6 +4578,8 @@ pub(crate) fn supports_minmax(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt.contains("timestamp")
         || dt == "date"
+        || dt == "time"
+        || dt == "time without time zone"
         || dt == "integer"
         || dt == "int4"
         || dt == "bigint"
@@ -5738,7 +6157,7 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
             use pgrx::datum::DatumWithOid;
             let insert_sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                &ddl.blobs_fqn
+                ddl.blobs_fqn
             );
             let args: Vec<DatumWithOid> = vec![
                 (col_idx as i16).into(),
@@ -5760,7 +6179,7 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
             use pgrx::datum::DatumWithOid;
             let insert_sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
-                &ddl.blooms_fqn
+                ddl.blooms_fqn
             );
             let args: Vec<DatumWithOid> = vec![
                 (col_idx as i16).into(),
@@ -5783,7 +6202,7 @@ pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) ->
             use pgrx::datum::DatumWithOid;
             let insert_sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                &ddl.text_lengths_fqn
+                ddl.text_lengths_fqn
             );
             let args: Vec<DatumWithOid> = vec![
                 (col_idx as i16).into(),
@@ -7114,8 +7533,22 @@ mod tests {
         ));
         assert!(matches!(classify_column("date", false), ColumnKind::Date));
         assert!(matches!(classify_column("jsonb", false), ColumnKind::Jsonb));
+        assert!(matches!(
+            classify_column("time without time zone", false),
+            ColumnKind::Time
+        ));
+        assert!(matches!(classify_column("uuid", false), ColumnKind::Uuid));
+        assert!(matches!(classify_column("bytea", false), ColumnKind::Bytea));
+        assert!(matches!(classify_column("inet", false), ColumnKind::Inet));
+        assert!(matches!(classify_column("cidr", false), ColumnKind::Inet));
         // Unknown types default to Text (no error — caller doesn't see this).
-        assert!(matches!(classify_column("uuid", false), ColumnKind::Text));
+        assert!(matches!(
+            classify_column("interval", false),
+            ColumnKind::Text
+        ));
+        assert!(matches!(classify_column("timetz", false), ColumnKind::Text));
+        // segment_by columns are always read as text for SQL literals.
+        assert!(matches!(classify_column("uuid", true), ColumnKind::Text));
     }
 
     #[test]

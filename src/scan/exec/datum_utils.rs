@@ -265,6 +265,61 @@ unsafe fn decode_compressed_datums(
                 compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
             unsafe { text_ranges_to_datums(&buf, &ranges, type_oid, typmod) }
         }
+        CompressionType::BinaryDictionary | CompressionType::BinaryDictionaryLz4 => {
+            // Binary payloads (uuid/bytea/inet native codecs): the stored
+            // bytes ARE the attribute's binary representation — wrap them in
+            // datums directly, no text or input-function round-trip.
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::BinaryDictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let byte_slices =
+                compression::dictionary::decode_to_byte_slices(dict_data, non_null_count);
+            if type_oid == pg_sys::UUIDOID {
+                unsafe { byte_slices_to_fixed_datums_arena(&byte_slices) }
+            } else {
+                unsafe { varlena_arena_alloc(&byte_slices) }
+            }
+        }
+        CompressionType::BinaryLz4Blocked => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            if type_oid == pg_sys::UUIDOID {
+                let byte_slices: Vec<&[u8]> = ranges
+                    .iter()
+                    .map(|&(off, len)| &buf[off..off + len])
+                    .collect();
+                unsafe { byte_slices_to_fixed_datums_arena(&byte_slices) }
+            } else {
+                unsafe { ranges_to_varlena_datums(&buf, &ranges) }
+            }
+        }
+        CompressionType::NumericScaled => {
+            let dscale = cc.data[0];
+            let inner_tag = CompressionType::from_u8(cc.data[1]);
+            let payload = &cc.data[2..];
+            let ints: Vec<i64> = match inner_tag {
+                CompressionType::DeltaVarint => {
+                    compression::integer::decode_i64(payload, non_null_count)
+                }
+                CompressionType::Constant => {
+                    compression::bitpacked::decode_constant_i64(payload, non_null_count)
+                }
+                CompressionType::ForBitpacked => {
+                    compression::bitpacked::decode_for_i64(payload, non_null_count)
+                }
+                other => pgrx::error!(
+                    "pg_deltax: unexpected inner tag {:?} in NumericScaled blob",
+                    other
+                ),
+            };
+            ints.iter()
+                .map(|&m| unsafe { make_numeric_datum(m, dscale) })
+                .collect()
+        }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
             bools
@@ -479,7 +534,11 @@ fn decode_numeric_blob_pairs(
         CompressionType::Dictionary
         | CompressionType::DictionaryLz4
         | CompressionType::Lz4
-        | CompressionType::Lz4Blocked => return None,
+        | CompressionType::Lz4Blocked
+        | CompressionType::BinaryDictionary
+        | CompressionType::BinaryDictionaryLz4
+        | CompressionType::BinaryLz4Blocked
+        | CompressionType::NumericScaled => return None,
     };
     Some(pairs)
 }
@@ -550,7 +609,7 @@ pub(super) unsafe fn decompress_blob_to_datums_truncated(
 ///
 /// Instead of allocating a PG varlena datum for every row and then filtering,
 /// this matches the LIKE pattern against raw `&str` slices (zero-copy) and only
-/// calls `str_to_text_datum()` for rows that match. Non-matching rows get a
+/// builds datums (`str_slices_to_text_datums_arena`) for rows that match. Non-matching rows get a
 /// dummy datum that will never be read (the returned selection vector marks them
 /// as filtered out).
 ///
@@ -1548,51 +1607,92 @@ pub(super) unsafe fn collation_strcmp(a: &str, b: &str) -> i32 {
     }
 }
 
-pub(super) unsafe fn str_to_text_datum(
-    s: &str,
-    type_oid: pg_sys::Oid,
+/// A type's input function resolved once, for reconstructing typed datums
+/// from their stored text renderings inside per-value loops. Hoists the
+/// `getTypeInputInfo` syscache lookups and the `fmgr_info` resolution out of
+/// the loop (`OidInputFunctionCall` redoes both per call), and reuses one
+/// NUL-terminated scratch buffer instead of allocating a `CString` per value.
+/// Must only be used on the main backend thread.
+///
+/// Why the input function at all: only text/varchar attributes may receive a
+/// raw text varlena. Any other type_oid means the stored string is the TEXT
+/// RENDERING of a different type — bpchar (needs blank-padding), jsonb
+/// canonical text (needs a real binary jsonb Datum or jsonb operators
+/// segfault), and the `classify_column` fallthrough types stored via their
+/// `::text` rendering (text[], inet, numeric, uuid, bytea, time, ...). The
+/// input function is the inverse of the write side, so the Datum matches the
+/// attribute's real binary layout. Handing a raw text varlena to e.g. a
+/// text[] slot makes PG read text bytes as an ArrayType header: garbage dims,
+/// silent NULLs or a crash.
+pub(super) struct TypeInputFn {
+    finfo: pg_sys::FmgrInfo,
+    typioparam: pg_sys::Oid,
     typmod: i32,
-) -> pg_sys::Datum {
-    unsafe {
-        // bpchar needs the type input function for padding; jsonb stores
-        // as canonical text and needs the input function to produce a real
-        // jsonb binary Datum (otherwise jsonb operators segfault).
-        if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
-            let cstr = std::ffi::CString::new(s).unwrap();
+    scratch: Vec<u8>,
+}
+
+impl TypeInputFn {
+    pub(super) unsafe fn resolve(type_oid: pg_sys::Oid, typmod: i32) -> Self {
+        unsafe {
             let mut typinput: pg_sys::Oid = pg_sys::InvalidOid;
             let mut typioparam: pg_sys::Oid = pg_sys::InvalidOid;
             pg_sys::getTypeInputInfo(type_oid, &mut typinput, &mut typioparam);
-            pg_sys::OidInputFunctionCall(typinput, cstr.as_ptr() as *mut _, typioparam, typmod)
-        } else {
-            // text/varchar: direct varlena construction (avoids type input function lookup)
-            let text = pg_sys::cstring_to_text_with_len(s.as_ptr() as *const _, s.len() as i32);
-            pg_sys::Datum::from(text as usize)
+            let mut finfo = pg_sys::FmgrInfo::default();
+            pg_sys::fmgr_info(typinput, &mut finfo);
+            Self {
+                finfo,
+                typioparam,
+                typmod,
+                scratch: Vec::new(),
+            }
+        }
+    }
+
+    pub(super) unsafe fn call(&mut self, s: &str) -> pg_sys::Datum {
+        // PG text never contains NUL bytes, so `s` is safe to pass as a
+        // C string once NUL-terminated.
+        debug_assert!(!s.as_bytes().contains(&0));
+        self.scratch.clear();
+        self.scratch.extend_from_slice(s.as_bytes());
+        self.scratch.push(0);
+        unsafe {
+            pg_sys::InputFunctionCall(
+                &mut self.finfo,
+                self.scratch.as_ptr() as *mut _,
+                self.typioparam,
+                self.typmod,
+            )
         }
     }
 }
 
-/// Allocate text/varchar datums from string slices using a single contiguous allocation.
+/// Build datums from string slices.
 ///
-/// Instead of N individual palloc calls (one per string), this allocates one
-/// large block and packs all varlena headers + string data sequentially.
-/// This dramatically improves cache locality during the per-row emit loop.
+/// For text/varchar: a single contiguous arena allocation — instead of N
+/// individual palloc calls (one per string), one large block packing all
+/// varlena headers + string data sequentially, which dramatically improves
+/// cache locality during the per-row emit loop.
 ///
-/// For bpchar, falls back to per-string allocation (needs type input function for padding).
+/// For anything that isn't text/varchar: per-string reconstruction through
+/// the type input function (bpchar padding, and the `classify_column`
+/// fallthrough types stored via their text rendering: text[], inet, numeric,
+/// uuid, ...), with per-value allocation by the input function.
 pub(super) unsafe fn str_slices_to_text_datums_arena(
     slices: &[&str],
     type_oid: pg_sys::Oid,
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
-    // bpchar needs the input function for padding. jsonb should normally go
-    // through `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not
-    // UTF-8); this branch is only a safety net for any caller that still
-    // hands us text.
-    if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
+    // Only text/varchar attributes may take the raw-varlena arena fast path.
+    // Any other type_oid means the stored strings are TEXT RENDERINGS of a
+    // different type and must be reconstructed via the type input function so
+    // the resulting Datum matches the attribute's real binary representation
+    // (see `TypeInputFn`). jsonb normally goes through
+    // `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not UTF-8);
+    // this branch is only a safety net for any caller that still hands us text.
+    if !matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID) {
         return unsafe {
-            slices
-                .iter()
-                .map(|s| str_to_text_datum(s, type_oid, typmod))
-                .collect()
+            let mut input_fn = TypeInputFn::resolve(type_oid, typmod);
+            slices.iter().map(|s| input_fn.call(s)).collect()
         };
     }
     // SAFETY: `&str` is guaranteed to be valid UTF-8, hence valid `&[u8]`.
@@ -1609,6 +1709,86 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
 /// per-row `jsonb_in` parse — parsing happened once at ingest.
 pub(super) unsafe fn byte_slices_to_jsonb_datums_arena(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
     unsafe { varlena_arena_alloc(slices) }
+}
+
+/// Build a PG `numeric` datum from a scaled-i64 mantissa (`value = mantissa /
+/// 10^dscale`), constructing the long-format NumericData varlena directly:
+/// `[vl_len][n_sign_dscale u16][n_weight i16][base-10000 digits i16...]`.
+/// Trailing zero base-10000 digits are stripped (PG's normal form — required
+/// for hashing/equality consistency); `dscale` still drives the rendering, so
+/// `numeric_out` reproduces the original text exactly.
+pub(super) unsafe fn make_numeric_datum(mantissa: i64, dscale: u8) -> pg_sys::Datum {
+    const NBASE: i128 = 10_000;
+    const NUMERIC_NEG: u16 = 0x4000;
+    let neg = mantissa < 0;
+    let abs = mantissa.unsigned_abs() as i128;
+    // Pad the fractional part to a whole number of base-10000 digits.
+    let fpad = (4 - (dscale as usize % 4)) % 4;
+    let scaled = abs * 10i128.pow(fpad as u32);
+    let frac_ndigits = (dscale as usize + fpad) / 4;
+
+    let mut digits: Vec<i16> = Vec::new();
+    let mut v = scaled;
+    while v > 0 {
+        digits.push((v % NBASE) as i16);
+        v /= NBASE;
+    }
+    digits.reverse();
+    let weight: i16 = if scaled == 0 {
+        0
+    } else {
+        (digits.len() as i32 - frac_ndigits as i32 - 1) as i16
+    };
+    while let Some(&0) = digits.last() {
+        digits.pop();
+    }
+    // Leading zero digits can't occur: the most significant base-10000 digit
+    // of a non-zero `scaled` is non-zero by construction.
+
+    unsafe {
+        let total_len = pg_sys::VARHDRSZ + 2 + 2 + 2 * digits.len();
+        let ptr = pg_sys::palloc(total_len) as *mut u8;
+        pgrx::set_varsize_4b(ptr as *mut pg_sys::varlena, total_len as i32);
+        let sign: u16 = if neg && !digits.is_empty() {
+            NUMERIC_NEG
+        } else {
+            0
+        };
+        let n_sign_dscale: u16 = sign | (dscale as u16 & 0x3FFF);
+        (ptr.add(pg_sys::VARHDRSZ) as *mut u16).write_unaligned(n_sign_dscale);
+        (ptr.add(pg_sys::VARHDRSZ + 2) as *mut i16).write_unaligned(weight);
+        let digit_base = ptr.add(pg_sys::VARHDRSZ + 4) as *mut i16;
+        for (i, &d) in digits.iter().enumerate() {
+            digit_base.add(i).write_unaligned(d);
+        }
+        pg_sys::Datum::from(ptr as usize)
+    }
+}
+
+/// Arena-allocate fixed-length pass-by-reference datums (uuid: 16 bytes) —
+/// each datum is a bare pointer to the copied bytes, no varlena header.
+/// Single contiguous palloc for cache locality, entries padded to MAXALIGN.
+pub(super) unsafe fn byte_slices_to_fixed_datums_arena(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
+    if slices.is_empty() {
+        return Vec::new();
+    }
+    unsafe {
+        const MAXALIGN: usize = 8;
+        let total_size: usize = slices
+            .iter()
+            .map(|b| (b.len() + MAXALIGN - 1) & !(MAXALIGN - 1))
+            .sum();
+        let arena = pg_sys::palloc(total_size) as *mut u8;
+        let mut datums = Vec::with_capacity(slices.len());
+        let mut offset = 0usize;
+        for b in slices {
+            let dst = arena.add(offset);
+            std::ptr::copy_nonoverlapping(b.as_ptr(), dst, b.len());
+            datums.push(pg_sys::Datum::from(dst as usize));
+            offset += (b.len() + MAXALIGN - 1) & !(MAXALIGN - 1);
+        }
+        datums
+    }
 }
 
 /// Arena-allocate a contiguous palloc block holding one varlena per input
@@ -1695,9 +1875,14 @@ unsafe fn ranges_to_varlena_datums(buf: &[u8], ranges: &[(usize, usize)]) -> Vec
 /// Build text/varchar/jsonb/bpchar Datums from decompressed `(buf, ranges)`.
 ///
 /// text/varchar/jsonb take the zero-validation arena path
-/// ([`ranges_to_varlena_datums`]). bpchar still needs the type input function
-/// for blank-padding, so it falls back to the per-string path (and is the only
-/// case that pays UTF-8 validation).
+/// ([`ranges_to_varlena_datums`]) — their stored bytes ARE the binary
+/// representation the attribute expects (jsonb payload / raw text). Every other
+/// type_oid holds a TEXT RENDERING of a different type (bpchar padding, and the
+/// `classify_column` fallthrough types: text[], inet, numeric, uuid, ...) and
+/// must be reconstructed through the type input function via `TypeInputFn`
+/// — otherwise PG reads the text bytes as the attribute's binary layout (e.g. a
+/// text[] ArrayType header) and returns silent NULLs or crashes. These pay UTF-8
+/// validation (their `::text` rendering is valid UTF-8).
 unsafe fn text_ranges_to_datums(
     buf: &[u8],
     ranges: &[(usize, usize)],
@@ -1705,13 +1890,17 @@ unsafe fn text_ranges_to_datums(
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
     unsafe {
-        if type_oid == pg_sys::BPCHAROID {
+        if !matches!(
+            type_oid,
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::JSONBOID
+        ) {
+            let mut input_fn = TypeInputFn::resolve(type_oid, typmod);
             ranges
                 .iter()
                 .map(|&(off, len)| {
                     let s = std::str::from_utf8(&buf[off..off + len])
                         .expect("invalid UTF-8 in LZ4 data");
-                    str_to_text_datum(s, type_oid, typmod)
+                    input_fn.call(s)
                 })
                 .collect()
         } else {
@@ -1722,10 +1911,12 @@ unsafe fn text_ranges_to_datums(
 
 /// Selection-aware variant of [`text_ranges_to_datums`]: build datums only for
 /// rows where `nn_selection[i]` is true (in order, for `merge_with_placeholder`).
-/// Skips UTF-8 validation for text/varchar (PG stores raw bytes); only bpchar
-/// pays the input function + validation. Avoids materializing a `Vec<&str>` over
-/// the whole column — important for the monolithic Lz4 path, which otherwise
-/// validates every row just to keep the (often few) matching ones.
+/// Skips UTF-8 validation for text/varchar/jsonb (PG stores raw bytes); bpchar
+/// and the `classify_column` fallthrough types (text[], inet, numeric, ...) pay
+/// the input function + validation so their Datum matches the attribute's real
+/// binary layout. Avoids materializing a `Vec<&str>` over the whole column —
+/// important for the monolithic Lz4 path, which otherwise validates every row
+/// just to keep the (often few) matching ones.
 unsafe fn matched_text_ranges_to_datums(
     buf: &[u8],
     ranges: &[(usize, usize)],
@@ -1734,7 +1925,11 @@ unsafe fn matched_text_ranges_to_datums(
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
     unsafe {
-        if type_oid == pg_sys::BPCHAROID {
+        if !matches!(
+            type_oid,
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::JSONBOID
+        ) {
+            let mut input_fn = TypeInputFn::resolve(type_oid, typmod);
             ranges
                 .iter()
                 .zip(nn_selection.iter())
@@ -1742,7 +1937,7 @@ unsafe fn matched_text_ranges_to_datums(
                 .map(|(&(off, len), _)| {
                     let s = std::str::from_utf8(&buf[off..off + len])
                         .expect("invalid UTF-8 in LZ4 data");
-                    str_to_text_datum(s, type_oid, typmod)
+                    input_fn.call(s)
                 })
                 .collect()
         } else {
