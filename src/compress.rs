@@ -4367,12 +4367,12 @@ fn format_value_for_insert(value: &str, data_type: &str) -> String {
         || dt == "int8"
         || dt == "smallint"
         || dt == "int2"
-        || dt == "double precision"
-        || dt == "float8"
-        || dt == "real"
-        || dt == "float4"
     {
         value.to_string()
+    } else if dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4" {
+        // Floats must be quoted: NaN/inf/-inf render as bare tokens that
+        // parse as identifiers, not literals (issue #54).
+        format!("'{}'", value)
     } else {
         format!("'{}'", value.replace('\'', "''"))
     }
@@ -4581,7 +4581,20 @@ fn sum_float_column<T: Copy + Into<f64> + PartialEq + Default>(
         }
     }
     if count > 0 {
-        (Some(format!("{:.17e}", sum)), count, nonzero)
+        // Non-finite sums (any NaN in the column, or overflow to ±Infinity)
+        // must be emitted as quoted literals — the string is spliced verbatim
+        // into an INSERT VALUES list, and a bare `NaN` parses as a column
+        // reference. The `_sum` column is NUMERIC, which accepts all three.
+        let sum_str = if sum.is_finite() {
+            format!("{:.17e}", sum)
+        } else if sum.is_nan() {
+            "'NaN'".to_string()
+        } else if sum > 0.0 {
+            "'Infinity'".to_string()
+        } else {
+            "'-Infinity'".to_string()
+        };
+        (Some(sum_str), count, nonzero)
     } else {
         (None, 0, 0)
     }
@@ -5229,6 +5242,28 @@ mod tests {
         let (sum, count, nonzero) = compute_typed_sum(&col);
         assert!(sum.is_some());
         assert_eq!((count, nonzero), (1, 1));
+    }
+
+    #[test]
+    fn compute_typed_sum_nonfinite_floats_emit_quoted_literals() {
+        // Issue #54: a bare `NaN` in the colstats INSERT parses as a column
+        // reference. Non-finite sums must come back as quoted SQL literals.
+        let col = TypedColumn::Float64(vec![Some(1.0), Some(f64::NAN)]);
+        let (sum, count, nonzero) = compute_typed_sum(&col);
+        assert_eq!(sum, Some("'NaN'".to_string()));
+        assert_eq!((count, nonzero), (2, 2));
+
+        let col = TypedColumn::Float64(vec![Some(f64::INFINITY), Some(1.0)]);
+        let (sum, _, _) = compute_typed_sum(&col);
+        assert_eq!(sum, Some("'Infinity'".to_string()));
+
+        let col = TypedColumn::Float64(vec![Some(f64::NEG_INFINITY)]);
+        let (sum, _, _) = compute_typed_sum(&col);
+        assert_eq!(sum, Some("'-Infinity'".to_string()));
+
+        let col = TypedColumn::Float32(vec![Some(f32::NAN)]);
+        let (sum, _, _) = compute_typed_sum(&col);
+        assert_eq!(sum, Some("'NaN'".to_string()));
     }
 
     #[test]
