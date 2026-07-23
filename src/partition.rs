@@ -640,6 +640,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
                 "blooms",
                 "text_lengths",
                 "valbitmap",
+                "tombstones",
                 "colstats",
                 "meta",
             ] {

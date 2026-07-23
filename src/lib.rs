@@ -119,6 +119,18 @@ pub(crate) static USE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// Intended for ad-hoc profiling; default off to avoid benchmark noise.
 pub(crate) static PROFILE_PLANNING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// When ON, DELETEs on compressed partitions always decompose-on-write
+/// instead of using the tombstone / whole-segment-drop fast paths. Decompose
+/// materializes the rows into the partition heap and runs an ordinary heap
+/// DELETE — the only DELETE form that emits a WAL row-event a logical
+/// subscriber can apply. The fast paths touch only companion tables, which a
+/// Scenario-1 subscription (publish the user table, `origin = none`) excludes,
+/// so a fast-path delete would never reach the subscriber. Off by default
+/// (fast paths win on latency); a Scenario-1 publisher turns it on, typically
+/// per-database (`ALTER DATABASE … SET pg_deltax.replicable_deletes = on`).
+/// See `dev/docs/COMPRESSED_DML.md` §7.
+pub(crate) static REPLICABLE_DELETES: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -209,6 +221,16 @@ CREATE TABLE IF NOT EXISTS deltax.deltax_partition (
     column_minmax   JSONB,
     column_valcounts JSONB,
     column_mcv      JSONB,
+    -- P1/P2.5 DML gate flags, maintained transactionally by the writers
+    -- (insert-note trigger, decompose, tombstone claim, compaction). The
+    -- planner and executor gates read these instead of physically probing
+    -- every partition heap + _tombstones table, which forced ~3 relcache
+    -- builds per partition per fresh backend (+30ms/query at 127
+    -- partitions). MVCC makes them exact: a snapshot that can see the
+    -- loose rows / tombstones can see the flag set in the same
+    -- transaction.
+    has_loose_rows  BOOLEAN NOT NULL DEFAULT false,
+    has_tombstones  BOOLEAN NOT NULL DEFAULT false,
     UNIQUE(schema_name, table_name)
 );
 
@@ -220,19 +242,60 @@ ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_mcv JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS max_segment_id INT;
+-- DEFAULT false is correct for every pre-DML deployment: compressed
+-- partitions were read-only, so no loose rows or tombstones can exist.
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS has_loose_rows BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS has_tombstones BOOLEAN NOT NULL DEFAULT false;
 
 CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    RAISE EXCEPTION 'cannot % compressed partition "%.%", decompress it first',
-        TG_OP,
-        TG_TABLE_SCHEMA,
-        TG_TABLE_NAME
-        USING ERRCODE = 'object_not_in_prerequisite_state';
+    -- P1 transparent DML: INSERTs land in the partition heap (the "loose
+    -- row" region) and are unioned with segment data at scan time. The
+    -- helper sends a relcache invalidation on the empty->non-empty
+    -- transition so cached plans that assumed an empty heap get replanned.
+    IF TG_OP = 'INSERT' THEN
+        PERFORM deltax.deltax_note_compressed_insert(TG_RELID);
+        RETURN NEW;
+    END IF;
+    -- P2 decompose-on-write: by the time a row-level UPDATE/DELETE fires,
+    -- the ExecutorStart interceptor has already decomposed every candidate
+    -- segment into ordinary heap rows, so any row this trigger can see IS a
+    -- heap row -- let it through. Rows still inside segments are by
+    -- construction invisible to the DML executor (the partition heap holds
+    -- only loose/decomposed rows). Internal maintenance (compaction,
+    -- decompose) is likewise plain heap DML.
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
 END;
 $$;
+
+-- Replication origin used to tag the WAL of internal maintenance writes
+-- (decompose-on-write's restored rows, compaction's segment folds + loose-row
+-- removal). Logical subscribers that hold the user table and (de)compress on
+-- their own schedule create their subscription WITH (origin = none) to filter
+-- this internal churn while still receiving the user's own DML; subscribers
+-- that replicate the raw companion/heap storage use the default origin = any
+-- and receive everything. Created eagerly (superuser, any wal_level); the
+-- Rust write paths look it up by name and no-op if it is somehow absent.
+-- Name has no `pg_` prefix (that prefix is reserved for origins).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin
+                   WHERE roname = 'deltax_internal') THEN
+        PERFORM pg_catalog.pg_replication_origin_create('deltax_internal');
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    -- Best-effort: if the origin can't be created (unusual), DML-on-compressed
+    -- still works — it just can't be origin-filtered by logical subscribers
+    -- until the origin exists.
+    NULL;
+END $$;
 "#,
     name = "create_catalog_tables",
 );
@@ -305,6 +368,14 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"pg_deltax.replicable_deletes",
+        c"Force DELETEs on compressed partitions to decompose-on-write so they replicate logically",
+        c"When ON, DELETEs on compressed partitions skip the tombstone and whole-segment-drop fast paths and decompose into ordinary heap rows, so the delete emits a WAL row-event that a logical subscriber (Scenario 1: publish the user table with origin=none) can apply. Off by default: the fast paths are much faster but touch only companion tables, which a Scenario-1 subscription excludes.",
+        &REPLICABLE_DELETES,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"pg_deltax.flatten_partitions",
         c"Plan all-compressed deltax tables as a single un-expanded relation",
         c"When ON (default), SELECT planning skips PostgreSQL's per-partition expansion for deltax parents whose data is entirely in compressed companions and installs DeltaXAppend directly on the parent rel. Tables with uncompressed data are never flattened and plan through the regular expansion.",
@@ -354,6 +425,9 @@ pub extern "C-unwind" fn _PG_init() {
     }
     unsafe {
         scan::register_executor_start_hook();
+    }
+    unsafe {
+        scan::register_executor_run_hook();
     }
     unsafe {
         copy::register_process_utility_hook();

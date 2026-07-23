@@ -355,6 +355,27 @@ fn maintain_one_table(client: &mut SpiClient, ht: &catalog::DeltatableInfo) {
         }
     }
 
+    // Compact loose heap rows (transparent INSERTs into compressed
+    // partitions) and tombstone-bearing segments into new segments so the
+    // metadata-only fast paths re-engage.
+    let compacted = crate::compress::auto_compact_partitions(client, ht);
+    if compacted > 0 {
+        log!(
+            "pg_deltax: compacted loose rows in {} partition(s) for {}.{}",
+            compacted,
+            ht.schema_name,
+            ht.table_name
+        );
+        if let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name) {
+            log!(
+                "pg_deltax: failed to refresh parent stats for {}.{}: {:?}",
+                ht.schema_name,
+                ht.table_name,
+                e
+            );
+        }
+    }
+
     // Auto-drop expired partitions (retention policy)
     let dropped = partition::auto_drop_partitions(client, ht);
     if dropped > 0 {

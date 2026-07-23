@@ -251,6 +251,15 @@ static CUSTOM_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
 // sort_col_attno is 1-based PG attribute number of the ORDER BY column.
 thread_local! {
     static TOPN_INFO: std::cell::Cell<(i64, bool, bool, i32, bool)> = const { std::cell::Cell::new((0, true, false, 0, false)) };
+
+    /// Per-companion "this path claims sorted output (pathkeys)" flags, keyed
+    /// by companion OID so concurrent paths for different partitions in one
+    /// query don't clobber each other. Written by `add_decompress_path`,
+    /// read by `plan_custom_path`, serialized as the `[-4, flag]` trailer so
+    /// the executor can detect the stale-plan hazard: a plan that promised
+    /// sorted output but whose partition heap has since gained loose rows.
+    static PATHKEYS_CLAIMED: std::cell::RefCell<std::collections::HashMap<u32, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Register every CustomScanMethods struct with PG's name-keyed registry.
@@ -327,6 +336,13 @@ pub unsafe fn add_decompress_path(
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &CUSTOM_PATH_METHODS.0;
+
+        // Record whether this path claims sorted output, keyed by companion
+        // OID (consumed in plan_custom_path).
+        PATHKEYS_CLAIMED.with(|m| {
+            m.borrow_mut()
+                .insert(u32::from(companion_oid), !pathkeys.is_null())
+        });
 
         // Store Top-N info for plan_custom_path.
         if effective_limit > 0 {
@@ -602,6 +618,19 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
             private_list = pg_sys::lappend_int(private_list, sort_col_attno);
             private_list = pg_sys::lappend_int(private_list, if nulls_first { 1 } else { 0 });
         }
+
+        // Append pathkeys-claimed marker: [-4, flag]. The executor errors if
+        // the flag is set but the partition heap has gained loose rows since
+        // planning (stale cached plan) — appended heap-tail rows would break
+        // the promised sort order.
+        let pathkeys_claimed = PATHKEYS_CLAIMED.with(|m| {
+            m.borrow()
+                .get(&u32::from(companion_oid))
+                .copied()
+                .unwrap_or(false)
+        });
+        private_list = pg_sys::lappend_int(private_list, -4);
+        private_list = pg_sys::lappend_int(private_list, if pathkeys_claimed { 1 } else { 0 });
 
         (*cscan).custom_private = private_list;
         (*cscan).custom_scan_tlist = std::ptr::null_mut();

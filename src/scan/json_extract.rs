@@ -2119,8 +2119,22 @@ unsafe fn rebuild_cscan_custom_private(cscan: *mut pg_sys::CustomScan, reference
                 InSynth,
             }
             let mut phase = Phase::BeforeMinus1;
+            // `[-4, flag]` (pathkeys-claimed marker) is a two-int section
+            // that may appear after the cols or top-n sections; preserve it
+            // verbatim wherever it sits.
+            let mut copy_next = false;
             for i in 0..(*cp).length {
                 let v = pg_sys::list_nth_int(cp, i);
+                if copy_next {
+                    new_cp = pg_sys::lappend_int(new_cp, v);
+                    copy_next = false;
+                    continue;
+                }
+                if v == -4 && phase != Phase::BeforeMinus1 {
+                    new_cp = pg_sys::lappend_int(new_cp, v);
+                    copy_next = true;
+                    continue;
+                }
                 match phase {
                     Phase::BeforeMinus1 => {
                         new_cp = pg_sys::lappend_int(new_cp, v);
