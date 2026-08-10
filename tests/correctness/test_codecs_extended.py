@@ -194,8 +194,9 @@ def test_direct_backfill_malformed_input_rolls_back_cleanly(db):
     assert rows == 0
 
 
-@pytest.mark.xfail(strict=True, reason="NaN float colstats are emitted as an unquoted SQL token")
 def test_float_special_nan_compression_regression(db):
+    """Issue #54: NaN float sums used to be spliced into the colstats INSERT
+    as a bare token, failing compression with `column "nan" does not exist`."""
     db.execute("SET pg_deltax.mock_now = '2025-01-20 12:00:00+00'")
     db.execute(
         """
@@ -229,6 +230,12 @@ def test_float_special_nan_compression_regression(db):
         """
     ).fetchone()[0]
     db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
+    db.commit()
+
+    rows = db.execute(
+        "SELECT id, val::text FROM float_special_nan ORDER BY id"
+    ).fetchall()
+    assert rows == [(1, "NaN"), (2, "Infinity")]
 
 
 @pytest.mark.xfail(strict=True, reason="direct backfill currently mis-restores NULL segment_by values")
